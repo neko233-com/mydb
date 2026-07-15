@@ -20,3 +20,45 @@ logs/
 # Temp
 tmp/
 temp/
+
+# Agent files
+.agent/
+.agents/
+.mimocode/
+.claude/
+.codex/
+*.agent
+
+# Backup files
+*.bak
+*.backup
+*.sql.gz
+*.sql.zst
+
+# Data directories
+data/
+*.db
+*.sqlite
+
+# Runtime files
+*.pid
+*.sock
+*.lock
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Build artifacts
+*.exe
+*.dll
+*.so
+*.dylib
+*.pdb
+
+# Test artifacts
+tests-output/
+coverage/
+*.profraw
+*.profdata
