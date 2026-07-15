@@ -1,0 +1,18 @@
+[package]
+name = "mydb-transaction"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mydb-storage = { path = "../mydb-storage" }
+tokio.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+parking_lot.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

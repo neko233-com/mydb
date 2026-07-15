@@ -1,0 +1,20 @@
+[package]
+name = "mydb-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "mydb-cli"
+path = "src/main.rs"
+
+[dependencies]
+mydb-wire = { path = "../mydb-wire" }
+tokio.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+rustyline = "14"
+colored = "2"
+dirs.workspace = true

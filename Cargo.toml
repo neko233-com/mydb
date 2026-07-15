@@ -1,0 +1,43 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/mydb-server",
+    "crates/mydb-cli",
+    "crates/mydb-wire",
+    "crates/mydb-parser",
+    "crates/mydb-storage",
+    "crates/mydb-transaction",
+    "crates/mydb-config",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["neko233"]
+repository = "https://github.com/neko233-com/mydb"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+thiserror = "1"
+bytes = "1"
+byteorder = "1"
+sha2 = "0.10"
+rand = "0.8"
+parking_lot = "0.12"
+dashmap = "5"
+arc-swap = "1"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+clap = { version = "4", features = ["derive"] }
+toml = "0.8"
+dirs = "5"
+indicatif = "0.17"
+console = "0.15"
+tempfile = "3"

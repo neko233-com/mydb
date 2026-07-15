@@ -1,0 +1,54 @@
+# MyDB Configuration
+# This file is used by mydb-server
+
+server:
+  # 监听地址
+  host: "0.0.0.0"
+  # 监听端口（默认 3306，与 MySQL 相同）
+  port: 3306
+  # 最大连接数
+  max_connections: 1000
+  # 工作线程数（0 = 自动检测 CPU 核心数）
+  thread_count: 0
+  # 连接超时（秒）
+  connect_timeout: 10
+  # 交互超时（秒）
+  interactive_timeout: 28800
+
+storage:
+  # 数据目录
+  data_dir: "/var/lib/mydb"
+  # 存储引擎
+  engine: "innodb"
+  # Buffer Pool 大小
+  buffer_pool_size: "1G"
+  # 日志文件大小
+  log_file_size: "256M"
+  # 页大小
+  page_size: 16384
+
+security:
+  # 认证方式
+  authentication: "mysql_native_password"
+  # 是否要求安全传输
+  require_secure_transport: false
+  # 密码过期时间（天，0 = 不过期）
+  password_lifetime: 0
+
+logging:
+  # 日志级别: trace, debug, info, warn, error
+  level: "info"
+  # 日志文件路径（空 = 标准输出）
+  file: ""
+  # 日志轮转大小
+  max_size: "100M"
+  # 保留日志文件数
+  max_files: 10
+
+character_set:
+  # 服务器字符集
+  server: "utf8mb4"
+  # 连接字符集
+  connection: "utf8mb4"
+  # 结果字符集
+  results: "utf8mb4"

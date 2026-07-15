@@ -1,0 +1,23 @@
+[package]
+name = "mydb-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "mydb-server"
+path = "src/main.rs"
+
+[dependencies]
+mydb-wire = { path = "../mydb-wire" }
+mydb-config = { path = "../mydb-config" }
+mydb-storage = { path = "../mydb-storage" }
+mydb-transaction = { path = "../mydb-transaction" }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+arc-swap.workspace = true
+parking_lot.workspace = true
+dirs.workspace = true

@@ -1,0 +1,16 @@
+[package]
+name = "mydb-parser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "mydb-parser"
+path = "src/main.rs"
+
+[dependencies]
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
