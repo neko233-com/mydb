@@ -425,7 +425,10 @@ impl Connection {
             buf.put_u16_le(value as u16);
         } else if value < 16777216 {
             buf.push(0xFD);
-            buf.put_u24_le(value as u32);
+            // Write 3 bytes manually
+            buf.push((value & 0xFF) as u8);
+            buf.push(((value >> 8) & 0xFF) as u8);
+            buf.push(((value >> 16) & 0xFF) as u8);
         } else {
             buf.push(0xFE);
             buf.put_u64_le(value);

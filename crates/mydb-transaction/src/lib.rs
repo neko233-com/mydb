@@ -230,7 +230,10 @@ impl LockManager {
             if existing.holder == tx_id {
                 // Same transaction, upgrade if needed
                 if lock_type == LockType::Exclusive && existing.lock_type == LockType::Shared {
-                    existing.lock_type = lock_type;
+                    // Remove and re-insert with new lock type
+                    let mut upgraded = existing.clone();
+                    upgraded.lock_type = lock_type;
+                    locks.insert(resource.to_string(), upgraded);
                 }
                 return Ok(());
             }
