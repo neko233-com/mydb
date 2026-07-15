@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+mydb-wal = { path = "../mydb-wal" }
 tokio.workspace = true
 bytes.workspace = true
 byteorder.workspace = true

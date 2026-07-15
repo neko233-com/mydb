@@ -8,6 +8,7 @@ members = [
     "crates/mydb-storage",
     "crates/mydb-transaction",
     "crates/mydb-config",
+    "crates/mydb-wal",
 ]
 
 [workspace.package]

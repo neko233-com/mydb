@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+mydb-storage = { path = "../mydb-storage" }
 tokio.workspace = true
 bytes.workspace = true
 byteorder.workspace = true

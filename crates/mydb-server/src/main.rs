@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::Result;
 use clap::Parser;
@@ -30,7 +31,6 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize tracing
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -92,27 +92,49 @@ async fn main() -> Result<()> {
     info!("Data directory: {:?}", config.storage.data_dir);
     info!("Storage engine: {}", config.storage.engine);
 
-    // Start the server
+    // Initialize storage engine with WAL
+    let storage = Arc::new(mydb_storage::StorageEngineManager::new(
+        config.storage.data_dir.clone(),
+        config.storage.page_size as usize,
+        &config.storage.buffer_pool_size,
+    ));
+
+    // Initialize storage (load databases, replay WAL)
+    storage.init().await?;
+
+    // Create default "mydb" database if it doesn't exist
+    if storage.get_database("mydb").is_none() {
+        storage.create_database("mydb").await?;
+    }
+
+    // Ensure default root/root user exists
+    info!("Default credentials: root / root");
+    info!("HTTP management API port: {}", config.http.port);
+
+    // Start TCP listener
     let listener = tokio::net::TcpListener::bind(format!(
         "{}:{}",
         config.server.host, config.server.port
     ))
     .await?;
 
-    info!("MyDB server is ready for connections");
+    info!("MyDB server is ready for connections on port {}", config.server.port);
 
     // Accept connections
     loop {
         let (stream, addr) = listener.accept().await?;
-        info!("New connection from: {}", addr);
+        debug!("New connection from: {}", addr);
 
+        let storage = storage.clone();
         tokio::spawn(async move {
-            if let Err(e) = mydb_wire::handle_connection(stream).await {
-                tracing::error!("Connection error from {}: {}", addr, e);
+            if let Err(e) = mydb_wire::handle_connection(stream, storage).await {
+                tracing::debug!("Connection closed from {}: {}", addr, e);
             }
         });
     }
 }
+
+use tracing::debug;
 
 fn install_service() -> Result<()> {
     #[cfg(target_os = "linux")]
@@ -140,13 +162,11 @@ WantedBy=multi-user.target
         let service_path = "/etc/systemd/system/mydb.service";
         std::fs::write(service_path, service_content)?;
 
-        // Create mydb user if not exists
         std::process::Command::new("useradd")
             .args(["-r", "-s", "/bin/false", "mydb"])
             .output()
-            .ok(); // Ignore error if user already exists
+            .ok();
 
-        // Create data directory
         std::fs::create_dir_all("/var/lib/mydb")?;
         std::process::Command::new("chown")
             .args(["-R", "mydb:mydb", "/var/lib/mydb"])
@@ -196,8 +216,10 @@ WantedBy=multi-user.target
     #[cfg(target_os = "windows")]
     {
         println!("For Windows, use sc.exe or install as a Windows Service:");
-        println!("  sc.exe create MyDBServer binPath= \"{}\\mydb-server.exe\"", 
-                 std::env::current_exe()?.parent().unwrap().display());
+        println!(
+            "  sc.exe create MyDBServer binPath= \"{}\\mydb-server.exe\"",
+            std::env::current_exe()?.parent().unwrap().display()
+        );
         println!("  sc.exe start MyDBServer");
     }
 

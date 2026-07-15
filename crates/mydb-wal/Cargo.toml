@@ -1,0 +1,15 @@
+[package]
+name = "mydb-wal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bytes.workspace = true
+crc32fast = "1"
+parking_lot.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
