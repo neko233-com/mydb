@@ -17,10 +17,12 @@ server:
 
 http:
   # HTTP 管理 API 端口
-  port: 9036
+  port: 4306
   # 监听地址（仅内网）
   host: "127.0.0.1"
-  # 管理员密码（请务必修改）
+  # 管理员用户名
+  admin_username: "root"
+  # 管理员密码
   admin_password: "root"
   # 是否启用 HTTP API
   enabled: true
@@ -46,6 +48,10 @@ memory:
   sort_buffer_size: "4M"
 
 security:
+  # MySQL 协议默认用户名
+  default_username: "root"
+  # MySQL 协议默认密码
+  default_password: "root"
   # 认证方式
   authentication: "mysql_native_password"
   # 是否要求安全传输

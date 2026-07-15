@@ -41,6 +41,8 @@ pub struct HttpSection {
     pub port: u16,
     #[serde(default = "default_http_host")]
     pub host: String,
+    #[serde(default = "default_admin_username")]
+    pub admin_username: String,
     #[serde(default = "default_admin_password")]
     pub admin_password: String,
     #[serde(default = "default_true")]
@@ -73,6 +75,10 @@ pub struct MemorySection {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SecuritySection {
+    #[serde(default = "default_root_username")]
+    pub default_username: String,
+    #[serde(default = "default_root_password")]
+    pub default_password: String,
     #[serde(default = "default_authentication")]
     pub authentication: String,
     #[serde(default)]
@@ -130,10 +136,13 @@ fn default_interactive_timeout() -> u64 {
     28800
 }
 fn default_http_port() -> u16 {
-    9036
+    4306
 }
 fn default_http_host() -> String {
     "127.0.0.1".to_string()
+}
+fn default_admin_username() -> String {
+    "root".to_string()
 }
 fn default_admin_password() -> String {
     "root".to_string()
@@ -167,6 +176,12 @@ fn default_sort_buffer_size() -> String {
 }
 fn default_authentication() -> String {
     "mysql_native_password".to_string()
+}
+fn default_root_username() -> String {
+    "root".to_string()
+}
+fn default_root_password() -> String {
+    "root".to_string()
 }
 fn default_backup_dir() -> PathBuf {
     PathBuf::from("/var/lib/mydb/backups")
@@ -205,6 +220,7 @@ impl Default for HttpSection {
         Self {
             port: default_http_port(),
             host: default_http_host(),
+            admin_username: default_admin_username(),
             admin_password: default_admin_password(),
             enabled: default_true(),
         }
@@ -236,6 +252,8 @@ impl Default for MemorySection {
 impl Default for SecuritySection {
     fn default() -> Self {
         Self {
+            default_username: default_root_username(),
+            default_password: default_root_password(),
             authentication: default_authentication(),
             require_secure_transport: false,
             password_lifetime: 0,
