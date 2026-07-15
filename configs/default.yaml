@@ -15,17 +15,35 @@ server:
   # 交互超时（秒）
   interactive_timeout: 28800
 
+http:
+  # HTTP 管理 API 端口
+  port: 9036
+  # 监听地址（仅内网）
+  host: "127.0.0.1"
+  # 管理员密码（请务必修改）
+  admin_password: "root"
+  # 是否启用 HTTP API
+  enabled: true
+
 storage:
   # 数据目录
   data_dir: "/var/lib/mydb"
-  # 存储引擎
+  # 存储引擎：innodb / memory
   engine: "innodb"
   # Buffer Pool 大小
-  buffer_pool_size: "1G"
+  buffer_pool_size: "800M"
   # 日志文件大小
   log_file_size: "256M"
   # 页大小
   page_size: 16384
+
+memory:
+  # 内存上限
+  max_memory: "1G"
+  # 查询缓存
+  query_cache_size: "64M"
+  # 排序缓冲
+  sort_buffer_size: "4M"
 
 security:
   # 认证方式
@@ -34,6 +52,14 @@ security:
   require_secure_transport: false
   # 密码过期时间（天，0 = 不过期）
   password_lifetime: 0
+
+backup:
+  # 备份目录
+  backup_dir: "/var/lib/mydb/backups"
+  # 自动备份间隔（小时，0 = 不自动备份）
+  auto_backup_interval: 0
+  # 保留备份数量
+  max_backups: 10
 
 logging:
   # 日志级别: trace, debug, info, warn, error
