@@ -969,6 +969,22 @@ impl AuthCatalog {
             Ok(())
         })
     }
+
+    fn revoke_role(&self, role: &str, user: &str) -> anyhow::Result<()> {
+        let role = normalize_auth_name(role);
+        let user = normalize_auth_name(user);
+        self.mutate(|data| {
+            if !data.roles.contains_key(&role) {
+                anyhow::bail!("Unknown role '{}'", role);
+            }
+            let entry = data
+                .users
+                .get_mut(&user)
+                .ok_or_else(|| anyhow::anyhow!("Unknown user '{}'", user))?;
+            entry.roles.remove(&role);
+            Ok(())
+        })
+    }
 }
 
 fn normalize_auth_name(name: &str) -> String {
@@ -4390,13 +4406,13 @@ impl Backend {
         let target_index = upper_remainder
             .find(marker)
             .ok_or_else(|| anyhow::anyhow!("authorization statement requires {}", marker.trim()))?;
+        let role = remainder[..target_index].trim();
+        let user = remainder[target_index + marker.len()..].trim();
         if revoke {
-            anyhow::bail!("REVOKE role is not implemented yet");
+            self.config.auth_catalog.revoke_role(role, user)?;
+        } else {
+            self.config.auth_catalog.grant_role(role, user)?;
         }
-        self.config.auth_catalog.grant_role(
-            remainder[..target_index].trim(),
-            remainder[target_index + marker.len()..].trim(),
-        )?;
         Ok(QueryOutcome::ok(0))
     }
 
@@ -28072,6 +28088,21 @@ mod tests {
             .config
             .auth_catalog
             .has_privilege("writer", "mydb", "INSERT"));
+        backend
+            .execute("REVOKE analyst FROM 'writer'")
+            .await
+            .unwrap();
+        let grants = backend.execute("SHOW GRANTS FOR 'writer'").await.unwrap();
+        let rendered = match grants {
+            QueryOutcome::Rows { rows, .. } => rows
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|value| String::from_utf8(value).unwrap())
+                .collect::<Vec<_>>(),
+            _ => panic!("expected grants rows"),
+        };
+        assert!(!rendered.iter().any(|grant| grant.contains("analyst")));
     }
 
     async fn query_rows(backend: &mut Backend, sql: &str) -> Vec<Vec<Option<Vec<u8>>>> {
