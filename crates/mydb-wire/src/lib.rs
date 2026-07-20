@@ -840,26 +840,35 @@ impl AuthCatalog {
 
     fn grant_privileges(
         &self,
-        principal: &str,
+        principals: &[String],
         database: Option<&str>,
         privileges: HashSet<String>,
     ) -> anyhow::Result<()> {
-        let principal = normalize_auth_name(principal);
+        let principals = normalize_auth_names(principals)?;
         let database = database.map(str::to_ascii_lowercase);
         self.mutate(|data| {
-            if let Some(user) = data.users.get_mut(&principal) {
-                let target = database
-                    .as_ref()
-                    .map(|database| {
-                        user.database_privileges
-                            .entry(database.clone())
-                            .or_default()
-                    })
-                    .unwrap_or(&mut user.global_privileges);
-                target.extend(privileges);
-                return Ok(());
+            for principal in &principals {
+                if !data.users.contains_key(principal) && !data.roles.contains_key(principal) {
+                    anyhow::bail!("Unknown user or role '{}'", principal);
+                }
             }
-            if let Some(role) = data.roles.get_mut(&principal) {
+            for principal in principals {
+                if let Some(user) = data.users.get_mut(&principal) {
+                    let target = database
+                        .as_ref()
+                        .map(|database| {
+                            user.database_privileges
+                                .entry(database.clone())
+                                .or_default()
+                        })
+                        .unwrap_or(&mut user.global_privileges);
+                    target.extend(privileges.iter().cloned());
+                    continue;
+                }
+                let role = data
+                    .roles
+                    .get_mut(&principal)
+                    .expect("principal was checked above");
                 let target = database
                     .as_ref()
                     .map(|database| {
@@ -868,37 +877,45 @@ impl AuthCatalog {
                             .or_default()
                     })
                     .unwrap_or(&mut role.global_privileges);
-                target.extend(privileges);
-                return Ok(());
+                target.extend(privileges.iter().cloned());
             }
-            anyhow::bail!("Unknown user or role '{}'", principal)
+            Ok(())
         })
     }
 
     fn revoke_privileges(
         &self,
-        principal: &str,
+        principals: &[String],
         database: Option<&str>,
         privileges: &HashSet<String>,
     ) -> anyhow::Result<()> {
-        let principal = normalize_auth_name(principal);
+        let principals = normalize_auth_names(principals)?;
         let database = database.map(str::to_ascii_lowercase);
         self.mutate(|data| {
-            let target = if let Some(user) = data.users.get_mut(&principal) {
-                database
-                    .as_ref()
-                    .and_then(|database| user.database_privileges.get_mut(database))
-                    .unwrap_or(&mut user.global_privileges)
-            } else if let Some(role) = data.roles.get_mut(&principal) {
-                database
-                    .as_ref()
-                    .and_then(|database| role.database_privileges.get_mut(database))
-                    .unwrap_or(&mut role.global_privileges)
-            } else {
-                anyhow::bail!("Unknown user or role '{}'", principal);
-            };
-            for privilege in privileges {
-                target.remove(privilege);
+            for principal in &principals {
+                if !data.users.contains_key(principal) && !data.roles.contains_key(principal) {
+                    anyhow::bail!("Unknown user or role '{}'", principal);
+                }
+            }
+            for principal in principals {
+                let target = if let Some(user) = data.users.get_mut(&principal) {
+                    database
+                        .as_ref()
+                        .and_then(|database| user.database_privileges.get_mut(database))
+                        .unwrap_or(&mut user.global_privileges)
+                } else {
+                    let role = data
+                        .roles
+                        .get_mut(&principal)
+                        .expect("principal was checked above");
+                    database
+                        .as_ref()
+                        .and_then(|database| role.database_privileges.get_mut(database))
+                        .unwrap_or(&mut role.global_privileges)
+                };
+                for privilege in privileges {
+                    target.remove(privilege);
+                }
             }
             Ok(())
         })
@@ -4535,7 +4552,7 @@ impl Backend {
                 anyhow::anyhow!("authorization statement requires {}", marker.trim())
             })?;
             let scope = after_on[..target_index].trim();
-            let principal = after_on[target_index + marker.len()..].trim();
+            let principals = split_csv(after_on[target_index + marker.len()..].trim());
             let database = if scope == "*.*" {
                 None
             } else {
@@ -4546,11 +4563,11 @@ impl Backend {
             if revoke {
                 self.config
                     .auth_catalog
-                    .revoke_privileges(principal, database, &privileges)?;
+                    .revoke_privileges(&principals, database, &privileges)?;
             } else {
                 self.config
                     .auth_catalog
-                    .grant_privileges(principal, database, privileges)?;
+                    .grant_privileges(&principals, database, privileges)?;
             }
             return Ok(QueryOutcome::ok(0));
         }
@@ -28131,7 +28148,7 @@ mod tests {
         catalog.create_roles(&["analyst".to_string()]).unwrap();
         catalog
             .grant_privileges(
-                "game_writer",
+                &["game_writer".to_string()],
                 Some("game"),
                 HashSet::from(["INSERT".to_string(), "UPDATE".to_string()]),
             )
@@ -28363,6 +28380,26 @@ mod tests {
             .read()
             .roles
             .contains_key("batch_reader"));
+        backend
+            .execute("GRANT SELECT ON mydb.* TO 'batch_one', 'batch_two'")
+            .await
+            .unwrap();
+        assert!(backend
+            .config
+            .auth_catalog
+            .has_privilege("batch_one", "mydb", "SELECT"));
+        assert!(backend
+            .config
+            .auth_catalog
+            .has_privilege("batch_two", "mydb", "SELECT"));
+        backend
+            .execute("REVOKE SELECT ON mydb.* FROM 'batch_one', 'batch_two'")
+            .await
+            .unwrap();
+        assert!(!backend
+            .config
+            .auth_catalog
+            .has_privilege("batch_one", "mydb", "SELECT"));
         assert!(backend
             .execute("DROP ROLE batch_reader, missing_role")
             .await
