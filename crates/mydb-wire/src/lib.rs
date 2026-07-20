@@ -607,6 +607,8 @@ struct AuthUser {
 struct AuthRole {
     global_privileges: HashSet<String>,
     database_privileges: HashMap<String, HashSet<String>>,
+    #[serde(default)]
+    roles: HashSet<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -735,19 +737,14 @@ impl AuthCatalog {
         let Some(user) = data.users.get(&normalize_auth_name(user)) else {
             return false;
         };
+        let database = database.to_ascii_lowercase();
         privilege_set_allows(&user.global_privileges, privilege)
             || user
                 .database_privileges
-                .get(&database.to_ascii_lowercase())
+                .get(&database)
                 .is_some_and(|set| privilege_set_allows(set, privilege))
             || user.roles.iter().any(|role| {
-                data.roles.get(role).is_some_and(|entry| {
-                    privilege_set_allows(&entry.global_privileges, privilege)
-                        || entry
-                            .database_privileges
-                            .get(&database.to_ascii_lowercase())
-                            .is_some_and(|set| privilege_set_allows(set, privilege))
-                })
+                role_has_privilege(&data, role, &database, privilege, &mut HashSet::new())
             })
     }
 
@@ -905,6 +902,9 @@ impl AuthCatalog {
             for user in data.users.values_mut() {
                 user.roles.remove(&role);
             }
+            for inherited_role in data.roles.values_mut() {
+                inherited_role.roles.remove(&role);
+            }
             Ok(())
         })
     }
@@ -916,10 +916,14 @@ impl AuthCatalog {
             (
                 &user.global_privileges,
                 &user.database_privileges,
-                Some(&user.roles),
+                &user.roles,
             )
         } else if let Some(role) = data.roles.get(&principal) {
-            (&role.global_privileges, &role.database_privileges, None)
+            (
+                &role.global_privileges,
+                &role.database_privileges,
+                &role.roles,
+            )
         } else {
             anyhow::bail!("Unknown user or role '{}'", principal);
         };
@@ -942,45 +946,61 @@ impl AuthCatalog {
                 ));
             }
         }
-        if let Some(roles) = roles {
-            for role in roles {
-                grants.push(format!(
-                    "GRANT `{}` TO {}",
-                    role.replace('`', "``"),
-                    subject
-                ));
-            }
+        for role in roles {
+            grants.push(format!(
+                "GRANT `{}` TO {}",
+                role.replace('`', "``"),
+                subject
+            ));
         }
         Ok(grants)
     }
 
-    fn grant_role(&self, role: &str, user: &str) -> anyhow::Result<()> {
+    fn grant_role(&self, role: &str, principal: &str) -> anyhow::Result<()> {
         let role = normalize_auth_name(role);
-        let user = normalize_auth_name(user);
+        let principal = normalize_auth_name(principal);
         self.mutate(|data| {
             if !data.roles.contains_key(&role) {
                 anyhow::bail!("Unknown role '{}'", role);
             }
-            let entry = data
-                .users
-                .get_mut(&user)
-                .ok_or_else(|| anyhow::anyhow!("Unknown user '{}'", user))?;
-            entry.roles.insert(role);
+            if let Some(entry) = data.users.get_mut(&principal) {
+                entry.roles.insert(role);
+                return Ok(());
+            }
+            if !data.roles.contains_key(&principal) {
+                anyhow::bail!("Unknown user or role '{}'", principal);
+            }
+            if role == principal || role_inherits(data, &role, &principal, &mut HashSet::new()) {
+                anyhow::bail!(
+                    "Cannot grant role '{}' to '{}' because it creates a cycle",
+                    role,
+                    principal
+                );
+            }
+            data.roles
+                .get_mut(&principal)
+                .expect("role was checked above")
+                .roles
+                .insert(role);
             Ok(())
         })
     }
 
-    fn revoke_role(&self, role: &str, user: &str) -> anyhow::Result<()> {
+    fn revoke_role(&self, role: &str, principal: &str) -> anyhow::Result<()> {
         let role = normalize_auth_name(role);
-        let user = normalize_auth_name(user);
+        let principal = normalize_auth_name(principal);
         self.mutate(|data| {
             if !data.roles.contains_key(&role) {
                 anyhow::bail!("Unknown role '{}'", role);
             }
+            if let Some(entry) = data.users.get_mut(&principal) {
+                entry.roles.remove(&role);
+                return Ok(());
+            }
             let entry = data
-                .users
-                .get_mut(&user)
-                .ok_or_else(|| anyhow::anyhow!("Unknown user '{}'", user))?;
+                .roles
+                .get_mut(&principal)
+                .ok_or_else(|| anyhow::anyhow!("Unknown user or role '{}'", principal))?;
             entry.roles.remove(&role);
             Ok(())
         })
@@ -1025,6 +1045,49 @@ fn verify_mysql_native_password_sha1(hash: &str, salt: &[u8], response: &[u8]) -
 
 fn privilege_set_allows(set: &HashSet<String>, privilege: &str) -> bool {
     set.contains("ALL") || set.contains(&privilege.to_ascii_uppercase())
+}
+
+fn role_has_privilege(
+    data: &AuthCatalogData,
+    role_name: &str,
+    database: &str,
+    privilege: &str,
+    visited: &mut HashSet<String>,
+) -> bool {
+    if !visited.insert(role_name.to_string()) {
+        return false;
+    }
+    let Some(role) = data.roles.get(role_name) else {
+        return false;
+    };
+    privilege_set_allows(&role.global_privileges, privilege)
+        || role
+            .database_privileges
+            .get(database)
+            .is_some_and(|set| privilege_set_allows(set, privilege))
+        || role
+            .roles
+            .iter()
+            .any(|nested| role_has_privilege(data, nested, database, privilege, visited))
+}
+
+fn role_inherits(
+    data: &AuthCatalogData,
+    role_name: &str,
+    sought_role: &str,
+    visited: &mut HashSet<String>,
+) -> bool {
+    if !visited.insert(role_name.to_string()) {
+        return false;
+    }
+    let Some(role) = data.roles.get(role_name) else {
+        return false;
+    };
+    role.roles.contains(sought_role)
+        || role
+            .roles
+            .iter()
+            .any(|nested| role_inherits(data, nested, sought_role, visited))
 }
 
 fn render_privileges(privileges: &HashSet<String>) -> String {
@@ -28103,6 +28166,49 @@ mod tests {
             _ => panic!("expected grants rows"),
         };
         assert!(!rendered.iter().any(|grant| grant.contains("analyst")));
+    }
+
+    #[tokio::test]
+    async fn nested_roles_inherit_privileges_and_reject_cycles() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = Arc::new(StorageEngineManager::new(
+            temp.path().to_path_buf(),
+            16384,
+            "4M",
+        ));
+        storage.init().await.unwrap();
+        storage.create_database("mydb").await.unwrap();
+        let mut backend = Backend::new(
+            storage,
+            Arc::new(ProtocolConfig::default()),
+            Arc::new(WireStats::default()),
+            1,
+        );
+        backend
+            .execute("CREATE USER 'nested_writer' IDENTIFIED BY 'writer-password'")
+            .await
+            .unwrap();
+        backend.execute("CREATE ROLE reader").await.unwrap();
+        backend.execute("CREATE ROLE analyst").await.unwrap();
+        backend
+            .execute("GRANT SELECT ON mydb.* TO reader")
+            .await
+            .unwrap();
+        backend.execute("GRANT reader TO analyst").await.unwrap();
+        backend
+            .execute("GRANT analyst TO 'nested_writer'")
+            .await
+            .unwrap();
+        assert!(backend
+            .config
+            .auth_catalog
+            .has_privilege("nested_writer", "mydb", "SELECT"));
+        assert!(backend.execute("GRANT analyst TO reader").await.is_err());
+        backend.execute("REVOKE reader FROM analyst").await.unwrap();
+        assert!(!backend
+            .config
+            .auth_catalog
+            .has_privilege("nested_writer", "mydb", "SELECT"));
     }
 
     async fn query_rows(backend: &mut Backend, sql: &str) -> Vec<Vec<Option<Vec<u8>>>> {
