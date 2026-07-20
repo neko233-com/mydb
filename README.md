@@ -88,7 +88,7 @@ MYDB_ADMIN_PASSWORD_FILE=/run/mydb-secrets/admin \
 mydb-server --config /etc/mydb/production.yaml
 ```
 
-MyDB 尚未提供原生 TLS。生产网络路径必须由 mTLS/TLS 代理或私有网络保护，代理到 loopback MyDB；不要设置 `require_secure_transport=true`，该设置会故意拒绝启动，避免产生未加密却声称安全传输的假象。SQL 用户/角色/GRANT、审计与密钥轮换尚未完成，不能把当前 root 单账号模型直接暴露给不可信租户或公网。
+MyDB 支持原生 TLS：配置 `security.tls_cert`、`security.tls_key` 和 `security.require_secure_transport=true` 后，未加密 SQL 连接会被拒绝。生产仍应将 SQL/HTTP 监听限制在私网或 loopback，并配合防火墙。SQL 用户、角色、`GRANT`/`REVOKE` 和审计日志已持久化；密钥轮换、完整 MySQL 权限/角色语义和危险操作审批仍在验收清单中，不能直接暴露给不可信公网。
 
 每次版本升级前后至少完成一次恢复演练：创建全量备份、写入校验行、创建增量备份、恢复到隔离实例并核对行数与业务校验。备份目录应位于独立持久化卷，并按恢复目标保留完整 full→incremental 父链。
 
