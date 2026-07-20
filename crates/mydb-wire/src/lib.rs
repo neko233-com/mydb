@@ -762,49 +762,77 @@ impl AuthCatalog {
         Ok(())
     }
 
-    fn create_user(&self, user: &str, password: &str) -> anyhow::Result<()> {
-        let user = normalize_auth_name(user);
-        if user.is_empty() || password.is_empty() {
+    fn create_users(&self, users: &[(String, String)]) -> anyhow::Result<()> {
+        if users.is_empty() {
+            anyhow::bail!("CREATE USER requires at least one user");
+        }
+        let users = users
+            .iter()
+            .map(|(user, password)| (normalize_auth_name(user), password.clone()))
+            .collect::<Vec<_>>();
+        if users
+            .iter()
+            .any(|(user, password)| user.is_empty() || password.is_empty())
+        {
             anyhow::bail!("user name and password must not be empty");
         }
         self.mutate(|data| {
-            if data.users.contains_key(&user) {
-                anyhow::bail!("Operation CREATE USER failed for '{}'", user);
+            let mut seen = HashSet::new();
+            for (user, _) in &users {
+                if !seen.insert(user) || data.users.contains_key(user) {
+                    anyhow::bail!("Operation CREATE USER failed for '{}'", user);
+                }
             }
-            data.users.insert(
-                user,
-                AuthUser {
-                    password_sha1: password_sha1_hex(password),
-                    global_privileges: HashSet::new(),
-                    database_privileges: HashMap::new(),
-                    roles: HashSet::new(),
-                },
-            );
+            for (user, password) in users {
+                data.users.insert(
+                    user,
+                    AuthUser {
+                        password_sha1: password_sha1_hex(&password),
+                        global_privileges: HashSet::new(),
+                        database_privileges: HashMap::new(),
+                        roles: HashSet::new(),
+                    },
+                );
+            }
             Ok(())
         })
     }
 
-    fn alter_user_password(&self, user: &str, password: &str) -> anyhow::Result<()> {
-        let user = normalize_auth_name(user);
+    fn alter_user_passwords(&self, users: &[(String, String)]) -> anyhow::Result<()> {
+        if users.is_empty() {
+            anyhow::bail!("ALTER USER requires at least one user");
+        }
+        let users = users
+            .iter()
+            .map(|(user, password)| (normalize_auth_name(user), password.clone()))
+            .collect::<Vec<_>>();
         self.mutate(|data| {
-            let entry = data
-                .users
-                .get_mut(&user)
-                .ok_or_else(|| anyhow::anyhow!("Operation ALTER USER failed for '{}'", user))?;
-            entry.password_sha1 = password_sha1_hex(password);
+            for (user, _) in &users {
+                if !data.users.contains_key(user) {
+                    anyhow::bail!("Operation ALTER USER failed for '{}'", user);
+                }
+            }
+            for (user, password) in users {
+                data.users
+                    .get_mut(&user)
+                    .expect("user was checked above")
+                    .password_sha1 = password_sha1_hex(&password);
+            }
             Ok(())
         })
     }
 
-    fn create_role(&self, role: &str) -> anyhow::Result<()> {
-        let role = normalize_auth_name(role);
+    fn create_roles(&self, roles: &[String]) -> anyhow::Result<()> {
+        let roles = normalize_auth_names(roles)?;
         self.mutate(|data| {
-            if data
-                .roles
-                .insert(role.clone(), AuthRole::default())
-                .is_some()
-            {
-                anyhow::bail!("Operation CREATE ROLE failed for '{}'", role);
+            let mut seen = HashSet::new();
+            for role in &roles {
+                if !seen.insert(role) || data.roles.contains_key(role) {
+                    anyhow::bail!("Operation CREATE ROLE failed for '{}'", role);
+                }
+            }
+            for role in roles {
+                data.roles.insert(role, AuthRole::default());
             }
             Ok(())
         })
@@ -876,34 +904,53 @@ impl AuthCatalog {
         })
     }
 
-    fn drop_user(&self, user: &str) -> anyhow::Result<()> {
-        let user = normalize_auth_name(user);
+    fn drop_users(&self, users: &[String]) -> anyhow::Result<()> {
+        let users = normalize_auth_names(users)?;
         self.mutate(|data| {
-            if data.users.remove(&user).is_none() {
-                anyhow::bail!("Operation DROP USER failed for '{}'", user);
+            for user in &users {
+                if !data.users.contains_key(user) {
+                    anyhow::bail!("Operation DROP USER failed for '{}'", user);
+                }
             }
-            if data
+            let global_administrators = data
                 .users
                 .values()
-                .all(|entry| !entry.global_privileges.contains("ALL"))
-            {
+                .filter(|entry| entry.global_privileges.contains("ALL"))
+                .count();
+            let dropped_administrators = users
+                .iter()
+                .filter(|user| data.users[*user].global_privileges.contains("ALL"))
+                .count();
+            if global_administrators <= dropped_administrators {
                 anyhow::bail!("refusing to remove final global administrator");
+            }
+            for user in users {
+                data.users.remove(&user);
             }
             Ok(())
         })
     }
 
-    fn drop_role(&self, role: &str) -> anyhow::Result<()> {
-        let role = normalize_auth_name(role);
+    fn drop_roles(&self, roles: &[String]) -> anyhow::Result<()> {
+        let roles = normalize_auth_names(roles)?;
         self.mutate(|data| {
-            if data.roles.remove(&role).is_none() {
-                anyhow::bail!("Operation DROP ROLE failed for '{}'", role);
+            for role in &roles {
+                if !data.roles.contains_key(role) {
+                    anyhow::bail!("Operation DROP ROLE failed for '{}'", role);
+                }
+            }
+            for role in &roles {
+                data.roles.remove(role);
             }
             for user in data.users.values_mut() {
-                user.roles.remove(&role);
+                for role in &roles {
+                    user.roles.remove(role);
+                }
             }
             for inherited_role in data.roles.values_mut() {
-                inherited_role.roles.remove(&role);
+                for role in &roles {
+                    inherited_role.roles.remove(role);
+                }
             }
             Ok(())
         })
@@ -1147,6 +1194,16 @@ fn sql_string_literal(value: &str) -> anyhow::Result<String> {
         anyhow::bail!("expected quoted string literal");
     };
     Ok(value.replace("''", "'"))
+}
+
+fn parse_user_identified_clause(clause: &str, statement: &str) -> anyhow::Result<(String, String)> {
+    let marker = clause
+        .to_ascii_uppercase()
+        .find(" IDENTIFIED BY ")
+        .ok_or_else(|| anyhow::anyhow!("{} requires IDENTIFIED BY", statement))?;
+    let user = clause[..marker].trim();
+    let password = sql_string_literal(clause[marker + " IDENTIFIED BY ".len()..].trim())?;
+    Ok((user.to_string(), password))
 }
 
 fn parse_privilege_list(value: &str) -> anyhow::Result<HashSet<String>> {
@@ -4438,32 +4495,33 @@ impl Backend {
         if upper.starts_with("CREATE USER ") || upper.starts_with("ALTER USER ") {
             let alter = upper.starts_with("ALTER USER ");
             let prefix = if alter { "ALTER USER" } else { "CREATE USER" };
-            let remainder = sql[prefix.len()..].trim();
-            let marker = remainder
-                .to_ascii_uppercase()
-                .find(" IDENTIFIED BY ")
-                .ok_or_else(|| anyhow::anyhow!("{} requires IDENTIFIED BY", prefix))?;
-            let user = remainder[..marker].trim();
-            let password = sql_string_literal(remainder[marker + 15..].trim())?;
+            let users = split_csv(sql[prefix.len()..].trim())
+                .iter()
+                .map(|clause| parse_user_identified_clause(clause, prefix))
+                .collect::<anyhow::Result<Vec<_>>>()?;
             if alter {
-                self.config
-                    .auth_catalog
-                    .alter_user_password(user, &password)?;
+                self.config.auth_catalog.alter_user_passwords(&users)?;
             } else {
-                self.config.auth_catalog.create_user(user, &password)?;
+                self.config.auth_catalog.create_users(&users)?;
             }
             return Ok(QueryOutcome::ok(0));
         }
         if upper.starts_with("CREATE ROLE ") {
-            self.config.auth_catalog.create_role(sql[11..].trim())?;
+            self.config
+                .auth_catalog
+                .create_roles(&split_csv(sql[11..].trim()))?;
             return Ok(QueryOutcome::ok(0));
         }
         if upper.starts_with("DROP USER ") {
-            self.config.auth_catalog.drop_user(sql[10..].trim())?;
+            self.config
+                .auth_catalog
+                .drop_users(&split_csv(sql[10..].trim()))?;
             return Ok(QueryOutcome::ok(0));
         }
         if upper.starts_with("DROP ROLE ") {
-            self.config.auth_catalog.drop_role(sql[10..].trim())?;
+            self.config
+                .auth_catalog
+                .drop_roles(&split_csv(sql[10..].trim()))?;
             return Ok(QueryOutcome::ok(0));
         }
         let revoke = upper.starts_with("REVOKE ");
@@ -28068,9 +28126,9 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let catalog = AuthCatalog::open(directory.path(), "root", "root-password").unwrap();
         catalog
-            .create_user("game_writer", "writer-password")
+            .create_users(&[("game_writer".to_string(), "writer-password".to_string())])
             .unwrap();
-        catalog.create_role("analyst").unwrap();
+        catalog.create_roles(&["analyst".to_string()]).unwrap();
         catalog
             .grant_privileges(
                 "game_writer",
@@ -28262,6 +28320,86 @@ mod tests {
             .config
             .auth_catalog
             .has_privilege("nested_reader", "mydb", "SELECT"));
+    }
+
+    #[tokio::test]
+    async fn batch_account_and_role_ddl_is_atomic() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = Arc::new(StorageEngineManager::new(
+            temp.path().to_path_buf(),
+            16384,
+            "4M",
+        ));
+        storage.init().await.unwrap();
+        storage.create_database("mydb").await.unwrap();
+        let mut backend = Backend::new(
+            storage,
+            Arc::new(ProtocolConfig::default()),
+            Arc::new(WireStats::default()),
+            1,
+        );
+        backend
+            .execute(
+                "CREATE USER 'batch_one' IDENTIFIED BY 'one-password', \
+                 'batch_two' IDENTIFIED BY 'two-password'",
+            )
+            .await
+            .unwrap();
+        backend
+            .execute("CREATE ROLE batch_reader, batch_writer")
+            .await
+            .unwrap();
+        assert!(backend
+            .config
+            .auth_catalog
+            .data
+            .read()
+            .users
+            .contains_key("batch_one"));
+        assert!(backend
+            .config
+            .auth_catalog
+            .data
+            .read()
+            .roles
+            .contains_key("batch_reader"));
+        assert!(backend
+            .execute("DROP ROLE batch_reader, missing_role")
+            .await
+            .is_err());
+        assert!(backend
+            .config
+            .auth_catalog
+            .data
+            .read()
+            .roles
+            .contains_key("batch_reader"));
+        assert!(backend
+            .execute("DROP USER 'batch_one', missing_user")
+            .await
+            .is_err());
+        assert!(backend
+            .config
+            .auth_catalog
+            .data
+            .read()
+            .users
+            .contains_key("batch_one"));
+        backend
+            .execute("DROP ROLE batch_reader, batch_writer")
+            .await
+            .unwrap();
+        backend
+            .execute("DROP USER 'batch_one', 'batch_two'")
+            .await
+            .unwrap();
+        assert!(!backend
+            .config
+            .auth_catalog
+            .data
+            .read()
+            .users
+            .contains_key("batch_one"));
     }
 
     async fn query_rows(backend: &mut Backend, sql: &str) -> Vec<Vec<Option<Vec<u8>>>> {
