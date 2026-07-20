@@ -762,7 +762,7 @@ impl AuthCatalog {
         Ok(())
     }
 
-    fn create_users(&self, users: &[(String, String)]) -> anyhow::Result<()> {
+    fn create_users(&self, users: &[(String, String)], if_not_exists: bool) -> anyhow::Result<()> {
         if users.is_empty() {
             anyhow::bail!("CREATE USER requires at least one user");
         }
@@ -779,11 +779,14 @@ impl AuthCatalog {
         self.mutate(|data| {
             let mut seen = HashSet::new();
             for (user, _) in &users {
-                if !seen.insert(user) || data.users.contains_key(user) {
+                if !seen.insert(user) || (!if_not_exists && data.users.contains_key(user)) {
                     anyhow::bail!("Operation CREATE USER failed for '{}'", user);
                 }
             }
             for (user, password) in users {
+                if if_not_exists && data.users.contains_key(&user) {
+                    continue;
+                }
                 data.users.insert(
                     user,
                     AuthUser {
@@ -822,16 +825,19 @@ impl AuthCatalog {
         })
     }
 
-    fn create_roles(&self, roles: &[String]) -> anyhow::Result<()> {
+    fn create_roles(&self, roles: &[String], if_not_exists: bool) -> anyhow::Result<()> {
         let roles = normalize_auth_names(roles)?;
         self.mutate(|data| {
             let mut seen = HashSet::new();
             for role in &roles {
-                if !seen.insert(role) || data.roles.contains_key(role) {
+                if !seen.insert(role) || (!if_not_exists && data.roles.contains_key(role)) {
                     anyhow::bail!("Operation CREATE ROLE failed for '{}'", role);
                 }
             }
             for role in roles {
+                if if_not_exists && data.roles.contains_key(&role) {
+                    continue;
+                }
                 data.roles.insert(role, AuthRole::default());
             }
             Ok(())
@@ -921,13 +927,22 @@ impl AuthCatalog {
         })
     }
 
-    fn drop_users(&self, users: &[String]) -> anyhow::Result<()> {
+    fn drop_users(&self, users: &[String], if_exists: bool) -> anyhow::Result<()> {
         let users = normalize_auth_names(users)?;
         self.mutate(|data| {
-            for user in &users {
-                if !data.users.contains_key(user) {
-                    anyhow::bail!("Operation DROP USER failed for '{}'", user);
+            if !if_exists {
+                for user in &users {
+                    if !data.users.contains_key(user) {
+                        anyhow::bail!("Operation DROP USER failed for '{}'", user);
+                    }
                 }
+            }
+            let users = users
+                .into_iter()
+                .filter(|user| data.users.contains_key(user))
+                .collect::<Vec<_>>();
+            if users.is_empty() {
+                return Ok(());
             }
             let global_administrators = data
                 .users
@@ -948,9 +963,23 @@ impl AuthCatalog {
         })
     }
 
-    fn drop_roles(&self, roles: &[String]) -> anyhow::Result<()> {
+    fn drop_roles(&self, roles: &[String], if_exists: bool) -> anyhow::Result<()> {
         let roles = normalize_auth_names(roles)?;
         self.mutate(|data| {
+            if !if_exists {
+                for role in &roles {
+                    if !data.roles.contains_key(role) {
+                        anyhow::bail!("Operation DROP ROLE failed for '{}'", role);
+                    }
+                }
+            }
+            let roles = roles
+                .into_iter()
+                .filter(|role| data.roles.contains_key(role))
+                .collect::<Vec<_>>();
+            if roles.is_empty() {
+                return Ok(());
+            }
             for role in &roles {
                 if !data.roles.contains_key(role) {
                     anyhow::bail!("Operation DROP ROLE failed for '{}'", role);
@@ -4509,9 +4538,19 @@ impl Backend {
 
     fn execute_auth_statement(&self, sql: &str) -> anyhow::Result<QueryOutcome> {
         let upper = sql.to_ascii_uppercase();
-        if upper.starts_with("CREATE USER ") || upper.starts_with("ALTER USER ") {
+        if upper.starts_with("CREATE USER ")
+            || upper.starts_with("CREATE USER IF NOT EXISTS ")
+            || upper.starts_with("ALTER USER ")
+        {
             let alter = upper.starts_with("ALTER USER ");
-            let prefix = if alter { "ALTER USER" } else { "CREATE USER" };
+            let if_not_exists = upper.starts_with("CREATE USER IF NOT EXISTS ");
+            let prefix = if alter {
+                "ALTER USER"
+            } else if if_not_exists {
+                "CREATE USER IF NOT EXISTS"
+            } else {
+                "CREATE USER"
+            };
             let users = split_csv(sql[prefix.len()..].trim())
                 .iter()
                 .map(|clause| parse_user_identified_clause(clause, prefix))
@@ -4519,26 +4558,46 @@ impl Backend {
             if alter {
                 self.config.auth_catalog.alter_user_passwords(&users)?;
             } else {
-                self.config.auth_catalog.create_users(&users)?;
+                self.config
+                    .auth_catalog
+                    .create_users(&users, if_not_exists)?;
             }
             return Ok(QueryOutcome::ok(0));
         }
-        if upper.starts_with("CREATE ROLE ") {
+        if upper.starts_with("CREATE ROLE ") || upper.starts_with("CREATE ROLE IF NOT EXISTS ") {
+            let if_not_exists = upper.starts_with("CREATE ROLE IF NOT EXISTS ");
+            let prefix = if if_not_exists {
+                "CREATE ROLE IF NOT EXISTS "
+            } else {
+                "CREATE ROLE "
+            };
             self.config
                 .auth_catalog
-                .create_roles(&split_csv(sql[11..].trim()))?;
+                .create_roles(&split_csv(sql[prefix.len()..].trim()), if_not_exists)?;
             return Ok(QueryOutcome::ok(0));
         }
-        if upper.starts_with("DROP USER ") {
+        if upper.starts_with("DROP USER ") || upper.starts_with("DROP USER IF EXISTS ") {
+            let if_exists = upper.starts_with("DROP USER IF EXISTS ");
+            let prefix = if if_exists {
+                "DROP USER IF EXISTS "
+            } else {
+                "DROP USER "
+            };
             self.config
                 .auth_catalog
-                .drop_users(&split_csv(sql[10..].trim()))?;
+                .drop_users(&split_csv(sql[prefix.len()..].trim()), if_exists)?;
             return Ok(QueryOutcome::ok(0));
         }
-        if upper.starts_with("DROP ROLE ") {
+        if upper.starts_with("DROP ROLE ") || upper.starts_with("DROP ROLE IF EXISTS ") {
+            let if_exists = upper.starts_with("DROP ROLE IF EXISTS ");
+            let prefix = if if_exists {
+                "DROP ROLE IF EXISTS "
+            } else {
+                "DROP ROLE "
+            };
             self.config
                 .auth_catalog
-                .drop_roles(&split_csv(sql[10..].trim()))?;
+                .drop_roles(&split_csv(sql[prefix.len()..].trim()), if_exists)?;
             return Ok(QueryOutcome::ok(0));
         }
         let revoke = upper.starts_with("REVOKE ");
@@ -28143,9 +28202,14 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let catalog = AuthCatalog::open(directory.path(), "root", "root-password").unwrap();
         catalog
-            .create_users(&[("game_writer".to_string(), "writer-password".to_string())])
+            .create_users(
+                &[("game_writer".to_string(), "writer-password".to_string())],
+                false,
+            )
             .unwrap();
-        catalog.create_roles(&["analyst".to_string()]).unwrap();
+        catalog
+            .create_roles(&["analyst".to_string()], false)
+            .unwrap();
         catalog
             .grant_privileges(
                 &["game_writer".to_string()],
@@ -28364,6 +28428,22 @@ mod tests {
             .unwrap();
         backend
             .execute("CREATE ROLE batch_reader, batch_writer")
+            .await
+            .unwrap();
+        backend
+            .execute("CREATE USER IF NOT EXISTS 'batch_one' IDENTIFIED BY 'ignored'")
+            .await
+            .unwrap();
+        backend
+            .execute("CREATE ROLE IF NOT EXISTS batch_reader")
+            .await
+            .unwrap();
+        backend
+            .execute("DROP USER IF EXISTS missing_user")
+            .await
+            .unwrap();
+        backend
+            .execute("DROP ROLE IF EXISTS missing_role")
             .await
             .unwrap();
         assert!(backend
