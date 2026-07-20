@@ -4604,7 +4604,16 @@ impl Backend {
         let remainder = sql[if revoke { 6 } else { 5 }..].trim();
         let upper_remainder = remainder.to_ascii_uppercase();
         if let Some(on) = upper_remainder.find(" ON ") {
-            let mut privileges = parse_privilege_list(&remainder[..on])?;
+            let grant_option_only = revoke
+                && remainder[..on]
+                    .to_ascii_uppercase()
+                    .starts_with("GRANT OPTION FOR ");
+            let mut privileges = if grant_option_only {
+                parse_privilege_list(&remainder["GRANT OPTION FOR ".len()..on])?;
+                HashSet::from(["GRANT OPTION".to_string()])
+            } else {
+                parse_privilege_list(&remainder[..on])?
+            };
             let after_on = &remainder[on + 4..];
             let marker = if revoke { " FROM " } else { " TO " };
             let target_index = after_on.to_ascii_uppercase().find(marker).ok_or_else(|| {
@@ -28491,6 +28500,14 @@ mod tests {
             .await
             .unwrap();
         assert!(backend
+            .config
+            .auth_catalog
+            .has_privilege("batch_one", "mydb", "GRANT OPTION"));
+        backend
+            .execute("REVOKE GRANT OPTION FOR UPDATE ON mydb.* FROM 'batch_one'")
+            .await
+            .unwrap();
+        assert!(!backend
             .config
             .auth_catalog
             .has_privilege("batch_one", "mydb", "GRANT OPTION"));
