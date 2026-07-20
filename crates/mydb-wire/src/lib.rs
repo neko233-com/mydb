@@ -3418,15 +3418,19 @@ impl Backend {
         }
 
         if upper.starts_with("SHOW GRANTS") {
-            let principal = upper
+            let requested_principal = upper
                 .find(" FOR ")
                 .map(|index| sql[index + 5..].trim().to_string())
-                .unwrap_or_else(|| {
-                    self.authenticated_user
-                        .lock()
-                        .clone()
-                        .unwrap_or_else(|| self.config.username.clone())
+                .filter(|principal| {
+                    !principal.eq_ignore_ascii_case("CURRENT_USER")
+                        && !principal.eq_ignore_ascii_case("CURRENT_USER()")
                 });
+            let principal = requested_principal.unwrap_or_else(|| {
+                self.authenticated_user
+                    .lock()
+                    .clone()
+                    .unwrap_or_else(|| self.config.username.clone())
+            });
             let rows = self
                 .config
                 .auth_catalog
@@ -28338,6 +28342,11 @@ mod tests {
             .iter()
             .any(|grant| grant.contains("INSERT, SELECT")));
         assert!(rendered.iter().any(|grant| grant.contains("analyst")));
+        let current = backend
+            .execute("SHOW GRANTS FOR CURRENT_USER()")
+            .await
+            .unwrap();
+        assert!(matches!(current, QueryOutcome::Rows { .. }));
         backend
             .execute("REVOKE INSERT ON mydb.* FROM 'writer'")
             .await
