@@ -1,0 +1,18 @@
+ARG RUST_IMAGE=rust:1-bookworm
+FROM ${RUST_IMAGE} AS builder
+WORKDIR /src
+
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+COPY vendor ./vendor
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=mydb-bench-bookworm-target,target=/src/target \
+    cargo build --release -p mydb-bench && \
+    cp /src/target/release/mydb-bench /tmp/mydb-bench
+
+FROM ubuntu:24.04
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+COPY --from=builder /tmp/mydb-bench /usr/local/bin/mydb-bench
+ENTRYPOINT ["mydb-bench"]

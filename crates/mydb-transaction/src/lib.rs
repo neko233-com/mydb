@@ -4,10 +4,10 @@ use std::sync::Arc;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info};
 use uuid::Uuid;
 
-use mydb_storage::{Database, StorageEngineManager};
+use mydb_storage::StorageEngineManager;
 
 // Transaction Isolation Levels
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -18,14 +18,16 @@ pub enum IsolationLevel {
     Serializable,
 }
 
-impl IsolationLevel {
-    pub fn from_str(s: &str) -> Self {
+impl std::str::FromStr for IsolationLevel {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_uppercase().as_str() {
-            "READ UNCOMMITTED" => Self::ReadUncommitted,
-            "READ COMMITTED" => Self::ReadCommitted,
-            "REPEATABLE READ" => Self::RepeatableRead,
-            "SERIALIZABLE" => Self::Serializable,
-            _ => Self::RepeatableRead,
+            "READ UNCOMMITTED" => Ok(Self::ReadUncommitted),
+            "READ COMMITTED" => Ok(Self::ReadCommitted),
+            "REPEATABLE READ" => Ok(Self::RepeatableRead),
+            "SERIALIZABLE" => Ok(Self::Serializable),
+            _ => Ok(Self::RepeatableRead),
         }
     }
 }
@@ -75,14 +77,12 @@ pub enum WriteOpType {
 // Transaction Manager
 pub struct TransactionManager {
     transactions: RwLock<HashMap<Uuid, Arc<RwLock<Transaction>>>>,
-    storage: Arc<StorageEngineManager>,
 }
 
 impl TransactionManager {
-    pub fn new(storage: Arc<StorageEngineManager>) -> Self {
+    pub fn new(_storage: Arc<StorageEngineManager>) -> Self {
         Self {
             transactions: RwLock::new(HashMap::new()),
-            storage,
         }
     }
 
@@ -98,9 +98,7 @@ impl TransactionManager {
         };
 
         let tx = Arc::new(RwLock::new(tx));
-        self.transactions
-            .write()
-            .insert(tx.read().id, tx.clone());
+        self.transactions.write().insert(tx.read().id, tx.clone());
 
         info!("Transaction started: {}", tx.read().id);
         tx
@@ -125,10 +123,18 @@ impl TransactionManager {
         for op in &tx.write_set {
             match op.op_type {
                 WriteOpType::Insert | WriteOpType::Update => {
-                    debug!("Applying write to {}.{}", tx.id, String::from_utf8_lossy(&op.key));
+                    debug!(
+                        "Applying write to {}.{}",
+                        tx.id,
+                        String::from_utf8_lossy(&op.key)
+                    );
                 }
                 WriteOpType::Delete => {
-                    debug!("Applying delete from {}.{}", tx.id, String::from_utf8_lossy(&op.key));
+                    debug!(
+                        "Applying delete from {}.{}",
+                        tx.id,
+                        String::from_utf8_lossy(&op.key)
+                    );
                 }
             }
         }
@@ -217,12 +223,7 @@ impl LockManager {
         }
     }
 
-    pub fn acquire_lock(
-        &self,
-        resource: &str,
-        lock_type: LockType,
-        tx_id: Uuid,
-    ) -> Result<()> {
+    pub fn acquire_lock(&self, resource: &str, lock_type: LockType, tx_id: Uuid) -> Result<()> {
         let mut locks = self.locks.write();
 
         if let Some(existing) = locks.get(resource) {
@@ -244,10 +245,7 @@ impl LockManager {
                     // Shared locks are compatible
                 }
                 _ => {
-                    anyhow::bail!(
-                        "Lock conflict on resource '{}'",
-                        resource
-                    );
+                    anyhow::bail!("Lock conflict on resource '{}'", resource);
                 }
             }
         }
@@ -277,6 +275,12 @@ impl LockManager {
     pub fn release_all_locks(&self, tx_id: Uuid) {
         let mut locks = self.locks.write();
         locks.retain(|_, lock| lock.holder != tx_id);
+    }
+}
+
+impl Default for LockManager {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -335,5 +339,11 @@ impl DeadlockDetector {
 
         path.pop();
         false
+    }
+}
+
+impl Default for DeadlockDetector {
+    fn default() -> Self {
+        Self::new()
     }
 }

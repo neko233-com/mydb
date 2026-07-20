@@ -12,6 +12,13 @@ pub enum WalRecordType {
     Checkpoint = 0x06,
     Commit = 0x07,
     Rollback = 0x08,
+    /// Versioned, serialized database write batch. A matching Commit makes it durable.
+    Batch = 0x09,
+    /// The committed batch has been fully applied and flushed to table storage.
+    Applied = 0x0A,
+    /// One checksummed record contains every transaction in an fsync group.
+    /// A complete record is committed; a torn record is ignored and truncated.
+    GroupCommit = 0x0B,
 }
 
 impl WalRecordType {
@@ -25,6 +32,9 @@ impl WalRecordType {
             0x06 => Some(Self::Checkpoint),
             0x07 => Some(Self::Commit),
             0x08 => Some(Self::Rollback),
+            0x09 => Some(Self::Batch),
+            0x0A => Some(Self::Applied),
+            0x0B => Some(Self::GroupCommit),
             _ => None,
         }
     }
@@ -41,6 +51,9 @@ impl fmt::Display for WalRecordType {
             Self::Checkpoint => write!(f, "CHECKPOINT"),
             Self::Commit => write!(f, "COMMIT"),
             Self::Rollback => write!(f, "ROLLBACK"),
+            Self::Batch => write!(f, "BATCH"),
+            Self::Applied => write!(f, "APPLIED"),
+            Self::GroupCommit => write!(f, "GROUP_COMMIT"),
         }
     }
 }
@@ -148,6 +161,9 @@ impl WalRecord {
 }
 
 /// Serialize a row as insert/update data
+pub type EncodedRow = Vec<(String, Vec<u8>)>;
+pub type NullableRow = (EncodedRow, std::collections::HashSet<String>);
+
 pub fn encode_row(row: &[(String, Vec<u8>)]) -> Vec<u8> {
     let mut buf = Vec::new();
 
@@ -168,7 +184,7 @@ pub fn encode_row(row: &[(String, Vec<u8>)]) -> Vec<u8> {
 }
 
 /// Deserialize row data
-pub fn decode_row(data: &[u8]) -> Option<Vec<(String, Vec<u8>)>> {
+pub fn decode_row(data: &[u8]) -> Option<EncodedRow> {
     if data.is_empty() {
         return None;
     }
@@ -210,6 +226,73 @@ pub fn decode_row(data: &[u8]) -> Option<Vec<(String, Vec<u8>)>> {
     Some(columns)
 }
 
+/// Serialize a row with SQL NULL information. The marker keeps old row pages readable.
+pub fn encode_nullable_row(
+    row: &[(String, Vec<u8>)],
+    null_columns: &std::collections::HashSet<String>,
+) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&[0xff, 1]);
+    buf.extend_from_slice(&(row.len() as u16).to_le_bytes());
+    for (name, value) in row {
+        buf.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        buf.extend_from_slice(name.as_bytes());
+        if null_columns.contains(name) {
+            buf.push(0);
+        } else {
+            buf.push(1);
+            buf.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            buf.extend_from_slice(value);
+        }
+    }
+    buf
+}
+
+/// Deserialize both the nullable format and legacy rows (legacy values are non-NULL).
+pub fn decode_nullable_row(data: &[u8]) -> Option<NullableRow> {
+    if data.first() != Some(&0xff) {
+        return decode_row(data).map(|row| (row, std::collections::HashSet::new()));
+    }
+    if data.len() < 4 || data[1] != 1 {
+        return None;
+    }
+    let mut pos = 2;
+    let count = u16::from_le_bytes(data[pos..pos + 2].try_into().ok()?) as usize;
+    pos += 2;
+    let mut row = Vec::with_capacity(count);
+    let mut nulls = std::collections::HashSet::new();
+    for _ in 0..count {
+        if pos + 2 > data.len() {
+            return None;
+        }
+        let name_len = u16::from_le_bytes(data[pos..pos + 2].try_into().ok()?) as usize;
+        pos += 2;
+        if pos + name_len + 1 > data.len() {
+            return None;
+        }
+        let name = String::from_utf8(data[pos..pos + name_len].to_vec()).ok()?;
+        pos += name_len;
+        let present = data[pos];
+        pos += 1;
+        if present == 0 {
+            nulls.insert(name.clone());
+            row.push((name, Vec::new()));
+            continue;
+        }
+        if present != 1 || pos + 4 > data.len() {
+            return None;
+        }
+        let value_len = u32::from_le_bytes(data[pos..pos + 4].try_into().ok()?) as usize;
+        pos += 4;
+        if pos + value_len > data.len() {
+            return None;
+        }
+        row.push((name, data[pos..pos + value_len].to_vec()));
+        pos += value_len;
+    }
+    Some((row, nulls))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,6 +318,20 @@ mod tests {
         assert_eq!(decoded.tx_id, 1);
         assert_eq!(decoded.table_name, "users");
         assert_eq!(decoded.data, record.data);
+    }
+
+    #[test]
+    fn nullable_row_distinguishes_null_from_empty_bytes() {
+        let row = vec![
+            ("null_value".to_string(), Vec::new()),
+            ("empty_value".to_string(), Vec::new()),
+        ];
+        let nulls = std::collections::HashSet::from(["null_value".to_string()]);
+        let encoded = encode_nullable_row(&row, &nulls);
+        let (decoded, decoded_nulls) = decode_nullable_row(&encoded).unwrap();
+        assert_eq!(decoded, row);
+        assert!(decoded_nulls.contains("null_value"));
+        assert!(!decoded_nulls.contains("empty_value"));
     }
 
     #[test]
@@ -268,6 +365,9 @@ mod tests {
             WalRecordType::Checkpoint,
             WalRecordType::Commit,
             WalRecordType::Rollback,
+            WalRecordType::Batch,
+            WalRecordType::Applied,
+            WalRecordType::GroupCommit,
         ] {
             let v = t as u8;
             assert_eq!(WalRecordType::from_u8(v), Some(t));

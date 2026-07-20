@@ -62,7 +62,7 @@ cargo clean --release 2>/dev/null || true
 
 # 构建 release 版本
 info "Building release..."
-cargo build --release
+cargo build --release -p mydb-server -p mydb-cli -p mydb-migrate -p mydb-dump
 
 # 创建打包目录
 BUILD_DIR="target/release/package"
@@ -73,9 +73,13 @@ mkdir -p "$BUILD_DIR"
 if [ "$OS" = "windows" ]; then
     cp target/release/mydb-server.exe "$BUILD_DIR/"
     cp target/release/mydb-cli.exe "$BUILD_DIR/"
+    cp target/release/mydb-migrate.exe "$BUILD_DIR/"
+    cp target/release/mydbdump.exe "$BUILD_DIR/"
 else
     cp target/release/mydb-server "$BUILD_DIR/"
     cp target/release/mydb-cli "$BUILD_DIR/"
+    cp target/release/mydb-migrate "$BUILD_DIR/"
+    cp target/release/mydbdump "$BUILD_DIR/"
 fi
 
 # 复制配置文件
@@ -103,7 +107,7 @@ fi
 
 cd ../..
 
-PACKAGE_PATH="target/release/package/${PACKAGE_FILE}"
+PACKAGE_PATH="target/release/${PACKAGE_NAME}.tar.gz"
 PACKAGE_SIZE=$(du -h "$PACKAGE_PATH" | cut -f1)
 
 success "Package created: $PACKAGE_PATH ($PACKAGE_SIZE)"

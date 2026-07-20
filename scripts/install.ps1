@@ -22,14 +22,18 @@
 #>
 
 param(
-    [ValidateSet("server", "cli", "all")]
+    [ValidateSet("server", "cli", "migrate", "dump", "all")]
     [string]$Component = "all",
+
+    [string]$Version = "latest",
     
     [string]$InstallDir = "$env:LOCALAPPDATA\MyDB",
     
     [string]$ConfigDir = "$env:APPDATA\mydb",
     
-    [switch]$NoPath
+    [switch]$NoPath,
+
+    [switch]$Service
 )
 
 $ErrorActionPreference = "Stop"
@@ -79,7 +83,12 @@ function Install-Component {
     $os = "windows"
     
     $filename = "mydb-${os}-${arch}"
-    $url = "https://github.com/${repo}/releases/download/latest/${filename}.zip"
+    $releaseBase = if ($Version -eq "latest") {
+        "https://github.com/${repo}/releases/latest/download"
+    } else {
+        "https://github.com/${repo}/releases/download/${Version}"
+    }
+    $url = "${releaseBase}/${filename}.zip"
     
     $tmpDir = Join-Path $env:TEMP "mydb-install-$([guid]::NewGuid().ToString('N'))"
     New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null
@@ -96,13 +105,18 @@ function Install-Component {
         New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
         
         $sourceDir = Join-Path $tmpDir $filename
-        if (Test-Path $sourceDir) {
-            Copy-Item "$sourceDir\mydb-server.exe" $InstallDir -Force
-            Copy-Item "$sourceDir\mydb-cli.exe" $InstallDir -Force
-        } else {
-            # Try direct copy
-            Copy-Item "$tmpDir\mydb-server.exe" $InstallDir -Force -ErrorAction SilentlyContinue
-            Copy-Item "$tmpDir\mydb-cli.exe" $InstallDir -Force -ErrorAction SilentlyContinue
+        if (-not (Test-Path $sourceDir)) { $sourceDir = $tmpDir }
+        $binaries = switch ($Name) {
+            "server" { @("mydb-server.exe") }
+            "cli" { @("mydb-cli.exe") }
+            "migrate" { @("mydb-migrate.exe") }
+            "dump" { @("mydbdump.exe") }
+            default { @("mydb-server.exe", "mydb-cli.exe", "mydb-migrate.exe", "mydbdump.exe") }
+        }
+        foreach ($binary in $binaries) {
+            $source = Join-Path $sourceDir $binary
+            if (-not (Test-Path $source)) { Write-Error "$binary missing from release package" }
+            Copy-Item $source $InstallDir -Force
         }
         
         Write-Success "$Name installed to $InstallDir"
@@ -128,7 +142,7 @@ server:
 storage:
   data_dir: "$($ConfigDir -replace '\\', '/')/data"
   engine: "innodb"
-  buffer_pool_size: "1G"
+  buffer_pool_size: "128M"
   page_size: 16384
 
 security:
@@ -205,21 +219,17 @@ function Main {
     Write-Info "Architecture: $arch"
     
     switch ($Component) {
-        "server" {
-            Install-Component -Name "server"
-        }
-        "cli" {
-            Install-Component -Name "cli"
-        }
-        "all" {
-            Install-Component -Name "server"
-            Install-Component -Name "cli"
-        }
+        "server" { Install-Component -Name "server" }
+        "cli" { Install-Component -Name "cli" }
+        "migrate" { Install-Component -Name "migrate" }
+        "dump" { Install-Component -Name "dump" }
+        "all" { Install-Component -Name "all" }
     }
     
     New-Config
     New-DataDir
     Set-Path
+    if ($Service) { Install-Service }
     
     Write-Host ""
     Write-Success "Installation complete!"
@@ -229,6 +239,8 @@ function Main {
     Write-Host ""
     Write-Host "Connect with:"
     Write-Host "  $InstallDir\mydb-cli.exe -h 127.0.0.1 -P 3306 -u root"
+    Write-Host "  $InstallDir\mydb-migrate.exe --help"
+    Write-Host "  $InstallDir\mydbdump.exe --help"
 }
 
 Main

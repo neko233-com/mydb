@@ -12,6 +12,7 @@ path = "src/main.rs"
 mydb-wire = { path = "../mydb-wire" }
 mydb-config = { path = "../mydb-config" }
 mydb-storage = { path = "../mydb-storage" }
+mydb-wal = { path = "../mydb-wal" }
 mydb-transaction = { path = "../mydb-transaction" }
 tokio.workspace = true
 tracing.workspace = true
@@ -21,3 +22,14 @@ clap.workspace = true
 arc-swap.workspace = true
 parking_lot.workspace = true
 dirs.workspace = true
+axum.workspace = true
+tower-http.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+tokio-rustls.workspace = true
+rustls-pemfile.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

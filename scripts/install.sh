@@ -50,7 +50,13 @@ download_binary() {
     local arch=$3
     
     local filename="mydb-${os}-${arch}"
-    local url="https://github.com/${REPO}/releases/download/${VERSION}/${filename}.tar.gz"
+    local release_base
+    if [ "$VERSION" = "latest" ]; then
+        release_base="https://github.com/${REPO}/releases/latest/download"
+    else
+        release_base="https://github.com/${REPO}/releases/download/${VERSION}"
+    fi
+    local url="${release_base}/${filename}.tar.gz"
     
     info "Downloading ${name}..."
     
@@ -68,11 +74,26 @@ download_binary() {
     # Extract
     tar -xzf "${tmp_dir}/${filename}.tar.gz" -C "$tmp_dir"
     
-    # Move binaries
+    local source_dir="$tmp_dir"
+    if [ -d "${tmp_dir}/${filename}" ]; then
+        source_dir="${tmp_dir}/${filename}"
+    fi
+
+    # Move requested binaries
     mkdir -p "$INSTALL_DIR"
-    mv "${tmp_dir}/${filename}/mydb-server" "$INSTALL_DIR/"
-    mv "${tmp_dir}/${filename}/mydb-cli" "$INSTALL_DIR/"
-    chmod +x "$INSTALL_DIR/mydb-server" "$INSTALL_DIR/mydb-cli"
+    case "$name" in
+        server) mv "${source_dir}/mydb-server" "$INSTALL_DIR/" ;;
+        cli) mv "${source_dir}/mydb-cli" "$INSTALL_DIR/" ;;
+        migrate) mv "${source_dir}/mydb-migrate" "$INSTALL_DIR/" ;;
+        dump) mv "${source_dir}/mydbdump" "$INSTALL_DIR/" ;;
+        all)
+            mv "${source_dir}/mydb-server" "$INSTALL_DIR/"
+            mv "${source_dir}/mydb-cli" "$INSTALL_DIR/"
+            mv "${source_dir}/mydb-migrate" "$INSTALL_DIR/"
+            mv "${source_dir}/mydbdump" "$INSTALL_DIR/"
+            ;;
+    esac
+    chmod +x "$INSTALL_DIR"/mydb-* 2>/dev/null || true
     
     rm -rf "$tmp_dir"
 }
@@ -92,7 +113,7 @@ server:
 storage:
   data_dir: "~/.mydb/data"
   engine: "innodb"
-  buffer_pool_size: "1G"
+  buffer_pool_size: "128M"
   page_size: 16384
 
 security:
@@ -188,16 +209,23 @@ main() {
             download_binary "cli" "$os" "$arch"
             success "CLI installed to ${INSTALL_DIR}/mydb-cli"
             ;;
+        migrate)
+            download_binary "migrate" "$os" "$arch"
+            success "Migration CLI installed to ${INSTALL_DIR}/mydb-migrate"
+            ;;
+        dump)
+            download_binary "dump" "$os" "$arch"
+            success "Backup CLI installed to ${INSTALL_DIR}/mydbdump"
+            ;;
         all)
-            download_binary "server" "$os" "$arch"
-            download_binary "cli" "$os" "$arch"
-            success "Server and CLI installed to ${INSTALL_DIR}"
+            download_binary "all" "$os" "$arch"
+            success "Server, CLI, and migration tool installed to ${INSTALL_DIR}"
             ;;
         service)
             install_service
             ;;
         *)
-            echo "Usage: $0 [server|cli|all|service]"
+            echo "Usage: $0 [server|cli|migrate|dump|all|service]"
             exit 1
             ;;
     esac
@@ -215,6 +243,8 @@ main() {
         echo ""
         echo "Connect with:"
         echo "  ${INSTALL_DIR}/mydb-cli -h 127.0.0.1 -P 3306 -u root"
+        echo "  ${INSTALL_DIR}/mydb-migrate --help"
+        echo "  ${INSTALL_DIR}/mydbdump --help"
     fi
 }
 

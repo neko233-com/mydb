@@ -1,0 +1,42 @@
+services:
+  mydb:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        RUST_IMAGE: "${MYDB_RUST_IMAGE:-rust:1-trixie}"
+        RUNTIME_IMAGE: "${MYDB_RUNTIME_IMAGE:-debian:13-slim}"
+        TARGET_CACHE_ID: "${MYDB_TARGET_CACHE_ID:-mydb-target-trixie}"
+    image: "${MYDB_IMAGE:-mydb:dev}"
+    container_name: mydb
+    restart: unless-stopped
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777,noexec,nosuid,nodev
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    ports:
+      - "${MYDB_HOST_PORT:-3306}:3306"
+      - "127.0.0.1:${MYDB_HOST_HTTP_PORT:-4306}:4306"
+    volumes:
+      - mydb-data:/var/lib/mydb
+    environment:
+      MYDB_ROOT_PASSWORD: "${MYDB_ROOT_PASSWORD:?MYDB_ROOT_PASSWORD must be set}"
+      MYDB_ADMIN_PASSWORD: "${MYDB_ADMIN_PASSWORD:?MYDB_ADMIN_PASSWORD must be set}"
+      MYDB_ENFORCE_STRONG_PASSWORDS: "${MYDB_ENFORCE_STRONG_PASSWORDS:-true}"
+    cpus: 0.50
+    mem_limit: 512m
+    mem_reservation: 128m
+    stop_grace_period: 30s
+
+volumes:
+  mydb-data:
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: "${MYDB_DOCKER_SUBNET:-10.233.0.0/24}"

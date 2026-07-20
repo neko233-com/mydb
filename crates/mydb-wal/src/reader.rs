@@ -1,29 +1,22 @@
 use std::fs::{self, File};
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{self, Read, Seek};
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use crc32fast::Hasher;
 use tracing::{debug, info, warn};
 
-use super::record::{WalRecord, WalRecordType};
+use super::record::WalRecord;
 
 // WAL file header
 const WAL_MAGIC: &[u8; 4] = b"WAL1";
-const CRC_SIZE: usize = 4;
-const LSN_SIZE: usize = 8;
-const PAYLOAD_LEN_SIZE: usize = 4;
-const HEADER_SIZE: usize = LSN_SIZE + PAYLOAD_LEN_SIZE;
-
 pub struct WalReader {
-    dir: PathBuf,
     files: Vec<WalFileInfo>,
 }
 
 struct WalFileInfo {
     index: u32,
     path: PathBuf,
-    size: u64,
 }
 
 impl WalReader {
@@ -40,12 +33,7 @@ impl WalReader {
                 if name.starts_with("wal_") && name.ends_with(".log") {
                     let index_str = &name[4..name.len() - 4];
                     if let Ok(index) = index_str.parse::<u32>() {
-                        let size = entry.metadata()?.len();
-                        files.push(WalFileInfo {
-                            index,
-                            path,
-                            size,
-                        });
+                        files.push(WalFileInfo { index, path });
                     }
                 }
             }
@@ -55,7 +43,7 @@ impl WalReader {
 
         info!("WAL reader: found {} files", files.len());
 
-        Ok(Self { dir, files })
+        Ok(Self { files })
     }
 
     /// Replay all WAL records starting from the given LSN
@@ -68,15 +56,12 @@ impl WalReader {
         let mut total_records = 0u64;
 
         for file_info in &self.files {
-            match Self::replay_file(&file_info.path, &mut callback) {
-                Ok(last_lsn) => {
-                    max_lsn = max_lsn.max(last_lsn);
-                }
-                Err(e) => {
-                    warn!("Error replaying WAL file {:?}: {}", file_info.path, e);
-                    // Continue with other files
-                }
-            }
+            let mut counting_callback = |record| {
+                total_records += 1;
+                callback(record);
+            };
+            let last_lsn = Self::replay_file(&file_info.path, &mut counting_callback, false)?;
+            max_lsn = max_lsn.max(last_lsn);
         }
 
         info!(
@@ -87,12 +72,14 @@ impl WalReader {
         Ok(max_lsn)
     }
 
-    /// Replay a single WAL file
-    fn replay_file<F>(file_path: &Path, callback: &mut F) -> Result<u64>
+    /// Replay a single WAL file. Recovery accepts an incomplete final record;
+    /// backup metadata scans use strict mode and reject every malformed byte.
+    fn replay_file<F>(file_path: &Path, callback: &mut F, strict: bool) -> Result<u64>
     where
         F: FnMut(WalRecord),
     {
         let mut file = File::open(file_path)?;
+        let file_len = file.metadata()?.len();
 
         // Read and verify header
         let mut magic = [0u8; 4];
@@ -110,31 +97,52 @@ impl WalReader {
         loop {
             // Read LSN
             let mut lsn_buf = [0u8; 8];
+            let record_offset = file.stream_position()?;
             match file.read_exact(&mut lsn_buf) {
                 Ok(()) => {}
-                Err(ref e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(ref e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                    if record_offset == file_len {
+                        break;
+                    }
+                    if strict {
+                        anyhow::bail!("torn WAL LSN at offset {record_offset}");
+                    }
+                    break;
+                }
                 Err(e) => return Err(e.into()),
             }
 
             // Read payload length
             let mut len_buf = [0u8; 4];
-            if file.read_exact(&mut len_buf).is_err() {
+            if let Err(error) = file.read_exact(&mut len_buf) {
+                if error.kind() != io::ErrorKind::UnexpectedEof {
+                    return Err(error.into());
+                }
+                if strict {
+                    anyhow::bail!("torn WAL length at offset {record_offset}");
+                }
                 break;
             }
 
             let payload_len = u32::from_le_bytes(len_buf) as usize;
+            let remaining = file_len.saturating_sub(file.stream_position()?);
+            let record_remaining = payload_len.checked_add(4).ok_or_else(|| {
+                anyhow::anyhow!("WAL payload length overflow at offset {record_offset}")
+            })? as u64;
+            if remaining < record_remaining {
+                if strict {
+                    anyhow::bail!("torn WAL payload at offset {record_offset}");
+                }
+                break;
+            }
 
             // Read payload
             let mut payload = vec![0u8; payload_len];
-            if file.read_exact(&mut payload).is_err() {
-                break;
-            }
+            file.read_exact(&mut payload)?;
 
             // Read CRC
             let mut crc_buf = [0u8; 4];
-            if file.read_exact(&mut crc_buf).is_err() {
-                break;
-            }
+            file.read_exact(&mut crc_buf)?;
 
             let expected_crc = u32::from_le_bytes(crc_buf);
 
@@ -145,6 +153,9 @@ impl WalReader {
             let actual_crc = hasher.finalize();
 
             if actual_crc != expected_crc {
+                if strict || file.stream_position()? < file_len {
+                    anyhow::bail!("WAL CRC mismatch at lsn={}", u64::from_le_bytes(lsn_buf));
+                }
                 warn!(
                     "WAL CRC mismatch at lsn={}: expected={:08x} actual={:08x} - stopping replay",
                     u64::from_le_bytes(lsn_buf),
@@ -160,6 +171,11 @@ impl WalReader {
                 callback(record);
                 last_lsn = lsn;
                 record_count += 1;
+            } else if strict {
+                anyhow::bail!("invalid WAL payload at lsn={lsn}");
+            } else {
+                warn!("invalid WAL payload at lsn={lsn} - stopping replay");
+                break;
             }
         }
 
@@ -173,40 +189,11 @@ impl WalReader {
 
     /// Get the maximum LSN across all WAL files
     pub fn max_lsn(&self) -> Result<u64> {
-        let mut max_lsn = 0u64;
-
+        let mut max_lsn = 0;
         for file_info in &self.files {
-            let mut file = File::open(&file_info.path)?;
-
-            // Skip header
-            file.seek(SeekFrom::Start(8))?;
-
-            let mut lsn_buf = [0u8; 8];
-            let mut len_buf = [0u8; 4];
-
-            loop {
-                match file.read_exact(&mut lsn_buf) {
-                    Ok(()) => {}
-                    Err(ref e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-                    Err(_) => break,
-                }
-
-                if file.read_exact(&mut len_buf).is_err() {
-                    break;
-                }
-
-                let payload_len = u32::from_le_bytes(len_buf) as u64;
-                if file
-                    .seek(SeekFrom::Current((payload_len + CRC_SIZE as u64) as i64))
-                    .is_err()
-                {
-                    break;
-                }
-
-                max_lsn = max_lsn.max(u64::from_le_bytes(lsn_buf));
-            }
+            let mut ignore = |_| {};
+            max_lsn = max_lsn.max(Self::replay_file(&file_info.path, &mut ignore, true)?);
         }
-
         Ok(max_lsn)
     }
 }
@@ -214,7 +201,7 @@ impl WalReader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::record::{WalRecordType, encode_row};
+    use crate::record::{encode_row, WalRecordType};
     use crate::writer::WalWriter;
 
     #[test]
@@ -263,13 +250,7 @@ mod tests {
         {
             let mut wal = WalWriter::open(tmp.path().into(), None).unwrap();
             for _ in 0..5 {
-                let mut record = WalRecord::new(
-                    0,
-                    WalRecordType::Insert,
-                    1,
-                    "test",
-                    vec![],
-                );
+                let mut record = WalRecord::new(0, WalRecordType::Insert, 1, "test", vec![]);
                 wal.append(&mut record).unwrap();
             }
             wal.sync().unwrap();
@@ -278,5 +259,54 @@ mod tests {
         let reader = WalReader::open(tmp.path().into()).unwrap();
         let max = reader.max_lsn().unwrap();
         assert_eq!(max, 5);
+    }
+
+    #[test]
+    fn max_lsn_rejects_terminal_crc_damage_and_torn_tail() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_path = tmp.path().join("wal_000000.log");
+        {
+            let mut wal = WalWriter::open(tmp.path().into(), None).unwrap();
+            let mut record = WalRecord::new(0, WalRecordType::Insert, 1, "test", vec![1]);
+            wal.append(&mut record).unwrap();
+            wal.sync().unwrap();
+        }
+        {
+            use std::io::{Seek, SeekFrom, Write};
+
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&wal_path)
+                .unwrap();
+            file.seek(SeekFrom::Start(8 + 8 + 4)).unwrap();
+            file.write_all(&[0xff]).unwrap();
+            file.sync_all().unwrap();
+        }
+        let reader = WalReader::open(tmp.path().into()).unwrap();
+        assert_eq!(reader.replay(|_| {}).unwrap(), 0);
+        assert!(reader.max_lsn().is_err());
+
+        let torn = tempfile::tempdir().unwrap();
+        let torn_path = torn.path().join("wal_000000.log");
+        {
+            let mut wal = WalWriter::open(torn.path().into(), None).unwrap();
+            let mut record = WalRecord::new(0, WalRecordType::Insert, 1, "test", vec![1]);
+            wal.append(&mut record).unwrap();
+            wal.sync().unwrap();
+        }
+        {
+            use std::io::Write;
+
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(torn_path)
+                .unwrap();
+            file.write_all(&[2, 0, 0]).unwrap();
+            file.sync_all().unwrap();
+        }
+        let reader = WalReader::open(torn.path().into()).unwrap();
+        assert_eq!(reader.replay(|_| {}).unwrap(), 1);
+        assert!(reader.max_lsn().is_err());
     }
 }

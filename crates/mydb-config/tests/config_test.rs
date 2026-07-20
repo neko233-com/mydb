@@ -1,18 +1,20 @@
 use std::path::PathBuf;
 
-use anyhow::Result;
 use mydb_config::ServerConfig;
 
 #[tokio::test]
 async fn test_default_config() {
     let config = ServerConfig::default();
-    
+
     assert_eq!(config.server.host, "0.0.0.0");
     assert_eq!(config.server.port, 3306);
     assert_eq!(config.server.max_connections, 1000);
-    assert_eq!(config.storage.engine, "innodb");
+    assert_eq!(config.storage.engine, "neko233");
     assert_eq!(config.storage.buffer_pool_size, "1G");
+    assert_eq!(config.storage.group_commit_window_us, 250);
     assert_eq!(config.logging.level, "info");
+    assert!(config.security.local_infile);
+    assert_eq!(config.security.max_load_data_size, 1024 * 1024 * 1024);
 }
 
 #[tokio::test]
@@ -27,17 +29,19 @@ storage:
   data_dir: "/tmp/mydb"
   engine: "innodb"
   buffer_pool_size: "512M"
+  group_commit_window_us: 500
 
 logging:
   level: "debug"
 "#;
-    
+
     let config: ServerConfig = serde_yaml::from_str(yaml).unwrap();
-    
+
     assert_eq!(config.server.host, "127.0.0.1");
     assert_eq!(config.server.port, 3307);
     assert_eq!(config.server.max_connections, 500);
     assert_eq!(config.storage.data_dir, PathBuf::from("/tmp/mydb"));
+    assert_eq!(config.storage.group_commit_window_us, 500);
     assert_eq!(config.logging.level, "debug");
 }
 

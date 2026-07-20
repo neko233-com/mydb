@@ -4,14 +4,17 @@
 
 MySQL 8.x 开源替代品，专为游戏业务优化。高并发、低延迟、易于部署和运维。
 
+执行状态以 [`CheckList.md`](CheckList.md) 为准；目标描述不等于已经实现。
+
 ---
 
 ## 存储引擎
 
 ### Memory 引擎
-- 纯内存存储，用于临时表和缓存
+- 纯内存共享表，用于临时状态和缓存
 - 支持哈希索引
-- 会话级别数据隔离
+- 与 MySQL 一致为非事务引擎：`ROLLBACK` 不撤销已执行写入
+- 表结构持久化；服务重启后行数据清空，WAL redo 不复活
 - 适用于：玩家会话数据、临时计算结果
 
 ### InnoDB 引擎
@@ -132,8 +135,8 @@ mydb-cli
 ## 备份与恢复
 
 ### 增量备份
-- 基于 LSN 的增量备份
-- 支持时间点恢复（PITR）
+- 基于 LSN 的增量备份（已支持 HTTP full→incremental 连续链）
+- 支持时间点恢复（RFC3339 → MDG2 提交时间 → 增量段目标 LSN）
 - 备份到本地/远程存储
 - 自动备份调度
 
@@ -194,12 +197,14 @@ memory:
 
 ## 性能目标
 
-| 指标 | MySQL 8.x | MyDB 目标 |
+| 指标 | MySQL 8.0 | MyDB 目标 |
 |------|-----------|-----------|
-| QPS (单机) | ~50,000 | ~80,000+ |
-| 延迟 P99 | ~10ms | ~5ms |
+| 游戏 actor 写吞吐 | 1.0x | >= 10.0x |
+| 写事务 P99 | 1.0x | <= 0.1x |
 | 内存效率 | 基准 | 提升 30% |
 | 启动时间 | ~5s | ~1s |
+
+性能验收只比较双方完全相同的 `ENGINE=InnoDB` 业务 DDL/DML，不约束 MyDB 内部实现。固定 Docker Ubuntu 24.04、linux/amd64；两个数据库使用独立同规格 ext4 loopback 盘和相同 BPS/IOPS、CPU、内存限制；预热与正式采样合计最多 60 秒，交替多轮并保留原始样本、中位数和 p50/p95/p99。当前尚未稳定达到 10x，不能据此卸载 MySQL80。
 
 ---
 
@@ -212,9 +217,9 @@ memory:
 
 ### 语法兼容
 - DDL: CREATE, ALTER, DROP
-- DML: SELECT, INSERT, UPDATE, DELETE
-- 事务: BEGIN, COMMIT, ROLLBACK
-- 存储过程（未来）
+- DML: SELECT DISTINCT，任意表数链式 INNER/LEFT/RIGHT JOIN（列对列等值/非等值、AND/OR、NULL-safe、多列 USING）、CROSS/NATURAL JOIN、JOIN 聚合/多列 GROUP BY/HAVING、非相关与复合布尔相关 IN/NOT IN/标量/EXISTS 子查询、嵌套/聚合/JOIN 派生表、非递归与常用递归 CTE、UNION/INTERSECT/EXCEPT DISTINCT/ALL、排名/导航/分布/聚合窗口函数，多列/表达式 ORDER BY 与 LIMIT OFFSET，常用 CASE/字符串/数值/CAST/JSON_EXTRACT/JSON_UNQUOTE，ASCII/ORD/长度/截取/插入/QUOTE、BIN/OCT/HEX/UNHEX/Base64/FORMAT、MD5/SHA/SHA1/SHA2/CRC32 摘要校验、UUID 二进制转换、IPv4/IPv6 网络地址函数、CONV/BIT_COUNT 进制位掩码、PI/角度/三角函数、NOW/CURRENT_TIMESTAMP/LOCALTIME/LOCALTIMESTAMP/CURDATE/CURTIME/CURRENT_TIME/SYSDATE 与 UTC_DATE/UTC_TIME/UTC_TIMESTAMP 当前时间函数（区分语句快照和调用时刻）、连接级 SYSTEM/固定偏移/IANA time_zone 语义、CONVERT_TZ 固定偏移/UTC/GMT/SYSTEM/IANA/DST 时区转换、TIME/MICROSECOND/TIME_TO_SEC/SEC_TO_TIME/TIMEDIFF/ADDTIME/SUBTIME/MAKETIME 时长函数、DATE_ADD/DATE_SUB/ADDDATE/SUBDATE/TIMESTAMP/TIMESTAMPADD 日期算术、DATE_FORMAT/GET_FORMAT/STR_TO_DATE/TIME_FORMAT 格式往返、WEEK/WEEKOFYEAR/YEARWEEK 周期函数、TO_DAYS/FROM_DAYS/TO_SECONDS 日序函数、PERIOD_ADD/PERIOD_DIFF 月周期函数、EXTRACT 基础与复合时间单位及 DAYOFYEAR/WEEKDAY/QUARTER/DAYNAME/MONTHNAME/LAST_DAY/MAKEDATE 日历函数，以及 FIND_IN_SET/FIELD/ELT/MAKE_SET/EXPORT_SET 标签权限函数，INSERT/REPLACE SELECT、UPDATE、DELETE、单目标 JOIN UPDATE/DELETE，有主键单表的函数化 UPDATE/DELETE 与 ORDER BY LIMIT；常用复合外键 RESTRICT/CASCADE/SET NULL 与 CHECK 约束，事务语句级预校验与级联读己写
+- 事务: BEGIN, COMMIT, ROLLBACK, SAVEPOINT, ROLLBACK TO, RELEASE SAVEPOINT
+- 存储过程与诊断区：CREATE/DROP/SHOW/CALL、IN/OUT/INOUT、复合控制流、事务原子性、SELECT INTO、只读单向游标、DECLARE CONDITION、简单/复合 CONTINUE/EXIT handler、NOT FOUND/SQLWARNING/SQLEXCEPTION、条件优先级、RESIGNAL condition/SET、Procedure 内 CURRENT/STACKED GET DIAGNOSTICS、连接顶层 CURRENT diagnostics area、max_error_count/sql_notes/真实 warning-error 总数、CREATE/ALTER characteristics、CREATED/LAST_ALTERED 与创建/修改时 SQL_MODE 持久化执行快照、Trigger/Procedure/参数 ENUM/SET 成员归一化与数字索引/位掩码转换、TIME/DATETIME/TIMESTAMP FSP 默认舍入和 TIME_TRUNCATE_FRACTIONAL 截断、普通 SELECT/嵌套 CALL 顺序多结果集和最终状态结果，以及 prepared CALL OUT/INOUT 单行结果、SERVER_PS_OUT_PARAMS 和常用声明类型 Binary Wire；主 condition 非保证排序差分、冷门语句清理边缘与 routine 权限仍在补齐
 
 ### 配置兼容
 - YAML 格式配置
@@ -227,33 +232,33 @@ memory:
 
 ### Phase 1: 核心功能
 - [x] MySQL 协议兼容层
-- [x] Memory 引擎
+- [x] Memory 引擎（共享、非事务、重启清空、redo 不复活）
 - [x] InnoDB 引擎基础
-- [ ] 事务管理
-- [ ] 锁管理
+- [x] 事务管理（批事务 WAL、redo、RU 跨连接脏读、RC/RR/Serializable）
+- [x] 锁管理（IS/IX/S/X、主键/唯一键行锁；范围写表锁回退，有序 Gap Lock 待实现）
 
 ### Phase 2: 运维工具
-- [ ] 一键安装/升级
-- [ ] 系统服务集成
-- [ ] 增量备份工具
-- [ ] 监控指标
+- [x] 一键安装/升级
+- [x] 系统服务集成
+- [x] 增量备份工具（HTTP 原生 LSN 连续链；`mydbdump` 提供跨库表内容校验增量）
+- [x] 监控指标
 
 ### Phase 3: HTTP 管理
-- [ ] HTTP API 框架
-- [ ] 认证与授权
-- [ ] 配置热重载
-- [ ] 备份管理接口
-- [ ] 内存监控接口
+- [x] HTTP API 框架
+- [x] 认证与授权
+- [x] 配置热重载
+- [x] 备份管理接口（actor 屏障全量、CRC/LSN 增量、父链校验、RFC3339 PITR、重启前安全恢复）
+- [x] 内存监控接口
 
 ### Phase 4: Agent 支持
-- [ ] AI Agent CLI
-- [ ] 自然语言查询
-- [ ] 智能优化建议
+- [x] AI Agent CLI（本地 health/slow/diagnose/SQL optimize；无外部模型依赖）
+- [x] 中英文自然语言运维查询（内置离线意图分类，只读实时信号/慢 SQL，不执行任意 SQL）
+- [x] 慢 SQL、健康诊断和静态 SQL 优化建议
 
 ### Phase 5: 生产就绪
-- [ ] 压力测试
-- [ ] 故障注入测试
-- [ ] 文档完善
+- [x] 压力测试工具
+- [x] 故障注入测试
+- [x] 文档完善
 - [ ] 社区建设
 
 ---

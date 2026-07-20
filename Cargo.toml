@@ -9,7 +9,11 @@ members = [
     "crates/mydb-transaction",
     "crates/mydb-config",
     "crates/mydb-wal",
+    "crates/mydb-migrate",
+    "crates/mydb-dump",
+    "crates/mydb-bench",
 ]
+exclude = ["vendor/opensrv-mysql"]
 
 [workspace.package]
 version = "0.1.0"
@@ -35,10 +39,27 @@ parking_lot = "0.12"
 dashmap = "5"
 arc-swap = "1"
 chrono = { version = "0.4", features = ["serde"] }
-uuid = { version = "1", features = ["v4"] }
+chrono-tz = { version = "0.10.4", features = ["case-insensitive"] }
+uuid = { version = "1", features = ["v1", "v4"] }
 clap = { version = "4", features = ["derive"] }
 toml = "0.8"
 dirs = "5"
 indicatif = "0.17"
 console = "0.15"
 tempfile = "3"
+async-trait = "0.1"
+opensrv-mysql = { path = "vendor/opensrv-mysql", version = "0.7", default-features = false, features = ["tls"] }
+sha1 = "0.10"
+axum = "0.8"
+tower-http = { version = "0.6", features = ["trace"] }
+mysql = { version = "28", default-features = false, features = ["minimal-rust", "rustls-tls-ring"] }
+zstd = "0.13"
+bincode = "1.3"
+rust_decimal = "1"
+encoding_rs = "0.8"
+base64 = "0.22"
+md5 = "0.7"
+crc32fast = "1"
+regex = "1"
+tokio-rustls = "0.25"
+rustls-pemfile = "2"

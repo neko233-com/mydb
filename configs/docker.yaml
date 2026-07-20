@@ -1,0 +1,61 @@
+server:
+  host: "0.0.0.0"
+  port: 3306
+  max_connections: 256
+  # Docker resource limits can expose host CPU count. Keep runtime aligned with
+  # compose/benchmark's one CPU allocation unless deployment overrides config.
+  thread_count: 1
+  connect_timeout: 10
+  interactive_timeout: 28800
+
+http:
+  host: "0.0.0.0"
+  port: 4306
+  admin_username: "root"
+  admin_password: "root"
+  enabled: true
+
+storage:
+  data_dir: "/var/lib/mydb/data"
+  engine: "neko233"
+  buffer_pool_size: "256M"
+  log_file_size: "64M"
+  page_size: 16384
+  group_commit_window_us: 250
+
+memory:
+  max_memory: "384M"
+  query_cache_size: "32M"
+  sort_buffer_size: "2M"
+
+security:
+  default_username: "root"
+  default_password: "root"
+  authentication: "mysql_native_password"
+  require_secure_transport: false
+  password_lifetime: 0
+  enforce_strong_passwords: true
+  local_infile: true
+  secure_file_priv: "/var/lib/mydb/imports"
+  max_load_data_size: 1073741824
+
+backup:
+  backup_dir: "/var/lib/mydb/backups"
+  auto_backup_interval: 0
+  max_backups: 5
+
+logging:
+  level: "info"
+  file: ""
+  max_size: "50M"
+  max_files: 3
+
+character_set:
+  server: "utf8mb4"
+  connection: "utf8mb4"
+  results: "utf8mb4"
+
+agent:
+  enabled: true
+  slow_query_threshold_ms: 100
+  max_slow_queries: 512

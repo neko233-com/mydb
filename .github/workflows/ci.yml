@@ -5,14 +5,25 @@ on:
     branches: [main, develop]
   pull_request:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      run_io_benchmark:
+        description: Run the 60-second Ubuntu 24.04 amd64 I/O-limited gate
+        required: false
+        default: false
+        type: boolean
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   test:
-    name: Test
-    runs-on: ubuntu-latest
+    name: Native (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     
     steps:
       - uses: actions/checkout@v4
@@ -37,7 +48,33 @@ jobs:
         run: cargo fmt --all -- --check
       
       - name: Clippy
+        if: runner.os == 'Linux'
         run: cargo clippy --all-targets --all-features -- -D warnings
       
       - name: Test
         run: cargo test --all
+
+  docker-smoke:
+    name: Docker functional smoke
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Smoke with official MySQL 8 CLI
+        run: bash scripts/docker-smoke.sh
+
+  performance-smoke:
+    name: Ubuntu 24.04 amd64 I/O-limited performance
+    if: github.event_name == 'workflow_dispatch' && inputs.run_io_benchmark
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run at most 60 seconds of benchmark workload
+        run: sudo env WRITE_BPS=20mb WRITE_IOPS=500 ROUNDS=3 MEASURE_SECONDS=60 bash scripts/bench-io-limited.sh
+      - name: Preserve raw benchmark evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mydb-ubuntu24-amd64-io-benchmark
+          path: target/io-bench/
+          if-no-files-found: warn

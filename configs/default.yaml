@@ -30,14 +30,16 @@ http:
 storage:
   # 数据目录
   data_dir: "/var/lib/mydb"
-  # 存储引擎：innodb / memory
-  engine: "innodb"
+  # 内部存储引擎；MySQL 协议侧 ENGINE=InnoDB 是兼容别名
+  engine: "neko233"
   # Buffer Pool 大小
   buffer_pool_size: "800M"
   # 日志文件大小
   log_file_size: "256M"
   # 页大小
   page_size: 16384
+  # group commit 收集窗口（微秒；0 = 不等待）
+  group_commit_window_us: 250
 
 memory:
   # 内存上限
@@ -56,8 +58,19 @@ security:
   authentication: "mysql_native_password"
   # 是否要求安全传输
   require_secure_transport: false
+  # MySQL STARTTLS PEM 证书和私钥；两项同时设置后服务广告 CLIENT_SSL
+  tls_cert: null
+  tls_key: null
   # 密码过期时间（天，0 = 不过期）
   password_lifetime: 0
+  # 生产环境设为 true：两个管理员 secret 至少 20 bytes、不得相同或使用占位值
+  enforce_strong_passwords: false
+  # 允许客户端显式使用 LOAD DATA LOCAL INFILE
+  local_infile: true
+  # 非 LOCAL 文件仅允许来自此目录；空值时使用 data_dir/imports
+  secure_file_priv: null
+  # 单次 LOAD DATA 最大字节数（默认 1 GiB）
+  max_load_data_size: 1073741824
 
 backup:
   # 备份目录
@@ -84,3 +97,11 @@ character_set:
   connection: "utf8mb4"
   # 结果字符集
   results: "utf8mb4"
+
+agent:
+  # 内置 Agent HTTP 诊断，默认开启
+  enabled: true
+  # 慢 SQL 阈值（毫秒）
+  slow_query_threshold_ms: 100
+  # 内存中保留最近慢 SQL 数量
+  max_slow_queries: 1024

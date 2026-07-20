@@ -65,7 +65,7 @@ cargo clean --release 2>$null
 
 # 构建 release 版本
 Write-Info "Building release..."
-cargo build --release
+cargo build --release -p mydb-server -p mydb-cli -p mydb-migrate -p mydb-dump
 if ($LASTEXITCODE -ne 0) { Write-Error "Build failed" }
 
 # 创建打包目录
@@ -76,6 +76,8 @@ New-Item -ItemType Directory -Path $buildDir -Force | Out-Null
 # 复制二进制文件
 Copy-Item "target/release/mydb-server.exe" "$buildDir/"
 Copy-Item "target/release/mydb-cli.exe" "$buildDir/"
+Copy-Item "target/release/mydb-migrate.exe" "$buildDir/"
+Copy-Item "target/release/mydbdump.exe" "$buildDir/"
 
 # 复制配置文件
 Copy-Item "configs/default.yaml" "$buildDir/config.yaml.example"
@@ -96,7 +98,7 @@ Push-Location $buildDir
 7z a "../${packageName}.zip" .
 Pop-Location
 
-$packagePath = "target/release/package/${packageName}.zip"
+$packagePath = "target/release/${packageName}.zip"
 $packageSize = (Get-Item $packagePath).Length / 1MB
 
 Write-Success "Package created: $packagePath ($([math]::Round($packageSize, 2)) MB)"

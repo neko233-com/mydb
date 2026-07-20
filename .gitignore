@@ -1,6 +1,5 @@
 # Dependencies
 target/
-Cargo.lock
 
 # IDE
 .vscode/
@@ -44,6 +43,9 @@ data/
 *.pid
 *.sock
 *.lock
+!Cargo.lock
+vendor/**/Cargo.lock
+vendor/**/target/
 
 # Environment files
 .env

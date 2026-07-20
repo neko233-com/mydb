@@ -1,9 +1,9 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufWriter, Seek, SeekFrom, Write};
+use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use crc32fast::Hasher;
 use parking_lot::Mutex;
 use tracing::{debug, info};
@@ -34,6 +34,11 @@ pub struct WalWriter {
 }
 
 impl WalWriter {
+    /// The LSN that will be assigned to the next appended record.
+    pub fn next_lsn(&self) -> u64 {
+        self.next_lsn.load(Ordering::SeqCst)
+    }
+
     /// Open or create WAL directory
     pub fn open(dir: PathBuf, max_file_size: Option<u64>) -> Result<Self> {
         fs::create_dir_all(&dir)?;
@@ -43,31 +48,28 @@ impl WalWriter {
         // Find the latest WAL file index
         let current_file_index = Self::find_latest_file_index(&dir)?;
 
-        // Open or create the current WAL file
+        // Open or create the current WAL file. Validate and truncate a torn or
+        // CRC-invalid tail before appending; otherwise one partial record would
+        // hide every valid record appended after the next restart.
         let file_path = Self::wal_file_path(&dir, current_file_index);
-        let needs_header = !file_path.exists();
-
-        let file = OpenOptions::new()
+        let mut file = OpenOptions::new()
             .create(true)
-            .append(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
             .open(&file_path)?;
-
-        let current_file_size = file.metadata()?.len();
-
-        let mut writer = BufWriter::new(file);
-
-        // Write header if new file
-        if needs_header {
-            writer.write_all(WAL_MAGIC)?;
-            writer.write_all(&0u32.to_le_bytes())?; // reserved
-        }
-
-        // Determine next LSN by scanning existing records
-        let next_lsn = if current_file_size > 0 {
-            Self::scan_last_lsn(&file_path)?
+        let (current_file_size, next_lsn) = if file.metadata()?.len() < 8 {
+            file.set_len(0)?;
+            file.seek(SeekFrom::Start(0))?;
+            file.write_all(WAL_MAGIC)?;
+            file.write_all(&0u32.to_le_bytes())?;
+            file.sync_all()?;
+            (8, 1)
         } else {
-            1
+            Self::recover_valid_tail(&mut file)?
         };
+        file.seek(SeekFrom::Start(current_file_size))?;
+        let writer = BufWriter::new(file);
 
         info!(
             "WAL opened: {:?} (index={}, size={}, next_lsn={})",
@@ -114,7 +116,10 @@ impl WalWriter {
 
         self.current_file_size += (HEADER_SIZE + payload.len() + CRC_SIZE) as u64;
 
-        debug!("WAL append: lsn={} type={} table={}", lsn, record.record_type, record.table_name);
+        debug!(
+            "WAL append: lsn={} type={} table={}",
+            lsn, record.record_type, record.table_name
+        );
 
         Ok(lsn)
     }
@@ -123,7 +128,9 @@ impl WalWriter {
     pub fn sync(&mut self) -> Result<()> {
         let _lock = self.flush_lock.lock();
         self.current_file.flush()?;
-        self.current_file.get_ref().sync_all()?;
+        // The WAL file/header already exists; fdatasync persists appended bytes
+        // and the file length without forcing unrelated inode metadata each group.
+        self.current_file.get_ref().sync_data()?;
         debug!("WAL synced");
         Ok(())
     }
@@ -214,20 +221,25 @@ impl WalWriter {
         dir.join(format!("wal_{:06}.log", index))
     }
 
-    /// Scan a WAL file to find the last LSN
-    fn scan_last_lsn(file_path: &Path) -> Result<u64> {
-        use std::io::Read;
+    /// Return the valid byte length and next LSN, truncating only a torn tail.
+    ///
+    /// A complete record with an invalid checksum before later bytes is durable
+    /// corruption, not a recoverable tail. Refuse to discard the later records.
+    fn recover_valid_tail(file: &mut File) -> Result<(u64, u64)> {
+        let file_len = file.metadata()?.len();
+        file.seek(SeekFrom::Start(0))?;
+        let mut magic = [0_u8; 4];
+        file.read_exact(&mut magic)?;
+        if magic != *WAL_MAGIC {
+            anyhow::bail!("invalid WAL magic");
+        }
+        let mut reserved = [0_u8; 4];
+        file.read_exact(&mut reserved)?;
 
-        let mut file = File::open(file_path)?;
+        let mut valid_len = 8_u64;
         let mut last_lsn = 0u64;
-
-        // Skip header (magic 4 bytes + reserved 4 bytes)
-        file.seek(SeekFrom::Start(8))?;
-
         let mut lsn_buf = [0u8; 8];
         let mut len_buf = [0u8; 4];
-        let mut crc_buf = [0u8; 4];
-
         loop {
             match file.read_exact(&mut lsn_buf) {
                 Ok(()) => {}
@@ -238,26 +250,46 @@ impl WalWriter {
             if file.read_exact(&mut len_buf).is_err() {
                 break;
             }
-
-            let payload_len = u32::from_le_bytes(len_buf) as u64;
-            let payload_size = payload_len + CRC_SIZE as u64;
-
-            // Skip payload + CRC
-            if file.seek(SeekFrom::Current(payload_size as i64)).is_err() {
+            let payload_len = u32::from_le_bytes(len_buf) as usize;
+            let remaining = file_len.saturating_sub(file.stream_position()?);
+            if remaining < payload_len as u64 + CRC_SIZE as u64 {
                 break;
             }
-
+            let mut payload = vec![0_u8; payload_len];
+            file.read_exact(&mut payload)?;
+            let mut crc_buf = [0_u8; CRC_SIZE];
+            file.read_exact(&mut crc_buf)?;
+            let mut hasher = Hasher::new();
+            hasher.update(&lsn_buf);
+            hasher.update(&payload);
+            let record_end = file.stream_position()?;
+            if hasher.finalize() != u32::from_le_bytes(crc_buf)
+                || WalRecord::decode_payload(u64::from_le_bytes(lsn_buf), &payload).is_none()
+            {
+                if record_end < file_len {
+                    anyhow::bail!(
+                        "WAL corruption at offset {} before later durable bytes",
+                        valid_len
+                    );
+                }
+                break;
+            }
             last_lsn = u64::from_le_bytes(lsn_buf);
+            valid_len = file.stream_position()?;
         }
-
-        Ok(last_lsn + 1)
+        if valid_len != file_len {
+            file.set_len(valid_len)?;
+            file.sync_all()?;
+        }
+        Ok((valid_len, last_lsn.saturating_add(1).max(1)))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::record::{WalRecordType, encode_row};
+    use crate::reader::WalReader;
+    use crate::record::{encode_row, WalRecordType};
 
     #[test]
     fn test_wal_append_and_sync() {
@@ -310,13 +342,7 @@ mod tests {
         {
             let mut wal = WalWriter::open(tmp.path().into(), None).unwrap();
             for _ in 0..5 {
-                let mut record = WalRecord::new(
-                    0,
-                    WalRecordType::Insert,
-                    1,
-                    "test",
-                    vec![1, 2, 3],
-                );
+                let mut record = WalRecord::new(0, WalRecordType::Insert, 1, "test", vec![1, 2, 3]);
                 wal.append(&mut record).unwrap();
             }
             wal.sync().unwrap();
@@ -325,15 +351,72 @@ mod tests {
         // Second session: reopen and check LSN continues
         {
             let mut wal = WalWriter::open(tmp.path().into(), None).unwrap();
-            let mut record = WalRecord::new(
-                0,
-                WalRecordType::Insert,
-                1,
-                "test",
-                vec![4, 5, 6],
-            );
+            let mut record = WalRecord::new(0, WalRecordType::Insert, 1, "test", vec![4, 5, 6]);
             let lsn = wal.append(&mut record).unwrap();
             assert_eq!(lsn, 6); // should continue from 5
         }
+    }
+
+    #[test]
+    fn reopen_truncates_torn_tail_before_new_appends() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_path = tmp.path().join("wal_000000.log");
+        {
+            let mut wal = WalWriter::open(tmp.path().into(), None).unwrap();
+            let mut record = WalRecord::new(0, WalRecordType::Insert, 1, "test", vec![1]);
+            wal.append(&mut record).unwrap();
+            wal.sync().unwrap();
+        }
+        {
+            let mut file = OpenOptions::new().append(true).open(&wal_path).unwrap();
+            file.write_all(&2_u64.to_le_bytes()).unwrap();
+            file.write_all(&100_u32.to_le_bytes()).unwrap();
+            file.write_all(&[0xaa, 0xbb]).unwrap();
+            file.sync_all().unwrap();
+        }
+        {
+            let mut wal = WalWriter::open(tmp.path().into(), None).unwrap();
+            let mut record = WalRecord::new(0, WalRecordType::Insert, 2, "test", vec![2]);
+            assert_eq!(wal.append(&mut record).unwrap(), 2);
+            wal.sync().unwrap();
+        }
+
+        let reader = WalReader::open(tmp.path().into()).unwrap();
+        let mut records = Vec::new();
+        reader.replay(|record| records.push(record)).unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].lsn, 1);
+        assert_eq!(records[1].lsn, 2);
+    }
+
+    #[test]
+    fn rejects_middle_record_corruption_without_discarding_later_records() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_path = tmp.path().join("wal_000000.log");
+        {
+            let mut wal = WalWriter::open(tmp.path().into(), None).unwrap();
+            for value in 1..=3 {
+                let mut record =
+                    WalRecord::new(0, WalRecordType::Insert, value, "test", vec![value as u8]);
+                wal.append(&mut record).unwrap();
+            }
+            wal.sync().unwrap();
+        }
+        {
+            let mut file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&wal_path)
+                .unwrap();
+            // Header, LSN, and payload length precede the first payload byte.
+            file.seek(SeekFrom::Start(8 + 8 + 4)).unwrap();
+            file.write_all(&[0xff]).unwrap();
+            file.sync_all().unwrap();
+        }
+
+        assert!(WalWriter::open(tmp.path().into(), None).is_err());
+        let reader = WalReader::open(tmp.path().into()).unwrap();
+        assert!(reader.replay(|_| {}).is_err());
+        assert!(reader.max_lsn().is_err());
     }
 }
