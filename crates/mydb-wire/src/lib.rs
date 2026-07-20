@@ -4604,14 +4604,25 @@ impl Backend {
         let remainder = sql[if revoke { 6 } else { 5 }..].trim();
         let upper_remainder = remainder.to_ascii_uppercase();
         if let Some(on) = upper_remainder.find(" ON ") {
-            let privileges = parse_privilege_list(&remainder[..on])?;
+            let mut privileges = parse_privilege_list(&remainder[..on])?;
             let after_on = &remainder[on + 4..];
             let marker = if revoke { " FROM " } else { " TO " };
             let target_index = after_on.to_ascii_uppercase().find(marker).ok_or_else(|| {
                 anyhow::anyhow!("authorization statement requires {}", marker.trim())
             })?;
             let scope = after_on[..target_index].trim();
-            let principals = split_csv(after_on[target_index + marker.len()..].trim());
+            let principal_clause = after_on[target_index + marker.len()..].trim();
+            let with_grant_option = !revoke
+                && principal_clause
+                    .to_ascii_uppercase()
+                    .strip_suffix(" WITH GRANT OPTION")
+                    .is_some();
+            let principal_clause = if with_grant_option {
+                principal_clause[..principal_clause.len() - " WITH GRANT OPTION".len()].trim()
+            } else {
+                principal_clause
+            };
+            let principals = split_csv(principal_clause);
             let database = if scope == "*.*" {
                 None
             } else {
@@ -4624,6 +4635,9 @@ impl Backend {
                     .auth_catalog
                     .revoke_privileges(&principals, database, &privileges)?;
             } else {
+                if with_grant_option {
+                    privileges.insert("GRANT OPTION".to_string());
+                }
                 self.config
                     .auth_catalog
                     .grant_privileges(&principals, database, privileges)?;
@@ -28472,6 +28486,14 @@ mod tests {
             .config
             .auth_catalog
             .has_privilege("batch_two", "mydb", "SELECT"));
+        backend
+            .execute("GRANT UPDATE ON mydb.* TO 'batch_one' WITH GRANT OPTION")
+            .await
+            .unwrap();
+        assert!(backend
+            .config
+            .auth_catalog
+            .has_privilege("batch_one", "mydb", "GRANT OPTION"));
         backend
             .execute("REVOKE SELECT ON mydb.* FROM 'batch_one', 'batch_two'")
             .await
