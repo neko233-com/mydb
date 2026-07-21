@@ -44,6 +44,7 @@ use mydb_storage::{
 pub const SERVER_VERSION: &str = "8.0.36-mydb-0.1.0";
 const MAX_SCALAR_RESULT_BYTES: usize = 64 * 1024 * 1024;
 const REGEX_CACHE_CAPACITY: usize = 256;
+const READ_ONLY_TRANSACTION_ERROR: &str = "Cannot execute statement in a READ ONLY transaction.";
 static REGEX_CACHE: OnceLock<parking_lot::Mutex<HashMap<String, Regex>>> = OnceLock::new();
 
 tokio::task_local! {
@@ -1392,6 +1393,37 @@ enum TransactionIsolation {
     Serializable,
 }
 
+fn start_transaction_read_only(upper: &str) -> anyhow::Result<bool> {
+    let read_only = upper.contains("READ ONLY");
+    let read_write = upper.contains("READ WRITE");
+    if read_only && read_write {
+        anyhow::bail!("START TRANSACTION cannot specify both READ ONLY and READ WRITE");
+    }
+    Ok(read_only)
+}
+
+fn is_read_only_transaction_write_statement(upper: &str) -> bool {
+    [
+        "INSERT ",
+        "REPLACE ",
+        "UPDATE ",
+        "DELETE ",
+        "LOAD DATA",
+        "CREATE ",
+        "ALTER ",
+        "DROP ",
+        "TRUNCATE ",
+        "RENAME ",
+        "GRANT ",
+        "REVOKE ",
+        "ANALYZE ",
+        "OPTIMIZE ",
+        "REPAIR ",
+    ]
+    .iter()
+    .any(|prefix| upper.starts_with(prefix))
+}
+
 #[derive(Debug, Clone)]
 pub struct SlowQuerySnapshot {
     pub unix_ms: u64,
@@ -1730,6 +1762,7 @@ struct Backend {
     autocommit: bool,
     transaction_writes: Arc<parking_lot::RwLock<Vec<WriteCommand>>>,
     transaction_isolation: TransactionIsolation,
+    transaction_read_only: bool,
     transaction_snapshot: HashMap<(String, String), Vec<Row>>,
     lock_wait_timeout: std::time::Duration,
     foreign_key_checks: bool,
@@ -1833,6 +1866,7 @@ impl Backend {
             autocommit: true,
             transaction_writes,
             transaction_isolation: TransactionIsolation::default(),
+            transaction_read_only: false,
             transaction_snapshot: HashMap::new(),
             lock_wait_timeout,
             foreign_key_checks: true,
@@ -1866,6 +1900,7 @@ impl Backend {
         self.savepoints.clear();
         self.stats.release_all_locks(self.connection_id);
         self.in_transaction = false;
+        self.transaction_read_only = false;
 
         let temporary_drops = self
             .temporary_tables
@@ -1935,6 +1970,7 @@ impl Backend {
             self.savepoints.clear();
             self.stats.release_all_locks(self.connection_id);
             self.in_transaction = false;
+            self.transaction_read_only = false;
         }
         if let Ok(outcome) = &outcome {
             match outcome {
@@ -2174,6 +2210,7 @@ impl Backend {
                     self.stats.release_all_locks(self.connection_id);
                     self.autocommit = true;
                     self.in_transaction = false;
+                    self.transaction_read_only = false;
                 } else if !enabled && self.autocommit {
                     self.savepoints.clear();
                     self.autocommit = false;
@@ -2307,6 +2344,13 @@ impl Backend {
             }
         }
         Ok(QueryOutcome::ok(0))
+    }
+
+    fn ensure_transaction_writable(&self) -> anyhow::Result<()> {
+        if self.transaction_read_only {
+            anyhow::bail!(READ_ONLY_TRANSACTION_ERROR);
+        }
+        Ok(())
     }
 
     fn execute_prepare_statement(&mut self, sql: &str) -> anyhow::Result<QueryOutcome> {
@@ -3374,9 +3418,13 @@ impl Backend {
             || (sql.starts_with("/*") && sql.ends_with("*/"))
             || upper.starts_with("LOCK TABLES ")
             || upper == "UNLOCK TABLES"
-            || (upper.starts_with("ALTER TABLE ")
-                && (upper.ends_with(" DISABLE KEYS") || upper.ends_with(" ENABLE KEYS")))
         {
+            return Ok(QueryOutcome::ok(0));
+        }
+        if upper.starts_with("ALTER TABLE ")
+            && (upper.ends_with(" DISABLE KEYS") || upper.ends_with(" ENABLE KEYS"))
+        {
+            self.ensure_transaction_writable()?;
             return Ok(QueryOutcome::ok(0));
         }
 
@@ -3395,10 +3443,16 @@ impl Backend {
         }
 
         if upper == "BEGIN" || upper.starts_with("START TRANSACTION") {
+            let read_only = if upper.starts_with("START TRANSACTION") {
+                start_transaction_read_only(&upper)?
+            } else {
+                false
+            };
             self.commit_pending().await?;
             self.transaction_snapshot.clear();
             self.savepoints.clear();
             self.in_transaction = true;
+            self.transaction_read_only = read_only;
             return Ok(QueryOutcome::ok(0));
         }
         if upper == "COMMIT" {
@@ -3412,6 +3466,7 @@ impl Backend {
             self.savepoints.clear();
             self.stats.release_all_locks(self.connection_id);
             self.in_transaction = false;
+            self.transaction_read_only = false;
             return Ok(QueryOutcome::ok(0));
         }
         if upper.starts_with("SAVEPOINT ") {
@@ -3463,6 +3518,9 @@ impl Backend {
         }
         if upper.starts_with("CALL ") {
             return self.execute_call(sql).await;
+        }
+        if is_read_only_transaction_write_statement(&upper) {
+            self.ensure_transaction_writable()?;
         }
         if upper.starts_with("CREATE USER ")
             || upper.starts_with("ALTER USER ")
@@ -3536,14 +3594,20 @@ impl Backend {
                 .collect();
             return Ok(QueryOutcome::rows(vec!["Grants"], rows));
         }
-        if upper == "SHOW DATABASES" {
+        if let Some(filter) = parse_show_command_filter(sql, "DATABASES") {
+            let filter = filter?;
             let mut names = vec!["information_schema".to_string(), "mysql".to_string()];
             names.extend(self.storage.list_databases());
             names.sort();
             names.dedup();
-            return Ok(QueryOutcome::rows(
-                vec!["Database"],
-                names.into_iter().map(|v| vec![Some(v)]).collect(),
+            let columns = vec!["Database".to_string()];
+            let rows = names
+                .into_iter()
+                .map(|name| vec![Some(name.into_bytes())])
+                .collect();
+            return Ok(QueryOutcome::byte_rows(
+                columns.clone(),
+                apply_show_filter(&columns, rows, filter, 0)?,
             ));
         }
         if upper.starts_with("SHOW CHARACTER SET") || upper.starts_with("SHOW CHARSET") {
@@ -3919,46 +3983,49 @@ impl Backend {
                 mysql_engine_rows_as_strings(),
             ));
         }
-        if upper.starts_with("SHOW VARIABLES") {
-            return Ok(QueryOutcome::rows(
-                vec!["Variable_name", "Value"],
+        if let Some(filter) = parse_show_scoped_metadata_filter(sql, "VARIABLES") {
+            let filter = filter?;
+            let columns = vec!["Variable_name".to_string(), "Value".to_string()];
+            let rows = vec![
+                vec![bytes("version"), bytes(SERVER_VERSION)],
+                vec![bytes("version_comment"), bytes("MyDB Server")],
                 vec![
-                    vec![Some("version".into()), Some(SERVER_VERSION.into())],
-                    vec![Some("version_comment".into()), Some("MyDB Server".into())],
-                    vec![
-                        Some("autocommit".into()),
-                        Some(if self.autocommit { "ON" } else { "OFF" }.into()),
-                    ],
-                    vec![Some("character_set_server".into()), Some("utf8mb4".into())],
-                    vec![
-                        Some("max_error_count".into()),
-                        Some(self.max_error_count().to_string()),
-                    ],
-                    vec![
-                        Some("sql_notes".into()),
-                        Some(
-                            if self.sql_notes_enabled() {
-                                "ON"
-                            } else {
-                                "OFF"
-                            }
-                            .into(),
-                        ),
-                    ],
+                    bytes("autocommit"),
+                    bytes(if self.autocommit { "ON" } else { "OFF" }),
                 ],
+                vec![bytes("character_set_server"), bytes("utf8mb4")],
+                vec![
+                    bytes("max_error_count"),
+                    bytes(&self.max_error_count().to_string()),
+                ],
+                vec![
+                    bytes("sql_notes"),
+                    bytes(if self.sql_notes_enabled() {
+                        "ON"
+                    } else {
+                        "OFF"
+                    }),
+                ],
+            ];
+            return Ok(QueryOutcome::byte_rows(
+                columns.clone(),
+                apply_show_filter(&columns, rows, filter, 0)?,
             ));
         }
-        if upper.starts_with("SHOW STATUS") {
+        if let Some(filter) = parse_show_scoped_metadata_filter(sql, "STATUS") {
+            let filter = filter?;
             let stats = self.stats.snapshot();
-            return Ok(QueryOutcome::rows(
-                vec!["Variable_name", "Value"],
+            let columns = vec!["Variable_name".to_string(), "Value".to_string()];
+            let rows = vec![
                 vec![
-                    vec![
-                        Some("Threads_connected".into()),
-                        Some(stats.active_connections.to_string()),
-                    ],
-                    vec![Some("Questions".into()), Some(stats.queries.to_string())],
+                    bytes("Threads_connected"),
+                    bytes(&stats.active_connections.to_string()),
                 ],
+                vec![bytes("Questions"), bytes(&stats.queries.to_string())],
+            ];
+            return Ok(QueryOutcome::byte_rows(
+                columns.clone(),
+                apply_show_filter(&columns, rows, filter, 0)?,
             ));
         }
 
@@ -4961,6 +5028,7 @@ impl Backend {
     }
 
     fn execute_auth_statement(&self, sql: &str) -> anyhow::Result<QueryOutcome> {
+        self.ensure_transaction_writable()?;
         let upper = sql.to_ascii_uppercase();
         if upper.starts_with("CREATE USER ")
             || upper.starts_with("CREATE USER IF NOT EXISTS ")
@@ -5096,6 +5164,7 @@ impl Backend {
         mut spec: LoadDataSpec,
         data: &[u8],
     ) -> anyhow::Result<QueryOutcome> {
+        self.ensure_transaction_writable()?;
         if data.len() > self.config.max_load_data_size {
             anyhow::bail!("LOAD DATA file exceeds server limit");
         }
@@ -6034,6 +6103,7 @@ impl Backend {
         writes: Vec<WriteCommand>,
         predicted: u64,
     ) -> anyhow::Result<QueryOutcome> {
+        self.ensure_transaction_writable()?;
         let locks = write_lock_requests(&self.storage, &writes)?;
         if let Err(error) = self
             .stats
@@ -6069,6 +6139,7 @@ impl Backend {
         writes: Vec<WriteCommand>,
         predicted: u64,
     ) -> anyhow::Result<QueryOutcome> {
+        self.ensure_transaction_writable()?;
         let trigger_locks = self.trigger_mutation_lock_requests(&writes)?;
         self.stats
             .acquire_locks(&trigger_locks, self.connection_id, self.lock_wait_timeout)
@@ -6214,6 +6285,7 @@ impl Backend {
         trigger_last_insert_id: u64,
         trigger_affected_rows: u64,
     ) -> anyhow::Result<QueryOutcome> {
+        self.ensure_transaction_writable()?;
         let memory_writes = writes_are_memory(&self.storage, &writes);
         if !self.foreign_key_checks {
             writes.insert(0, WriteCommand::ForeignKeyChecksDisabled);
@@ -8196,6 +8268,7 @@ impl Backend {
     }
 
     async fn submit_ddl(&mut self, writes: Vec<WriteCommand>) -> anyhow::Result<QueryOutcome> {
+        self.ensure_transaction_writable()?;
         self.in_transaction = false;
         let locks = write_lock_requests(&self.storage, &writes)?;
         if let Err(error) = self
@@ -8215,6 +8288,7 @@ impl Backend {
         &mut self,
         writes: Vec<WriteCommand>,
     ) -> anyhow::Result<QueryOutcome> {
+        self.ensure_transaction_writable()?;
         self.in_transaction = false;
         let locks = write_lock_requests(&self.storage, &writes[..1])?;
         if let Err(error) = self
@@ -8234,6 +8308,7 @@ impl Backend {
         &mut self,
         renames: Vec<(String, String)>,
     ) -> anyhow::Result<QueryOutcome> {
+        self.ensure_transaction_writable()?;
         let mut writes = Vec::new();
         let mut lock_commands = Vec::new();
         let mut destinations = HashSet::new();
@@ -8353,6 +8428,7 @@ impl Backend {
         self.transaction_snapshot.clear();
         self.savepoints.clear();
         self.stats.release_all_locks(self.connection_id);
+        self.transaction_read_only = false;
         result
     }
 
@@ -8383,6 +8459,7 @@ impl Backend {
         &mut self,
         writes: Vec<WriteCommand>,
     ) -> anyhow::Result<QueryOutcome> {
+        self.ensure_transaction_writable()?;
         let locks = write_lock_requests(&self.storage, &writes)?;
         self.submit_temporary_batch_with_locks(writes, locks).await
     }
@@ -8391,6 +8468,7 @@ impl Backend {
         &mut self,
         writes: Vec<WriteCommand>,
     ) -> anyhow::Result<QueryOutcome> {
+        self.ensure_transaction_writable()?;
         let locks = write_lock_requests(&self.storage, &writes[..1])?;
         self.submit_temporary_batch_with_locks(writes, locks).await
     }
@@ -8400,6 +8478,7 @@ impl Backend {
         writes: Vec<WriteCommand>,
         locks: Vec<LockRequest>,
     ) -> anyhow::Result<QueryOutcome> {
+        self.ensure_transaction_writable()?;
         let previous_locks = self.stats.connection_lock_snapshot(self.connection_id);
         if let Err(error) = self
             .stats
@@ -21406,6 +21485,8 @@ fn mysql_error_kind(message: &str) -> ErrorKind {
         ErrorKind::ER_LOCK_NOWAIT
     } else if message.starts_with("Deadlock found when trying to get lock") {
         ErrorKind::ER_LOCK_DEADLOCK
+    } else if message == READ_ONLY_TRANSACTION_ERROR {
+        ErrorKind::ER_CANT_EXECUTE_IN_READ_ONLY_TRANSACTION
     } else if message.starts_with("Cannot truncate a table referenced in a foreign key constraint")
     {
         ErrorKind::ER_TRUNCATE_ILLEGAL_FK
@@ -30446,6 +30527,45 @@ fn take_show_identifier(value: &str) -> anyhow::Result<(String, &str)> {
     Ok((identifier, value[end..].trim_start()))
 }
 
+fn strip_show_keyword_ci<'a>(value: &'a str, keyword: &str) -> Option<&'a str> {
+    let tail = value.get(keyword.len()..)?;
+    if !value
+        .get(..keyword.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(keyword))
+    {
+        return None;
+    }
+    match tail.as_bytes().first() {
+        None | Some(b';') => Some(tail),
+        Some(byte) if byte.is_ascii_whitespace() => Some(tail.trim_start()),
+        _ => None,
+    }
+}
+
+fn parse_show_command_filter(
+    sql: &str,
+    command: &str,
+) -> Option<anyhow::Result<Option<ShowMetadataFilter>>> {
+    let remainder = strip_show_keyword_ci(sql.trim_start(), "SHOW")?;
+    let remainder = strip_show_keyword_ci(remainder, command)?;
+    Some(parse_show_metadata_filter(remainder))
+}
+
+fn parse_show_scoped_metadata_filter(
+    sql: &str,
+    command: &str,
+) -> Option<anyhow::Result<Option<ShowMetadataFilter>>> {
+    let mut remainder = strip_show_keyword_ci(sql.trim_start(), "SHOW")?;
+    for scope in ["GLOBAL", "SESSION", "LOCAL"] {
+        if let Some(tail) = strip_show_keyword_ci(remainder, scope) {
+            remainder = tail;
+            break;
+        }
+    }
+    let remainder = strip_show_keyword_ci(remainder, command)?;
+    Some(parse_show_metadata_filter(remainder))
+}
+
 fn parse_show_metadata_filter(value: &str) -> anyhow::Result<Option<ShowMetadataFilter>> {
     let value = value.trim().trim_end_matches(';').trim();
     if value.is_empty() {
@@ -33006,6 +33126,59 @@ mod tests {
         assert!(privileges
             .iter()
             .any(|row| { row.first().and_then(Option::as_deref) == Some(b"Select".as_slice()) }));
+    }
+
+    #[tokio::test]
+    async fn show_metadata_filters_support_database_variable_and_status_scopes() {
+        let (_temp, _storage, mut backend, _second) = transaction_backends().await;
+        backend
+            .execute("CREATE DATABASE metadata_filter_db")
+            .await
+            .unwrap();
+
+        let expected_database = vec![vec![bytes("metadata_filter_db")]];
+        assert_eq!(
+            query_rows(&mut backend, "SHOW DATABASES LIKE 'metadata_filter_db'",).await,
+            expected_database
+        );
+        assert_eq!(
+            query_rows(
+                &mut backend,
+                "SHOW DATABASES WHERE Database = 'metadata_filter_db'",
+            )
+            .await,
+            vec![vec![bytes("metadata_filter_db")]]
+        );
+
+        assert_eq!(
+            query_rows(&mut backend, "SHOW SESSION VARIABLES LIKE 'autocommit'").await,
+            vec![vec![bytes("autocommit"), bytes("ON")]]
+        );
+        assert_eq!(
+            query_rows(
+                &mut backend,
+                "SHOW GLOBAL VARIABLES WHERE Variable_name = 'version'",
+            )
+            .await,
+            vec![vec![bytes("version"), bytes(SERVER_VERSION)]]
+        );
+        assert!(query_rows(
+            &mut backend,
+            "SHOW SESSION VARIABLES LIKE 'missing_variable'",
+        )
+        .await
+        .is_empty());
+
+        let status = query_rows(&mut backend, "SHOW GLOBAL STATUS LIKE 'Questions'").await;
+        assert_eq!(status.len(), 1);
+        assert_eq!(status[0][0], bytes("Questions"));
+        let status = query_rows(
+            &mut backend,
+            "SHOW SESSION STATUS WHERE Variable_name = 'Threads_connected'",
+        )
+        .await;
+        assert_eq!(status.len(), 1);
+        assert_eq!(status[0][0], bytes("Threads_connected"));
     }
 
     #[tokio::test]
@@ -45351,6 +45524,128 @@ mod tests {
             ),
             b"20"
         );
+    }
+
+    #[tokio::test]
+    async fn start_transaction_read_only_rejects_writes_and_clears_at_transaction_end() {
+        let (_temp, _storage, mut backend, _second) = transaction_backends().await;
+        backend
+            .execute(
+                "CREATE PROCEDURE read_only_write() BEGIN INSERT INTO actors (id,value) VALUES (2,20); END",
+            )
+            .await
+            .unwrap();
+
+        backend
+            .execute("START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY")
+            .await
+            .unwrap();
+        assert!(backend.transaction_read_only);
+        assert_eq!(
+            single_value(
+                backend
+                    .execute("SELECT value FROM actors WHERE id=1")
+                    .await
+                    .unwrap()
+            ),
+            b"10"
+        );
+
+        for sql in [
+            "INSERT INTO actors (id,value) VALUES (2,20)",
+            "REPLACE INTO actors (id,value) VALUES (1,99)",
+            "UPDATE actors SET value=99 WHERE id=1",
+            "DELETE FROM actors WHERE id=1",
+            "LOAD DATA INFILE 'actors.csv' INTO TABLE actors",
+            "CREATE TABLE read_only_blocked (id BIGINT)",
+            "ALTER TABLE actors ADD COLUMN blocked BIGINT",
+            "ALTER TABLE actors DISABLE KEYS",
+            "TRUNCATE TABLE actors",
+            "DROP TABLE actors",
+            "CREATE USER 'read_only_blocked' IDENTIFIED BY 'secret'",
+            "CALL read_only_write()",
+        ] {
+            let error = backend.execute(sql).await.unwrap_err().to_string();
+            assert_eq!(error, READ_ONLY_TRANSACTION_ERROR, "{sql}");
+            assert_eq!(
+                mysql_error_kind(&error),
+                ErrorKind::ER_CANT_EXECUTE_IN_READ_ONLY_TRANSACTION,
+                "{sql}"
+            );
+        }
+
+        let load = parse_load_data(
+            "LOAD DATA LOCAL INFILE 'actors.csv' INTO TABLE actors",
+            "mydb",
+        )
+        .unwrap();
+        assert_eq!(
+            backend
+                .submit_load_data(load, b"2,20\n")
+                .await
+                .unwrap_err()
+                .to_string(),
+            READ_ONLY_TRANSACTION_ERROR
+        );
+        assert_eq!(
+            single_value(
+                backend
+                    .execute("SELECT COUNT(*) FROM actors")
+                    .await
+                    .unwrap()
+            ),
+            b"1"
+        );
+
+        backend.execute("ROLLBACK").await.unwrap();
+        assert!(!backend.transaction_read_only);
+        backend
+            .execute("INSERT INTO actors (id,value) VALUES (2,20)")
+            .await
+            .unwrap();
+
+        backend
+            .execute("START TRANSACTION READ ONLY")
+            .await
+            .unwrap();
+        assert!(backend.transaction_read_only);
+        backend.execute("COMMIT").await.unwrap();
+        assert!(!backend.transaction_read_only);
+
+        backend
+            .execute("CREATE TEMPORARY TABLE read_only_reset_tmp (id BIGINT)")
+            .await
+            .unwrap();
+        backend
+            .execute("START TRANSACTION READ ONLY")
+            .await
+            .unwrap();
+        backend.reset_connection().await.unwrap();
+        assert!(!backend.transaction_read_only);
+        assert!(backend
+            .execute("SELECT * FROM read_only_reset_tmp")
+            .await
+            .is_err());
+
+        backend.execute("SET autocommit=0").await.unwrap();
+        backend
+            .execute("START TRANSACTION READ ONLY")
+            .await
+            .unwrap();
+        backend.execute("SET autocommit=1").await.unwrap();
+        assert!(backend.autocommit);
+        assert!(!backend.transaction_read_only);
+
+        backend
+            .execute("START TRANSACTION READ WRITE")
+            .await
+            .unwrap();
+        assert!(!backend.transaction_read_only);
+        backend
+            .execute("UPDATE actors SET value=21 WHERE id=2")
+            .await
+            .unwrap();
+        backend.execute("ROLLBACK").await.unwrap();
     }
 
     #[tokio::test]
