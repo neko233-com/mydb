@@ -704,7 +704,7 @@ pub enum EventFinishAction {
     Keep,
     /// A one-shot event with ON COMPLETION PRESERVE remains visible but is
     /// disabled after its final execution.
-    Disable(EventDefinition),
+    Disable(Box<EventDefinition>),
     /// A one-shot event with ON COMPLETION NOT PRESERVE is removed.
     Drop,
 }
@@ -752,6 +752,7 @@ fn apply_finish_event_to_catalog(
             event_metadata.insert(stored, metadata.clone());
         }
         EventFinishAction::Disable(replacement) => {
+            let replacement = replacement.as_ref();
             if !replacement.name.eq_ignore_ascii_case(event) {
                 anyhow::bail!(
                     "EVENT completion replacement '{}' does not match '{}'",
@@ -938,6 +939,7 @@ fn move_event_between_catalogs(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn move_event_between_catalogs_with_metadata_cas(
     source_events: &mut HashMap<String, EventDefinition>,
     source_metadata: &mut HashMap<String, EventMetadata>,
@@ -1413,37 +1415,38 @@ impl Database {
         if routines_file.exists() {
             let content = std::fs::read_to_string(&routines_file)?;
             let value: serde_json::Value = serde_json::from_str(&content)?;
-            if matches!(
-                value
-                    .get("format_version")
-                    .and_then(serde_json::Value::as_u64),
-                Some(2 | 3 | 4)
-            ) {
-                let catalog: RoutineCatalogV4 = serde_json::from_value(value)?;
-                *self.procedures.write() = catalog.procedures;
-                *self.procedure_metadata.write() = catalog.metadata;
-                *self.functions.write() = catalog.functions;
-                *self.function_metadata.write() = catalog.function_metadata;
-                *self.events.write() = catalog.events;
-                *self.event_metadata.write() = catalog.event_metadata;
-            } else {
-                let procedures: HashMap<String, ProcedureDefinition> =
-                    serde_json::from_value(value)?;
-                let fallback = routine_file_timestamp(&routines_file);
-                *self.procedure_metadata.write() = procedures
-                    .keys()
-                    .map(|name| {
-                        (
-                            name.clone(),
-                            ProcedureMetadata {
-                                created: fallback.clone(),
-                                last_altered: fallback.clone(),
-                                sql_mode: String::new(),
-                            },
-                        )
-                    })
-                    .collect();
-                *self.procedures.write() = procedures;
+            let format_version = value
+                .get("format_version")
+                .and_then(serde_json::Value::as_u64);
+            match format_version {
+                Some(2..=4) => {
+                    let catalog: RoutineCatalogV4 = serde_json::from_value(value)?;
+                    *self.procedures.write() = catalog.procedures;
+                    *self.procedure_metadata.write() = catalog.metadata;
+                    *self.functions.write() = catalog.functions;
+                    *self.function_metadata.write() = catalog.function_metadata;
+                    *self.events.write() = catalog.events;
+                    *self.event_metadata.write() = catalog.event_metadata;
+                }
+                _ => {
+                    let procedures: HashMap<String, ProcedureDefinition> =
+                        serde_json::from_value(value)?;
+                    let fallback = routine_file_timestamp(&routines_file);
+                    *self.procedure_metadata.write() = procedures
+                        .keys()
+                        .map(|name| {
+                            (
+                                name.clone(),
+                                ProcedureMetadata {
+                                    created: fallback.clone(),
+                                    last_altered: fallback.clone(),
+                                    sql_mode: String::new(),
+                                },
+                            )
+                        })
+                        .collect();
+                    *self.procedures.write() = procedures;
+                }
             }
         }
         Ok(())
@@ -11041,7 +11044,7 @@ mod tests {
                 expected_create_sql: altered_event.create_sql.clone(),
                 expected_revision: altered.revision,
                 metadata: completed.clone(),
-                action: EventFinishAction::Disable(disabled.clone()),
+                action: EventFinishAction::Disable(Box::new(disabled.clone())),
             }],
             true,
         );

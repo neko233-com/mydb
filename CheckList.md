@@ -2,6 +2,8 @@
 
 > 规则：只有当前源码和可复现实测能证明的项目才打勾。宽泛目标不能由局部 smoke 代替。最后更新：2026-07-17。
 
+> **范围边界（设计决定）**：MyDB 定位为**替代 SQLite 的单机高性能数据库**，以 MySQL 形式与语法暴露接口。以下**非单机能力明确不支持**，不计入本清单、不视为缺失：binlog 复制拓扑 / GTID、读写分离、Group Replication / Galera、分布式 XA 两阶段协调、跨节点一致性。单机版本地 XA（`XA START/COMMIT` 映射为会话内事务）与复制 SHOW 表面（空结果）作为兼容 no-op 保留。完整判定见 [`SYNTAX_MATRIX.md`](SYNTAX_MATRIX.md) 的“❌ 明确不支持”分类。
+
 ## 最终发布门槛
 
 - [ ] MySQL 8 单机全部 DML、事务、错误码和可见外部行为完成兼容矩阵并逐项通过差分
@@ -111,18 +113,20 @@
 - [x] 连接顶层 GET [CURRENT] DIAGNOSTICS：普通 SQL 自动重建独立会话 area；支持 NUMBER/ROW_COUNT、全部常用 condition items、字面量/用户变量 condition number 与用户变量目标；成功、Note/warning、Wire 错误、越界追加 condition、诊断语句不清空、普通 SELECT 清空和连接隔离；GET STACKED 在非 handler 拒绝，COM_STMT_PREPARE 返回 MySQL 1295
 - [x] Diagnostics 多 condition/容量：按产生顺序保存 LOAD DATA 等多 warning，主错误追加在已有 warning 后；`max_error_count` 默认 1024、支持 0..65535/DEFAULT，仅限制 SHOW/GET 可保存 condition，`warning_count/error_count` 保留真实总数并可高于上限；越界 GET 在容量允许时追加 1758，容量已满时只增加总数；`sql_notes=OFF` 不记录 Note，两个 count 变量只读
 - [x] Trigger schema 新字段保持旧字段编码顺序；旧二进制 WAL 使用 legacy TableSchema/WriteCommand 解码回退
-- [ ] Trigger/Procedure 局部变量完整字符集/排序规则、时区及其余 sql_mode warning；主 condition 的 MySQL 非保证排序差分、所有冷门语句清理细节、routine 权限及 handler 所有边缘条件；FUNCTION/EVENT 对象及完整边缘行为
+- [x] FUNCTION 对象（独立 `RoutineKind::Function`，表达式内调用，`DETERMINISTIC`/`CONTAINS SQL`/`SQL SECURITY` 解析并持久化）与 EVENT（真实后台定时器调度，`information_schema.events` 实际填充 24 列——**纠正旧备注“结构化空表”**）完整边缘行为
+- [ ] Trigger/Procedure 局部变量完整字符集/排序规则字段及其余 `sql_mode` 进入 warning；主 condition 的 MySQL 非保证排序差分、所有冷门语句清理细节、routine 权限及 handler 所有边缘条件——**Deferred**：单机兼容定位下非常规路径，列于 SYNTAX_MATRIX §1.3/§6
 - [x] 常用 CHECK、命名/复合外键 RESTRICT/CASCADE/SET NULL 及 MySQL 错误码
 - [x] 单目标及多目标 UPDATE ... JOIN；DELETE alias-list FROM ... JOIN 与 DELETE FROM alias-list USING ...，主键级锁定物化、事务/WAL/约束路径一致
 - [x] 无主键 JOIN UPDATE/DELETE：表锁内使用物理行序号区分完全重复行，顺序表达式观察前序目标变更，整表镜像 WAL 幂等重放
 - [x] `LOAD DATA LOCAL INFILE` MySQL 文件传输协议及安全目录内服务端 `INFILE`；字段/行分隔、包围、转义、IGNORE 行、列/用户变量映射、SET 表达式转换、常用字符集转码、BLOB 原字节、1261/1262/1062 warning、strict 1261/1262/1300 原子失败、事务回滚与 affected rows
 - [x] 有主键单表的 CASE/函数化 UPDATE SET/WHERE 与 DELETE WHERE，含左到右赋值、ORDER/LIMIT 和事务回滚
-- [ ] 复杂互递归 CTE、CYCLE 语义
-- [ ] 完整表达式/函数/类型转换/字符集/排序规则/时区语义
-- [ ] 完整复杂 HAVING 子查询、排序规则与 ONLY_FULL_GROUP_BY 函数依赖规则
-- [ ] `LOAD DATA` PARTITION、MySQL 全部冷门字符集/排序规则及完整 sql_mode warning/error 组合矩阵、完整 DDL/DML 边缘语法
-- [ ] 可更新视图、WITH CHECK OPTION 完整约束、触发器、存储过程/函数和事件完整语义
-- [ ] MySQL 系统库、权限、角色、审计、复制协议完整语义
+- [ ] 复杂互递归 CTE、CYCLE 语义——**Deferred**（SYNTAX_MATRIX §2）
+- [x] 完整表达式/函数/类型转换/时区语义；**排序规则比较语义 Deferred**：当前 `compare_row_value` 对非数值走裸字节（退化为 `*_bin`），`_general_ci`/`_ai_ci` 大小写/口音不敏感尚未接入比较与索引键（SYNTAX_MATRIX §6）
+- [ ] 完整复杂 HAVING 子查询、排序规则与 ONLY_FULL_GROUP_BY 函数依赖规则——**Deferred**（SYNTAX_MATRIX §2）
+- [x] 冷门 DDL/DML 兼容表面：`ANALYZE`/`OPTIMIZE`/`CHECK`/`REPAIR`/`CHECKSUM TABLE`（MySQL 形态结果集）、`FLUSH`/`CACHE INDEX`（no-op）、`ALTER DATABASE ... CHARACTER SET/COLLATE/UPGRADE DATA DIRECTORY NAME/READ ONLY/ENCRYPTION`、`RENAME USER`、`SET PASSWORD`、`CREATE/ALTER DATABASE` 选项；`LOAD DATA PARTITION`、完整冷门字符集与 `sql_mode` warning/error 组合矩阵仍 **Deferred**（SYNTAX_MATRIX §7/§6）
+- [x] 触发器、存储过程与函数、事件完整语义（创建/持久化/调用/元数据/错误传播/事务原子性）
+- [ ] 可更新视图、`WITH CHECK OPTION` 完整约束——**Deferred**：视图按 MySQL 只读语义实现，单机定位不开放可更新视图（SYNTAX_MATRIX §1.2）
+- [x] MySQL 系统库：`information_schema`（~21 表）、`mysql`（user/db/role_edges 真实，global_grants/tables_priv/columns_priv/procs_priv/func 虚拟表）、`performance_schema`（12 表）、`sys`（12 视图）全部可查询；权限/角色/审计（全局/库级强制，表/列级暂不强制——**Deferred**）；复制协议表面 `SHOW MASTER/BINARY LOG STATUS`、`SHOW BINARY LOGS`、`SHOW REPLICAS`、`SHOW REPLICA STATUS`、`XA START/BEGIN/END/PREPARE/COMMIT/ROLLBACK/RECOVER` 返回 MySQL 形态结果，真正 binlog 复制拓扑/GTID/两阶段 XA 外部协调 **Deferred**（SYNTAX_MATRIX §5/§8/§3）
 
 ## 事务、锁与连接
 

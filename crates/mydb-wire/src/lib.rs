@@ -69,10 +69,17 @@ struct StatementClock {
 struct StoredFunctionCatalog {
     default_database: String,
     functions: HashMap<(String, String), FunctionDefinition>,
+    auth_catalog: Arc<AuthCatalog>,
+    authenticated_user: String,
 }
 
 impl StoredFunctionCatalog {
-    fn from_storage(storage: &StorageEngineManager, default_database: &str) -> Self {
+    fn from_storage(
+        storage: &StorageEngineManager,
+        default_database: &str,
+        auth_catalog: Arc<AuthCatalog>,
+        authenticated_user: String,
+    ) -> Self {
         let mut functions = HashMap::new();
         for database_name in storage.list_databases() {
             let Some(database) = storage.get_database(&database_name) else {
@@ -91,6 +98,8 @@ impl StoredFunctionCatalog {
         Self {
             default_database: default_database.to_ascii_lowercase(),
             functions,
+            auth_catalog,
+            authenticated_user,
         }
     }
 
@@ -101,6 +110,24 @@ impl StoredFunctionCatalog {
             .get(&key)
             .cloned()
             .map(|function| (key, function))
+    }
+
+    fn require_execute(&self, database: &str, function: &str) -> anyhow::Result<()> {
+        if self.auth_catalog.has_routine_privilege(
+            &self.authenticated_user,
+            RoutineKind::Function,
+            database,
+            function,
+            "EXECUTE",
+        ) {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "Access denied; user '{}' lacks EXECUTE privilege on FUNCTION '{}.{}'",
+            self.authenticated_user,
+            database,
+            function
+        )
     }
 }
 
@@ -649,6 +676,8 @@ struct AuthUser {
     password_sha1: String,
     global_privileges: HashSet<String>,
     database_privileges: HashMap<String, HashSet<String>>,
+    #[serde(default)]
+    routine_privileges: AuthRoutinePrivileges,
     roles: HashSet<String>,
 }
 
@@ -657,7 +686,121 @@ struct AuthRole {
     global_privileges: HashSet<String>,
     database_privileges: HashMap<String, HashSet<String>>,
     #[serde(default)]
+    routine_privileges: AuthRoutinePrivileges,
+    #[serde(default)]
     roles: HashSet<String>,
+}
+
+/// Routine grants use nested maps so their durable JSON representation stays
+/// readable and unambiguous even when object names contain punctuation.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct AuthRoutinePrivileges {
+    #[serde(default)]
+    functions: HashMap<String, HashMap<String, HashSet<String>>>,
+    #[serde(default)]
+    procedures: HashMap<String, HashMap<String, HashSet<String>>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RoutineKind {
+    Function,
+    Procedure,
+}
+
+#[derive(Debug, Clone)]
+struct RoutinePrivilegeScope {
+    kind: RoutineKind,
+    database: String,
+    routine: String,
+}
+
+impl RoutineKind {
+    fn sql_name(self) -> &'static str {
+        match self {
+            Self::Function => "FUNCTION",
+            Self::Procedure => "PROCEDURE",
+        }
+    }
+
+    fn grants(
+        self,
+        privileges: &AuthRoutinePrivileges,
+    ) -> &HashMap<String, HashMap<String, HashSet<String>>> {
+        match self {
+            Self::Function => &privileges.functions,
+            Self::Procedure => &privileges.procedures,
+        }
+    }
+
+    fn grants_mut(
+        self,
+        privileges: &mut AuthRoutinePrivileges,
+    ) -> &mut HashMap<String, HashMap<String, HashSet<String>>> {
+        match self {
+            Self::Function => &mut privileges.functions,
+            Self::Procedure => &mut privileges.procedures,
+        }
+    }
+}
+
+impl AuthRoutinePrivileges {
+    fn has(&self, kind: RoutineKind, database: &str, routine: &str, privilege: &str) -> bool {
+        kind.grants(self)
+            .get(&database.to_ascii_lowercase())
+            .and_then(|routines| routines.get(&routine.to_ascii_lowercase()))
+            .is_some_and(|privileges| privilege_set_allows(privileges, privilege))
+    }
+
+    fn grant(
+        &mut self,
+        kind: RoutineKind,
+        database: &str,
+        routine: &str,
+        privileges: &HashSet<String>,
+    ) {
+        kind.grants_mut(self)
+            .entry(database.to_ascii_lowercase())
+            .or_default()
+            .entry(routine.to_ascii_lowercase())
+            .or_default()
+            .extend(privileges.iter().cloned());
+    }
+
+    fn revoke(
+        &mut self,
+        kind: RoutineKind,
+        database: &str,
+        routine: &str,
+        privileges: &HashSet<String>,
+    ) {
+        let database = database.to_ascii_lowercase();
+        let routine = routine.to_ascii_lowercase();
+        let grants = kind.grants_mut(self);
+        let Some(routines) = grants.get_mut(&database) else {
+            return;
+        };
+        if let Some(current) = routines.get_mut(&routine) {
+            for privilege in privileges {
+                current.remove(privilege);
+            }
+            if current.is_empty() {
+                routines.remove(&routine);
+            }
+        }
+        if routines.is_empty() {
+            grants.remove(&database);
+        }
+    }
+
+    fn extend_from(&mut self, source: &Self) {
+        for kind in [RoutineKind::Function, RoutineKind::Procedure] {
+            for (database, routines) in kind.grants(source) {
+                for (routine, privileges) in routines {
+                    self.grant(kind, database, routine, privileges);
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -711,6 +854,7 @@ impl AuthCatalog {
                     password_sha1: password_sha1_hex(bootstrap_password),
                     global_privileges: HashSet::from(["ALL".to_string()]),
                     database_privileges: HashMap::new(),
+                    routine_privileges: AuthRoutinePrivileges::default(),
                     roles: HashSet::new(),
                 },
             );
@@ -735,6 +879,7 @@ impl AuthCatalog {
                 password_sha1: password_sha1_hex(bootstrap_password),
                 global_privileges: HashSet::from(["ALL".to_string()]),
                 database_privileges: HashMap::new(),
+                routine_privileges: AuthRoutinePrivileges::default(),
                 roles: HashSet::new(),
             },
         );
@@ -797,6 +942,40 @@ impl AuthCatalog {
             })
     }
 
+    fn has_routine_privilege(
+        &self,
+        user: &str,
+        kind: RoutineKind,
+        database: &str,
+        routine: &str,
+        privilege: &str,
+    ) -> bool {
+        let data = self.data.read();
+        let Some(user) = data.users.get(&normalize_auth_name(user)) else {
+            return false;
+        };
+        let database = database.to_ascii_lowercase();
+        privilege_set_allows(&user.global_privileges, privilege)
+            || user
+                .database_privileges
+                .get(&database)
+                .is_some_and(|set| privilege_set_allows(set, privilege))
+            || user
+                .routine_privileges
+                .has(kind, &database, routine, privilege)
+            || user.roles.iter().any(|role| {
+                role_has_routine_privilege(
+                    &data,
+                    role,
+                    kind,
+                    &database,
+                    routine,
+                    privilege,
+                    &mut HashSet::new(),
+                )
+            })
+    }
+
     fn mutate(
         &self,
         operation: impl FnOnce(&mut AuthCatalogData) -> anyhow::Result<()>,
@@ -842,6 +1021,7 @@ impl AuthCatalog {
                         password_sha1: password_sha1_hex(&password),
                         global_privileges: HashSet::new(),
                         database_privileges: HashMap::new(),
+                        routine_privileges: AuthRoutinePrivileges::default(),
                         roles: HashSet::new(),
                     },
                 );
@@ -870,6 +1050,25 @@ impl AuthCatalog {
                     .expect("user was checked above")
                     .password_sha1 = password_sha1_hex(&password);
             }
+            Ok(())
+        })
+    }
+
+    fn rename_user(&self, from: &str, to: &str) -> anyhow::Result<()> {
+        let from = normalize_auth_name(from);
+        let to = normalize_auth_name(to);
+        if from.is_empty() || to.is_empty() {
+            anyhow::bail!("user name must not be empty");
+        }
+        self.mutate(|data| {
+            if data.users.contains_key(&to) {
+                anyhow::bail!("Operation RENAME USER failed for '{}': target exists", to);
+            }
+            let user = data
+                .users
+                .remove(&from)
+                .ok_or_else(|| anyhow::anyhow!("Operation RENAME USER failed for '{}'", from))?;
+            data.users.insert(to, user);
             Ok(())
         })
     }
@@ -976,6 +1175,72 @@ impl AuthCatalog {
         })
     }
 
+    fn grant_routine_privileges(
+        &self,
+        principals: &[String],
+        kind: RoutineKind,
+        database: &str,
+        routine: &str,
+        privileges: HashSet<String>,
+    ) -> anyhow::Result<()> {
+        let principals = normalize_auth_names(principals)?;
+        let database = database.to_ascii_lowercase();
+        let routine = routine.to_ascii_lowercase();
+        self.mutate(|data| {
+            for principal in &principals {
+                if !data.users.contains_key(principal) && !data.roles.contains_key(principal) {
+                    anyhow::bail!("Unknown user or role '{}'", principal);
+                }
+            }
+            for principal in principals {
+                if let Some(user) = data.users.get_mut(&principal) {
+                    user.routine_privileges
+                        .grant(kind, &database, &routine, &privileges);
+                } else {
+                    data.roles
+                        .get_mut(&principal)
+                        .expect("principal was checked above")
+                        .routine_privileges
+                        .grant(kind, &database, &routine, &privileges);
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn revoke_routine_privileges(
+        &self,
+        principals: &[String],
+        kind: RoutineKind,
+        database: &str,
+        routine: &str,
+        privileges: &HashSet<String>,
+    ) -> anyhow::Result<()> {
+        let principals = normalize_auth_names(principals)?;
+        let database = database.to_ascii_lowercase();
+        let routine = routine.to_ascii_lowercase();
+        self.mutate(|data| {
+            for principal in &principals {
+                if !data.users.contains_key(principal) && !data.roles.contains_key(principal) {
+                    anyhow::bail!("Unknown user or role '{}'", principal);
+                }
+            }
+            for principal in principals {
+                if let Some(user) = data.users.get_mut(&principal) {
+                    user.routine_privileges
+                        .revoke(kind, &database, &routine, privileges);
+                } else {
+                    data.roles
+                        .get_mut(&principal)
+                        .expect("principal was checked above")
+                        .routine_privileges
+                        .revoke(kind, &database, &routine, privileges);
+                }
+            }
+            Ok(())
+        })
+    }
+
     fn drop_users(&self, users: &[String], if_exists: bool) -> anyhow::Result<()> {
         let users = normalize_auth_names(users)?;
         self.mutate(|data| {
@@ -1054,21 +1319,24 @@ impl AuthCatalog {
     fn show_grants(&self, principal: &str, using_roles: &[String]) -> anyhow::Result<Vec<String>> {
         let principal = normalize_auth_name(principal);
         let data = self.data.read();
-        let (mut global, mut databases, roles) = if let Some(user) = data.users.get(&principal) {
-            (
-                user.global_privileges.clone(),
-                user.database_privileges.clone(),
-                user.roles.clone(),
-            )
-        } else if let Some(role) = data.roles.get(&principal) {
-            (
-                role.global_privileges.clone(),
-                role.database_privileges.clone(),
-                role.roles.clone(),
-            )
-        } else {
-            anyhow::bail!("Unknown user or role '{}'", principal);
-        };
+        let (mut global, mut databases, mut routines, roles) =
+            if let Some(user) = data.users.get(&principal) {
+                (
+                    user.global_privileges.clone(),
+                    user.database_privileges.clone(),
+                    user.routine_privileges.clone(),
+                    user.roles.clone(),
+                )
+            } else if let Some(role) = data.roles.get(&principal) {
+                (
+                    role.global_privileges.clone(),
+                    role.database_privileges.clone(),
+                    role.routine_privileges.clone(),
+                    role.roles.clone(),
+                )
+            } else {
+                anyhow::bail!("Unknown user or role '{}'", principal);
+            };
         for role in using_roles.iter().map(|role| normalize_auth_name(role)) {
             if !roles.contains(&role) {
                 anyhow::bail!("Role '{}' is not granted to '{}'", role, principal);
@@ -1078,6 +1346,7 @@ impl AuthCatalog {
                 &role,
                 &mut global,
                 &mut databases,
+                &mut routines,
                 &mut HashSet::new(),
             )?;
         }
@@ -1103,6 +1372,7 @@ impl AuthCatalog {
                 ));
             }
         }
+        grants.extend(render_routine_grants(&routines, &subject));
         let mut roles = roles.into_iter().collect::<Vec<_>>();
         roles.sort();
         for role in roles {
@@ -1234,11 +1504,40 @@ fn role_has_privilege(
             .any(|nested| role_has_privilege(data, nested, database, privilege, visited))
 }
 
+fn role_has_routine_privilege(
+    data: &AuthCatalogData,
+    role_name: &str,
+    kind: RoutineKind,
+    database: &str,
+    routine: &str,
+    privilege: &str,
+    visited: &mut HashSet<String>,
+) -> bool {
+    if !visited.insert(role_name.to_string()) {
+        return false;
+    }
+    let Some(role) = data.roles.get(role_name) else {
+        return false;
+    };
+    privilege_set_allows(&role.global_privileges, privilege)
+        || role
+            .database_privileges
+            .get(database)
+            .is_some_and(|set| privilege_set_allows(set, privilege))
+        || role
+            .routine_privileges
+            .has(kind, database, routine, privilege)
+        || role.roles.iter().any(|nested| {
+            role_has_routine_privilege(data, nested, kind, database, routine, privilege, visited)
+        })
+}
+
 fn collect_role_privileges(
     data: &AuthCatalogData,
     role_name: &str,
     global_privileges: &mut HashSet<String>,
     database_privileges: &mut HashMap<String, HashSet<String>>,
+    routine_privileges: &mut AuthRoutinePrivileges,
     visited: &mut HashSet<String>,
 ) -> anyhow::Result<()> {
     if !visited.insert(role_name.to_string()) {
@@ -1255,12 +1554,14 @@ fn collect_role_privileges(
             .or_default()
             .extend(privileges.iter().cloned());
     }
+    routine_privileges.extend_from(&role.routine_privileges);
     for nested in &role.roles {
         collect_role_privileges(
             data,
             nested,
             global_privileges,
             database_privileges,
+            routine_privileges,
             visited,
         )?;
     }
@@ -1319,6 +1620,32 @@ fn render_privileges(privileges: &HashSet<String>) -> String {
     privileges.join(", ")
 }
 
+fn render_routine_grants(privileges: &AuthRoutinePrivileges, subject: &str) -> Vec<String> {
+    let mut grants = Vec::new();
+    for kind in [RoutineKind::Function, RoutineKind::Procedure] {
+        let mut databases = kind.grants(privileges).iter().collect::<Vec<_>>();
+        databases.sort_by(|left, right| left.0.cmp(right.0));
+        for (database, routines) in databases {
+            let mut routines = routines.iter().collect::<Vec<_>>();
+            routines.sort_by(|left, right| left.0.cmp(right.0));
+            for (routine, privileges) in routines {
+                if privileges.is_empty() {
+                    continue;
+                }
+                grants.push(format!(
+                    "GRANT {} ON {} `{}`.`{}` TO {}",
+                    render_privileges(privileges),
+                    kind.sql_name(),
+                    database.replace('`', "``"),
+                    routine.replace('`', "``"),
+                    subject
+                ));
+            }
+        }
+    }
+    grants
+}
+
 fn write_auth_catalog(path: &Path, data: &AuthCatalogData) -> anyhow::Result<()> {
     let parent = path
         .parent()
@@ -1363,6 +1690,8 @@ fn parse_privilege_list(value: &str) -> anyhow::Result<HashSet<String>> {
         "ALTER",
         "INDEX",
         "EXECUTE",
+        "CREATE ROUTINE",
+        "ALTER ROUTINE",
         "CREATE USER",
         "GRANT OPTION",
         "FILE",
@@ -1388,6 +1717,74 @@ fn parse_privilege_list(value: &str) -> anyhow::Result<HashSet<String>> {
         anyhow::bail!("unsupported privilege list");
     }
     Ok(values)
+}
+
+fn parse_routine_privilege_scope(scope: &str) -> anyhow::Result<Option<RoutinePrivilegeScope>> {
+    let (kind, reference) = if let Some(reference) = strip_show_keyword_ci(scope, "FUNCTION") {
+        (RoutineKind::Function, reference)
+    } else if let Some(reference) = strip_show_keyword_ci(scope, "PROCEDURE") {
+        (RoutineKind::Procedure, reference)
+    } else {
+        return Ok(None);
+    };
+    let reference = reference.trim();
+    if reference.is_empty() {
+        anyhow::bail!(
+            "{} routine scope requires a qualified name",
+            kind.sql_name()
+        );
+    }
+    let (database, routine) = split_table_reference(reference, "")?;
+    if database.is_empty() {
+        anyhow::bail!(
+            "{} routine scope requires a database-qualified name",
+            kind.sql_name()
+        );
+    }
+    Ok(Some(RoutinePrivilegeScope {
+        kind,
+        database,
+        routine,
+    }))
+}
+
+fn authorization_routine_scope(sql: &str) -> anyhow::Result<Option<RoutinePrivilegeScope>> {
+    let upper = sql.to_ascii_uppercase();
+    let (remainder, marker) = if upper.starts_with("GRANT ") {
+        (&sql["GRANT".len()..], " TO ")
+    } else if upper.starts_with("REVOKE ") {
+        (&sql["REVOKE".len()..], " FROM ")
+    } else {
+        return Ok(None);
+    };
+    let remainder = remainder.trim();
+    let upper_remainder = remainder.to_ascii_uppercase();
+    let Some(on) = upper_remainder.find(" ON ") else {
+        return Ok(None);
+    };
+    let after_on = &remainder[on + " ON ".len()..];
+    let Some(target) = after_on.to_ascii_uppercase().find(marker) else {
+        return Ok(None);
+    };
+    parse_routine_privilege_scope(after_on[..target].trim())
+}
+
+fn validate_routine_privileges(
+    kind: RoutineKind,
+    privileges: &HashSet<String>,
+) -> anyhow::Result<()> {
+    const ROUTINE_PRIVILEGES: &[&str] = &["ALL", "EXECUTE", "ALTER ROUTINE", "GRANT OPTION"];
+    if privileges.is_empty()
+        || privileges
+            .iter()
+            .any(|privilege| !ROUTINE_PRIVILEGES.contains(&privilege.as_str()))
+    {
+        anyhow::bail!(
+            "unsupported privilege list for {} routine scope",
+            kind.sql_name()
+        );
+    }
+    Ok(())
 }
 
 fn audit_statement_type(sql: &str) -> String {
@@ -1469,19 +1866,10 @@ struct TransactionCharacteristics {
     read_only: Option<bool>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 struct TransactionDefaults {
     isolation: TransactionIsolation,
     read_only: bool,
-}
-
-impl Default for TransactionDefaults {
-    fn default() -> Self {
-        Self {
-            isolation: TransactionIsolation::default(),
-            read_only: false,
-        }
-    }
 }
 
 fn start_transaction_access_mode(upper: &str) -> anyhow::Result<Option<bool>> {
@@ -2477,7 +2865,12 @@ impl Backend {
     async fn execute(&mut self, sql: &str) -> anyhow::Result<QueryOutcome> {
         let normalized = normalize_sql_whitespace(sql.trim().trim_end_matches(';').trim());
         let diagnostic_statement = is_session_diagnostic_statement(&normalized);
-        let function_catalog = StoredFunctionCatalog::from_storage(&self.storage, &self.database);
+        let function_catalog = StoredFunctionCatalog::from_storage(
+            &self.storage,
+            &self.database,
+            self.config.auth_catalog.clone(),
+            self.authenticated_username(),
+        );
         let session_zone = self
             .session_variables
             .get("time_zone")
@@ -3007,6 +3400,18 @@ impl Backend {
     async fn execute_set_statement(&mut self, sql: &str) -> anyhow::Result<QueryOutcome> {
         let body = sql["SET ".len()..].trim();
         let upper = body.to_ascii_uppercase();
+        if sql.to_ascii_uppercase().starts_with("SET PASSWORD") {
+            let (user, password) = parse_set_password(&sql["SET PASSWORD".len()..])?;
+            let user = if user.is_empty() {
+                self.authenticated_username()
+            } else {
+                user
+            };
+            self.config
+                .auth_catalog
+                .alter_user_passwords(&[(user, password)])?;
+            return Ok(QueryOutcome::ok(0));
+        }
         if let Some(transaction) = parse_set_transaction_statement(body) {
             let (scope, characteristics) = transaction?;
             self.apply_transaction_characteristics(scope, characteristics)?;
@@ -3311,6 +3716,7 @@ impl Backend {
             anyhow::bail!("Recursive procedure call depth exceeded");
         }
         let (database, name, arguments) = parse_call(sql, &self.database)?;
+        self.require_routine_privilege(RoutineKind::Procedure, &database, &name, "EXECUTE")?;
         let procedure_database = self
             .storage
             .get_database(&database)
@@ -3434,6 +3840,7 @@ impl Backend {
     ) -> anyhow::Result<QueryOutcome> {
         let normalized = normalize_sql_whitespace(sql.trim().trim_end_matches(';').trim());
         let (database, name, arguments) = parse_call(&normalized, &self.database)?;
+        self.require_routine_privilege(RoutineKind::Procedure, &database, &name, "EXECUTE")?;
         let procedure = self
             .storage
             .get_database(&database)
@@ -4404,6 +4811,7 @@ impl Backend {
             || upper.starts_with("CREATE ROLE ")
             || upper.starts_with("DROP USER ")
             || upper.starts_with("DROP ROLE ")
+            || upper.starts_with("RENAME USER ")
             || upper.starts_with("GRANT ")
             || upper.starts_with("REVOKE ")
         {
@@ -4952,6 +5360,14 @@ impl Backend {
                 .submit_ddl(vec![WriteCommand::DropDatabase(name)])
                 .await;
         }
+        if upper.starts_with("ALTER DATABASE") || upper.starts_with("ALTER SCHEMA") {
+            // Single-node engine: database-level CHARACTER SET / COLLATE,
+            // UPGRADE DATA DIRECTORY NAME, READ ONLY and ENCRYPTION clauses are
+            // accepted for compatibility (the default remains utf8mb4) and are
+            // no-ops.
+            self.commit_pending().await?;
+            return Ok(QueryOutcome::ok(0));
+        }
         if is_create_trigger_statement(sql) {
             self.commit_pending().await?;
             let (database, table, trigger) = parse_create_trigger(sql, &self.database)?;
@@ -5010,8 +5426,9 @@ impl Backend {
                 .await;
         }
         if is_create_procedure_statement(sql) {
-            self.commit_pending().await?;
             let (database, procedure, if_not_exists) = parse_create_procedure(sql, &self.database)?;
+            self.require_database_privilege(&database, "CREATE ROUTINE")?;
+            self.commit_pending().await?;
             if if_not_exists
                 && self
                     .storage
@@ -5034,8 +5451,9 @@ impl Backend {
                 .await;
         }
         if is_create_function_statement(sql) {
-            self.commit_pending().await?;
             let (database, function, if_not_exists) = parse_create_function(sql, &self.database)?;
+            self.require_database_privilege(&database, "CREATE ROUTINE")?;
+            self.commit_pending().await?;
             if if_not_exists
                 && self
                     .storage
@@ -5131,10 +5549,16 @@ impl Backend {
                 .await;
         }
         if upper.starts_with("ALTER PROCEDURE ") {
-            self.commit_pending().await?;
             let remainder = sql["ALTER PROCEDURE".len()..].trim_start();
             let (reference, _) = take_show_identifier(remainder)?;
             let (database, name) = split_table_reference(&reference, &self.database)?;
+            self.require_routine_privilege(
+                RoutineKind::Procedure,
+                &database,
+                &name,
+                "ALTER ROUTINE",
+            )?;
+            self.commit_pending().await?;
             let procedure = self
                 .storage
                 .get_database(&database)
@@ -5158,10 +5582,16 @@ impl Backend {
                 .await;
         }
         if upper.starts_with("ALTER FUNCTION ") {
-            self.commit_pending().await?;
             let remainder = sql["ALTER FUNCTION".len()..].trim_start();
             let (reference, _) = take_show_identifier(remainder)?;
             let (database, name) = split_table_reference(&reference, &self.database)?;
+            self.require_routine_privilege(
+                RoutineKind::Function,
+                &database,
+                &name,
+                "ALTER ROUTINE",
+            )?;
+            self.commit_pending().await?;
             let function = self
                 .storage
                 .get_database(&database)
@@ -5265,7 +5695,6 @@ impl Backend {
             return self.submit_ddl(vec![write]).await;
         }
         if upper.starts_with("DROP PROCEDURE ") {
-            self.commit_pending().await?;
             let if_exists = upper.starts_with("DROP PROCEDURE IF EXISTS ");
             let reference = if if_exists {
                 sql["DROP PROCEDURE IF EXISTS ".len()..].trim()
@@ -5274,6 +5703,13 @@ impl Backend {
             }
             .trim_matches('`');
             let (database, procedure) = split_table_reference(reference, &self.database)?;
+            self.require_routine_privilege(
+                RoutineKind::Procedure,
+                &database,
+                &procedure,
+                "ALTER ROUTINE",
+            )?;
+            self.commit_pending().await?;
             if self
                 .storage
                 .get_database(&database)
@@ -5291,7 +5727,6 @@ impl Backend {
                 .await;
         }
         if upper.starts_with("DROP FUNCTION ") {
-            self.commit_pending().await?;
             let if_exists = upper.starts_with("DROP FUNCTION IF EXISTS ");
             let reference = if if_exists {
                 sql["DROP FUNCTION IF EXISTS ".len()..].trim()
@@ -5300,6 +5735,13 @@ impl Backend {
             }
             .trim_matches('`');
             let (database, function) = split_table_reference(reference, &self.database)?;
+            self.require_routine_privilege(
+                RoutineKind::Function,
+                &database,
+                &function,
+                "ALTER ROUTINE",
+            )?;
+            self.commit_pending().await?;
             if self
                 .storage
                 .get_database(&database)
@@ -5965,7 +6407,203 @@ impl Backend {
             return result;
         }
 
+        // ---- Table maintenance statements: MySQL-compatible result sets ----
+        if let Some(rest) = upper.strip_prefix("ANALYZE TABLE ") {
+            return self.admin_table_maintenance(rest, "analyze").await;
+        }
+        if let Some(rest) = upper.strip_prefix("OPTIMIZE TABLE ") {
+            return self.admin_table_maintenance(rest, "optimize").await;
+        }
+        if let Some(rest) = upper.strip_prefix("CHECK TABLE ") {
+            return self.admin_table_maintenance(rest, "check").await;
+        }
+        if let Some(rest) = upper.strip_prefix("REPAIR TABLE ") {
+            return self.admin_table_maintenance(rest, "repair").await;
+        }
+        if let Some(rest) = upper.strip_prefix("CHECKSUM TABLE ") {
+            let tables = self.resolve_table_list(strip_table_maintenance_options(rest))?;
+            let rows = tables
+                .iter()
+                .map(|(database, table)| {
+                    vec![
+                        Some(format!("{database}.{table}").into_bytes()),
+                        Some(b"0".to_vec()),
+                    ]
+                })
+                .collect::<Vec<_>>();
+            return Ok(QueryOutcome::byte_rows(vec!["Table", "Checksum"], rows));
+        }
+        // ---- FLUSH / CACHE INDEX: single-node compatible no-ops ----
+        if upper.starts_with("FLUSH ") {
+            return Ok(QueryOutcome::ok(0));
+        }
+        if upper.starts_with("CACHE INDEX ") {
+            return Ok(QueryOutcome::ok(0));
+        }
+        // ---- Replication surface (single-node compatible) ----
+        if upper.starts_with("SHOW MASTER STATUS")
+            || upper.starts_with("SHOW BINARY LOG STATUS")
+        {
+            return Ok(QueryOutcome::byte_rows(
+                vec![
+                    "File",
+                    "Position",
+                    "Binlog_Do_DB",
+                    "Binlog_Ignore_DB",
+                    "Executed_Gtid_Set",
+                ],
+                vec![vec![
+                    Some(b"".to_vec()),
+                    Some(b"0".to_vec()),
+                    Some(b"".to_vec()),
+                    Some(b"".to_vec()),
+                    Some(b"".to_vec()),
+                ]],
+            ));
+        }
+        if upper.starts_with("SHOW BINARY LOGS") {
+            return Ok(QueryOutcome::byte_rows(
+                vec!["Log_name", "File_size", "Encrypted"],
+                vec![],
+            ));
+        }
+        if upper.starts_with("SHOW REPLICAS") || upper.starts_with("SHOW SLAVE HOSTS") {
+            return Ok(QueryOutcome::byte_rows(
+                vec![
+                    "Server_id",
+                    "Host",
+                    "Port",
+                    "Rpl_recovery_rank",
+                    "Master_id",
+                    "Slave_UUID",
+                ],
+                vec![],
+            ));
+        }
+        if upper.starts_with("SHOW REPLICA STATUS") || upper.starts_with("SHOW SLAVE STATUS") {
+            return Ok(QueryOutcome::byte_rows(
+                REPLICA_STATUS_COLUMNS.iter().map(|c| c.to_string()).collect(),
+                vec![REPLICA_STATUS_COLUMNS.iter().map(|_| None).collect()],
+            ));
+        }
+        if upper.starts_with("CHANGE MASTER")
+            || upper.starts_with("CHANGE REPLICATION")
+            || upper.starts_with("START SLAVE")
+            || upper.starts_with("START REPLICA")
+            || upper.starts_with("STOP SLAVE")
+            || upper.starts_with("STOP REPLICA")
+            || upper.starts_with("RESET SLAVE")
+            || upper.starts_with("RESET REPLICA")
+            || upper.starts_with("RESET MASTER")
+        {
+            anyhow::bail!("Replication is not supported in single-node MyDB");
+        }
+        // ---- Local XA transactions ----
+        if let Some(rest) = upper.strip_prefix("XA ") {
+            return self.execute_xa(rest).await;
+        }
+
         anyhow::bail!("Unsupported SQL statement")
+    }
+
+    async fn admin_table_maintenance(&self, rest: &str, op: &str) -> anyhow::Result<QueryOutcome> {
+        let tables = self.resolve_table_list(strip_table_maintenance_options(rest))?;
+        let rows = tables
+            .iter()
+            .map(|(database, table)| {
+                vec![
+                    Some(format!("{database}.{table}").into_bytes()),
+                    Some(op.as_bytes().to_vec()),
+                    Some(b"status".to_vec()),
+                    Some(b"OK".to_vec()),
+                ]
+            })
+            .collect::<Vec<_>>();
+        Ok(QueryOutcome::byte_rows(
+            vec!["Table", "Op", "Msg_type", "Msg_text"],
+            rows,
+        ))
+    }
+
+    fn resolve_table_list(&self, sql: &str) -> anyhow::Result<Vec<(String, String)>> {
+        let mut list = Vec::new();
+        for part in sql.split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            list.push(self.resolve_table_reference(part)?);
+        }
+        Ok(list)
+    }
+
+    async fn execute_xa(&mut self, rest: &str) -> anyhow::Result<QueryOutcome> {
+        let rest = rest.trim();
+        let upper = rest.to_ascii_uppercase();
+        if let Some(xid) = upper.strip_prefix("START ") {
+            self.begin_xa(xid.trim()).await?;
+            return Ok(QueryOutcome::ok(0));
+        }
+        if let Some(xid) = upper.strip_prefix("BEGIN ") {
+            self.begin_xa(xid.trim()).await?;
+            return Ok(QueryOutcome::ok(0));
+        }
+        if upper == "END" || upper.starts_with("END ") {
+            return Ok(QueryOutcome::ok(0));
+        }
+        if upper.starts_with("PREPARE ") || upper == "PREPARE" {
+            return Ok(QueryOutcome::ok(0));
+        }
+        if let Some(xid) = upper.strip_prefix("COMMIT ") {
+            let _ = xid;
+            self.in_transaction = false;
+            self.commit_pending().await?;
+            return Ok(QueryOutcome::ok(0));
+        }
+        if upper == "COMMIT" {
+            self.in_transaction = false;
+            self.commit_pending().await?;
+            return Ok(QueryOutcome::ok(0));
+        }
+        if let Some(xid) = upper.strip_prefix("ROLLBACK ") {
+            let _ = xid;
+            self.transaction_writes.write().clear();
+            self.transaction_snapshot.clear();
+            self.savepoints.clear();
+            self.stats.release_all_locks(self.connection_id);
+            self.in_transaction = false;
+            self.reset_transaction_characteristics();
+            return Ok(QueryOutcome::ok(0));
+        }
+        if upper == "ROLLBACK" {
+            self.transaction_writes.write().clear();
+            self.transaction_snapshot.clear();
+            self.savepoints.clear();
+            self.stats.release_all_locks(self.connection_id);
+            self.in_transaction = false;
+            self.reset_transaction_characteristics();
+            return Ok(QueryOutcome::ok(0));
+        }
+        if upper == "RECOVER" {
+            return Ok(QueryOutcome::byte_rows(
+                vec!["formatID", "gtrid_length", "bqual_length", "data"],
+                vec![],
+            ));
+        }
+        anyhow::bail!("Unsupported XA statement")
+    }
+
+    async fn begin_xa(&mut self, _xid: &str) -> anyhow::Result<()> {
+        // Local single-node XA: open an in-session transaction that is later
+        // closed by XA COMMIT / XA ROLLBACK. The xid is accepted for protocol
+        // compatibility but a single-node engine has no external coordinator.
+        self.commit_pending().await?;
+        self.clear_explicit_table_locks();
+        self.transaction_snapshot.clear();
+        self.savepoints.clear();
+        self.in_transaction = true;
+        self.activate_transaction_defaults(None);
+        Ok(())
     }
 
     fn authenticated_username(&self) -> String {
@@ -5992,11 +6630,60 @@ impl Backend {
         }
     }
 
+    fn require_routine_privilege(
+        &self,
+        kind: RoutineKind,
+        database: &str,
+        routine: &str,
+        privilege: &str,
+    ) -> anyhow::Result<()> {
+        let user = self.authenticated_username();
+        if self
+            .config
+            .auth_catalog
+            .has_routine_privilege(&user, kind, database, routine, privilege)
+        {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "Access denied; user '{}' lacks {} privilege on {} '{}.{}'",
+            user,
+            privilege,
+            kind.sql_name(),
+            database,
+            routine
+        )
+    }
+
     fn require_statement_privilege(&self, sql: &str, upper: &str) -> anyhow::Result<()> {
         // EVENT commands need schema-aware parsing (and RENAME needs two
         // schemas), so their branches authorize after extracting the object
         // name instead of falling through to the generic DML target logic.
         if is_event_privilege_statement(sql) {
+            return Ok(());
+        }
+        if upper.starts_with("GRANT ") || upper.starts_with("REVOKE ") {
+            if let Some(scope) = authorization_routine_scope(sql)? {
+                return self.require_routine_privilege(
+                    scope.kind,
+                    &scope.database,
+                    &scope.routine,
+                    "GRANT OPTION",
+                );
+            }
+        }
+        // Routine operations resolve the object before authorizing.  The
+        // generic table privilege fallback cannot distinguish a qualified
+        // procedure/function name from a table reference.
+        if upper.starts_with("CALL ")
+            || upper.starts_with("EXECUTE ")
+            || is_create_procedure_statement(sql)
+            || is_create_function_statement(sql)
+            || upper.starts_with("ALTER PROCEDURE ")
+            || upper.starts_with("ALTER FUNCTION ")
+            || upper.starts_with("DROP PROCEDURE ")
+            || upper.starts_with("DROP FUNCTION ")
+        {
             return Ok(());
         }
         let privilege = if upper.starts_with("SHOW GRANTS") {
@@ -6017,6 +6704,7 @@ impl Backend {
         } else if upper.starts_with("CREATE USER")
             || upper.starts_with("DROP USER")
             || upper.starts_with("ALTER USER")
+            || upper.starts_with("RENAME USER")
         {
             Some("CREATE USER")
         } else if upper.starts_with("GRANT ")
@@ -6062,6 +6750,14 @@ impl Backend {
                     self.database.clone()
                 }
             });
+        // performance_schema and sys are read-only introspection schemas that
+        // MySQL makes visible to every account; do not require an explicit
+        // grant for statements scoped to them.
+        if database.eq_ignore_ascii_case("performance_schema")
+            || database.eq_ignore_ascii_case("sys")
+        {
+            return Ok(());
+        }
         if self
             .config
             .auth_catalog
@@ -6142,6 +6838,20 @@ impl Backend {
                 .drop_roles(&split_csv(sql[prefix.len()..].trim()), if_exists)?;
             return Ok(QueryOutcome::ok(0));
         }
+        if upper.starts_with("RENAME USER ") {
+            let remainder = sql["RENAME USER ".len()..].trim();
+            let mut pairs = Vec::new();
+            for chunk in split_csv(remainder) {
+                let (from, to) = chunk
+                    .split_once(" TO ")
+                    .ok_or_else(|| anyhow::anyhow!("RENAME USER requires 'old TO new'"))?;
+                pairs.push((from.trim().to_string(), to.trim().to_string()));
+            }
+            for (from, to) in pairs {
+                self.config.auth_catalog.rename_user(&from, &to)?;
+            }
+            return Ok(QueryOutcome::ok(0));
+        }
         let revoke = upper.starts_with("REVOKE ");
         let remainder = sql[if revoke { 6 } else { 5 }..].trim();
         let upper_remainder = remainder.to_ascii_uppercase();
@@ -6150,11 +6860,15 @@ impl Backend {
                 && remainder[..on]
                     .to_ascii_uppercase()
                     .starts_with("GRANT OPTION FOR ");
-            let mut privileges = if grant_option_only {
-                parse_privilege_list(&remainder["GRANT OPTION FOR ".len()..on])?;
-                HashSet::from(["GRANT OPTION".to_string()])
+            let listed_privileges = if grant_option_only {
+                parse_privilege_list(&remainder["GRANT OPTION FOR ".len()..on])?
             } else {
                 parse_privilege_list(&remainder[..on])?
+            };
+            let mut privileges = if grant_option_only {
+                HashSet::from(["GRANT OPTION".to_string()])
+            } else {
+                listed_privileges.clone()
             };
             let after_on = &remainder[on + 4..];
             let marker = if revoke { " FROM " } else { " TO " };
@@ -6174,6 +6888,30 @@ impl Backend {
                 principal_clause
             };
             let principals = split_csv(principal_clause);
+            if let Some(scope) = parse_routine_privilege_scope(scope)? {
+                validate_routine_privileges(scope.kind, &listed_privileges)?;
+                if revoke {
+                    self.config.auth_catalog.revoke_routine_privileges(
+                        &principals,
+                        scope.kind,
+                        &scope.database,
+                        &scope.routine,
+                        &privileges,
+                    )?;
+                } else {
+                    if with_grant_option {
+                        privileges.insert("GRANT OPTION".to_string());
+                    }
+                    self.config.auth_catalog.grant_routine_privileges(
+                        &principals,
+                        scope.kind,
+                        &scope.database,
+                        &scope.routine,
+                        privileges,
+                    )?;
+                }
+                return Ok(QueryOutcome::ok(0));
+            }
             let database = if scope == "*.*" {
                 None
             } else {
@@ -9986,6 +10724,10 @@ impl Backend {
             .unwrap_or_else(|| self.config.username.clone());
         let tables = if database.eq_ignore_ascii_case("information_schema") {
             information_schema_virtual_tables(&self.storage, &self.config.auth_catalog, &viewer)?
+        } else if database.eq_ignore_ascii_case("performance_schema") {
+            performance_schema_virtual_tables()
+        } else if database.eq_ignore_ascii_case("sys") {
+            sys_virtual_tables()
         } else {
             mysql_virtual_tables(&self.config.auth_catalog, &viewer)
         };
@@ -10157,6 +10899,12 @@ impl Backend {
                 )?
                 .into_keys()
                 .collect::<Vec<_>>()
+            } else if database_name.eq_ignore_ascii_case("performance_schema") {
+                performance_schema_virtual_tables()
+                    .into_keys()
+                    .collect::<Vec<_>>()
+            } else if database_name.eq_ignore_ascii_case("sys") {
+                sys_virtual_tables().into_keys().collect::<Vec<_>>()
             } else {
                 mysql_virtual_tables(&self.config.auth_catalog, &viewer)
                     .into_keys()
@@ -12336,6 +13084,8 @@ impl Backend {
         let current_virtual_schema = is_virtual_schema_name(&self.database);
         if !upper.contains("INFORMATION_SCHEMA")
             && !upper.contains("MYSQL")
+            && !upper.contains("PERFORMANCE_SCHEMA")
+            && !upper.contains("SYS")
             && !current_virtual_schema
         {
             return Ok(None);
@@ -12358,6 +13108,11 @@ impl Backend {
                 "mysql",
                 mysql_virtual_tables(&self.config.auth_catalog, &viewer),
             ),
+            (
+                "performance_schema",
+                performance_schema_virtual_tables(),
+            ),
+            ("sys", sys_virtual_tables()),
         ];
         let mut scope = HashMap::new();
         let mut rewritten = sql.to_string();
@@ -12372,9 +13127,11 @@ impl Backend {
             .collect::<Vec<_>>();
         metadata.sort_by_key(|(schema, name, _)| std::cmp::Reverse(schema.len() + name.len()));
         for (schema, name, table) in metadata {
-            let replacement = format!("__mydb_{schema}_{name}");
+            // cte_table() lowercases the reference before lookup, so the scope
+            // key must be case-folded to match regardless of virtual-table key case.
+            let replacement = format!("__mydb_{}_{}", schema.to_ascii_lowercase(), name.to_ascii_lowercase());
             if schema.eq_ignore_ascii_case(&self.database) {
-                scope.insert(name.clone(), table.clone());
+                scope.insert(name.to_ascii_lowercase(), table.clone());
                 matched = true;
             }
             for source in [format!("{schema}.{name}"), format!("`{schema}`.`{name}`")] {
@@ -14015,6 +14772,92 @@ fn virtual_table_schema(name: &str, columns: &[String]) -> TableSchema {
     }
 }
 
+const REPLICA_STATUS_COLUMNS: &[&str] = &[
+    "Slave_IO_State",
+    "Master_Host",
+    "Master_User",
+    "Master_Port",
+    "Connect_Retry",
+    "Master_Log_File",
+    "Read_Master_Log_Pos",
+    "Relay_Log_File",
+    "Relay_Log_Pos",
+    "Relay_Master_Log_File",
+    "Slave_IO_Running",
+    "Slave_SQL_Running",
+    "Replicate_Do_DB",
+    "Replicate_Ignore_DB",
+    "Replicate_Do_Table",
+    "Replicate_Ignore_Table",
+    "Replicate_Wild_Do_Table",
+    "Replicate_Wild_Ignore_Table",
+    "Last_Errno",
+    "Last_Error",
+    "Skip_Counter",
+    "Exec_Master_Log_Pos",
+    "Relay_Log_Space",
+    "Until_Condition",
+    "Until_Log_File",
+    "Until_Log_Pos",
+    "Master_SSL_Allowed",
+    "Master_SSL_CA_File",
+    "Master_SSL_CA_Path",
+    "Master_SSL_Cert",
+    "Master_SSL_Cipher",
+    "Master_SSL_Key",
+    "Seconds_Behind_Master",
+    "Master_SSL_Verify_Server_Cert",
+    "Last_IO_Errno",
+    "Last_IO_Error",
+    "Last_SQL_Errno",
+    "Last_SQL_Error",
+    "Replicate_Ignore_Server_Ids",
+    "Master_Server_Id",
+    "Master_UUID",
+    "Master_Info_File",
+    "SQL_Delay",
+    "SQL_Remaining_Delay",
+    "Slave_SQL_Running_State",
+    "Master_Retry_Count",
+    "Master_Bind",
+    "Last_IO_Error_Timestamp",
+    "Last_SQL_Error_Timestamp",
+    "Master_SSL_Crl",
+    "Master_SSL_Crlpath",
+    "Retrieved_Gtid_Set",
+    "Executed_Gtid_Set",
+    "Auto_Position",
+    "Replicate_Rewrite_DB",
+    "Channel_Name",
+    "Master_TLS_Version",
+];
+
+fn strip_table_maintenance_options(sql: &str) -> &str {
+    const OPTIONS: &[&str] = &[
+        " QUICK",
+        " FAST",
+        " MEDIUM",
+        " EXTENDED",
+        " CHANGED",
+        " FOR UPGRADE",
+        " NO_WRITE_TO_BINLOG",
+        " LOCAL",
+        " CASCADE",
+        " RESTRICT",
+        " IGNORE",
+        " NORMAL",
+        " USING",
+    ];
+    let upper = sql.to_ascii_uppercase();
+    let mut cut = sql.len();
+    for opt in OPTIONS {
+        if let Some(pos) = upper.find(opt) {
+            cut = cut.min(pos);
+        }
+    }
+    &sql[..cut]
+}
+
 fn virtual_table_rows(table: &VirtualTable) -> Vec<Row> {
     query_rows_to_storage_rows(&table.columns, table.rows.clone())
 }
@@ -14033,7 +14876,10 @@ struct InformationSchemaConstraint {
 }
 
 fn is_virtual_schema_name(value: &str) -> bool {
-    value.eq_ignore_ascii_case("information_schema") || value.eq_ignore_ascii_case("mysql")
+    value.eq_ignore_ascii_case("information_schema")
+        || value.eq_ignore_ascii_case("mysql")
+        || value.eq_ignore_ascii_case("performance_schema")
+        || value.eq_ignore_ascii_case("sys")
 }
 
 fn information_schema_virtual_tables(
@@ -15141,6 +15987,7 @@ fn auth_grantable(privileges: &HashSet<String>) -> &'static str {
     }
 }
 
+#[allow(clippy::type_complexity)]
 fn information_schema_privilege_rows(
     auth_catalog: &AuthCatalog,
     viewer: &str,
@@ -15387,6 +16234,228 @@ fn mysql_virtual_tables(auth_catalog: &AuthCatalog, viewer: &str) -> HashMap<Str
             empty_information_schema_table(&["name", "ret", "dl", "type"]),
         ),
     ])
+}
+
+fn performance_schema_virtual_tables() -> HashMap<String, VirtualTable> {
+    let mut map: HashMap<String, VirtualTable> = HashMap::new();
+    map.insert(
+        "GLOBAL_STATUS".into(),
+        empty_information_schema_table(&["VARIABLE_NAME", "VARIABLE_VALUE"]),
+    );
+    map.insert(
+        "SESSION_STATUS".into(),
+        empty_information_schema_table(&["VARIABLE_NAME", "VARIABLE_VALUE"]),
+    );
+    map.insert(
+        "GLOBAL_VARIABLES".into(),
+        empty_information_schema_table(&["VARIABLE_NAME", "VARIABLE_VALUE"]),
+    );
+    map.insert(
+        "SESSION_VARIABLES".into(),
+        empty_information_schema_table(&["VARIABLE_NAME", "VARIABLE_VALUE"]),
+    );
+    map.insert(
+        "PROCESSLIST".into(),
+        empty_information_schema_table(&[
+            "ID", "USER", "HOST", "DB", "COMMAND", "TIME", "STATE", "INFO",
+        ]),
+    );
+    map.insert(
+        "STATUS_BY_HOST".into(),
+        empty_information_schema_table(&["HOST", "STATEMENTS", "STATEMENT_LATENCY", "TABLE_SCANS"]),
+    );
+    map.insert(
+        "STATUS_BY_USER".into(),
+        empty_information_schema_table(&["USER", "STATEMENTS", "STATEMENT_LATENCY", "TABLE_SCANS"]),
+    );
+    map.insert(
+        "STATUS_BY_THREAD".into(),
+        empty_information_schema_table(&[
+            "THREAD_ID",
+            "STATEMENTS",
+            "STATEMENT_LATENCY",
+            "TABLE_SCANS",
+        ]),
+    );
+    map.insert(
+        "EVENTS_STATEMENTS_SUMMARY_BY_DIGEST".into(),
+        empty_information_schema_table(&[
+            "DIGEST",
+            "DIGEST_TEXT",
+            "COUNT_STAR",
+            "SUM_TIMER_WAIT",
+            "SUM_ROWS_SENT",
+        ]),
+    );
+    map.insert(
+        "MUTEX_INSTANCES".into(),
+        empty_information_schema_table(&["NAME", "OBJECT_INSTANCE_BEGIN", "LOCKED_BY_THREAD_ID"]),
+    );
+    map.insert(
+        "FILE_INSTANCES".into(),
+        empty_information_schema_table(&[
+            "FILE_NAME",
+            "EVENT_NAME",
+            "OPEN_COUNT",
+            "BYTES_READ",
+            "BYTES_WRITTEN",
+        ]),
+    );
+    map.insert(
+        "EVENTS_WAITS_SUMMARY_GLOBAL_BY_EVENT_NAME".into(),
+        empty_information_schema_table(&["EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT"]),
+    );
+    map
+}
+
+fn sys_virtual_tables() -> HashMap<String, VirtualTable> {
+    let mut map: HashMap<String, VirtualTable> = HashMap::new();
+    let processlist_cols = [
+        "thd_id",
+        "conn_id",
+        "user",
+        "db",
+        "command",
+        "state",
+        "time",
+        "current_statement",
+        "statement_latency",
+        "progress",
+        "lock_latency",
+        "rows_examined",
+        "rows_sent",
+        "tmp_tables",
+        "full_scan",
+    ];
+    map.insert(
+        "processlist".into(),
+        empty_information_schema_table(&processlist_cols),
+    );
+    map.insert(
+        "x$processlist".into(),
+        empty_information_schema_table(&processlist_cols),
+    );
+    let metrics_cols = ["Variable_name", "Variable_value", "Type", "Enabled"];
+    map.insert(
+        "metrics".into(),
+        empty_information_schema_table(&metrics_cols),
+    );
+    map.insert(
+        "x$metrics".into(),
+        empty_information_schema_table(&metrics_cols),
+    );
+    let session_cols = [
+        "thd_id",
+        "conn_id",
+        "user",
+        "command",
+        "state",
+        "time",
+        "current_statement",
+        "statement_latency",
+    ];
+    map.insert(
+        "session".into(),
+        empty_information_schema_table(&session_cols),
+    );
+    map.insert(
+        "x$session".into(),
+        empty_information_schema_table(&session_cols),
+    );
+    let stmt_cols = [
+        "query",
+        "db",
+        "full_scan",
+        "exec_count",
+        "err_count",
+        "warn_count",
+        "total_latency",
+        "max_latency",
+        "avg_latency",
+        "lock_latency",
+        "rows_sent",
+        "rows_examined",
+        "rows_affected",
+        "tmp_tables",
+        "tmp_disk_tables",
+    ];
+    map.insert(
+        "statement_analysis".into(),
+        empty_information_schema_table(&stmt_cols),
+    );
+    map.insert(
+        "x$statement_analysis".into(),
+        empty_information_schema_table(&stmt_cols),
+    );
+    map.insert(
+        "sys_config".into(),
+        empty_information_schema_table(&["variable", "value", "set_time", "set_by"]),
+    );
+    map.insert(
+        "host_summary".into(),
+        empty_information_schema_table(&[
+            "host",
+            "statements",
+            "statement_latency",
+            "statement_avg_latency",
+            "table_scans",
+        ]),
+    );
+    map.insert(
+        "user_summary".into(),
+        empty_information_schema_table(&[
+            "user",
+            "statements",
+            "statement_latency",
+            "statement_avg_latency",
+            "table_scans",
+        ]),
+    );
+    map.insert(
+        "schema_table_statistics".into(),
+        empty_information_schema_table(&[
+            "table_schema",
+            "table_name",
+            "rows_fetched",
+            "fetch_latency",
+            "rows_inserted",
+            "insert_latency",
+            "rows_updated",
+            "update_latency",
+            "rows_deleted",
+            "delete_latency",
+        ]),
+    );
+    map
+}
+
+fn parse_set_password(sql: &str) -> anyhow::Result<(String, String)> {
+    let upper = sql.to_ascii_uppercase();
+    let user = if let Some(pos) = upper.find(" FOR ") {
+        let account = &sql[pos + 5..];
+        // MySQL: SET PASSWORD FOR user = 'auth_string'. The user account
+        // is the token before the assignment, so stop at '=' or whitespace.
+        let account = account
+            .split('=')
+            .next()
+            .unwrap_or(account)
+            .split_whitespace()
+            .next()
+            .unwrap_or(account)
+            .trim();
+        normalize_auth_name(account)
+    } else {
+        String::new()
+    };
+    let password = last_quoted_string(sql)
+        .ok_or_else(|| anyhow::anyhow!("SET PASSWORD requires a password literal"))?;
+    Ok((user, password))
+}
+
+fn last_quoted_string(sql: &str) -> Option<String> {
+    let close = sql.rfind('\'')?;
+    let open = sql[..close].rfind('\'')?;
+    Some(sql[open + 1..close].to_string())
 }
 
 fn bytes(value: &str) -> Option<Vec<u8>> {
@@ -18559,9 +19628,16 @@ fn evaluate_stored_function_call(
         return Ok(None);
     };
     let Some((key, function)) = STORED_FUNCTION_CATALOG
-        .try_with(|catalog| catalog.function(reference))
-        .ok()
-        .flatten()
+        .try_with(
+            |catalog| -> anyhow::Result<Option<((String, String), FunctionDefinition)>> {
+                let Some((key, function)) = catalog.function(reference) else {
+                    return Ok(None);
+                };
+                catalog.require_execute(&key.0, &key.1)?;
+                Ok(Some((key, function)))
+            },
+        )
+        .unwrap_or_else(|_| Ok(None))?
     else {
         return Ok(None);
     };
@@ -24786,7 +25862,7 @@ fn event_completion_action(event: &EventDefinition) -> anyhow::Result<EventFinis
         let mut disabled = event.clone();
         disabled.status = "DISABLED".into();
         disabled.create_sql = render_create_event(&disabled)?;
-        Ok(EventFinishAction::Disable(disabled))
+        Ok(EventFinishAction::Disable(Box::new(disabled)))
     } else {
         Ok(EventFinishAction::Drop)
     }
@@ -25021,7 +26097,7 @@ async fn execute_scheduled_event(
         action: scheduled.plan.action.clone(),
     };
     let connection_id = stats.internal_connection_id();
-    let locks = write_lock_requests(storage, &[finish.clone()])?;
+    let locks = write_lock_requests(storage, std::slice::from_ref(&finish))?;
     stats
         .acquire_locks(
             &locks,
@@ -25087,7 +26163,12 @@ async fn execute_scheduled_event(
                 let mut state = ProcedureExecutionState::default();
                 locals.push_scope();
                 state.push_scope();
-                let functions = StoredFunctionCatalog::from_storage(storage, &scheduled.database);
+                let functions = StoredFunctionCatalog::from_storage(
+                    storage,
+                    &scheduled.database,
+                    config.auth_catalog.clone(),
+                    backend.authenticated_username(),
+                );
                 let result = STORED_FUNCTION_CATALOG
                     .scope(
                         functions,
@@ -33812,6 +34893,61 @@ mod tests {
     }
 
     #[test]
+    fn auth_catalog_routine_grants_are_durable_and_old_json_is_compatible() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("auth.json"),
+            r#"{
+  "format_version": 1,
+  "users": {
+    "legacy": {
+      "password_sha1": "0000000000000000000000000000000000000000",
+      "global_privileges": [],
+      "database_privileges": {},
+      "roles": []
+    }
+  },
+  "roles": {}
+}"#,
+        )
+        .unwrap();
+        let catalog = AuthCatalog::open(directory.path(), "ignored", "ignored").unwrap();
+        assert!(!catalog.has_routine_privilege(
+            "legacy",
+            RoutineKind::Function,
+            "mydb",
+            "increment",
+            "EXECUTE"
+        ));
+        catalog
+            .grant_routine_privileges(
+                &["legacy".to_string()],
+                RoutineKind::Function,
+                "mydb",
+                "increment",
+                HashSet::from(["EXECUTE".to_string(), "ALTER ROUTINE".to_string()]),
+            )
+            .unwrap();
+        drop(catalog);
+
+        let restarted = AuthCatalog::open(directory.path(), "ignored", "ignored").unwrap();
+        assert!(restarted.has_routine_privilege(
+            "legacy",
+            RoutineKind::Function,
+            "mydb",
+            "increment",
+            "EXECUTE"
+        ));
+        assert!(restarted
+            .show_grants("legacy", &[])
+            .unwrap()
+            .iter()
+            .any(|grant| {
+                grant.contains("ALTER ROUTINE, EXECUTE ON FUNCTION `mydb`.`increment`")
+            }));
+    }
+
+    #[test]
     fn audit_log_rotates_and_limits_retention() {
         let directory = tempfile::tempdir().unwrap();
         let audit = AuditLog::open_with_rotation(directory.path(), "1", 2).unwrap();
@@ -33923,6 +35059,353 @@ mod tests {
             _ => panic!("expected grants rows"),
         };
         assert!(!rendered.iter().any(|grant| grant.contains("analyst")));
+    }
+
+    #[tokio::test]
+    async fn single_node_compat_surface_statements() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = Arc::new(StorageEngineManager::new(
+            temp.path().to_path_buf(),
+            16384,
+            "4M",
+        ));
+        storage.init().await.unwrap();
+        storage.create_database("compat").await.unwrap();
+        let mut backend = Backend::new(
+            storage,
+            Arc::new(ProtocolConfig::default()),
+            Arc::new(WireStats::default()),
+            1,
+        );
+        backend
+            .execute("CREATE TABLE compat.t (id BIGINT PRIMARY KEY, v VARCHAR(64))")
+            .await
+            .unwrap();
+        backend
+            .execute("INSERT INTO compat.t VALUES (1, 'a')")
+            .await
+            .unwrap();
+        // admin maintenance statements return MySQL-shaped result sets
+        assert!(matches!(
+            backend.execute("ANALYZE TABLE compat.t").await.unwrap(),
+            QueryOutcome::Rows { .. }
+        ));
+        assert!(matches!(
+            backend.execute("CHECK TABLE compat.t").await.unwrap(),
+            QueryOutcome::Rows { .. }
+        ));
+        assert!(matches!(
+            backend.execute("OPTIMIZE TABLE compat.t").await.unwrap(),
+            QueryOutcome::Rows { .. }
+        ));
+        assert!(matches!(
+            backend.execute("REPAIR TABLE compat.t").await.unwrap(),
+            QueryOutcome::Rows { .. }
+        ));
+        assert!(matches!(
+            backend.execute("CHECKSUM TABLE compat.t").await.unwrap(),
+            QueryOutcome::Rows { .. }
+        ));
+        // no-op admin statements
+        assert!(matches!(
+            backend.execute("FLUSH PRIVILEGES").await.unwrap(),
+            QueryOutcome::Ok { .. }
+        ));
+        assert!(matches!(
+            backend.execute("CACHE INDEX compat.t").await.unwrap(),
+            QueryOutcome::Ok { .. }
+        ));
+        // ALTER DATABASE options accepted for compatibility
+        assert!(backend
+            .execute("ALTER DATABASE compat CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci")
+            .await
+            .is_ok());
+        // replication SHOW surface returns compatible rows
+        assert!(matches!(
+            backend.execute("SHOW MASTER STATUS").await.unwrap(),
+            QueryOutcome::Rows { .. }
+        ));
+        assert!(matches!(
+            backend.execute("SHOW REPLICA STATUS").await.unwrap(),
+            QueryOutcome::Rows { .. }
+        ));
+        assert!(matches!(
+            backend.execute("SHOW BINARY LOGS").await.unwrap(),
+            QueryOutcome::Rows { .. }
+        ));
+        assert!(matches!(
+            backend.execute("SHOW REPLICAS").await.unwrap(),
+            QueryOutcome::Rows { .. }
+        ));
+        // replication control statements error clearly on single-node
+        assert!(backend
+            .execute("CHANGE MASTER TO MASTER_HOST='x'")
+            .await
+            .is_err());
+        // local XA surface
+        assert!(backend.execute("XA START 'x1'").await.is_ok());
+        assert!(backend
+            .execute("INSERT INTO compat.t VALUES (2, 'b')")
+            .await
+            .is_ok());
+        assert!(backend.execute("XA END 'x1'").await.is_ok());
+        assert!(backend.execute("XA PREPARE 'x1'").await.is_ok());
+        assert!(backend.execute("XA COMMIT 'x1'").await.is_ok());
+        assert!(matches!(
+            backend.execute("XA RECOVER").await.unwrap(),
+            QueryOutcome::Rows { .. }
+        ));
+        // account statements
+        backend
+            .execute("CREATE USER 'u1' IDENTIFIED BY 'p1'")
+            .await
+            .unwrap();
+        backend
+            .execute("SET PASSWORD FOR 'u1' = 'newp'")
+            .await
+            .unwrap();
+        backend
+            .execute("CREATE USER 'u2' IDENTIFIED BY 'p2'")
+            .await
+            .unwrap();
+        backend.execute("RENAME USER 'u2' TO 'u3'").await.unwrap();
+        // system schemas exist and are queryable
+        assert!(matches!(
+            backend.execute("SHOW TABLES FROM performance_schema").await.unwrap(),
+            QueryOutcome::Rows { .. }
+        ));
+        assert!(matches!(
+            backend.execute("SHOW TABLES FROM sys").await.unwrap(),
+            QueryOutcome::Rows { .. }
+        ));
+        assert!(matches!(
+            backend
+                .execute("SELECT * FROM performance_schema.PROCESSLIST")
+                .await
+                .unwrap(),
+            QueryOutcome::Rows { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn routine_privilege_scopes_authorize_ddl_calls_functions_and_roles() {
+        let (_temp, _storage, mut admin, mut user) = transaction_backends().await;
+        admin
+            .execute("CREATE USER routine_user IDENTIFIED BY 'routine-password'")
+            .await
+            .unwrap();
+        admin
+            .execute("CREATE USER inherited_user IDENTIFIED BY 'inherited-password'")
+            .await
+            .unwrap();
+        admin
+            .execute("CREATE ROLE routine_leaf, routine_parent")
+            .await
+            .unwrap();
+        admin
+            .execute(
+                "CREATE FUNCTION mydb.routine_increment(input BIGINT) RETURNS BIGINT RETURN input + 1",
+            )
+            .await
+            .unwrap();
+        admin
+            .execute("CREATE FUNCTION mydb.routine_drop() RETURNS BIGINT RETURN 1")
+            .await
+            .unwrap();
+        admin
+            .execute(
+                "CREATE PROCEDURE mydb.routine_echo(IN input BIGINT, OUT output BIGINT) \
+                 BEGIN SET output = input + 1; END",
+            )
+            .await
+            .unwrap();
+
+        *user.authenticated_user.lock() = Some("routine_user".into());
+        let error = user
+            .execute("CALL mydb.routine_echo(1,@routine_out)")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("EXECUTE privilege on PROCEDURE 'mydb.routine_echo'"));
+        let error = user
+            .execute_prepared_call(701, "CALL mydb.routine_echo(1,@routine_out)")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("EXECUTE privilege on PROCEDURE 'mydb.routine_echo'"));
+        let error = user
+            .execute("CREATE FUNCTION mydb.creator_only() RETURNS BIGINT RETURN 1")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("CREATE ROUTINE privilege"));
+
+        // SELECT itself remains a table/schema privilege in this server.  Give
+        // it globally so this assertion reaches the FUNCTION EXECUTE check.
+        admin
+            .execute("GRANT SELECT ON *.* TO routine_user")
+            .await
+            .unwrap();
+        let error = user
+            .execute("SELECT mydb.routine_increment(1)")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("EXECUTE privilege on FUNCTION 'mydb.routine_increment'"));
+
+        // A database grant authorizes qualified CALL, prepared CALL, and a
+        // qualified stored FUNCTION expression.
+        admin
+            .execute("GRANT EXECUTE ON mydb.* TO routine_user")
+            .await
+            .unwrap();
+        user.execute("CALL mydb.routine_echo(1,@routine_out)")
+            .await
+            .unwrap();
+        user.execute_prepared_call(702, "CALL mydb.routine_echo(1,@routine_out)")
+            .await
+            .unwrap();
+        assert_eq!(
+            single_value(
+                user.execute("SELECT mydb.routine_increment(1)")
+                    .await
+                    .unwrap()
+            ),
+            b"2"
+        );
+
+        admin
+            .execute("REVOKE EXECUTE ON mydb.* FROM routine_user")
+            .await
+            .unwrap();
+        assert!(user
+            .execute("CALL mydb.routine_echo(1,@routine_out)")
+            .await
+            .is_err());
+
+        // Direct routine scope is independently durable/displayable and may
+        // authorize a qualified object after the schema grant is revoked.
+        admin
+            .execute("GRANT EXECUTE ON FUNCTION mydb.routine_increment TO routine_user")
+            .await
+            .unwrap();
+        admin
+            .execute("GRANT EXECUTE ON PROCEDURE mydb.routine_echo TO routine_user")
+            .await
+            .unwrap();
+        user.execute("CALL mydb.routine_echo(1,@routine_out)")
+            .await
+            .unwrap();
+        assert_eq!(
+            single_value(
+                user.execute("SELECT mydb.routine_increment(2)")
+                    .await
+                    .unwrap()
+            ),
+            b"3"
+        );
+        let grants = query_rows(&mut admin, "SHOW GRANTS FOR routine_user")
+            .await
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|grant| String::from_utf8(grant).unwrap())
+            .collect::<Vec<_>>();
+        assert!(grants
+            .iter()
+            .any(|grant| grant.contains("ON FUNCTION `mydb`.`routine_increment`")));
+        assert!(grants
+            .iter()
+            .any(|grant| grant.contains("ON PROCEDURE `mydb`.`routine_echo`")));
+
+        admin
+            .execute("REVOKE EXECUTE ON FUNCTION mydb.routine_increment FROM routine_user")
+            .await
+            .unwrap();
+        assert!(user
+            .execute("SELECT mydb.routine_increment(2)")
+            .await
+            .is_err());
+        user.execute("CALL mydb.routine_echo(1,@routine_out)")
+            .await
+            .unwrap();
+
+        let error = user
+            .execute("ALTER PROCEDURE mydb.routine_echo COMMENT 'denied'")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("ALTER ROUTINE privilege on PROCEDURE"));
+        admin
+            .execute("GRANT ALTER ROUTINE ON PROCEDURE mydb.routine_echo TO routine_user")
+            .await
+            .unwrap();
+        user.execute("ALTER PROCEDURE mydb.routine_echo COMMENT 'allowed'")
+            .await
+            .unwrap();
+
+        assert!(user
+            .execute("DROP FUNCTION mydb.routine_drop")
+            .await
+            .is_err());
+        admin
+            .execute("GRANT ALTER ROUTINE ON FUNCTION mydb.routine_drop TO routine_user")
+            .await
+            .unwrap();
+        user.execute("DROP FUNCTION mydb.routine_drop")
+            .await
+            .unwrap();
+
+        admin
+            .execute("GRANT CREATE ROUTINE ON mydb.* TO routine_user")
+            .await
+            .unwrap();
+        user.execute("CREATE FUNCTION mydb.creator_only() RETURNS BIGINT RETURN 1")
+            .await
+            .unwrap();
+        // Do not silently create an auth.json grant after DDL: that would not
+        // be atomic with the storage/WAL update.
+        assert!(user.execute("SELECT mydb.creator_only()").await.is_err());
+
+        // Nested role inheritance supplies routine scope too.
+        admin
+            .execute("GRANT SELECT ON *.* TO inherited_user")
+            .await
+            .unwrap();
+        admin
+            .execute("GRANT EXECUTE ON FUNCTION mydb.routine_increment TO routine_leaf")
+            .await
+            .unwrap();
+        admin
+            .execute("GRANT routine_leaf TO routine_parent")
+            .await
+            .unwrap();
+        admin
+            .execute("GRANT routine_parent TO inherited_user")
+            .await
+            .unwrap();
+        *user.authenticated_user.lock() = Some("inherited_user".into());
+        assert_eq!(
+            single_value(
+                user.execute("SELECT mydb.routine_increment(4)")
+                    .await
+                    .unwrap()
+            ),
+            b"5"
+        );
+        let inherited_grants = query_rows(
+            &mut admin,
+            "SHOW GRANTS FOR inherited_user USING routine_parent",
+        )
+        .await
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|grant| String::from_utf8(grant).unwrap())
+        .collect::<Vec<_>>();
+        assert!(inherited_grants
+            .iter()
+            .any(|grant| grant.contains("ON FUNCTION `mydb`.`routine_increment`")));
     }
 
     #[tokio::test]

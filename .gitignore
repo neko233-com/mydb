@@ -28,6 +28,9 @@ temp/
 .codex/
 *.agent
 
+# Project internal memory / assistant data (not source)
+.workbuddy/
+
 # Backup files
 *.bak
 *.backup

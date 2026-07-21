@@ -2,9 +2,14 @@
 
 ## 核心定位
 
-MySQL 8.x 开源替代品，专为游戏业务优化。高并发、低延迟、易于部署和运维。
+**替代 SQLite 的单机高性能数据库，但以 MySQL 的形式与语法暴露接口，追求超高性能。**
 
-执行状态以 [`CheckList.md`](CheckList.md) 为准；目标描述不等于已经实现。
+- 对业务：直接用 MySQL 协议、客户端、DDL/DML 与事务，无需改写 SQL；可作为 SQLite 的高性能、可联网替代。
+- 对内：Rust 实现的 Neko233 引擎（Actor 顺序写、group commit、WAL、copy-on-write），目标在同资源、同持久化级别下显著高于 MySQL/SQLite。
+- **非单机能力明确不支持（设计决定）**：binlog 复制拓扑 / GTID、读写分离、Group Replication / Galera、分布式 XA 两阶段协调、跨节点一致性。单机版本地 XA 与复制 SHOW 表面作为兼容 no-op 保留。
+- 专为游戏行业写多读少、低交互延迟、低资源常驻场景优化。
+
+执行状态以 [`CheckList.md`](CheckList.md) 为准；目标描述不等于已经实现。非单机能力不在 CheckList 范围内。
 
 ---
 
