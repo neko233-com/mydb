@@ -4697,10 +4697,8 @@ impl Backend {
             };
         }
         if upper.starts_with("SELECT ") || upper.starts_with("WITH ") {
-            if upper.starts_with("SELECT ") {
-                if let Some(outcome) = self.select_virtual_schema(sql).await? {
-                    return Ok(outcome);
-                }
+            if let Some(outcome) = self.select_virtual_schema(sql).await? {
+                return Ok(outcome);
             }
             let locking_read = upper.contains(" FOR UPDATE")
                 || upper.contains(" FOR SHARE")
@@ -10712,7 +10710,7 @@ impl Backend {
 
     async fn select_virtual_schema(&mut self, sql: &str) -> anyhow::Result<Option<QueryOutcome>> {
         let upper = sql.to_ascii_uppercase();
-        if !upper.contains("INFORMATION_SCHEMA.") && !upper.contains("MYSQL.") {
+        if !upper.contains("INFORMATION_SCHEMA") && !upper.contains("MYSQL") {
             return Ok(None);
         }
         let viewer = self
@@ -10747,14 +10745,15 @@ impl Backend {
             .collect::<Vec<_>>();
         metadata.sort_by_key(|(schema, name, _)| std::cmp::Reverse(schema.len() + name.len()));
         for (schema, name, table) in metadata {
-            let source = format!("{schema}.{name}");
             let replacement = format!("__mydb_{schema}_{name}");
-            let (next, replacements) =
-                replace_ascii_case_insensitive(&rewritten, &source, &replacement);
-            if replacements > 0 {
-                matched = true;
-                rewritten = next;
-                scope.insert(replacement, table);
+            for source in [format!("{schema}.{name}"), format!("`{schema}`.`{name}`")] {
+                let (next, replacements) =
+                    replace_ascii_case_insensitive(&rewritten, &source, &replacement);
+                if replacements > 0 {
+                    matched = true;
+                    rewritten = next;
+                    scope.insert(replacement.clone(), table.clone());
+                }
             }
         }
         if !matched {
@@ -13241,6 +13240,62 @@ const SUPPORTED_AUTH_PRIVILEGES: &[&str] = &[
     "RELOAD",
 ];
 
+// Keep these in MySQL's grant-table order. `mysql.user` contains global
+// static privileges, while `mysql.db` only carries database-level ones.
+const MYSQL_USER_PRIVILEGE_COLUMNS: &[(&str, &str)] = &[
+    ("Select_priv", "SELECT"),
+    ("Insert_priv", "INSERT"),
+    ("Update_priv", "UPDATE"),
+    ("Delete_priv", "DELETE"),
+    ("Create_priv", "CREATE"),
+    ("Drop_priv", "DROP"),
+    ("Reload_priv", "RELOAD"),
+    ("Shutdown_priv", "SHUTDOWN"),
+    ("Process_priv", "PROCESS"),
+    ("File_priv", "FILE"),
+    ("Grant_priv", "GRANT OPTION"),
+    ("References_priv", "REFERENCES"),
+    ("Index_priv", "INDEX"),
+    ("Alter_priv", "ALTER"),
+    ("Show_db_priv", "SHOW DATABASES"),
+    ("Super_priv", "SUPER"),
+    ("Create_tmp_table_priv", "CREATE TEMPORARY TABLES"),
+    ("Lock_tables_priv", "LOCK TABLES"),
+    ("Execute_priv", "EXECUTE"),
+    ("Repl_slave_priv", "REPLICATION SLAVE"),
+    ("Repl_client_priv", "REPLICATION CLIENT"),
+    ("Create_view_priv", "CREATE VIEW"),
+    ("Show_view_priv", "SHOW VIEW"),
+    ("Create_routine_priv", "CREATE ROUTINE"),
+    ("Alter_routine_priv", "ALTER ROUTINE"),
+    ("Create_user_priv", "CREATE USER"),
+    ("Event_priv", "EVENT"),
+    ("Trigger_priv", "TRIGGER"),
+    ("Create_tablespace_priv", "CREATE TABLESPACE"),
+];
+
+const MYSQL_DB_PRIVILEGE_COLUMNS: &[(&str, &str)] = &[
+    ("Select_priv", "SELECT"),
+    ("Insert_priv", "INSERT"),
+    ("Update_priv", "UPDATE"),
+    ("Delete_priv", "DELETE"),
+    ("Create_priv", "CREATE"),
+    ("Drop_priv", "DROP"),
+    ("Grant_priv", "GRANT OPTION"),
+    ("References_priv", "REFERENCES"),
+    ("Index_priv", "INDEX"),
+    ("Alter_priv", "ALTER"),
+    ("Create_tmp_table_priv", "CREATE TEMPORARY TABLES"),
+    ("Lock_tables_priv", "LOCK TABLES"),
+    ("Create_view_priv", "CREATE VIEW"),
+    ("Show_view_priv", "SHOW VIEW"),
+    ("Create_routine_priv", "CREATE ROUTINE"),
+    ("Alter_routine_priv", "ALTER ROUTINE"),
+    ("Execute_priv", "EXECUTE"),
+    ("Event_priv", "EVENT"),
+    ("Trigger_priv", "TRIGGER"),
+];
+
 fn auth_catalog_metadata_principals(
     auth_catalog: &AuthCatalog,
     viewer: &str,
@@ -13300,12 +13355,13 @@ fn auth_privilege_set(privileges: &HashSet<String>) -> Vec<String> {
     let mut output: Vec<String> = if privileges.contains("ALL") {
         SUPPORTED_AUTH_PRIVILEGES
             .iter()
+            .filter(|privilege| **privilege != "GRANT OPTION")
             .map(|privilege| (*privilege).to_string())
             .collect()
     } else {
         privileges
             .iter()
-            .filter(|privilege| privilege.as_str() != "ALL")
+            .filter(|privilege| !matches!(privilege.as_str(), "ALL" | "GRANT OPTION"))
             .cloned()
             .collect()
     };
@@ -13368,42 +13424,15 @@ fn mysql_virtual_tables(auth_catalog: &AuthCatalog, viewer: &str) -> HashMap<Str
     let principals = auth_catalog_metadata_principals(auth_catalog, viewer);
     let mut user_rows = Vec::new();
     let mut db_rows = Vec::new();
-    let mut global_grants_rows = Vec::new();
+    // MySQL stores static privileges in mysql.user/mysql.db. This engine does
+    // not implement dynamic global privileges, so mysql.global_grants is
+    // intentionally empty rather than duplicating static grants.
+    let global_grants_rows: Vec<Vec<Option<Vec<u8>>>> = Vec::new();
     let mut role_edges_rows = Vec::new();
-    let privilege_columns = [
-        ("Select_priv", "SELECT"),
-        ("Insert_priv", "INSERT"),
-        ("Update_priv", "UPDATE"),
-        ("Delete_priv", "DELETE"),
-        ("Create_priv", "CREATE"),
-        ("Drop_priv", "DROP"),
-        ("Reload_priv", "RELOAD"),
-        ("Process_priv", "PROCESS"),
-        ("File_priv", "FILE"),
-        ("Grant_priv", "GRANT OPTION"),
-        ("References_priv", "REFERENCES"),
-        ("Index_priv", "INDEX"),
-        ("Alter_priv", "ALTER"),
-        ("Show_db_priv", "SHOW DATABASES"),
-        ("Super_priv", "SUPER"),
-        ("Create_tmp_table_priv", "CREATE TEMPORARY TABLES"),
-        ("Lock_tables_priv", "LOCK TABLES"),
-        ("Execute_priv", "EXECUTE"),
-        ("Repl_slave_priv", "REPLICATION SLAVE"),
-        ("Repl_client_priv", "REPLICATION CLIENT"),
-        ("Create_view_priv", "CREATE VIEW"),
-        ("Show_view_priv", "SHOW VIEW"),
-        ("Create_routine_priv", "CREATE ROUTINE"),
-        ("Alter_routine_priv", "ALTER ROUTINE"),
-        ("Create_user_priv", "CREATE USER"),
-        ("Event_priv", "EVENT"),
-        ("Trigger_priv", "TRIGGER"),
-        ("Create_tablespace_priv", "CREATE TABLESPACE"),
-    ];
     for principal in &principals {
         let (user, host) = mysql_account_parts(&principal.principal);
         let mut row = vec![bytes(&host), bytes(&user)];
-        row.extend(privilege_columns.iter().map(|(_, privilege)| {
+        row.extend(MYSQL_USER_PRIVILEGE_COLUMNS.iter().map(|(_, privilege)| {
             bytes(
                 if auth_privilege_enabled(&principal.global_privileges, privilege) {
                     "Y"
@@ -13414,27 +13443,37 @@ fn mysql_virtual_tables(auth_catalog: &AuthCatalog, viewer: &str) -> HashMap<Str
         }));
         row.extend([
             bytes(""),
-            None,
-            None,
-            None,
+            bytes(""),
+            bytes(""),
+            bytes(""),
             bytes("0"),
             bytes("0"),
             bytes("0"),
             bytes("0"),
-            bytes(if principal.is_role {
-                "mysql_native_password"
-            } else {
-                "mysql_native_password"
-            }),
+            bytes("mysql_native_password"),
             None,
-            None,
-            None,
-            bytes("N"),
             bytes("N"),
             None,
             None,
+            bytes(if principal.is_role { "Y" } else { "N" }),
+            bytes(
+                if auth_privilege_enabled(&principal.global_privileges, "CREATE ROLE") {
+                    "Y"
+                } else {
+                    "N"
+                },
+            ),
+            bytes(
+                if auth_privilege_enabled(&principal.global_privileges, "DROP ROLE") {
+                    "Y"
+                } else {
+                    "N"
+                },
+            ),
             None,
-            Some(Vec::new()),
+            None,
+            None,
+            None,
         ]);
         user_rows.push(row);
 
@@ -13442,7 +13481,7 @@ fn mysql_virtual_tables(auth_catalog: &AuthCatalog, viewer: &str) -> HashMap<Str
         schemas.sort_by(|left, right| left.0.cmp(right.0));
         for (schema, privileges) in schemas {
             let mut row = vec![bytes(&host), bytes(schema), bytes(&user)];
-            row.extend(privilege_columns.iter().take(25).map(|(_, privilege)| {
+            row.extend(MYSQL_DB_PRIVILEGE_COLUMNS.iter().map(|(_, privilege)| {
                 bytes(if auth_privilege_enabled(privileges, privilege) {
                     "Y"
                 } else {
@@ -13450,14 +13489,6 @@ fn mysql_virtual_tables(auth_catalog: &AuthCatalog, viewer: &str) -> HashMap<Str
                 })
             }));
             db_rows.push(row);
-        }
-        for privilege in auth_privilege_set(&principal.global_privileges) {
-            global_grants_rows.push(vec![
-                bytes(&user),
-                bytes(&host),
-                bytes(&privilege),
-                bytes(auth_grantable(&principal.global_privileges)),
-            ]);
         }
         for role in &principal.roles {
             let (from_user, from_host) = mysql_account_parts(role);
@@ -13472,12 +13503,14 @@ fn mysql_virtual_tables(auth_catalog: &AuthCatalog, viewer: &str) -> HashMap<Str
     }
     user_rows.sort_by(|left, right| left[1].cmp(&right[1]).then_with(|| left[0].cmp(&right[0])));
     db_rows.sort_by(|left, right| left[1].cmp(&right[1]).then_with(|| left[2].cmp(&right[2])));
-    global_grants_rows
-        .sort_by(|left, right| left[0].cmp(&right[0]).then_with(|| left[2].cmp(&right[2])));
     role_edges_rows.sort();
 
     let mut user_columns = vec!["Host", "User"];
-    user_columns.extend(privilege_columns.iter().map(|(column, _)| *column));
+    user_columns.extend(
+        MYSQL_USER_PRIVILEGE_COLUMNS
+            .iter()
+            .map(|(column, _)| *column),
+    );
     user_columns.extend([
         "ssl_type",
         "ssl_cipher",
@@ -13489,17 +13522,19 @@ fn mysql_virtual_tables(auth_catalog: &AuthCatalog, viewer: &str) -> HashMap<Str
         "max_user_connections",
         "plugin",
         "authentication_string",
+        "password_expired",
         "password_last_changed",
         "password_lifetime",
         "account_locked",
-        "password_expired",
-        "password_history",
-        "password_reuse_interval",
-        "password_require_current",
+        "Create_role_priv",
+        "Drop_role_priv",
+        "Password_reuse_history",
+        "Password_reuse_time",
+        "Password_require_current",
         "User_attributes",
     ]);
     let mut db_columns = vec!["Host", "Db", "User"];
-    db_columns.extend(privilege_columns.iter().take(25).map(|(column, _)| *column));
+    db_columns.extend(MYSQL_DB_PRIVILEGE_COLUMNS.iter().map(|(column, _)| *column));
     HashMap::from([
         (
             "user".into(),
@@ -13864,33 +13899,97 @@ fn split_identifier_list(value: &str) -> Vec<String> {
 }
 
 fn replace_ascii_case_insensitive(value: &str, needle: &str, replacement: &str) -> (String, usize) {
-    let upper_value = value.to_ascii_uppercase();
-    let upper_needle = needle.to_ascii_uppercase();
     let mut output = String::with_capacity(value.len());
     let mut cursor = 0;
     let mut replacements = 0;
-    while let Some(relative) = upper_value[cursor..].find(&upper_needle) {
-        let position = cursor + relative;
-        let before_is_identifier = position
+    while cursor < value.len() {
+        let tail = &value[cursor..];
+        if tail.starts_with("--")
+            && tail
+                .as_bytes()
+                .get(2)
+                .is_none_or(|byte| byte.is_ascii_whitespace())
+        {
+            let end = tail
+                .find('\n')
+                .map(|index| cursor + index)
+                .unwrap_or(value.len());
+            output.push_str(&value[cursor..end]);
+            cursor = end;
+            continue;
+        }
+        if tail.starts_with('#') {
+            let end = tail
+                .find('\n')
+                .map(|index| cursor + index)
+                .unwrap_or(value.len());
+            output.push_str(&value[cursor..end]);
+            cursor = end;
+            continue;
+        }
+        if tail.starts_with("/*") {
+            let end = tail
+                .find("*/")
+                .map(|index| cursor + index + 2)
+                .unwrap_or(value.len());
+            output.push_str(&value[cursor..end]);
+            cursor = end;
+            continue;
+        }
+        let byte = value.as_bytes()[cursor];
+        if matches!(byte, b'\'' | b'"') {
+            let quote = byte;
+            let mut end = cursor + 1;
+            while end < value.len() {
+                let current = value.as_bytes()[end];
+                if current == b'\\' {
+                    end = end.saturating_add(2);
+                    continue;
+                }
+                if current == quote {
+                    if value.as_bytes().get(end + 1) == Some(&quote) {
+                        end += 2;
+                        continue;
+                    }
+                    end += 1;
+                    break;
+                }
+                let width = value[end..]
+                    .chars()
+                    .next()
+                    .expect("valid UTF-8 cursor")
+                    .len_utf8();
+                end += width;
+            }
+            let end = end.min(value.len());
+            output.push_str(&value[cursor..end]);
+            cursor = end;
+            continue;
+        }
+        let after = cursor.saturating_add(needle.len());
+        let before_is_identifier = cursor
             .checked_sub(1)
-            .and_then(|position| upper_value.as_bytes().get(position))
+            .and_then(|position| value.as_bytes().get(position))
             .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_');
-        let after = position + needle.len();
-        let after_is_identifier = upper_value
+        let after_is_identifier = value
             .as_bytes()
             .get(after)
             .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_');
-        if before_is_identifier || after_is_identifier {
-            output.push_str(&value[cursor..position + 1]);
-            cursor = position + 1;
+        if !before_is_identifier
+            && !after_is_identifier
+            && value
+                .get(cursor..after)
+                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(needle))
+        {
+            output.push_str(replacement);
+            cursor = after;
+            replacements += 1;
             continue;
         }
-        output.push_str(&value[cursor..position]);
-        output.push_str(replacement);
-        cursor = position + needle.len();
-        replacements += 1;
+        let width = tail.chars().next().expect("valid UTF-8 cursor").len_utf8();
+        output.push_str(&tail[..width]);
+        cursor += width;
     }
-    output.push_str(&value[cursor..]);
     (output, replacements)
 }
 
@@ -29895,7 +29994,7 @@ mod tests {
             .unwrap();
         backend.execute("CREATE ROLE catalog_role").await.unwrap();
         backend
-            .execute("GRANT SELECT, INSERT ON mydb.* TO 'catalog_reader'")
+            .execute("GRANT SELECT, INSERT ON mydb.* TO 'catalog_reader' WITH GRANT OPTION")
             .await
             .unwrap();
         backend
@@ -29949,6 +30048,92 @@ mod tests {
             .await,
             vec![vec![bytes("catalog_role"), bytes("catalog_reader")]]
         );
+        assert_eq!(
+            single_value(backend.execute("SELECT 'mysql.user'").await.unwrap()),
+            b"mysql.user"
+        );
+        assert_eq!(
+            query_rows(
+                &mut backend,
+                "SELECT User FROM `mysql`.`user` WHERE User='catalog_reader'",
+            )
+            .await,
+            vec![vec![bytes("catalog_reader")]]
+        );
+        assert_eq!(
+            query_rows(
+                &mut backend,
+                "WITH catalog AS (SELECT User FROM mysql.user WHERE User='catalog_reader') \
+                 SELECT User FROM catalog",
+            )
+            .await,
+            vec![vec![bytes("catalog_reader")]]
+        );
+
+        let tables = mysql_virtual_tables(&backend.config.auth_catalog, "root");
+        let mut expected_user_columns = vec!["Host".to_string(), "User".to_string()];
+        expected_user_columns.extend(
+            MYSQL_USER_PRIVILEGE_COLUMNS
+                .iter()
+                .map(|(column, _)| (*column).to_string()),
+        );
+        expected_user_columns.extend(
+            [
+                "ssl_type",
+                "ssl_cipher",
+                "x509_issuer",
+                "x509_subject",
+                "max_questions",
+                "max_updates",
+                "max_connections",
+                "max_user_connections",
+                "plugin",
+                "authentication_string",
+                "password_expired",
+                "password_last_changed",
+                "password_lifetime",
+                "account_locked",
+                "Create_role_priv",
+                "Drop_role_priv",
+                "Password_reuse_history",
+                "Password_reuse_time",
+                "Password_require_current",
+                "User_attributes",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        );
+        let user_table = tables.get("user").unwrap();
+        assert_eq!(user_table.columns, expected_user_columns);
+        assert_eq!(user_table.columns.len(), 51);
+        assert!(user_table
+            .rows
+            .iter()
+            .all(|row| row.len() == user_table.columns.len()));
+        let db_table = tables.get("db").unwrap();
+        assert_eq!(db_table.columns.len(), 22);
+        assert_eq!(
+            db_table.columns,
+            ["Host", "Db", "User"]
+                .into_iter()
+                .map(str::to_string)
+                .chain(
+                    MYSQL_DB_PRIVILEGE_COLUMNS
+                        .iter()
+                        .map(|(column, _)| (*column).to_string()),
+                )
+                .collect::<Vec<_>>(),
+        );
+        assert!(db_table
+            .rows
+            .iter()
+            .all(|row| row.len() == db_table.columns.len()));
+        assert!(tables.get("global_grants").unwrap().rows.is_empty());
+        let (_, schema_privileges) =
+            information_schema_privilege_rows(&backend.config.auth_catalog, "root");
+        assert!(schema_privileges.iter().all(|row| {
+            row.get(3).and_then(Option::as_deref) != Some(b"GRANT OPTION".as_slice())
+        }));
     }
 
     #[tokio::test]
