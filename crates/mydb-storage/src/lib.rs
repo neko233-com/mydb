@@ -578,6 +578,22 @@ pub struct ProcedureDefinition {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FunctionParameter {
+    pub name: String,
+    pub data_type: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FunctionDefinition {
+    pub name: String,
+    pub parameters: Vec<FunctionParameter>,
+    pub returns: String,
+    pub body: String,
+    pub definer: String,
+    pub create_sql: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProcedureMetadata {
     pub created: String,
     pub last_altered: String,
@@ -914,6 +930,8 @@ pub struct Database {
     pub tables: RwLock<HashMap<String, TableSchema>>,
     pub procedures: RwLock<HashMap<String, ProcedureDefinition>>,
     procedure_metadata: RwLock<HashMap<String, ProcedureMetadata>>,
+    pub functions: RwLock<HashMap<String, FunctionDefinition>>,
+    function_metadata: RwLock<HashMap<String, ProcedureMetadata>>,
     pub buffer_pool: Arc<BufferPool>,
     disk_manager: DiskManager,
     data_dir: PathBuf,
@@ -932,10 +950,16 @@ pub struct Database {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct RoutineCatalogV2 {
+struct RoutineCatalogV3 {
     format_version: u32,
+    #[serde(default)]
     procedures: HashMap<String, ProcedureDefinition>,
+    #[serde(default)]
     metadata: HashMap<String, ProcedureMetadata>,
+    #[serde(default)]
+    functions: HashMap<String, FunctionDefinition>,
+    #[serde(default)]
+    function_metadata: HashMap<String, ProcedureMetadata>,
 }
 
 fn routine_file_timestamp(path: &Path) -> String {
@@ -978,6 +1002,8 @@ impl Database {
             tables: RwLock::new(HashMap::new()),
             procedures: RwLock::new(HashMap::new()),
             procedure_metadata: RwLock::new(HashMap::new()),
+            functions: RwLock::new(HashMap::new()),
+            function_metadata: RwLock::new(HashMap::new()),
             buffer_pool,
             disk_manager,
             data_dir,
@@ -1029,14 +1055,17 @@ impl Database {
         if routines_file.exists() {
             let content = std::fs::read_to_string(&routines_file)?;
             let value: serde_json::Value = serde_json::from_str(&content)?;
-            if value
-                .get("format_version")
-                .and_then(serde_json::Value::as_u64)
-                == Some(2)
-            {
-                let catalog: RoutineCatalogV2 = serde_json::from_value(value)?;
+            if matches!(
+                value
+                    .get("format_version")
+                    .and_then(serde_json::Value::as_u64),
+                Some(2 | 3)
+            ) {
+                let catalog: RoutineCatalogV3 = serde_json::from_value(value)?;
                 *self.procedures.write() = catalog.procedures;
                 *self.procedure_metadata.write() = catalog.metadata;
+                *self.functions.write() = catalog.functions;
+                *self.function_metadata.write() = catalog.function_metadata;
             } else {
                 let procedures: HashMap<String, ProcedureDefinition> =
                     serde_json::from_value(value)?;
@@ -1072,10 +1101,12 @@ impl Database {
         let content = serde_json::to_string_pretty(&schemas)?;
         write_schema_snapshot(&schema_file, content.as_bytes())?;
         let routines_file = table_dir.join("routines.json");
-        let routines = serde_json::to_string_pretty(&RoutineCatalogV2 {
-            format_version: 2,
+        let routines = serde_json::to_string_pretty(&RoutineCatalogV3 {
+            format_version: 3,
             procedures: self.procedures.read().clone(),
             metadata: self.procedure_metadata.read().clone(),
+            functions: self.functions.read().clone(),
+            function_metadata: self.function_metadata.read().clone(),
         })?;
         write_schema_snapshot(&routines_file, routines.as_bytes())?;
         finalize_table_rewrites(&table_dir, &schemas)?;
@@ -1235,6 +1266,88 @@ impl Database {
 
     pub fn get_procedure_metadata(&self, name: &str) -> Option<ProcedureMetadata> {
         self.procedure_metadata
+            .read()
+            .iter()
+            .find(|(stored, _)| stored.eq_ignore_ascii_case(name))
+            .map(|(_, metadata)| metadata.clone())
+    }
+
+    pub fn create_function(&self, function: FunctionDefinition) -> Result<()> {
+        self.create_function_with_metadata(function, ProcedureMetadata::new(String::new()))
+    }
+
+    pub fn create_function_with_metadata(
+        &self,
+        function: FunctionDefinition,
+        metadata: ProcedureMetadata,
+    ) -> Result<()> {
+        let mut functions = self.functions.write();
+        if functions
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case(&function.name))
+        {
+            anyhow::bail!("FUNCTION {} already exists", function.name);
+        }
+        let name = function.name.clone();
+        functions.insert(name.clone(), function);
+        self.function_metadata.write().insert(name, metadata);
+        Ok(())
+    }
+
+    pub fn drop_function(&self, name: &str) -> Result<()> {
+        let mut functions = self.functions.write();
+        let stored = functions
+            .keys()
+            .find(|stored| stored.eq_ignore_ascii_case(name))
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("FUNCTION {} does not exist", name))?;
+        functions.remove(&stored);
+        self.function_metadata.write().remove(&stored);
+        Ok(())
+    }
+
+    pub fn alter_function(&self, name: &str, create_sql: String) -> Result<()> {
+        let metadata = self
+            .get_function_metadata(name)
+            .unwrap_or_else(|| ProcedureMetadata::new(String::new()))
+            .altered(String::new());
+        self.alter_function_with_metadata(name, create_sql, metadata)
+    }
+
+    pub fn alter_function_with_metadata(
+        &self,
+        name: &str,
+        create_sql: String,
+        metadata: ProcedureMetadata,
+    ) -> Result<()> {
+        let mut functions = self.functions.write();
+        let stored = functions
+            .keys()
+            .find(|stored| stored.eq_ignore_ascii_case(name))
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("FUNCTION {} does not exist", name))?;
+        functions
+            .get_mut(&stored)
+            .expect("resolved function")
+            .create_sql = create_sql;
+        self.function_metadata.write().insert(stored, metadata);
+        Ok(())
+    }
+
+    pub fn get_function(&self, name: &str) -> Option<FunctionDefinition> {
+        self.functions
+            .read()
+            .iter()
+            .find(|(stored, _)| stored.eq_ignore_ascii_case(name))
+            .map(|(_, function)| function.clone())
+    }
+
+    pub fn list_functions(&self) -> Vec<FunctionDefinition> {
+        self.functions.read().values().cloned().collect()
+    }
+
+    pub fn get_function_metadata(&self, name: &str) -> Option<ProcedureMetadata> {
+        self.function_metadata
             .read()
             .iter()
             .find(|(stored, _)| stored.eq_ignore_ascii_case(name))
@@ -2627,6 +2740,23 @@ pub enum WriteCommand {
     AlterProcedureV2 {
         database: String,
         procedure: String,
+        create_sql: String,
+        metadata: ProcedureMetadata,
+    },
+    // Function variants are appended so every historical bincode WAL
+    // discriminant remains stable.
+    CreateFunctionV2 {
+        database: String,
+        function: FunctionDefinition,
+        metadata: ProcedureMetadata,
+    },
+    DropFunction {
+        database: String,
+        function: String,
+    },
+    AlterFunctionV2 {
+        database: String,
+        function: String,
         create_sql: String,
         metadata: ProcedureMetadata,
     },
@@ -5696,6 +5826,10 @@ fn normalize_replay_commands(
         .iter()
         .map(|(name, database)| (name.clone(), database.procedures.read().clone()))
         .collect::<HashMap<_, _>>();
+    let mut functions = actual
+        .iter()
+        .map(|(name, database)| (name.clone(), database.functions.read().clone()))
+        .collect::<HashMap<_, _>>();
     let mut normalized = Vec::with_capacity(commands.len());
     for command in commands {
         match command {
@@ -5703,12 +5837,14 @@ fn normalize_replay_commands(
                 if !catalog.contains_key(&name) {
                     catalog.insert(name.clone(), HashMap::new());
                     procedures.insert(name.clone(), HashMap::new());
+                    functions.insert(name.clone(), HashMap::new());
                     normalized.push(WriteCommand::CreateDatabase(name));
                 }
             }
             WriteCommand::DropDatabase(name) => {
                 if catalog.remove(&name).is_some() {
                     procedures.remove(&name);
+                    functions.remove(&name);
                     normalized.push(WriteCommand::DropDatabase(name));
                 }
             }
@@ -5984,6 +6120,65 @@ fn normalize_replay_commands(
                     normalized.push(WriteCommand::AlterProcedureV2 {
                         database,
                         procedure,
+                        create_sql,
+                        metadata,
+                    });
+                }
+            }
+            WriteCommand::CreateFunctionV2 {
+                database,
+                function,
+                metadata,
+            } => {
+                let Some(items) = functions.get_mut(&database) else {
+                    continue;
+                };
+                if !items
+                    .keys()
+                    .any(|name| name.eq_ignore_ascii_case(&function.name))
+                {
+                    items.insert(function.name.clone(), function.clone());
+                    normalized.push(WriteCommand::CreateFunctionV2 {
+                        database,
+                        function,
+                        metadata,
+                    });
+                }
+            }
+            WriteCommand::DropFunction { database, function } => {
+                let Some(items) = functions.get_mut(&database) else {
+                    continue;
+                };
+                let stored = items
+                    .keys()
+                    .find(|name| name.eq_ignore_ascii_case(&function))
+                    .cloned();
+                if let Some(stored) = stored {
+                    items.remove(&stored);
+                    normalized.push(WriteCommand::DropFunction { database, function });
+                }
+            }
+            WriteCommand::AlterFunctionV2 {
+                database,
+                function,
+                create_sql,
+                metadata,
+            } => {
+                let Some(items) = functions.get_mut(&database) else {
+                    continue;
+                };
+                let stored = items
+                    .keys()
+                    .find(|name| name.eq_ignore_ascii_case(&function))
+                    .cloned();
+                if let Some(stored) = stored {
+                    items
+                        .get_mut(&stored)
+                        .expect("resolved function")
+                        .create_sql = create_sql.clone();
+                    normalized.push(WriteCommand::AlterFunctionV2 {
+                        database,
+                        function,
                         create_sql,
                         metadata,
                     });
@@ -6271,6 +6466,30 @@ async fn apply_write_batch(
                 db.alter_procedure_with_metadata(&procedure, create_sql, metadata)?;
                 db.save().await?;
             }
+            WriteCommand::CreateFunctionV2 {
+                database,
+                function,
+                metadata,
+            } => {
+                let db = databases.read().get(&database).cloned().unwrap();
+                db.create_function_with_metadata(function, metadata)?;
+                db.save().await?;
+            }
+            WriteCommand::DropFunction { database, function } => {
+                let db = databases.read().get(&database).cloned().unwrap();
+                db.drop_function(&function)?;
+                db.save().await?;
+            }
+            WriteCommand::AlterFunctionV2 {
+                database,
+                function,
+                create_sql,
+                metadata,
+            } => {
+                let db = databases.read().get(&database).cloned().unwrap();
+                db.alter_function_with_metadata(&function, create_sql, metadata)?;
+                db.save().await?;
+            }
         }
     }
     if !defer_catalog_save {
@@ -6487,6 +6706,7 @@ fn validate_write_batch(
 
     let mut catalog: HashMap<String, HashMap<String, TableSchema>> = HashMap::new();
     let mut procedures: HashMap<String, HashMap<String, ProcedureDefinition>> = HashMap::new();
+    let mut functions: HashMap<String, HashMap<String, FunctionDefinition>> = HashMap::new();
     // Keep only keys introduced by this candidate batch. Existing keys stay in
     // the database-owned sets and are checked in place, avoiding an O(database)
     // clone for every actor request as tables grow.
@@ -6499,6 +6719,7 @@ fn validate_write_batch(
         let schemas = database.tables.read().clone();
         catalog.insert(database_name.clone(), schemas);
         procedures.insert(database_name.clone(), database.procedures.read().clone());
+        functions.insert(database_name.clone(), database.functions.read().clone());
     }
 
     for command in commands {
@@ -6509,6 +6730,7 @@ fn validate_write_batch(
                 }
                 catalog.insert(name.clone(), Default::default());
                 procedures.insert(name.clone(), Default::default());
+                functions.insert(name.clone(), Default::default());
                 reset_databases.insert(name.clone());
             }
             WriteCommand::DropDatabase(name) => {
@@ -6516,6 +6738,7 @@ fn validate_write_batch(
                     anyhow::bail!("Unknown database '{}'", name);
                 }
                 procedures.remove(name);
+                functions.remove(name);
                 constraint_keys.retain(|(database, _, _), _| database != name);
                 reset_databases.insert(name.clone());
             }
@@ -6956,6 +7179,50 @@ fn validate_write_batch(
                 items
                     .get_mut(&stored)
                     .expect("resolved procedure")
+                    .create_sql = create_sql.clone();
+            }
+            WriteCommand::CreateFunctionV2 {
+                database, function, ..
+            } => {
+                let items = functions
+                    .get_mut(database)
+                    .ok_or_else(|| anyhow::anyhow!("Unknown database '{}'", database))?;
+                if items
+                    .keys()
+                    .any(|name| name.eq_ignore_ascii_case(&function.name))
+                {
+                    anyhow::bail!("FUNCTION {} already exists", function.name);
+                }
+                items.insert(function.name.clone(), function.clone());
+            }
+            WriteCommand::DropFunction { database, function } => {
+                let items = functions
+                    .get_mut(database)
+                    .ok_or_else(|| anyhow::anyhow!("Unknown database '{}'", database))?;
+                let stored = items
+                    .keys()
+                    .find(|name| name.eq_ignore_ascii_case(function))
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("FUNCTION {} does not exist", function))?;
+                items.remove(&stored);
+            }
+            WriteCommand::AlterFunctionV2 {
+                database,
+                function,
+                create_sql,
+                ..
+            } => {
+                let items = functions
+                    .get_mut(database)
+                    .ok_or_else(|| anyhow::anyhow!("Unknown database '{}'", database))?;
+                let stored = items
+                    .keys()
+                    .find(|name| name.eq_ignore_ascii_case(function))
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("FUNCTION {} does not exist", function))?;
+                items
+                    .get_mut(&stored)
+                    .expect("resolved function")
                     .create_sql = create_sql.clone();
             }
         }
@@ -7755,6 +8022,22 @@ mod tests {
             database: "game".into(),
             table: table.into(),
             row,
+        }
+    }
+
+    fn function_definition(name: &str) -> FunctionDefinition {
+        FunctionDefinition {
+            name: name.into(),
+            parameters: vec![FunctionParameter {
+                name: "p_value".into(),
+                data_type: "BIGINT".into(),
+            }],
+            returns: "BIGINT".into(),
+            body: "RETURN p_value + 1".into(),
+            definer: "root@%".into(),
+            create_sql: format!(
+                "CREATE FUNCTION {name}(p_value BIGINT) RETURNS BIGINT RETURN p_value + 1"
+            ),
         }
     }
 
@@ -8618,6 +8901,115 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn function_catalog_is_wal_backed_and_persistent() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = StorageEngineManager::new(temp.path().to_path_buf(), 16384, "4M");
+        manager.init().await.unwrap();
+        manager.create_database("game").await.unwrap();
+
+        let created = ProcedureMetadata::new("STRICT_TRANS_TABLES".into());
+        manager
+            .execute_write(WriteCommand::CreateFunctionV2 {
+                database: "game".into(),
+                function: function_definition("add_one"),
+                metadata: created.clone(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            manager
+                .get_database("game")
+                .unwrap()
+                .get_function("ADD_ONE")
+                .unwrap()
+                .returns,
+            "BIGINT"
+        );
+
+        let altered = created.altered("ANSI_QUOTES".into());
+        manager
+            .execute_write(WriteCommand::AlterFunctionV2 {
+                database: "game".into(),
+                function: "add_one".into(),
+                create_sql: "CREATE FUNCTION add_one(p_value BIGINT) RETURNS BIGINT COMMENT 'altered' RETURN p_value + 1".into(),
+                metadata: altered.clone(),
+            })
+            .await
+            .unwrap();
+        drop(manager);
+
+        let restarted = StorageEngineManager::new(temp.path().to_path_buf(), 16384, "4M");
+        restarted.init().await.unwrap();
+        let database = restarted.get_database("game").unwrap();
+        assert!(database
+            .get_function("add_one")
+            .unwrap()
+            .create_sql
+            .contains("COMMENT 'altered'"));
+        assert_eq!(database.get_function_metadata("ADD_ONE"), Some(altered));
+
+        restarted
+            .execute_write(WriteCommand::DropFunction {
+                database: "game".into(),
+                function: "ADD_ONE".into(),
+            })
+            .await
+            .unwrap();
+        assert!(restarted
+            .get_database("game")
+            .unwrap()
+            .get_function("add_one")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn function_catalog_v3_loads_v2_and_upgrades_on_save() {
+        let temp = tempfile::tempdir().unwrap();
+        let database_dir = temp.path().join("legacy_v2");
+        std::fs::create_dir_all(&database_dir).unwrap();
+        std::fs::write(database_dir.join("schema.json"), "{}").unwrap();
+        let procedure = ProcedureDefinition {
+            name: "old_routine".into(),
+            parameters: Vec::new(),
+            body: "BEGIN END".into(),
+            definer: "root@%".into(),
+            create_sql: "CREATE PROCEDURE old_routine() BEGIN END".into(),
+        };
+        let metadata = ProcedureMetadata::new("ANSI".into());
+        let v2_catalog = serde_json::json!({
+            "format_version": 2,
+            "procedures": { "old_routine": procedure },
+            "metadata": { "old_routine": metadata },
+        });
+        std::fs::write(
+            database_dir.join("routines.json"),
+            serde_json::to_vec_pretty(&v2_catalog).unwrap(),
+        )
+        .unwrap();
+
+        let manager = StorageEngineManager::new(temp.path().to_path_buf(), 16384, "4M");
+        manager.init().await.unwrap();
+        let database = manager.get_database("legacy_v2").unwrap();
+        assert!(database.get_procedure("OLD_ROUTINE").is_some());
+        assert!(database.list_functions().is_empty());
+
+        manager
+            .execute_write(WriteCommand::CreateFunctionV2 {
+                database: "legacy_v2".into(),
+                function: function_definition("add_one"),
+                metadata: ProcedureMetadata::new("STRICT_TRANS_TABLES".into()),
+            })
+            .await
+            .unwrap();
+        let catalog: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(database_dir.join("routines.json")).unwrap())
+                .unwrap();
+        assert_eq!(catalog["format_version"], 3);
+        assert!(catalog["functions"]["add_one"].is_object());
+        assert!(catalog["function_metadata"]["add_one"].is_object());
+    }
+
+    #[tokio::test]
     async fn procedure_v2_metadata_persists_and_legacy_catalog_upgrades() {
         let temp = tempfile::tempdir().unwrap();
         let legacy_dir = temp.path().join("legacy");
@@ -8690,7 +9082,7 @@ mod tests {
             &std::fs::read(temp.path().join("game").join("routines.json")).unwrap(),
         )
         .unwrap();
-        assert_eq!(catalog["format_version"], 2);
+        assert_eq!(catalog["format_version"], 3);
     }
 
     #[tokio::test]

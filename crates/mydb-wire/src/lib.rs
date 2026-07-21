@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{self, Write};
@@ -35,10 +35,10 @@ use tracing::{debug, info};
 use mydb_storage::{
     apply_expression_assignments, is_current_timestamp_default, is_memory_schema,
     table_engine_from_sql, AlterTableOperation, Column, ColumnPosition, DataType,
-    ExpressionAssignment, Index, NumericOperator, ProcedureDefinition, ProcedureMetadata,
-    ProcedureParameter, ProcedureParameterMode, Row, RowPredicate, StorageEngineManager,
-    TableEngine, TableSchema, TriggerDefinition, TriggerEvent, TriggerTiming,
-    UpdateValueExpression, WriteCommand,
+    ExpressionAssignment, FunctionDefinition, FunctionParameter, Index, NumericOperator,
+    ProcedureDefinition, ProcedureMetadata, ProcedureParameter, ProcedureParameterMode, Row,
+    RowPredicate, StorageEngineManager, TableEngine, TableSchema, TriggerDefinition, TriggerEvent,
+    TriggerTiming, UpdateValueExpression, WriteCommand,
 };
 
 pub const SERVER_VERSION: &str = "8.0.36-mydb-0.1.0";
@@ -50,9 +50,56 @@ tokio::task_local! {
     static STATEMENT_CLOCK: StatementClock;
 }
 
+tokio::task_local! {
+    static STORED_FUNCTION_CATALOG: StoredFunctionCatalog;
+}
+
+thread_local! {
+    static STORED_FUNCTION_CALL_STACK: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
 struct StatementClock {
     utc: DateTime<Utc>,
     session_zone: Cell<MysqlTimeZone>,
+}
+
+#[derive(Clone)]
+struct StoredFunctionCatalog {
+    default_database: String,
+    functions: HashMap<(String, String), FunctionDefinition>,
+}
+
+impl StoredFunctionCatalog {
+    fn from_storage(storage: &StorageEngineManager, default_database: &str) -> Self {
+        let mut functions = HashMap::new();
+        for database_name in storage.list_databases() {
+            let Some(database) = storage.get_database(&database_name) else {
+                continue;
+            };
+            for function in database.list_functions() {
+                functions.insert(
+                    (
+                        database_name.to_ascii_lowercase(),
+                        function.name.to_ascii_lowercase(),
+                    ),
+                    function,
+                );
+            }
+        }
+        Self {
+            default_database: default_database.to_ascii_lowercase(),
+            functions,
+        }
+    }
+
+    fn function(&self, reference: &str) -> Option<((String, String), FunctionDefinition)> {
+        let (database, function) = split_table_reference(reference, &self.default_database).ok()?;
+        let key = (database.to_ascii_lowercase(), function.to_ascii_lowercase());
+        self.functions
+            .get(&key)
+            .cloned()
+            .map(|function| (key, function))
+    }
 }
 
 type Predicate = Option<RowPredicate>;
@@ -1858,19 +1905,23 @@ impl Backend {
     async fn execute(&mut self, sql: &str) -> anyhow::Result<QueryOutcome> {
         let normalized = normalize_sql_whitespace(sql.trim().trim_end_matches(';').trim());
         let diagnostic_statement = is_session_diagnostic_statement(&normalized);
+        let function_catalog = StoredFunctionCatalog::from_storage(&self.storage, &self.database);
         let session_zone = self
             .session_variables
             .get("time_zone")
             .and_then(|value| value.as_deref())
             .and_then(parse_mysql_time_zone)
             .unwrap_or(MysqlTimeZone::System);
-        let outcome = STATEMENT_CLOCK
+        let outcome = STORED_FUNCTION_CATALOG
             .scope(
-                StatementClock {
-                    utc: Utc::now(),
-                    session_zone: Cell::new(session_zone),
-                },
-                self.execute_inner(sql),
+                function_catalog,
+                STATEMENT_CLOCK.scope(
+                    StatementClock {
+                        utc: Utc::now(),
+                        session_zone: Cell::new(session_zone),
+                    },
+                    self.execute_inner(sql),
+                ),
             )
             .await;
         if outcome.as_ref().err().is_some_and(|error| {
@@ -3273,7 +3324,8 @@ impl Backend {
             || original_upper.starts_with("DROP PREPARE ")
             || original_upper.starts_with("CALL ")
             || original_upper.starts_with("GET ")
-            || is_create_procedure_statement(original_sql);
+            || is_create_procedure_statement(original_sql)
+            || is_create_function_statement(original_sql);
         let sql = if keeps_session_syntax {
             original_sql
         } else {
@@ -3557,6 +3609,48 @@ impl Backend {
                 rows,
             ));
         }
+        if upper.starts_with("SHOW FUNCTION STATUS") {
+            let mut rows = Vec::new();
+            for database_name in self.storage.list_databases() {
+                if let Some(database) = self.storage.get_database(&database_name) {
+                    for function in database.list_functions() {
+                        let characteristics = function_characteristics(&function);
+                        let metadata = database
+                            .get_function_metadata(&function.name)
+                            .unwrap_or_else(|| ProcedureMetadata::new(String::new()));
+                        rows.push(vec![
+                            Some(database_name.clone()),
+                            Some(function.name),
+                            Some("FUNCTION".into()),
+                            Some(function.definer),
+                            Some(metadata.last_altered),
+                            Some(metadata.created),
+                            Some(characteristics.security.as_str().into()),
+                            Some(characteristics.comment.unwrap_or_default()),
+                            Some("utf8mb4".into()),
+                            Some("utf8mb4_0900_ai_ci".into()),
+                            Some("utf8mb4_0900_ai_ci".into()),
+                        ]);
+                    }
+                }
+            }
+            return Ok(QueryOutcome::rows(
+                vec![
+                    "Db",
+                    "Name",
+                    "Type",
+                    "Definer",
+                    "Modified",
+                    "Created",
+                    "Security_type",
+                    "Comment",
+                    "character_set_client",
+                    "collation_connection",
+                    "Database Collation",
+                ],
+                rows,
+            ));
+        }
         if upper.starts_with("SHOW TABLES") || upper.starts_with("SHOW FULL TABLES") {
             return self.show_tables(sql);
         }
@@ -3680,6 +3774,37 @@ impl Backend {
                     Some(procedure.name),
                     Some(String::new()),
                     Some(procedure.create_sql),
+                    Some("utf8mb4".into()),
+                    Some("utf8mb4_0900_ai_ci".into()),
+                    Some("utf8mb4_0900_ai_ci".into()),
+                ]],
+            ));
+        }
+        if upper.starts_with("SHOW CREATE FUNCTION ") {
+            let reference = sql
+                .split_whitespace()
+                .last()
+                .unwrap_or("")
+                .trim_matches('`');
+            let (database, name) = split_table_reference(reference, &self.database)?;
+            let function = self
+                .storage
+                .get_database(&database)
+                .and_then(|database| database.get_function(&name))
+                .ok_or_else(|| anyhow::anyhow!("FUNCTION {}.{} does not exist", database, name))?;
+            return Ok(QueryOutcome::rows(
+                vec![
+                    "Function",
+                    "sql_mode",
+                    "Create Function",
+                    "character_set_client",
+                    "collation_connection",
+                    "Database Collation",
+                ],
+                vec![vec![
+                    Some(function.name),
+                    Some(String::new()),
+                    Some(function.create_sql),
                     Some("utf8mb4".into()),
                     Some("utf8mb4_0900_ai_ci".into()),
                     Some("utf8mb4_0900_ai_ci".into()),
@@ -3870,6 +3995,30 @@ impl Backend {
                 }])
                 .await;
         }
+        if is_create_function_statement(sql) {
+            self.commit_pending().await?;
+            let (database, function, if_not_exists) = parse_create_function(sql, &self.database)?;
+            if if_not_exists
+                && self
+                    .storage
+                    .get_database(&database)
+                    .and_then(|database| database.get_function(&function.name))
+                    .is_some()
+            {
+                self.record_warning(SqlWarning::note(
+                    1304,
+                    format!("FUNCTION {} already exists", function.name),
+                ));
+                return Ok(QueryOutcome::ok(0));
+            }
+            return self
+                .submit_ddl(vec![WriteCommand::CreateFunctionV2 {
+                    database,
+                    function,
+                    metadata: ProcedureMetadata::new(self.session_sql_mode()),
+                }])
+                .await;
+        }
         if upper.starts_with("ALTER PROCEDURE ") {
             self.commit_pending().await?;
             let remainder = sql["ALTER PROCEDURE".len()..].trim_start();
@@ -3892,6 +4041,33 @@ impl Backend {
                 .submit_ddl(vec![WriteCommand::AlterProcedureV2 {
                     database,
                     procedure,
+                    create_sql,
+                    metadata,
+                }])
+                .await;
+        }
+        if upper.starts_with("ALTER FUNCTION ") {
+            self.commit_pending().await?;
+            let remainder = sql["ALTER FUNCTION".len()..].trim_start();
+            let (reference, _) = take_show_identifier(remainder)?;
+            let (database, name) = split_table_reference(&reference, &self.database)?;
+            let function = self
+                .storage
+                .get_database(&database)
+                .and_then(|database| database.get_function(&name))
+                .ok_or_else(|| anyhow::anyhow!("FUNCTION {}.{} does not exist", database, name))?;
+            let (database, function, create_sql) =
+                parse_alter_function(sql, &self.database, &function)?;
+            let metadata = self
+                .storage
+                .get_database(&database)
+                .and_then(|database| database.get_function_metadata(&function))
+                .unwrap_or_else(|| ProcedureMetadata::new(String::new()))
+                .altered(self.session_sql_mode());
+            return self
+                .submit_ddl(vec![WriteCommand::AlterFunctionV2 {
+                    database,
+                    function,
                     create_sql,
                     metadata,
                 }])
@@ -3921,6 +4097,29 @@ impl Backend {
                     database,
                     procedure,
                 }])
+                .await;
+        }
+        if upper.starts_with("DROP FUNCTION ") {
+            self.commit_pending().await?;
+            let if_exists = upper.starts_with("DROP FUNCTION IF EXISTS ");
+            let reference = if if_exists {
+                sql["DROP FUNCTION IF EXISTS ".len()..].trim()
+            } else {
+                sql["DROP FUNCTION ".len()..].trim()
+            }
+            .trim_matches('`');
+            let (database, function) = split_table_reference(reference, &self.database)?;
+            if self
+                .storage
+                .get_database(&database)
+                .and_then(|database| database.get_function(&function))
+                .is_none()
+                && if_exists
+            {
+                return Ok(QueryOutcome::ok(0));
+            }
+            return self
+                .submit_ddl(vec![WriteCommand::DropFunction { database, function }])
                 .await;
         }
         if upper.starts_with("DROP TRIGGER ") {
@@ -11061,7 +11260,10 @@ fn write_lock_requests(
             | WriteCommand::DropProcedure { database, .. }
             | WriteCommand::AlterProcedure { database, .. }
             | WriteCommand::CreateProcedureV2 { database, .. }
-            | WriteCommand::AlterProcedureV2 { database, .. } => {
+            | WriteCommand::AlterProcedureV2 { database, .. }
+            | WriteCommand::CreateFunctionV2 { database, .. }
+            | WriteCommand::DropFunction { database, .. }
+            | WriteCommand::AlterFunctionV2 { database, .. } => {
                 add_lock_request(
                     &mut requests,
                     format!("database:{database}"),
@@ -12199,6 +12401,77 @@ fn information_schema_virtual_tables(
                 bytes(&metadata.sql_mode),
                 bytes(characteristics.comment.as_deref().unwrap_or("")),
                 bytes(&procedure.definer),
+                bytes("utf8mb4"),
+                bytes("utf8mb4_0900_ai_ci"),
+                bytes("utf8mb4_0900_ai_ci"),
+            ]);
+        }
+        for function in database.list_functions() {
+            let characteristics = function_characteristics(&function);
+            let metadata = database
+                .get_function_metadata(&function.name)
+                .unwrap_or_else(|| ProcedureMetadata::new(String::new()));
+            let returns_data_type = function
+                .returns
+                .split(['(', ' '])
+                .next()
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            parameters_rows.push(vec![
+                bytes("def"),
+                bytes(&database_name),
+                bytes(&function.name),
+                bytes("0"),
+                None,
+                None,
+                bytes(&returns_data_type),
+                bytes(&function.returns),
+            ]);
+            for (index, parameter) in function.parameters.iter().enumerate() {
+                parameters_rows.push(vec![
+                    bytes("def"),
+                    bytes(&database_name),
+                    bytes(&function.name),
+                    bytes(&(index + 1).to_string()),
+                    bytes("IN"),
+                    bytes(&parameter.name),
+                    bytes(
+                        parameter
+                            .data_type
+                            .split(['(', ' '])
+                            .next()
+                            .unwrap_or("")
+                            .to_ascii_lowercase()
+                            .as_str(),
+                    ),
+                    bytes(&parameter.data_type),
+                ]);
+            }
+            routines_rows.push(vec![
+                bytes(&function.name),
+                bytes("def"),
+                bytes(&database_name),
+                bytes(&function.name),
+                bytes("FUNCTION"),
+                bytes(&returns_data_type),
+                bytes("SQL"),
+                bytes(&function.body),
+                None,
+                None,
+                bytes("SQL"),
+                bytes(if characteristics.deterministic {
+                    "YES"
+                } else {
+                    "NO"
+                }),
+                bytes(characteristics.data_access.as_str()),
+                None,
+                bytes(characteristics.security.as_str()),
+                bytes(&metadata.created),
+                bytes(&metadata.last_altered),
+                bytes(&metadata.sql_mode),
+                bytes(characteristics.comment.as_deref().unwrap_or("")),
+                bytes(&function.definer),
                 bytes("utf8mb4"),
                 bytes("utf8mb4_0900_ai_ci"),
                 bytes("utf8mb4_0900_ai_ci"),
@@ -15685,6 +15958,97 @@ fn mysql_timestamp_difference(
     Ok(value)
 }
 
+fn parse_stored_function_call(expression: &str) -> Option<(&str, Vec<String>)> {
+    let expression = expression.trim();
+    let open = expression.find('(')?;
+    if matching_parenthesis(expression, open) != Some(expression.len() - 1) {
+        return None;
+    }
+    let reference = expression[..open].trim();
+    if reference.is_empty()
+        || !reference.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '_' | '.' | '`')
+        })
+    {
+        return None;
+    }
+    Some((
+        reference,
+        split_csv(&expression[open + 1..expression.len() - 1]),
+    ))
+}
+
+fn stored_function_return_expression(body: &str) -> anyhow::Result<&str> {
+    let body = body.trim().trim_end_matches(';').trim();
+    let expression = body
+        .get("RETURN".len()..)
+        .filter(|_| {
+            body.get(.."RETURN".len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("RETURN"))
+        })
+        .ok_or_else(|| anyhow::anyhow!("Stored function body must be a scalar RETURN expression"))?
+        .trim();
+    if expression.is_empty() || expression.contains(';') {
+        anyhow::bail!("Stored function body must be a single scalar RETURN expression");
+    }
+    Ok(expression)
+}
+
+fn evaluate_stored_function_call(
+    expression: &str,
+    row: &Row,
+) -> anyhow::Result<Option<Option<Vec<u8>>>> {
+    let Some((reference, arguments)) = parse_stored_function_call(expression) else {
+        return Ok(None);
+    };
+    let Some((key, function)) = STORED_FUNCTION_CATALOG
+        .try_with(|catalog| catalog.function(reference))
+        .ok()
+        .flatten()
+    else {
+        return Ok(None);
+    };
+    if arguments.len() != function.parameters.len() {
+        anyhow::bail!(
+            "Incorrect number of arguments for FUNCTION {}.{}; expected {}, got {}",
+            key.0,
+            key.1,
+            function.parameters.len(),
+            arguments.len()
+        );
+    }
+    let stack_key = format!("{}.{}", key.0, key.1);
+    let entered = STORED_FUNCTION_CALL_STACK.with(|stack| {
+        let mut stack = stack.borrow_mut();
+        if stack.len() >= 32 || stack.contains(&stack_key) {
+            false
+        } else {
+            stack.push(stack_key);
+            true
+        }
+    });
+    if !entered {
+        anyhow::bail!("Recursive stored function call is not allowed");
+    }
+    let result = (|| {
+        let mut locals = Row::new();
+        for (parameter, argument) in function.parameters.iter().zip(arguments) {
+            let value = evaluate_scalar_expression(&argument, row)?;
+            match coerce_trigger_local_value(&parameter.data_type, value, false)? {
+                Some(value) => locals.push(&parameter.name, value),
+                None => locals.push_null(&parameter.name),
+            }
+        }
+        let expression = stored_function_return_expression(&function.body)?;
+        let value = evaluate_scalar_expression(expression, &locals)?;
+        coerce_trigger_local_value(&function.returns, value, false)
+    })();
+    STORED_FUNCTION_CALL_STACK.with(|stack| {
+        stack.borrow_mut().pop();
+    });
+    Ok(Some(result?))
+}
+
 fn evaluate_scalar_expression(value: &str, row: &Row) -> anyhow::Result<Option<Vec<u8>>> {
     let expression = trim_outer_parentheses(projection_without_alias(value).trim());
     let upper = expression.to_ascii_uppercase();
@@ -17884,6 +18248,9 @@ fn evaluate_scalar_expression(value: &str, row: &Row) -> anyhow::Result<Option<V
             _ => unreachable!(),
         };
         return Ok(Some(format_mysql_number(value).into_bytes()));
+    }
+    if let Some(value) = evaluate_stored_function_call(expression, row)? {
+        return Ok(value);
     }
     let column = normalize_column_reference(expression);
     if row.contains(&column) {
@@ -20117,11 +20484,15 @@ fn mysql_error_kind(message: &str) -> ErrorKind {
         ErrorKind::ER_WRONG_NUMBER_OF_COLUMNS_IN_SELECT
     } else if message == "Result consisted of more than one row" {
         ErrorKind::ER_TOO_MANY_ROWS
-    } else if (message.starts_with("SAVEPOINT ") || message.starts_with("PROCEDURE "))
+    } else if (message.starts_with("SAVEPOINT ")
+        || message.starts_with("PROCEDURE ")
+        || message.starts_with("FUNCTION "))
         && message.ends_with(" does not exist")
     {
         ErrorKind::ER_SP_DOES_NOT_EXIST
-    } else if message.starts_with("PROCEDURE ") && message.ends_with(" already exists") {
+    } else if (message.starts_with("PROCEDURE ") || message.starts_with("FUNCTION "))
+        && message.ends_with(" already exists")
+    {
         ErrorKind::ER_SP_ALREADY_EXISTS
     } else if message == "Case not found for CASE statement" {
         ErrorKind::ER_SP_CASE_NOT_FOUND
@@ -20335,6 +20706,12 @@ fn is_create_procedure_statement(sql: &str) -> bool {
         || (upper.starts_with("CREATE DEFINER") && upper.contains(" PROCEDURE "))
 }
 
+fn is_create_function_statement(sql: &str) -> bool {
+    let upper = sql.to_ascii_uppercase();
+    upper.starts_with("CREATE FUNCTION ")
+        || (upper.starts_with("CREATE DEFINER") && upper.contains(" FUNCTION "))
+}
+
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum ProcedureDataAccess {
     #[default]
@@ -20506,6 +20883,18 @@ fn procedure_characteristics(procedure: &ProcedureDefinition) -> ProcedureCharac
     .unwrap_or_default()
 }
 
+fn function_characteristics(function: &FunctionDefinition) -> ProcedureCharacteristics {
+    let Some(open) = function.create_sql.find('(') else {
+        return ProcedureCharacteristics::default();
+    };
+    let Some(close) = matching_parenthesis(&function.create_sql, open) else {
+        return ProcedureCharacteristics::default();
+    };
+    parse_function_returns_clause(&function.create_sql[close + 1..])
+        .map(|(_, characteristics, _)| characteristics)
+        .unwrap_or_default()
+}
+
 fn render_create_procedure(
     procedure: &ProcedureDefinition,
     characteristics: &ProcedureCharacteristics,
@@ -20554,6 +20943,51 @@ fn render_create_procedure(
     }
     output.push(' ');
     output.push_str(&procedure.body);
+    output
+}
+
+fn render_create_function(
+    function: &FunctionDefinition,
+    characteristics: &ProcedureCharacteristics,
+) -> String {
+    let parameters = function
+        .parameters
+        .iter()
+        .map(|parameter| format!("`{}` {}", parameter.name, parameter.data_type))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut output = format!(
+        "CREATE DEFINER={} FUNCTION `{}`({}) RETURNS {}",
+        render_procedure_definer(&function.definer),
+        function.name,
+        parameters,
+        function.returns,
+    );
+    if characteristics.language_explicit {
+        output.push_str(" LANGUAGE SQL");
+    }
+    if characteristics.deterministic_explicit {
+        output.push_str(if characteristics.deterministic {
+            " DETERMINISTIC"
+        } else {
+            " NOT DETERMINISTIC"
+        });
+    }
+    if characteristics.data_access_explicit {
+        output.push(' ');
+        output.push_str(characteristics.data_access.as_str());
+    }
+    if characteristics.security_explicit {
+        output.push_str(" SQL SECURITY ");
+        output.push_str(characteristics.security.as_str());
+    }
+    if let Some(comment) = &characteristics.comment {
+        output.push_str(" COMMENT '");
+        output.push_str(&comment.replace('\\', "\\\\").replace('\'', "''"));
+        output.push('\'');
+    }
+    output.push(' ');
+    output.push_str(&function.body);
     output
 }
 
@@ -20672,6 +21106,161 @@ fn parse_create_procedure(
             create_sql: sql.to_string(),
         },
         if_not_exists,
+    ))
+}
+
+fn parse_function_parameter(value: &str) -> anyhow::Result<FunctionParameter> {
+    let mut cursor = 0;
+    let name = parse_sql_identifier_at(value, &mut cursor)?;
+    if matches!(name.to_ascii_uppercase().as_str(), "IN" | "OUT" | "INOUT") {
+        anyhow::bail!("FUNCTION parameters cannot declare IN, OUT, or INOUT mode");
+    }
+    let data_type = value[cursor..].trim();
+    if data_type.is_empty() {
+        anyhow::bail!("Function parameter '{}' requires a data type", name);
+    }
+    validate_stored_program_data_type(data_type)?;
+    Ok(FunctionParameter {
+        name,
+        data_type: data_type.to_string(),
+    })
+}
+
+fn function_characteristic_start(value: &str) -> usize {
+    [
+        " LANGUAGE SQL",
+        " NOT DETERMINISTIC",
+        " DETERMINISTIC",
+        " CONTAINS SQL",
+        " NO SQL",
+        " READS SQL DATA",
+        " MODIFIES SQL DATA",
+        " SQL SECURITY ",
+        " COMMENT ",
+    ]
+    .into_iter()
+    .filter_map(|keyword| find_top_level_keyword(value, keyword, 0))
+    .min()
+    .unwrap_or(value.len())
+}
+
+fn parse_function_returns_clause(
+    value: &str,
+) -> anyhow::Result<(String, ProcedureCharacteristics, &str)> {
+    let value = value.trim_start();
+    let remainder = value
+        .get("RETURNS".len()..)
+        .filter(|_| {
+            value
+                .get(.."RETURNS".len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("RETURNS"))
+        })
+        .ok_or_else(|| anyhow::anyhow!("CREATE FUNCTION requires RETURNS data type"))?
+        .trim_start();
+    let return_position = find_top_level_keyword(remainder, " RETURN ", 0)
+        .ok_or_else(|| anyhow::anyhow!("CREATE FUNCTION requires a RETURN expression"))?;
+    let before_return = remainder[..return_position].trim();
+    let characteristic_start = function_characteristic_start(before_return);
+    let returns = before_return[..characteristic_start].trim();
+    if returns.is_empty() {
+        anyhow::bail!("CREATE FUNCTION requires RETURNS data type");
+    }
+    validate_stored_program_data_type(returns)?;
+    let characteristics = &before_return[characteristic_start..];
+    let (characteristics, tail, _) = parse_procedure_characteristics(
+        characteristics,
+        ProcedureCharacteristics::default(),
+        true,
+    )?;
+    if !tail.is_empty() {
+        anyhow::bail!("Unexpected CREATE FUNCTION clause '{}'", tail);
+    }
+    Ok((
+        returns.to_string(),
+        characteristics,
+        remainder[return_position + 1..].trim_start(),
+    ))
+}
+
+fn parse_create_function(
+    sql: &str,
+    current_database: &str,
+) -> anyhow::Result<(String, FunctionDefinition, bool)> {
+    let upper = sql.to_ascii_uppercase();
+    let (function_position, after_position) = if upper.starts_with("CREATE FUNCTION ") {
+        (6, "CREATE FUNCTION".len())
+    } else {
+        let position = find_top_level_keyword(sql, " FUNCTION ", 0)
+            .ok_or_else(|| anyhow::anyhow!("CREATE FUNCTION requires FUNCTION"))?;
+        (position, position + " FUNCTION ".len())
+    };
+    let definer = sql[..function_position]
+        .find('=')
+        .map(|position| normalize_procedure_definer(&sql[position + 1..function_position]))
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "root@%".into());
+    let mut remainder = sql[after_position..].trim_start();
+    let if_not_exists = remainder
+        .get(.."IF NOT EXISTS".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("IF NOT EXISTS"));
+    if if_not_exists {
+        remainder = remainder["IF NOT EXISTS".len()..].trim_start();
+    }
+    let open = remainder
+        .find('(')
+        .ok_or_else(|| anyhow::anyhow!("CREATE FUNCTION requires a parameter list"))?;
+    let close = matching_parenthesis(remainder, open)
+        .ok_or_else(|| anyhow::anyhow!("CREATE FUNCTION has an unclosed parameter list"))?;
+    let reference = remainder[..open].trim().trim_matches('`');
+    let (database, name) = split_table_reference(reference, current_database)?;
+    let parameters = split_csv(&remainder[open + 1..close])
+        .into_iter()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| parse_function_parameter(&value))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let mut parameter_names = HashSet::new();
+    for parameter in &parameters {
+        if !parameter_names.insert(parameter.name.to_ascii_lowercase()) {
+            anyhow::bail!("Duplicate function parameter '{}'", parameter.name);
+        }
+    }
+    let (returns, _, body) = parse_function_returns_clause(&remainder[close + 1..])?;
+    stored_function_return_expression(body)?;
+    Ok((
+        database,
+        FunctionDefinition {
+            name,
+            parameters,
+            returns,
+            body: body.to_string(),
+            definer,
+            create_sql: sql.to_string(),
+        },
+        if_not_exists,
+    ))
+}
+
+fn parse_alter_function(
+    sql: &str,
+    current_database: &str,
+    function: &FunctionDefinition,
+) -> anyhow::Result<(String, String, String)> {
+    let remainder = sql["ALTER FUNCTION".len()..].trim_start();
+    let (reference, characteristics) = take_show_identifier(remainder)?;
+    let (database, name) = split_table_reference(&reference, current_database)?;
+    let current = function_characteristics(function);
+    let (characteristics, tail, count) =
+        parse_procedure_characteristics(characteristics, current, false)?;
+    if count == 0 {
+        anyhow::bail!("ALTER FUNCTION requires characteristics");
+    }
+    if !tail.is_empty() {
+        anyhow::bail!("Unexpected ALTER FUNCTION clause '{}'", tail);
+    }
+    Ok((
+        database,
+        name,
+        render_create_function(function, &characteristics),
     ))
 }
 
@@ -29503,6 +30092,75 @@ mod tests {
             .execute("DROP VIEW IF EXISTS drop_batch_view_one, missing_view")
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn stored_functions_are_callable_and_expose_mysql_metadata() {
+        let (_temp, _storage, mut backend, _second) = transaction_backends().await;
+        backend
+            .execute(
+                "CREATE FUNCTION add_one(input BIGINT) RETURNS BIGINT DETERMINISTIC RETURN input + 1",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            query_rows(&mut backend, "SELECT add_one(value) FROM actors").await,
+            vec![vec![Some(b"11".to_vec())]]
+        );
+        assert_eq!(
+            query_rows(&mut backend, "SELECT add_one(ABS(-2)),add_one(NULL)").await,
+            vec![vec![Some(b"3".to_vec()), None]]
+        );
+        let create = query_rows(&mut backend, "SHOW CREATE FUNCTION add_one").await;
+        assert!(
+            String::from_utf8_lossy(create[0][2].as_deref().unwrap()).contains("RETURNS BIGINT")
+        );
+        backend
+            .execute("ALTER FUNCTION add_one COMMENT 'increments values'")
+            .await
+            .unwrap();
+        let create = query_rows(&mut backend, "SHOW CREATE FUNCTION add_one").await;
+        assert!(String::from_utf8_lossy(create[0][2].as_deref().unwrap())
+            .contains("COMMENT 'increments values'"));
+        assert_eq!(
+            query_rows(
+                &mut backend,
+                "SELECT ROUTINE_TYPE,DATA_TYPE FROM information_schema.routines WHERE ROUTINE_NAME='add_one'",
+            )
+            .await,
+            vec![vec![Some(b"FUNCTION".to_vec()), Some(b"bigint".to_vec())]]
+        );
+        assert_eq!(
+            query_rows(
+                &mut backend,
+                "SELECT PARAMETER_MODE,PARAMETER_NAME FROM information_schema.parameters WHERE SPECIFIC_NAME='add_one' AND ORDINAL_POSITION=1",
+            )
+            .await,
+            vec![vec![Some(b"IN".to_vec()), Some(b"input".to_vec())]]
+        );
+        let status = query_rows(&mut backend, "SHOW FUNCTION STATUS").await;
+        assert!(status
+            .iter()
+            .any(|row| { row.get(1).and_then(Option::as_deref) == Some(b"add_one".as_slice()) }));
+        backend
+            .execute("CREATE FUNCTION recursion_probe(input BIGINT) RETURNS BIGINT RETURN recursion_probe(input)")
+            .await
+            .unwrap();
+        assert!(backend
+            .execute("SELECT recursion_probe(1)")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("Recursive stored function"));
+        backend.execute("DROP FUNCTION add_one").await.unwrap();
+        backend
+            .execute("DROP FUNCTION IF EXISTS add_one")
+            .await
+            .unwrap();
+        assert!(backend
+            .execute("SHOW CREATE FUNCTION add_one")
+            .await
+            .is_err());
     }
 
     #[tokio::test]
