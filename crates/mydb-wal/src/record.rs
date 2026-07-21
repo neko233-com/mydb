@@ -88,24 +88,25 @@ impl WalRecord {
 
     /// Serialize record to bytes (without LSN and CRC, those are added by writer)
     pub fn encode_payload(&self) -> Vec<u8> {
-        let mut buf = Vec::new();
+        let mut buf = Vec::with_capacity(self.payload_len());
+        self.write_payload_to_buf(&mut buf);
+        buf
+    }
 
-        // Record type (1 byte)
+    #[inline(always)]
+    pub fn payload_len(&self) -> usize {
+        1 + 8 + 2 + self.table_name.len() + 4 + self.data.len()
+    }
+
+    #[inline(always)]
+    pub fn write_payload_to_buf(&self, buf: &mut Vec<u8>) {
         buf.push(self.record_type as u8);
-
-        // Transaction ID (8 bytes)
         buf.extend_from_slice(&self.tx_id.to_le_bytes());
-
-        // Table name length (2 bytes) + table name
         let name_bytes = self.table_name.as_bytes();
         buf.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
         buf.extend_from_slice(name_bytes);
-
-        // Data length (4 bytes) + data
         buf.extend_from_slice(&(self.data.len() as u32).to_le_bytes());
         buf.extend_from_slice(&self.data);
-
-        buf
     }
 
     /// Deserialize record payload from bytes
