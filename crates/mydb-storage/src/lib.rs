@@ -594,6 +594,28 @@ pub struct FunctionDefinition {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventSchedule {
+    pub execute_at: Option<String>,
+    pub interval_value: Option<String>,
+    pub interval_field: Option<String>,
+    pub starts: Option<String>,
+    pub ends: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventDefinition {
+    pub name: String,
+    pub definer: String,
+    pub time_zone: String,
+    pub body: String,
+    pub schedule: EventSchedule,
+    pub status: String,
+    pub on_completion: String,
+    pub comment: String,
+    pub create_sql: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProcedureMetadata {
     pub created: String,
     pub last_altered: String,
@@ -614,6 +636,35 @@ impl ProcedureMetadata {
         Self {
             created: self.created.clone(),
             last_altered: Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+            sql_mode,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventMetadata {
+    pub created: String,
+    pub last_altered: String,
+    pub last_executed: Option<String>,
+    pub sql_mode: String,
+}
+
+impl EventMetadata {
+    pub fn new(sql_mode: String) -> Self {
+        let now = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        Self {
+            created: now.clone(),
+            last_altered: now,
+            last_executed: None,
+            sql_mode,
+        }
+    }
+
+    pub fn altered(&self, sql_mode: String) -> Self {
+        Self {
+            created: self.created.clone(),
+            last_altered: Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+            last_executed: self.last_executed.clone(),
             sql_mode,
         }
     }
@@ -932,6 +983,8 @@ pub struct Database {
     procedure_metadata: RwLock<HashMap<String, ProcedureMetadata>>,
     pub functions: RwLock<HashMap<String, FunctionDefinition>>,
     function_metadata: RwLock<HashMap<String, ProcedureMetadata>>,
+    pub events: RwLock<HashMap<String, EventDefinition>>,
+    event_metadata: RwLock<HashMap<String, EventMetadata>>,
     pub buffer_pool: Arc<BufferPool>,
     disk_manager: DiskManager,
     data_dir: PathBuf,
@@ -950,7 +1003,7 @@ pub struct Database {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct RoutineCatalogV3 {
+struct RoutineCatalogV4 {
     format_version: u32,
     #[serde(default)]
     procedures: HashMap<String, ProcedureDefinition>,
@@ -960,6 +1013,10 @@ struct RoutineCatalogV3 {
     functions: HashMap<String, FunctionDefinition>,
     #[serde(default)]
     function_metadata: HashMap<String, ProcedureMetadata>,
+    #[serde(default)]
+    events: HashMap<String, EventDefinition>,
+    #[serde(default)]
+    event_metadata: HashMap<String, EventMetadata>,
 }
 
 fn routine_file_timestamp(path: &Path) -> String {
@@ -1004,6 +1061,8 @@ impl Database {
             procedure_metadata: RwLock::new(HashMap::new()),
             functions: RwLock::new(HashMap::new()),
             function_metadata: RwLock::new(HashMap::new()),
+            events: RwLock::new(HashMap::new()),
+            event_metadata: RwLock::new(HashMap::new()),
             buffer_pool,
             disk_manager,
             data_dir,
@@ -1059,13 +1118,15 @@ impl Database {
                 value
                     .get("format_version")
                     .and_then(serde_json::Value::as_u64),
-                Some(2 | 3)
+                Some(2 | 3 | 4)
             ) {
-                let catalog: RoutineCatalogV3 = serde_json::from_value(value)?;
+                let catalog: RoutineCatalogV4 = serde_json::from_value(value)?;
                 *self.procedures.write() = catalog.procedures;
                 *self.procedure_metadata.write() = catalog.metadata;
                 *self.functions.write() = catalog.functions;
                 *self.function_metadata.write() = catalog.function_metadata;
+                *self.events.write() = catalog.events;
+                *self.event_metadata.write() = catalog.event_metadata;
             } else {
                 let procedures: HashMap<String, ProcedureDefinition> =
                     serde_json::from_value(value)?;
@@ -1101,12 +1162,14 @@ impl Database {
         let content = serde_json::to_string_pretty(&schemas)?;
         write_schema_snapshot(&schema_file, content.as_bytes())?;
         let routines_file = table_dir.join("routines.json");
-        let routines = serde_json::to_string_pretty(&RoutineCatalogV3 {
-            format_version: 3,
+        let routines = serde_json::to_string_pretty(&RoutineCatalogV4 {
+            format_version: 4,
             procedures: self.procedures.read().clone(),
             metadata: self.procedure_metadata.read().clone(),
             functions: self.functions.read().clone(),
             function_metadata: self.function_metadata.read().clone(),
+            events: self.events.read().clone(),
+            event_metadata: self.event_metadata.read().clone(),
         })?;
         write_schema_snapshot(&routines_file, routines.as_bytes())?;
         finalize_table_rewrites(&table_dir, &schemas)?;
@@ -1348,6 +1411,84 @@ impl Database {
 
     pub fn get_function_metadata(&self, name: &str) -> Option<ProcedureMetadata> {
         self.function_metadata
+            .read()
+            .iter()
+            .find(|(stored, _)| stored.eq_ignore_ascii_case(name))
+            .map(|(_, metadata)| metadata.clone())
+    }
+
+    pub fn create_event(&self, event: EventDefinition) -> Result<()> {
+        self.create_event_with_metadata(event, EventMetadata::new(String::new()))
+    }
+
+    pub fn create_event_with_metadata(
+        &self,
+        event: EventDefinition,
+        metadata: EventMetadata,
+    ) -> Result<()> {
+        let mut events = self.events.write();
+        if events
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case(&event.name))
+        {
+            anyhow::bail!("EVENT {} already exists", event.name);
+        }
+        let name = event.name.clone();
+        events.insert(name.clone(), event);
+        self.event_metadata.write().insert(name, metadata);
+        Ok(())
+    }
+
+    pub fn drop_event(&self, name: &str) -> Result<()> {
+        let mut events = self.events.write();
+        let stored = events
+            .keys()
+            .find(|stored| stored.eq_ignore_ascii_case(name))
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("EVENT {} does not exist", name))?;
+        events.remove(&stored);
+        self.event_metadata.write().remove(&stored);
+        Ok(())
+    }
+
+    pub fn alter_event(&self, event: EventDefinition) -> Result<()> {
+        let metadata = self
+            .get_event_metadata(&event.name)
+            .unwrap_or_else(|| EventMetadata::new(String::new()))
+            .altered(String::new());
+        self.alter_event_with_metadata(event, metadata)
+    }
+
+    pub fn alter_event_with_metadata(
+        &self,
+        event: EventDefinition,
+        metadata: EventMetadata,
+    ) -> Result<()> {
+        let mut events = self.events.write();
+        let stored = events
+            .keys()
+            .find(|stored| stored.eq_ignore_ascii_case(&event.name))
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("EVENT {} does not exist", event.name))?;
+        events.insert(stored.clone(), event);
+        self.event_metadata.write().insert(stored, metadata);
+        Ok(())
+    }
+
+    pub fn get_event(&self, name: &str) -> Option<EventDefinition> {
+        self.events
+            .read()
+            .iter()
+            .find(|(stored, _)| stored.eq_ignore_ascii_case(name))
+            .map(|(_, event)| event.clone())
+    }
+
+    pub fn list_events(&self) -> Vec<EventDefinition> {
+        self.events.read().values().cloned().collect()
+    }
+
+    pub fn get_event_metadata(&self, name: &str) -> Option<EventMetadata> {
+        self.event_metadata
             .read()
             .iter()
             .find(|(stored, _)| stored.eq_ignore_ascii_case(name))
@@ -2759,6 +2900,22 @@ pub enum WriteCommand {
         function: String,
         create_sql: String,
         metadata: ProcedureMetadata,
+    },
+    // Event variants are appended so every historical bincode WAL
+    // discriminant remains stable.
+    CreateEventV4 {
+        database: String,
+        event: EventDefinition,
+        metadata: EventMetadata,
+    },
+    DropEvent {
+        database: String,
+        event: String,
+    },
+    AlterEventV4 {
+        database: String,
+        event: EventDefinition,
+        metadata: EventMetadata,
     },
 }
 
@@ -5830,6 +5987,10 @@ fn normalize_replay_commands(
         .iter()
         .map(|(name, database)| (name.clone(), database.functions.read().clone()))
         .collect::<HashMap<_, _>>();
+    let mut events = actual
+        .iter()
+        .map(|(name, database)| (name.clone(), database.events.read().clone()))
+        .collect::<HashMap<_, _>>();
     let mut normalized = Vec::with_capacity(commands.len());
     for command in commands {
         match command {
@@ -5838,6 +5999,7 @@ fn normalize_replay_commands(
                     catalog.insert(name.clone(), HashMap::new());
                     procedures.insert(name.clone(), HashMap::new());
                     functions.insert(name.clone(), HashMap::new());
+                    events.insert(name.clone(), HashMap::new());
                     normalized.push(WriteCommand::CreateDatabase(name));
                 }
             }
@@ -5845,6 +6007,7 @@ fn normalize_replay_commands(
                 if catalog.remove(&name).is_some() {
                     procedures.remove(&name);
                     functions.remove(&name);
+                    events.remove(&name);
                     normalized.push(WriteCommand::DropDatabase(name));
                 }
             }
@@ -6184,6 +6347,60 @@ fn normalize_replay_commands(
                     });
                 }
             }
+            WriteCommand::CreateEventV4 {
+                database,
+                event,
+                metadata,
+            } => {
+                let Some(items) = events.get_mut(&database) else {
+                    continue;
+                };
+                if !items
+                    .keys()
+                    .any(|name| name.eq_ignore_ascii_case(&event.name))
+                {
+                    items.insert(event.name.clone(), event.clone());
+                    normalized.push(WriteCommand::CreateEventV4 {
+                        database,
+                        event,
+                        metadata,
+                    });
+                }
+            }
+            WriteCommand::DropEvent { database, event } => {
+                let Some(items) = events.get_mut(&database) else {
+                    continue;
+                };
+                let stored = items
+                    .keys()
+                    .find(|name| name.eq_ignore_ascii_case(&event))
+                    .cloned();
+                if let Some(stored) = stored {
+                    items.remove(&stored);
+                    normalized.push(WriteCommand::DropEvent { database, event });
+                }
+            }
+            WriteCommand::AlterEventV4 {
+                database,
+                event,
+                metadata,
+            } => {
+                let Some(items) = events.get_mut(&database) else {
+                    continue;
+                };
+                let stored = items
+                    .keys()
+                    .find(|name| name.eq_ignore_ascii_case(&event.name))
+                    .cloned();
+                if let Some(stored) = stored {
+                    items.insert(stored, event.clone());
+                    normalized.push(WriteCommand::AlterEventV4 {
+                        database,
+                        event,
+                        metadata,
+                    });
+                }
+            }
         }
     }
     Ok(normalized)
@@ -6490,6 +6707,29 @@ async fn apply_write_batch(
                 db.alter_function_with_metadata(&function, create_sql, metadata)?;
                 db.save().await?;
             }
+            WriteCommand::CreateEventV4 {
+                database,
+                event,
+                metadata,
+            } => {
+                let db = databases.read().get(&database).cloned().unwrap();
+                db.create_event_with_metadata(event, metadata)?;
+                db.save().await?;
+            }
+            WriteCommand::DropEvent { database, event } => {
+                let db = databases.read().get(&database).cloned().unwrap();
+                db.drop_event(&event)?;
+                db.save().await?;
+            }
+            WriteCommand::AlterEventV4 {
+                database,
+                event,
+                metadata,
+            } => {
+                let db = databases.read().get(&database).cloned().unwrap();
+                db.alter_event_with_metadata(event, metadata)?;
+                db.save().await?;
+            }
         }
     }
     if !defer_catalog_save {
@@ -6707,6 +6947,7 @@ fn validate_write_batch(
     let mut catalog: HashMap<String, HashMap<String, TableSchema>> = HashMap::new();
     let mut procedures: HashMap<String, HashMap<String, ProcedureDefinition>> = HashMap::new();
     let mut functions: HashMap<String, HashMap<String, FunctionDefinition>> = HashMap::new();
+    let mut events: HashMap<String, HashMap<String, EventDefinition>> = HashMap::new();
     // Keep only keys introduced by this candidate batch. Existing keys stay in
     // the database-owned sets and are checked in place, avoiding an O(database)
     // clone for every actor request as tables grow.
@@ -6720,6 +6961,7 @@ fn validate_write_batch(
         catalog.insert(database_name.clone(), schemas);
         procedures.insert(database_name.clone(), database.procedures.read().clone());
         functions.insert(database_name.clone(), database.functions.read().clone());
+        events.insert(database_name.clone(), database.events.read().clone());
     }
 
     for command in commands {
@@ -6731,6 +6973,7 @@ fn validate_write_batch(
                 catalog.insert(name.clone(), Default::default());
                 procedures.insert(name.clone(), Default::default());
                 functions.insert(name.clone(), Default::default());
+                events.insert(name.clone(), Default::default());
                 reset_databases.insert(name.clone());
             }
             WriteCommand::DropDatabase(name) => {
@@ -6739,6 +6982,7 @@ fn validate_write_batch(
                 }
                 procedures.remove(name);
                 functions.remove(name);
+                events.remove(name);
                 constraint_keys.retain(|(database, _, _), _| database != name);
                 reset_databases.insert(name.clone());
             }
@@ -7224,6 +7468,44 @@ fn validate_write_batch(
                     .get_mut(&stored)
                     .expect("resolved function")
                     .create_sql = create_sql.clone();
+            }
+            WriteCommand::CreateEventV4 {
+                database, event, ..
+            } => {
+                let items = events
+                    .get_mut(database)
+                    .ok_or_else(|| anyhow::anyhow!("Unknown database '{}'", database))?;
+                if items
+                    .keys()
+                    .any(|name| name.eq_ignore_ascii_case(&event.name))
+                {
+                    anyhow::bail!("EVENT {} already exists", event.name);
+                }
+                items.insert(event.name.clone(), event.clone());
+            }
+            WriteCommand::DropEvent { database, event } => {
+                let items = events
+                    .get_mut(database)
+                    .ok_or_else(|| anyhow::anyhow!("Unknown database '{}'", database))?;
+                let stored = items
+                    .keys()
+                    .find(|name| name.eq_ignore_ascii_case(event))
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("EVENT {} does not exist", event))?;
+                items.remove(&stored);
+            }
+            WriteCommand::AlterEventV4 {
+                database, event, ..
+            } => {
+                let items = events
+                    .get_mut(database)
+                    .ok_or_else(|| anyhow::anyhow!("Unknown database '{}'", database))?;
+                let stored = items
+                    .keys()
+                    .find(|name| name.eq_ignore_ascii_case(&event.name))
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("EVENT {} does not exist", event.name))?;
+                items.insert(stored, event.clone());
             }
         }
     }
@@ -8037,6 +8319,28 @@ mod tests {
             definer: "root@%".into(),
             create_sql: format!(
                 "CREATE FUNCTION {name}(p_value BIGINT) RETURNS BIGINT RETURN p_value + 1"
+            ),
+        }
+    }
+
+    fn event_definition(name: &str) -> EventDefinition {
+        EventDefinition {
+            name: name.into(),
+            definer: "root@%".into(),
+            time_zone: "SYSTEM".into(),
+            body: "BEGIN SET @event_ran = 1; END".into(),
+            schedule: EventSchedule {
+                execute_at: None,
+                interval_value: Some("1".into()),
+                interval_field: Some("DAY".into()),
+                starts: Some("2026-01-01 00:00:00".into()),
+                ends: None,
+            },
+            status: "ENABLED".into(),
+            on_completion: "PRESERVE".into(),
+            comment: "daily event".into(),
+            create_sql: format!(
+                "CREATE EVENT {name} ON SCHEDULE EVERY 1 DAY STARTS '2026-01-01 00:00:00' ON COMPLETION PRESERVE DO BEGIN SET @event_ran = 1; END"
             ),
         }
     }
@@ -8963,7 +9267,141 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn function_catalog_v3_loads_v2_and_upgrades_on_save() {
+    async fn event_catalog_is_wal_backed_and_persistent() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = StorageEngineManager::new(temp.path().to_path_buf(), 16384, "4M");
+        manager.init().await.unwrap();
+        manager.create_database("game").await.unwrap();
+
+        let rejected = event_definition("daily_event");
+        assert!(manager
+            .execute_batch(vec![
+                WriteCommand::CreateEventV4 {
+                    database: "game".into(),
+                    event: rejected.clone(),
+                    metadata: EventMetadata::new("STRICT_TRANS_TABLES".into()),
+                },
+                WriteCommand::CreateEventV4 {
+                    database: "game".into(),
+                    event: rejected,
+                    metadata: EventMetadata::new("STRICT_TRANS_TABLES".into()),
+                },
+            ])
+            .await
+            .is_err());
+        assert!(manager
+            .get_database("game")
+            .unwrap()
+            .get_event("daily_event")
+            .is_none());
+
+        let created = EventMetadata::new("STRICT_TRANS_TABLES".into());
+        manager
+            .execute_write(WriteCommand::CreateEventV4 {
+                database: "game".into(),
+                event: event_definition("daily_event"),
+                metadata: created.clone(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            manager
+                .get_database("game")
+                .unwrap()
+                .get_event("DAILY_EVENT")
+                .unwrap()
+                .schedule
+                .interval_value,
+            Some("1".into())
+        );
+
+        let mut altered_event = event_definition("daily_event");
+        altered_event.schedule.interval_value = Some("2".into());
+        altered_event.status = "DISABLED".into();
+        altered_event.comment = "altered event".into();
+        altered_event.create_sql =
+            "ALTER EVENT daily_event ON SCHEDULE EVERY 2 DAY DISABLE COMMENT 'altered event'"
+                .into();
+        let altered = created.altered("ANSI_QUOTES".into());
+        manager
+            .execute_write(WriteCommand::AlterEventV4 {
+                database: "game".into(),
+                event: altered_event,
+                metadata: altered.clone(),
+            })
+            .await
+            .unwrap();
+        drop(manager);
+
+        let restarted = StorageEngineManager::new(temp.path().to_path_buf(), 16384, "4M");
+        restarted.init().await.unwrap();
+        let database = restarted.get_database("game").unwrap();
+        let persisted = database.get_event("daily_event").unwrap();
+        assert_eq!(persisted.schedule.interval_value, Some("2".into()));
+        assert_eq!(persisted.status, "DISABLED");
+        assert_eq!(persisted.comment, "altered event");
+        assert_eq!(database.get_event_metadata("DAILY_EVENT"), Some(altered));
+
+        restarted
+            .execute_write(WriteCommand::DropEvent {
+                database: "game".into(),
+                event: "DAILY_EVENT".into(),
+            })
+            .await
+            .unwrap();
+        assert!(restarted
+            .get_database("game")
+            .unwrap()
+            .get_event("daily_event")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn event_catalog_v4_loads_v3_and_upgrades_on_save() {
+        let temp = tempfile::tempdir().unwrap();
+        let database_dir = temp.path().join("legacy_v3");
+        std::fs::create_dir_all(&database_dir).unwrap();
+        std::fs::write(database_dir.join("schema.json"), "{}").unwrap();
+        let function = function_definition("add_one");
+        let function_metadata = ProcedureMetadata::new("ANSI".into());
+        let v3_catalog = serde_json::json!({
+            "format_version": 3,
+            "procedures": {},
+            "metadata": {},
+            "functions": { "add_one": function },
+            "function_metadata": { "add_one": function_metadata },
+        });
+        std::fs::write(
+            database_dir.join("routines.json"),
+            serde_json::to_vec_pretty(&v3_catalog).unwrap(),
+        )
+        .unwrap();
+
+        let manager = StorageEngineManager::new(temp.path().to_path_buf(), 16384, "4M");
+        manager.init().await.unwrap();
+        let database = manager.get_database("legacy_v3").unwrap();
+        assert!(database.get_function("ADD_ONE").is_some());
+        assert!(database.list_events().is_empty());
+
+        manager
+            .execute_write(WriteCommand::CreateEventV4 {
+                database: "legacy_v3".into(),
+                event: event_definition("daily_event"),
+                metadata: EventMetadata::new("STRICT_TRANS_TABLES".into()),
+            })
+            .await
+            .unwrap();
+        let catalog: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(database_dir.join("routines.json")).unwrap())
+                .unwrap();
+        assert_eq!(catalog["format_version"], 4);
+        assert!(catalog["functions"]["add_one"].is_object());
+        assert!(catalog["events"]["daily_event"].is_object());
+        assert!(catalog["event_metadata"]["daily_event"].is_object());
+    }
+
+    #[tokio::test]
+    async fn function_catalog_v4_loads_v2_and_upgrades_on_save() {
         let temp = tempfile::tempdir().unwrap();
         let database_dir = temp.path().join("legacy_v2");
         std::fs::create_dir_all(&database_dir).unwrap();
@@ -9004,7 +9442,7 @@ mod tests {
         let catalog: serde_json::Value =
             serde_json::from_slice(&std::fs::read(database_dir.join("routines.json")).unwrap())
                 .unwrap();
-        assert_eq!(catalog["format_version"], 3);
+        assert_eq!(catalog["format_version"], 4);
         assert!(catalog["functions"]["add_one"].is_object());
         assert!(catalog["function_metadata"]["add_one"].is_object());
     }
@@ -9082,7 +9520,7 @@ mod tests {
             &std::fs::read(temp.path().join("game").join("routines.json")).unwrap(),
         )
         .unwrap();
-        assert_eq!(catalog["format_version"], 3);
+        assert_eq!(catalog["format_version"], 4);
     }
 
     #[tokio::test]

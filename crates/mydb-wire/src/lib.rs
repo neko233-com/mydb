@@ -4698,7 +4698,7 @@ impl Backend {
         }
         if upper.starts_with("SELECT ") || upper.starts_with("WITH ") {
             if upper.starts_with("SELECT ") {
-                if let Some(outcome) = self.select_information_schema(sql).await? {
+                if let Some(outcome) = self.select_virtual_schema(sql).await? {
                     return Ok(outcome);
                 }
             }
@@ -10710,23 +10710,45 @@ impl Backend {
             .find_map(|scope| scope.get(&name))
     }
 
-    async fn select_information_schema(
-        &mut self,
-        sql: &str,
-    ) -> anyhow::Result<Option<QueryOutcome>> {
+    async fn select_virtual_schema(&mut self, sql: &str) -> anyhow::Result<Option<QueryOutcome>> {
         let upper = sql.to_ascii_uppercase();
-        if !upper.contains(" FROM INFORMATION_SCHEMA.") {
+        if !upper.contains("INFORMATION_SCHEMA.") && !upper.contains("MYSQL.") {
             return Ok(None);
         }
-        let metadata = information_schema_virtual_tables(&self.storage)?;
+        let viewer = self
+            .authenticated_user
+            .lock()
+            .clone()
+            .unwrap_or_else(|| self.config.username.clone());
+        let schemas = [
+            (
+                "information_schema",
+                information_schema_virtual_tables(
+                    &self.storage,
+                    &self.config.auth_catalog,
+                    &viewer,
+                )?,
+            ),
+            (
+                "mysql",
+                mysql_virtual_tables(&self.config.auth_catalog, &viewer),
+            ),
+        ];
         let mut scope = HashMap::new();
         let mut rewritten = sql.to_string();
         let mut matched = false;
-        let mut metadata = metadata.into_iter().collect::<Vec<_>>();
-        metadata.sort_by_key(|item| std::cmp::Reverse(item.0.len()));
-        for (name, table) in metadata {
-            let source = format!("information_schema.{name}");
-            let replacement = format!("__mydb_information_schema_{name}");
+        let mut metadata = schemas
+            .into_iter()
+            .flat_map(|(schema, metadata)| {
+                metadata
+                    .into_iter()
+                    .map(move |(name, table)| (schema, name, table))
+            })
+            .collect::<Vec<_>>();
+        metadata.sort_by_key(|(schema, name, _)| std::cmp::Reverse(schema.len() + name.len()));
+        for (schema, name, table) in metadata {
+            let source = format!("{schema}.{name}");
+            let replacement = format!("__mydb_{schema}_{name}");
             let (next, replacements) =
                 replace_ascii_case_insensitive(&rewritten, &source, &replacement);
             if replacements > 0 {
@@ -11263,7 +11285,10 @@ fn write_lock_requests(
             | WriteCommand::AlterProcedureV2 { database, .. }
             | WriteCommand::CreateFunctionV2 { database, .. }
             | WriteCommand::DropFunction { database, .. }
-            | WriteCommand::AlterFunctionV2 { database, .. } => {
+            | WriteCommand::AlterFunctionV2 { database, .. }
+            | WriteCommand::CreateEventV4 { database, .. }
+            | WriteCommand::DropEvent { database, .. }
+            | WriteCommand::AlterEventV4 { database, .. } => {
                 add_lock_request(
                     &mut requests,
                     format!("database:{database}"),
@@ -12323,6 +12348,8 @@ struct InformationSchemaConstraint {
 
 fn information_schema_virtual_tables(
     storage: &StorageEngineManager,
+    auth_catalog: &AuthCatalog,
+    viewer: &str,
 ) -> anyhow::Result<HashMap<String, VirtualTable>> {
     let mut schemata_rows = vec![
         information_schema_schemata_row("information_schema"),
@@ -12339,6 +12366,8 @@ fn information_schema_virtual_tables(
     let mut triggers_rows = Vec::new();
     let mut routines_rows = Vec::new();
     let mut parameters_rows = Vec::new();
+    let (user_privileges_rows, schema_privileges_rows) =
+        information_schema_privilege_rows(auth_catalog, viewer);
     let mut databases = storage.list_databases();
     databases.sort();
     databases.dedup();
@@ -13087,6 +13116,55 @@ fn information_schema_virtual_tables(
             },
         ),
         (
+            "user_privileges".into(),
+            VirtualTable {
+                columns: ["GRANTEE", "TABLE_CATALOG", "PRIVILEGE_TYPE", "IS_GRANTABLE"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+                rows: user_privileges_rows,
+            },
+        ),
+        (
+            "schema_privileges".into(),
+            VirtualTable {
+                columns: [
+                    "GRANTEE",
+                    "TABLE_CATALOG",
+                    "TABLE_SCHEMA",
+                    "PRIVILEGE_TYPE",
+                    "IS_GRANTABLE",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+                rows: schema_privileges_rows,
+            },
+        ),
+        (
+            "table_privileges".into(),
+            empty_information_schema_table(&[
+                "GRANTEE",
+                "TABLE_CATALOG",
+                "TABLE_SCHEMA",
+                "TABLE_NAME",
+                "PRIVILEGE_TYPE",
+                "IS_GRANTABLE",
+            ]),
+        ),
+        (
+            "column_privileges".into(),
+            empty_information_schema_table(&[
+                "GRANTEE",
+                "TABLE_CATALOG",
+                "TABLE_SCHEMA",
+                "TABLE_NAME",
+                "COLUMN_NAME",
+                "PRIVILEGE_TYPE",
+                "IS_GRANTABLE",
+            ]),
+        ),
+        (
             "events".into(),
             empty_information_schema_table(&[
                 "EVENT_CATALOG",
@@ -13135,6 +13213,386 @@ fn information_schema_virtual_tables(
             },
         ),
     ]))
+}
+
+#[derive(Clone)]
+struct AuthPrincipalMetadata {
+    principal: String,
+    global_privileges: HashSet<String>,
+    database_privileges: HashMap<String, HashSet<String>>,
+    roles: HashSet<String>,
+    is_role: bool,
+}
+
+const SUPPORTED_AUTH_PRIVILEGES: &[&str] = &[
+    "SELECT",
+    "INSERT",
+    "UPDATE",
+    "DELETE",
+    "CREATE",
+    "DROP",
+    "ALTER",
+    "INDEX",
+    "EXECUTE",
+    "CREATE USER",
+    "GRANT OPTION",
+    "FILE",
+    "PROCESS",
+    "RELOAD",
+];
+
+fn auth_catalog_metadata_principals(
+    auth_catalog: &AuthCatalog,
+    viewer: &str,
+) -> Vec<AuthPrincipalMetadata> {
+    let viewer = normalize_auth_name(viewer);
+    let can_inspect_all = auth_catalog.has_privilege(&viewer, "", "CREATE USER")
+        || auth_catalog.has_privilege(&viewer, "", "GRANT OPTION");
+    let data = auth_catalog.data.read();
+    let mut principals = data
+        .users
+        .iter()
+        .filter(|(principal, _)| can_inspect_all || **principal == viewer)
+        .map(|(principal, user)| AuthPrincipalMetadata {
+            principal: principal.clone(),
+            global_privileges: user.global_privileges.clone(),
+            database_privileges: user.database_privileges.clone(),
+            roles: user.roles.clone(),
+            is_role: false,
+        })
+        .collect::<Vec<_>>();
+    if can_inspect_all {
+        principals.extend(
+            data.roles
+                .iter()
+                .map(|(principal, role)| AuthPrincipalMetadata {
+                    principal: principal.clone(),
+                    global_privileges: role.global_privileges.clone(),
+                    database_privileges: role.database_privileges.clone(),
+                    roles: role.roles.clone(),
+                    is_role: true,
+                }),
+        );
+    }
+    principals.sort_by(|left, right| left.principal.cmp(&right.principal));
+    principals
+}
+
+fn mysql_account_parts(principal: &str) -> (String, String) {
+    let principal = principal.trim();
+    let (user, host) = principal.split_once('@').unwrap_or((principal, "%"));
+    (
+        user.trim().trim_matches(['`', '\'', '"']).to_string(),
+        host.trim().trim_matches(['`', '\'', '"']).to_string(),
+    )
+}
+
+fn mysql_grantee(principal: &str) -> String {
+    let (user, host) = mysql_account_parts(principal);
+    format!(
+        "'{}'@'{}'",
+        user.replace('\'', "''"),
+        host.replace('\'', "''")
+    )
+}
+
+fn auth_privilege_set(privileges: &HashSet<String>) -> Vec<String> {
+    let mut output: Vec<String> = if privileges.contains("ALL") {
+        SUPPORTED_AUTH_PRIVILEGES
+            .iter()
+            .map(|privilege| (*privilege).to_string())
+            .collect()
+    } else {
+        privileges
+            .iter()
+            .filter(|privilege| privilege.as_str() != "ALL")
+            .cloned()
+            .collect()
+    };
+    output.sort();
+    output
+}
+
+fn auth_privilege_enabled(privileges: &HashSet<String>, privilege: &str) -> bool {
+    privileges.contains(privilege)
+        || (privileges.contains("ALL") && SUPPORTED_AUTH_PRIVILEGES.contains(&privilege))
+}
+
+fn auth_grantable(privileges: &HashSet<String>) -> &'static str {
+    if auth_privilege_enabled(privileges, "GRANT OPTION") {
+        "YES"
+    } else {
+        "NO"
+    }
+}
+
+fn information_schema_privilege_rows(
+    auth_catalog: &AuthCatalog,
+    viewer: &str,
+) -> (Vec<Vec<Option<Vec<u8>>>>, Vec<Vec<Option<Vec<u8>>>>) {
+    let mut user_rows = Vec::new();
+    let mut schema_rows = Vec::new();
+    for principal in auth_catalog_metadata_principals(auth_catalog, viewer) {
+        let grantee = mysql_grantee(&principal.principal);
+        let grantable = auth_grantable(&principal.global_privileges);
+        for privilege in auth_privilege_set(&principal.global_privileges) {
+            user_rows.push(vec![
+                bytes(&grantee),
+                bytes("def"),
+                bytes(&privilege),
+                bytes(grantable),
+            ]);
+        }
+        let mut schemas = principal
+            .database_privileges
+            .into_iter()
+            .collect::<Vec<_>>();
+        schemas.sort_by(|left, right| left.0.cmp(&right.0));
+        for (schema, privileges) in schemas {
+            let grantable = auth_grantable(&privileges);
+            for privilege in auth_privilege_set(&privileges) {
+                schema_rows.push(vec![
+                    bytes(&grantee),
+                    bytes("def"),
+                    bytes(&schema),
+                    bytes(&privilege),
+                    bytes(grantable),
+                ]);
+            }
+        }
+    }
+    (user_rows, schema_rows)
+}
+
+fn mysql_virtual_tables(auth_catalog: &AuthCatalog, viewer: &str) -> HashMap<String, VirtualTable> {
+    let principals = auth_catalog_metadata_principals(auth_catalog, viewer);
+    let mut user_rows = Vec::new();
+    let mut db_rows = Vec::new();
+    let mut global_grants_rows = Vec::new();
+    let mut role_edges_rows = Vec::new();
+    let privilege_columns = [
+        ("Select_priv", "SELECT"),
+        ("Insert_priv", "INSERT"),
+        ("Update_priv", "UPDATE"),
+        ("Delete_priv", "DELETE"),
+        ("Create_priv", "CREATE"),
+        ("Drop_priv", "DROP"),
+        ("Reload_priv", "RELOAD"),
+        ("Process_priv", "PROCESS"),
+        ("File_priv", "FILE"),
+        ("Grant_priv", "GRANT OPTION"),
+        ("References_priv", "REFERENCES"),
+        ("Index_priv", "INDEX"),
+        ("Alter_priv", "ALTER"),
+        ("Show_db_priv", "SHOW DATABASES"),
+        ("Super_priv", "SUPER"),
+        ("Create_tmp_table_priv", "CREATE TEMPORARY TABLES"),
+        ("Lock_tables_priv", "LOCK TABLES"),
+        ("Execute_priv", "EXECUTE"),
+        ("Repl_slave_priv", "REPLICATION SLAVE"),
+        ("Repl_client_priv", "REPLICATION CLIENT"),
+        ("Create_view_priv", "CREATE VIEW"),
+        ("Show_view_priv", "SHOW VIEW"),
+        ("Create_routine_priv", "CREATE ROUTINE"),
+        ("Alter_routine_priv", "ALTER ROUTINE"),
+        ("Create_user_priv", "CREATE USER"),
+        ("Event_priv", "EVENT"),
+        ("Trigger_priv", "TRIGGER"),
+        ("Create_tablespace_priv", "CREATE TABLESPACE"),
+    ];
+    for principal in &principals {
+        let (user, host) = mysql_account_parts(&principal.principal);
+        let mut row = vec![bytes(&host), bytes(&user)];
+        row.extend(privilege_columns.iter().map(|(_, privilege)| {
+            bytes(
+                if auth_privilege_enabled(&principal.global_privileges, privilege) {
+                    "Y"
+                } else {
+                    "N"
+                },
+            )
+        }));
+        row.extend([
+            bytes(""),
+            None,
+            None,
+            None,
+            bytes("0"),
+            bytes("0"),
+            bytes("0"),
+            bytes("0"),
+            bytes(if principal.is_role {
+                "mysql_native_password"
+            } else {
+                "mysql_native_password"
+            }),
+            None,
+            None,
+            None,
+            bytes("N"),
+            bytes("N"),
+            None,
+            None,
+            None,
+            Some(Vec::new()),
+        ]);
+        user_rows.push(row);
+
+        let mut schemas = principal.database_privileges.iter().collect::<Vec<_>>();
+        schemas.sort_by(|left, right| left.0.cmp(right.0));
+        for (schema, privileges) in schemas {
+            let mut row = vec![bytes(&host), bytes(schema), bytes(&user)];
+            row.extend(privilege_columns.iter().take(25).map(|(_, privilege)| {
+                bytes(if auth_privilege_enabled(privileges, privilege) {
+                    "Y"
+                } else {
+                    "N"
+                })
+            }));
+            db_rows.push(row);
+        }
+        for privilege in auth_privilege_set(&principal.global_privileges) {
+            global_grants_rows.push(vec![
+                bytes(&user),
+                bytes(&host),
+                bytes(&privilege),
+                bytes(auth_grantable(&principal.global_privileges)),
+            ]);
+        }
+        for role in &principal.roles {
+            let (from_user, from_host) = mysql_account_parts(role);
+            role_edges_rows.push(vec![
+                bytes(&from_host),
+                bytes(&from_user),
+                bytes(&host),
+                bytes(&user),
+                bytes("N"),
+            ]);
+        }
+    }
+    user_rows.sort_by(|left, right| left[1].cmp(&right[1]).then_with(|| left[0].cmp(&right[0])));
+    db_rows.sort_by(|left, right| left[1].cmp(&right[1]).then_with(|| left[2].cmp(&right[2])));
+    global_grants_rows
+        .sort_by(|left, right| left[0].cmp(&right[0]).then_with(|| left[2].cmp(&right[2])));
+    role_edges_rows.sort();
+
+    let mut user_columns = vec!["Host", "User"];
+    user_columns.extend(privilege_columns.iter().map(|(column, _)| *column));
+    user_columns.extend([
+        "ssl_type",
+        "ssl_cipher",
+        "x509_issuer",
+        "x509_subject",
+        "max_questions",
+        "max_updates",
+        "max_connections",
+        "max_user_connections",
+        "plugin",
+        "authentication_string",
+        "password_last_changed",
+        "password_lifetime",
+        "account_locked",
+        "password_expired",
+        "password_history",
+        "password_reuse_interval",
+        "password_require_current",
+        "User_attributes",
+    ]);
+    let mut db_columns = vec!["Host", "Db", "User"];
+    db_columns.extend(privilege_columns.iter().take(25).map(|(column, _)| *column));
+    HashMap::from([
+        (
+            "user".into(),
+            VirtualTable {
+                columns: user_columns.into_iter().map(str::to_string).collect(),
+                rows: user_rows,
+            },
+        ),
+        (
+            "db".into(),
+            VirtualTable {
+                columns: db_columns.into_iter().map(str::to_string).collect(),
+                rows: db_rows,
+            },
+        ),
+        (
+            "global_grants".into(),
+            VirtualTable {
+                columns: ["USER", "HOST", "PRIV", "WITH_GRANT_OPTION"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+                rows: global_grants_rows,
+            },
+        ),
+        (
+            "role_edges".into(),
+            VirtualTable {
+                columns: [
+                    "FROM_HOST",
+                    "FROM_USER",
+                    "TO_HOST",
+                    "TO_USER",
+                    "WITH_ADMIN_OPTION",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+                rows: role_edges_rows,
+            },
+        ),
+        (
+            "default_roles".into(),
+            empty_information_schema_table(&[
+                "HOST",
+                "USER",
+                "DEFAULT_ROLE_HOST",
+                "DEFAULT_ROLE_USER",
+            ]),
+        ),
+        (
+            "tables_priv".into(),
+            empty_information_schema_table(&[
+                "Host",
+                "Db",
+                "User",
+                "Table_name",
+                "Grantor",
+                "Timestamp",
+                "Table_priv",
+                "Column_priv",
+            ]),
+        ),
+        (
+            "columns_priv".into(),
+            empty_information_schema_table(&[
+                "Host",
+                "Db",
+                "User",
+                "Table_name",
+                "Column_name",
+                "Timestamp",
+                "Column_priv",
+            ]),
+        ),
+        (
+            "procs_priv".into(),
+            empty_information_schema_table(&[
+                "Host",
+                "Db",
+                "User",
+                "Routine_name",
+                "Routine_type",
+                "Grantor",
+                "Proc_priv",
+                "Timestamp",
+            ]),
+        ),
+        (
+            "func".into(),
+            empty_information_schema_table(&["name", "ret", "dl", "type"]),
+        ),
+    ])
 }
 
 fn bytes(value: &str) -> Option<Vec<u8>> {
@@ -29426,6 +29884,71 @@ mod tests {
             _ => panic!("expected grants rows"),
         };
         assert!(!rendered.iter().any(|grant| grant.contains("analyst")));
+    }
+
+    #[tokio::test]
+    async fn mysql_system_tables_and_information_schema_privileges_reflect_auth_catalog() {
+        let (_temp, _storage, mut backend, _second) = transaction_backends().await;
+        backend
+            .execute("CREATE USER 'catalog_reader' IDENTIFIED BY 'reader-password'")
+            .await
+            .unwrap();
+        backend.execute("CREATE ROLE catalog_role").await.unwrap();
+        backend
+            .execute("GRANT SELECT, INSERT ON mydb.* TO 'catalog_reader'")
+            .await
+            .unwrap();
+        backend
+            .execute("GRANT catalog_role TO 'catalog_reader'")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            query_rows(
+                &mut backend,
+                "SELECT User,Host,Select_priv,Insert_priv,Create_user_priv \
+                 FROM mysql.user WHERE User='catalog_reader'",
+            )
+            .await,
+            vec![vec![
+                bytes("catalog_reader"),
+                bytes("%"),
+                bytes("N"),
+                bytes("N"),
+                bytes("N"),
+            ]]
+        );
+        assert_eq!(
+            query_rows(
+                &mut backend,
+                "SELECT Db,User,Select_priv,Insert_priv FROM mysql.db \
+                 WHERE User='catalog_reader'",
+            )
+            .await,
+            vec![vec![
+                bytes("mydb"),
+                bytes("catalog_reader"),
+                bytes("Y"),
+                bytes("Y"),
+            ]]
+        );
+        assert_eq!(
+            query_rows(
+                &mut backend,
+                "SELECT PRIVILEGE_TYPE FROM information_schema.schema_privileges \
+                 WHERE TABLE_SCHEMA='mydb' ORDER BY PRIVILEGE_TYPE",
+            )
+            .await,
+            vec![vec![bytes("INSERT")], vec![bytes("SELECT")]]
+        );
+        assert_eq!(
+            query_rows(
+                &mut backend,
+                "SELECT FROM_USER,TO_USER FROM mysql.role_edges WHERE TO_USER='catalog_reader'",
+            )
+            .await,
+            vec![vec![bytes("catalog_role"), bytes("catalog_reader")]]
+        );
     }
 
     #[tokio::test]
