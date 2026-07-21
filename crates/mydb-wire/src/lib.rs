@@ -3986,24 +3986,32 @@ impl Backend {
         }
         if upper.starts_with("DROP VIEW") {
             self.commit_pending().await?;
-            let reference = last_identifier(sql)?;
-            let (database, table) = self.resolve_table_reference(&reference)?;
-            let existing = self
-                .storage
-                .get_database(&database)
-                .and_then(|database| database.get_table(&table));
-            let Some(existing) = existing else {
-                if upper.contains(" IF EXISTS ") {
-                    return Ok(QueryOutcome::ok(0));
-                }
-                anyhow::bail!("Unknown table '{}.{}'", database, table);
+            let if_exists = upper.starts_with("DROP VIEW IF EXISTS ");
+            let prefix = if if_exists {
+                "DROP VIEW IF EXISTS "
+            } else {
+                "DROP VIEW "
             };
-            if view_select_sql(&existing).is_none() {
-                anyhow::bail!("'{}.{}' is not VIEW", database, table);
+            let references = split_csv(sql[prefix.len()..].trim());
+            let mut commands = Vec::with_capacity(references.len());
+            for reference in references {
+                let (database, table) = self.resolve_table_reference(&reference)?;
+                let existing = self
+                    .storage
+                    .get_database(&database)
+                    .and_then(|database| database.get_table(&table));
+                let Some(existing) = existing else {
+                    if if_exists {
+                        continue;
+                    }
+                    anyhow::bail!("Unknown table '{}.{}'", database, table);
+                };
+                if view_select_sql(&existing).is_none() {
+                    anyhow::bail!("'{}.{}' is not VIEW", database, table);
+                }
+                commands.push(WriteCommand::DropTable { database, table });
             }
-            return self
-                .submit_ddl(vec![WriteCommand::DropTable { database, table }])
-                .await;
+            return self.submit_ddl(commands).await;
         }
         if upper.starts_with("CREATE TEMPORARY TABLE") {
             return self.create_temporary_table(sql).await;
@@ -4109,43 +4117,52 @@ impl Backend {
                 .await;
         }
         if upper.starts_with("DROP TABLE") {
-            let reference = last_identifier(sql)?;
-            let (logical_database, logical_table) =
-                split_table_reference(&reference, &self.database)?;
-            if self
-                .temporary_tables
-                .contains_key(&Self::temporary_table_key(
-                    &logical_database,
-                    &logical_table,
-                ))
-            {
-                return self
-                    .drop_temporary_table(&reference, upper.contains(" IF EXISTS "))
-                    .await;
+            let if_exists = upper.starts_with("DROP TABLE IF EXISTS ");
+            let prefix = if if_exists {
+                "DROP TABLE IF EXISTS "
+            } else {
+                "DROP TABLE "
+            };
+            let references = split_csv(sql[prefix.len()..].trim());
+            if references.len() == 1 {
+                let (database, table) = split_table_reference(&references[0], &self.database)?;
+                if self
+                    .temporary_tables
+                    .contains_key(&Self::temporary_table_key(&database, &table))
+                {
+                    return self.drop_temporary_table(&references[0], if_exists).await;
+                }
             }
             self.commit_pending().await?;
-            let (database, table) = (logical_database, logical_table);
-            if upper.contains(" IF EXISTS ")
-                && self
+            let mut commands = Vec::with_capacity(references.len());
+            for reference in references {
+                let (database, table) = split_table_reference(&reference, &self.database)?;
+                if self
+                    .temporary_tables
+                    .contains_key(&Self::temporary_table_key(&database, &table))
+                {
+                    anyhow::bail!(
+                        "DROP TABLE cannot drop temporary table '{}.{}'",
+                        database,
+                        table
+                    );
+                }
+                let existing = self
                     .storage
                     .get_database(&database)
-                    .and_then(|db| db.get_table(&table))
-                    .is_none()
-            {
-                return Ok(QueryOutcome::ok(0));
+                    .and_then(|database| database.get_table(&table));
+                let Some(existing) = existing else {
+                    if if_exists {
+                        continue;
+                    }
+                    anyhow::bail!("Unknown table '{}.{}'", database, table);
+                };
+                if view_select_sql(&existing).is_some() {
+                    anyhow::bail!("'{}.{}' is not BASE TABLE", database, table);
+                }
+                commands.push(WriteCommand::DropTable { database, table });
             }
-            if self
-                .storage
-                .get_database(&database)
-                .and_then(|database| database.get_table(&table))
-                .as_ref()
-                .is_some_and(|schema| view_select_sql(schema).is_some())
-            {
-                anyhow::bail!("'{}.{}' is not BASE TABLE", database, table);
-            }
-            return self
-                .submit_ddl(vec![WriteCommand::DropTable { database, table }])
-                .await;
+            return self.submit_ddl(commands).await;
         }
         if upper.starts_with("RENAME TABLE ") {
             self.commit_pending().await?;
@@ -28992,6 +29009,50 @@ mod tests {
                 .to_string()
                 .contains("does not exist"));
         }
+    }
+
+    #[tokio::test]
+    async fn drop_table_and_view_accept_multiple_objects() {
+        let (_temp, storage, mut backend, _second) = transaction_backends().await;
+        backend
+            .execute("CREATE TABLE drop_batch_one (id BIGINT PRIMARY KEY)")
+            .await
+            .unwrap();
+        backend
+            .execute("CREATE TABLE drop_batch_two (id BIGINT PRIMARY KEY)")
+            .await
+            .unwrap();
+        backend
+            .execute("DROP TABLE drop_batch_one, drop_batch_two")
+            .await
+            .unwrap();
+        assert!(storage
+            .get_database("mydb")
+            .unwrap()
+            .get_table("drop_batch_one")
+            .is_none());
+        assert!(storage
+            .get_database("mydb")
+            .unwrap()
+            .get_table("drop_batch_two")
+            .is_none());
+
+        backend
+            .execute("CREATE VIEW drop_batch_view_one AS SELECT 1 AS id")
+            .await
+            .unwrap();
+        backend
+            .execute("CREATE VIEW drop_batch_view_two AS SELECT 2 AS id")
+            .await
+            .unwrap();
+        backend
+            .execute("DROP VIEW drop_batch_view_one, drop_batch_view_two")
+            .await
+            .unwrap();
+        backend
+            .execute("DROP VIEW IF EXISTS drop_batch_view_one, missing_view")
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
