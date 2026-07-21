@@ -1317,6 +1317,7 @@ fn parse_privilege_list(value: &str) -> anyhow::Result<HashSet<String>> {
         "FILE",
         "PROCESS",
         "RELOAD",
+        "LOCK TABLES",
         "EVENT",
     ];
     let values = value
@@ -1359,6 +1360,10 @@ pub struct WireStats {
     table_lock_acquires: AtomicU64,
     slow_queries: parking_lot::Mutex<VecDeque<SlowQuerySnapshot>>,
     transaction_locks: parking_lot::Mutex<HashMap<String, LockState>>,
+    // LOCK TABLES locks outlive a transaction, so keep them separate from
+    // transaction_locks.  Every operation that needs both registries takes
+    // transaction_locks before explicit_table_locks.
+    explicit_table_locks: parking_lot::Mutex<HashMap<String, LockState>>,
     waits_for: parking_lot::Mutex<HashMap<u32, HashSet<u32>>>,
     pending_transactions:
         parking_lot::Mutex<HashMap<u32, Weak<parking_lot::RwLock<Vec<WriteCommand>>>>>,
@@ -1401,6 +1406,11 @@ fn start_transaction_read_only(upper: &str) -> anyhow::Result<bool> {
     }
     Ok(read_only)
 }
+
+const LOCK_TABLES_IN_STORED_PROGRAM_ERROR: &str =
+    "LOCK TABLES is not allowed in stored procedures or functions";
+const ACTIVE_TABLE_LOCKS_ERROR: &str =
+    "Can't execute the given command because you have active locked tables or an active transaction";
 
 fn is_read_only_transaction_write_statement(upper: &str) -> bool {
     [
@@ -1464,12 +1474,15 @@ impl WireStats {
             deadlocks: self.deadlocks.load(Ordering::Relaxed),
             row_lock_acquires: self.row_lock_acquires.load(Ordering::Relaxed),
             table_lock_acquires: self.table_lock_acquires.load(Ordering::Relaxed),
-            active_locks: self
-                .transaction_locks
-                .lock()
-                .values()
-                .map(|lock| lock.holders.len())
-                .sum(),
+            active_locks: {
+                let transaction_locks = self.transaction_locks.lock();
+                let explicit_table_locks = self.explicit_table_locks.lock();
+                transaction_locks
+                    .values()
+                    .chain(explicit_table_locks.values())
+                    .map(|lock| lock.holders.len())
+                    .sum()
+            },
         }
     }
 
@@ -1534,9 +1547,44 @@ impl WireStats {
         connection_id: u32,
         timeout: std::time::Duration,
     ) -> anyhow::Result<()> {
+        let snapshot = self.connection_lock_snapshot(connection_id);
         for request in requests {
-            self.acquire_lock(&request.resource, connection_id, request.mode, timeout)
-                .await?;
+            if let Err(error) = self
+                .acquire_lock(&request.resource, connection_id, request.mode, timeout)
+                .await
+            {
+                self.restore_connection_locks(connection_id, snapshot);
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    // A nonlocking read must still be visible to an explicit LOCK TABLES
+    // lease, but it must not conflict with ordinary InnoDB-style transaction
+    // locks. Keep a short-lived marker in transaction_locks so a concurrent
+    // LOCK TABLES acquisition observes the read atomically, while checking
+    // compatibility only against the explicit-lock registry.
+    async fn acquire_read_locks_against_explicit(
+        &self,
+        requests: &[LockRequest],
+        connection_id: u32,
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<()> {
+        let snapshot = self.connection_lock_snapshot(connection_id);
+        for request in requests {
+            if let Err(error) = self
+                .acquire_read_lock_against_explicit(
+                    &request.resource,
+                    connection_id,
+                    request.mode,
+                    timeout,
+                )
+                .await
+            {
+                self.restore_connection_locks(connection_id, snapshot);
+                return Err(error);
+            }
         }
         Ok(())
     }
@@ -1557,12 +1605,10 @@ impl WireStats {
 
     fn try_acquire_locks(&self, requests: &[LockRequest], connection_id: u32) -> bool {
         let mut locks = self.transaction_locks.lock();
+        let explicit_table_locks = self.explicit_table_locks.lock();
         let compatible = requests.iter().all(|request| {
-            locks.get(&request.resource).is_none_or(|lock| {
-                lock.holders.iter().all(|(holder, held)| {
-                    *holder == connection_id || lock_modes_compatible(*held, request.mode)
-                })
-            })
+            lock_request_compatible(&locks, request, connection_id)
+                && lock_request_compatible(&explicit_table_locks, request, connection_id)
         });
         if !compatible {
             return false;
@@ -1582,6 +1628,42 @@ impl WireStats {
         true
     }
 
+    async fn acquire_explicit_table_locks(
+        &self,
+        requests: &[LockRequest],
+        connection_id: u32,
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<()> {
+        let mut requested_modes = HashMap::new();
+        for request in requests {
+            if !request.resource.starts_with("table:") && !request.resource.starts_with("database:")
+            {
+                anyhow::bail!("explicit table locks must target table or database resources");
+            }
+            add_lock_request(&mut requested_modes, request.resource.clone(), request.mode);
+        }
+        let requests = sorted_lock_requests(requested_modes);
+        let snapshot = self.explicit_table_lock_snapshot(connection_id);
+        for request in &requests {
+            if let Err(error) = self
+                .acquire_explicit_table_lock(
+                    &request.resource,
+                    connection_id,
+                    request.mode,
+                    timeout,
+                )
+                .await
+            {
+                // LOCK TABLES is a single operation.  A timeout/deadlock on a
+                // later table must not leave locks acquired earlier in this
+                // call (or upgrades of pre-existing explicit locks) behind.
+                self.restore_explicit_table_locks(connection_id, snapshot);
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
     async fn acquire_lock(
         &self,
         resource: &str,
@@ -1595,17 +1677,21 @@ impl WireStats {
             let notified = self.lock_changed.notified();
             let blockers = {
                 let mut locks = self.transaction_locks.lock();
-                let lock = locks.entry(resource.to_string()).or_default();
-                let blockers = lock
-                    .holders
-                    .iter()
-                    .filter_map(|(holder, held)| {
-                        (*holder != connection_id && !lock_modes_compatible(*held, mode))
-                            .then_some(*holder)
-                    })
+                let explicit_table_locks = self.explicit_table_locks.lock();
+                let blockers = lock_request_blockers(&locks, resource, connection_id, mode)
+                    .into_iter()
+                    .chain(lock_request_blockers(
+                        &explicit_table_locks,
+                        resource,
+                        connection_id,
+                        mode,
+                    ))
                     .collect::<HashSet<_>>();
                 if blockers.is_empty() {
-                    lock.holders
+                    locks
+                        .entry(resource.to_string())
+                        .or_default()
+                        .holders
                         .entry(connection_id)
                         .and_modify(|held| *held = merge_lock_modes(*held, mode))
                         .or_insert(mode);
@@ -1647,12 +1733,195 @@ impl WireStats {
         }
     }
 
+    async fn acquire_read_lock_against_explicit(
+        &self,
+        resource: &str,
+        connection_id: u32,
+        mode: LockMode,
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<()> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut waiting_recorded = false;
+        loop {
+            let notified = self.lock_changed.notified();
+            let blockers = {
+                let mut transaction_locks = self.transaction_locks.lock();
+                let explicit_table_locks = self.explicit_table_locks.lock();
+                let blockers =
+                    lock_request_blockers(&explicit_table_locks, resource, connection_id, mode);
+                if blockers.is_empty() {
+                    transaction_locks
+                        .entry(resource.to_string())
+                        .or_default()
+                        .holders
+                        .entry(connection_id)
+                        .and_modify(|held| *held = merge_lock_modes(*held, mode))
+                        .or_insert(mode);
+                }
+                blockers
+            };
+            if blockers.is_empty() {
+                self.waits_for.lock().remove(&connection_id);
+                self.table_lock_acquires.fetch_add(1, Ordering::Relaxed);
+                return Ok(());
+            }
+            {
+                let mut waits_for = self.waits_for.lock();
+                waits_for.insert(connection_id, blockers.clone());
+                let deadlocked = blockers.iter().any(|blocker| {
+                    wait_graph_reaches(&waits_for, *blocker, connection_id, &mut HashSet::new())
+                });
+                if deadlocked {
+                    waits_for.remove(&connection_id);
+                    self.deadlocks.fetch_add(1, Ordering::Relaxed);
+                    anyhow::bail!(
+                        "Deadlock found when trying to get lock; try restarting transaction"
+                    );
+                }
+            }
+            if !waiting_recorded {
+                self.lock_waits.fetch_add(1, Ordering::Relaxed);
+                waiting_recorded = true;
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                self.waits_for.lock().remove(&connection_id);
+                self.lock_timeouts.fetch_add(1, Ordering::Relaxed);
+                anyhow::bail!("Lock wait timeout exceeded for '{}'", resource);
+            }
+        }
+    }
+
+    async fn acquire_explicit_table_lock(
+        &self,
+        resource: &str,
+        connection_id: u32,
+        mode: LockMode,
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<()> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut waiting_recorded = false;
+        loop {
+            let notified = self.lock_changed.notified();
+            let blockers = {
+                let transaction_locks = self.transaction_locks.lock();
+                let mut explicit_table_locks = self.explicit_table_locks.lock();
+                let blockers =
+                    lock_request_blockers(&transaction_locks, resource, connection_id, mode)
+                        .into_iter()
+                        .chain(lock_request_blockers(
+                            &explicit_table_locks,
+                            resource,
+                            connection_id,
+                            mode,
+                        ))
+                        .collect::<HashSet<_>>();
+                if blockers.is_empty() {
+                    explicit_table_locks
+                        .entry(resource.to_string())
+                        .or_default()
+                        .holders
+                        .entry(connection_id)
+                        .and_modify(|held| *held = merge_lock_modes(*held, mode))
+                        .or_insert(mode);
+                }
+                blockers
+            };
+            if blockers.is_empty() {
+                self.waits_for.lock().remove(&connection_id);
+                self.table_lock_acquires.fetch_add(1, Ordering::Relaxed);
+                return Ok(());
+            }
+            {
+                let mut waits_for = self.waits_for.lock();
+                waits_for.insert(connection_id, blockers.clone());
+                let deadlocked = blockers.iter().any(|blocker| {
+                    wait_graph_reaches(&waits_for, *blocker, connection_id, &mut HashSet::new())
+                });
+                if deadlocked {
+                    waits_for.remove(&connection_id);
+                    self.deadlocks.fetch_add(1, Ordering::Relaxed);
+                    anyhow::bail!(
+                        "Deadlock found when trying to get lock; try restarting transaction"
+                    );
+                }
+            }
+            if !waiting_recorded {
+                self.lock_waits.fetch_add(1, Ordering::Relaxed);
+                waiting_recorded = true;
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                self.waits_for.lock().remove(&connection_id);
+                self.lock_timeouts.fetch_add(1, Ordering::Relaxed);
+                anyhow::bail!("Lock wait timeout exceeded for '{}'", resource);
+            }
+        }
+    }
+
     fn release_all_locks(&self, connection_id: u32) {
         let mut locks = self.transaction_locks.lock();
         locks.retain(|_, lock| {
             lock.holders.remove(&connection_id);
             !lock.holders.is_empty()
         });
+        drop(locks);
+        let mut waits_for = self.waits_for.lock();
+        waits_for.remove(&connection_id);
+        for blockers in waits_for.values_mut() {
+            blockers.remove(&connection_id);
+        }
+        waits_for.retain(|_, blockers| !blockers.is_empty());
+        drop(waits_for);
+        self.lock_changed.notify_waiters();
+    }
+
+    fn release_explicit_table_locks(&self, connection_id: u32) {
+        let mut locks = self.explicit_table_locks.lock();
+        locks.retain(|_, lock| {
+            lock.holders.remove(&connection_id);
+            !lock.holders.is_empty()
+        });
+        drop(locks);
+        let mut waits_for = self.waits_for.lock();
+        waits_for.remove(&connection_id);
+        for blockers in waits_for.values_mut() {
+            blockers.remove(&connection_id);
+        }
+        waits_for.retain(|_, blockers| !blockers.is_empty());
+        drop(waits_for);
+        self.lock_changed.notify_waiters();
+    }
+
+    fn explicit_table_lock_snapshot(&self, connection_id: u32) -> HashMap<String, LockMode> {
+        self.explicit_table_locks
+            .lock()
+            .iter()
+            .filter_map(|(resource, state)| {
+                state
+                    .holders
+                    .get(&connection_id)
+                    .copied()
+                    .map(|mode| (resource.clone(), mode))
+            })
+            .collect()
+    }
+
+    fn restore_explicit_table_locks(
+        &self,
+        connection_id: u32,
+        snapshot: HashMap<String, LockMode>,
+    ) {
+        let mut locks = self.explicit_table_locks.lock();
+        locks.retain(|_, lock| {
+            lock.holders.remove(&connection_id);
+            !lock.holders.is_empty()
+        });
+        for (resource, mode) in snapshot {
+            locks
+                .entry(resource)
+                .or_default()
+                .holders
+                .insert(connection_id, mode);
+        }
         drop(locks);
         let mut waits_for = self.waits_for.lock();
         waits_for.remove(&connection_id);
@@ -1722,6 +1991,34 @@ fn wait_graph_reaches(
     })
 }
 
+fn lock_request_compatible(
+    locks: &HashMap<String, LockState>,
+    request: &LockRequest,
+    connection_id: u32,
+) -> bool {
+    lock_request_blockers(locks, &request.resource, connection_id, request.mode).is_empty()
+}
+
+fn lock_request_blockers(
+    locks: &HashMap<String, LockState>,
+    resource: &str,
+    connection_id: u32,
+    mode: LockMode,
+) -> HashSet<u32> {
+    locks
+        .get(resource)
+        .map(|lock| {
+            lock.holders
+                .iter()
+                .filter_map(|(holder, held)| {
+                    (*holder != connection_id && !lock_modes_compatible(*held, mode))
+                        .then_some(*holder)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn lock_modes_compatible(held: LockMode, requested: LockMode) -> bool {
     matches!(
         (held, requested),
@@ -1784,6 +2081,12 @@ struct Backend {
     session_diagnostics: ProcedureDiagnosticsArea,
     temporary_tables: HashMap<(String, String), String>,
     next_temporary_table_id: u64,
+    // LOCK TABLES uses a connection-scoped whitelist.  The actual lock lease
+    // lives in WireStats so other sessions block; this map enforces MySQL's
+    // rule that the locking session may access only its declared tables.
+    explicit_table_locks: HashMap<(String, String), LockMode>,
+    explicit_table_references: HashMap<String, (String, String)>,
+    plain_select_lock_scope: bool,
     procedure_depth: u32,
     authenticated_user: parking_lot::Mutex<Option<String>>,
     client_address: String,
@@ -1793,6 +2096,13 @@ struct Backend {
 struct TransactionSavepoint {
     name: String,
     writes_len: usize,
+}
+
+#[derive(Debug, Clone)]
+struct ParsedTableLock {
+    reference: String,
+    alias: Option<String>,
+    mode: LockMode,
 }
 
 #[derive(Debug, Clone)]
@@ -1888,6 +2198,9 @@ impl Backend {
             session_diagnostics: ProcedureDiagnosticsArea::default(),
             temporary_tables: HashMap::new(),
             next_temporary_table_id: 1,
+            explicit_table_locks: HashMap::new(),
+            explicit_table_references: HashMap::new(),
+            plain_select_lock_scope: false,
             procedure_depth: 0,
             authenticated_user: parking_lot::Mutex::new(None),
             client_address: "local".to_string(),
@@ -1899,6 +2212,10 @@ impl Backend {
         self.transaction_snapshot.clear();
         self.savepoints.clear();
         self.stats.release_all_locks(self.connection_id);
+        self.stats.release_explicit_table_locks(self.connection_id);
+        self.explicit_table_locks.clear();
+        self.explicit_table_references.clear();
+        self.plain_select_lock_scope = false;
         self.in_transaction = false;
         self.transaction_read_only = false;
 
@@ -2351,6 +2668,120 @@ impl Backend {
             anyhow::bail!(READ_ONLY_TRANSACTION_ERROR);
         }
         Ok(())
+    }
+
+    async fn lock_tables(&mut self, sql: &str) -> anyhow::Result<QueryOutcome> {
+        if self.procedure_depth > 0 {
+            anyhow::bail!(LOCK_TABLES_IN_STORED_PROGRAM_ERROR);
+        }
+        let parsed = parse_lock_tables(sql)?;
+        let user = self
+            .authenticated_user
+            .lock()
+            .clone()
+            .unwrap_or_else(|| self.config.username.clone());
+        let mut requested = HashMap::new();
+        let mut table_modes = HashMap::new();
+        let mut references = HashMap::new();
+        for item in parsed {
+            let (database, table) = self.resolve_table_reference_unrestricted(&item.reference)?;
+            if is_virtual_schema_name(&database) {
+                anyhow::bail!(
+                    "LOCK TABLES does not support virtual system table '{}.{}'",
+                    database,
+                    table
+                );
+            }
+            if table.starts_with("__mydb_tmp_") {
+                // Temporary tables are connection-private. MySQL accepts a
+                // LOCK TABLES clause for them but does not acquire a lock.
+                continue;
+            }
+            for privilege in ["LOCK TABLES", "SELECT"] {
+                if !self
+                    .config
+                    .auth_catalog
+                    .has_privilege(&user, &database, privilege)
+                {
+                    anyhow::bail!(
+                        "Access denied; user '{}' lacks {} privilege on '{}.{}'",
+                        user,
+                        privilege,
+                        database,
+                        table
+                    );
+                }
+            }
+            if self
+                .storage
+                .get_database(&database)
+                .and_then(|database| database.get_table(&table))
+                .is_none()
+            {
+                anyhow::bail!("Table '{}.{}' does not exist", database, table);
+            }
+            let key = Self::explicit_table_key(&database, &table);
+            table_modes
+                .entry(key.clone())
+                .and_modify(|mode| *mode = merge_lock_modes(*mode, item.mode))
+                .or_insert(item.mode);
+            let reference_name = item
+                .alias
+                .as_deref()
+                .unwrap_or(&table)
+                .trim_matches('`')
+                .to_ascii_lowercase();
+            if references
+                .insert(reference_name.clone(), (database.clone(), table.clone()))
+                .is_some()
+            {
+                anyhow::bail!("Duplicate LOCK TABLES table reference '{}'", reference_name);
+            }
+            let database_mode = if item.mode == LockMode::Exclusive {
+                LockMode::IntentionExclusive
+            } else {
+                LockMode::IntentionShared
+            };
+            add_lock_request(
+                &mut requested,
+                format!("database:{database}"),
+                database_mode,
+            );
+            add_lock_request(
+                &mut requested,
+                format!("table:{database}.{table}"),
+                item.mode,
+            );
+        }
+
+        // MySQL commits the current transaction and replaces any previous
+        // table-lock set before acquiring a new one.
+        self.commit_pending().await?;
+        self.in_transaction = false;
+        self.clear_explicit_table_locks();
+        self.stats
+            .acquire_explicit_table_locks(
+                &sorted_lock_requests(requested),
+                self.connection_id,
+                self.lock_wait_timeout,
+            )
+            .await?;
+        self.explicit_table_locks = table_modes;
+        self.explicit_table_references = references;
+        Ok(QueryOutcome::ok(0))
+    }
+
+    async fn unlock_tables(&mut self) -> anyhow::Result<QueryOutcome> {
+        if self.procedure_depth > 0 {
+            anyhow::bail!(LOCK_TABLES_IN_STORED_PROGRAM_ERROR);
+        }
+        if !self.explicit_table_locks.is_empty() {
+            let affected = self.commit_pending().await?;
+            self.in_transaction = false;
+            self.clear_explicit_table_locks();
+            return Ok(QueryOutcome::ok(affected));
+        }
+        Ok(QueryOutcome::ok(0))
     }
 
     fn execute_prepare_statement(&mut self, sql: &str) -> anyhow::Result<QueryOutcome> {
@@ -3416,8 +3847,6 @@ impl Backend {
             || sql.starts_with('#')
             || sql.starts_with("/*!")
             || (sql.starts_with("/*") && sql.ends_with("*/"))
-            || upper.starts_with("LOCK TABLES ")
-            || upper == "UNLOCK TABLES"
         {
             return Ok(QueryOutcome::ok(0));
         }
@@ -3429,6 +3858,16 @@ impl Backend {
         }
 
         self.require_statement_privilege(sql, &upper)?;
+
+        if is_lock_tables_statement(&upper) {
+            return self.lock_tables(sql).await;
+        }
+        if is_unlock_tables_statement(&upper) {
+            return self.unlock_tables().await;
+        }
+        if !self.explicit_table_locks.is_empty() && is_table_lock_restricted_ddl(&upper) {
+            anyhow::bail!(ACTIVE_TABLE_LOCKS_ERROR);
+        }
 
         if upper.starts_with("USE ") {
             let database = sql["USE".len()..].trim().trim_matches('`');
@@ -3449,6 +3888,9 @@ impl Backend {
                 false
             };
             self.commit_pending().await?;
+            // START TRANSACTION implicitly releases table locks acquired with
+            // LOCK TABLES, while COMMIT and ROLLBACK themselves do not.
+            self.clear_explicit_table_locks();
             self.transaction_snapshot.clear();
             self.savepoints.clear();
             self.in_transaction = true;
@@ -4603,7 +5045,7 @@ impl Backend {
             self.commit_pending().await?;
             let mut commands = Vec::with_capacity(references.len());
             for reference in references {
-                let (database, table) = split_table_reference(&reference, &self.database)?;
+                let (database, table) = self.resolve_table_reference(&reference)?;
                 if self
                     .temporary_tables
                     .contains_key(&Self::temporary_table_key(&database, &table))
@@ -4931,17 +5373,28 @@ impl Backend {
                 || upper.contains(" LOCK IN SHARE MODE")
                 || (self.in_transaction
                     && self.transaction_isolation == TransactionIsolation::Serializable);
-            if calculates_found_rows {
-                let count_query = found_rows_count_query(sql);
-                let full_result = Box::pin(self.select(&count_query)).await?;
-                let QueryOutcome::Rows { rows, .. } = full_result else {
-                    anyhow::bail!("SQL_CALC_FOUND_ROWS requires a row result");
-                };
-                self.pending_found_rows = Some(rows.len() as u64);
+            let statement_lock_snapshot =
+                (!locking_read).then(|| self.stats.connection_lock_snapshot(self.connection_id));
+            let previous_plain_select_lock_scope = self.plain_select_lock_scope;
+            self.plain_select_lock_scope = !locking_read;
+            let mut result = async {
+                if calculates_found_rows {
+                    let count_query = found_rows_count_query(sql);
+                    let full_result = Box::pin(self.select(&count_query)).await?;
+                    let QueryOutcome::Rows { rows, .. } = full_result else {
+                        anyhow::bail!("SQL_CALC_FOUND_ROWS requires a row result");
+                    };
+                    self.pending_found_rows = Some(rows.len() as u64);
+                }
+                self.select(sql).await
             }
-            let mut result = self.select(sql).await;
+            .await;
+            self.plain_select_lock_scope = previous_plain_select_lock_scope;
             apply_projection_label_overrides(&mut result, projection_labels.as_deref());
-            if locking_read && !self.in_transaction && self.autocommit {
+            if let Some(snapshot) = statement_lock_snapshot {
+                self.stats
+                    .restore_connection_locks(self.connection_id, snapshot);
+            } else if locking_read && !self.in_transaction && self.autocommit {
                 self.stats.release_all_locks(self.connection_id);
             }
             return result;
@@ -6104,6 +6557,7 @@ impl Backend {
         predicted: u64,
     ) -> anyhow::Result<QueryOutcome> {
         self.ensure_transaction_writable()?;
+        self.ensure_explicit_write_access(&writes)?;
         let locks = write_lock_requests(&self.storage, &writes)?;
         if let Err(error) = self
             .stats
@@ -6140,6 +6594,7 @@ impl Backend {
         predicted: u64,
     ) -> anyhow::Result<QueryOutcome> {
         self.ensure_transaction_writable()?;
+        self.ensure_explicit_write_access(&writes)?;
         let trigger_locks = self.trigger_mutation_lock_requests(&writes)?;
         self.stats
             .acquire_locks(&trigger_locks, self.connection_id, self.lock_wait_timeout)
@@ -6286,6 +6741,7 @@ impl Backend {
         trigger_affected_rows: u64,
     ) -> anyhow::Result<QueryOutcome> {
         self.ensure_transaction_writable()?;
+        self.ensure_explicit_write_access(&writes)?;
         let memory_writes = writes_are_memory(&self.storage, &writes);
         if !self.foreign_key_checks {
             writes.insert(0, WriteCommand::ForeignKeyChecksDisabled);
@@ -8269,6 +8725,7 @@ impl Backend {
 
     async fn submit_ddl(&mut self, writes: Vec<WriteCommand>) -> anyhow::Result<QueryOutcome> {
         self.ensure_transaction_writable()?;
+        self.ensure_explicit_write_access(&writes)?;
         self.in_transaction = false;
         let locks = write_lock_requests(&self.storage, &writes)?;
         if let Err(error) = self
@@ -8289,6 +8746,7 @@ impl Backend {
         writes: Vec<WriteCommand>,
     ) -> anyhow::Result<QueryOutcome> {
         self.ensure_transaction_writable()?;
+        self.ensure_explicit_write_access(&writes)?;
         self.in_transaction = false;
         let locks = write_lock_requests(&self.storage, &writes[..1])?;
         if let Err(error) = self
@@ -8313,7 +8771,21 @@ impl Backend {
         let mut lock_commands = Vec::new();
         let mut destinations = HashSet::new();
         for (source, destination) in renames {
-            let (source_database, source_table) = split_table_reference(&source, &self.database)?;
+            let (logical_database, logical_table) = split_table_reference(&source, &self.database)?;
+            if self
+                .temporary_tables
+                .contains_key(&Self::temporary_table_key(
+                    &logical_database,
+                    &logical_table,
+                ))
+            {
+                anyhow::bail!(
+                    "RENAME TABLE cannot rename temporary table '{}.{}'",
+                    logical_database,
+                    logical_table
+                );
+            }
+            let (source_database, source_table) = self.resolve_table_reference(&source)?;
             let (destination_database, destination_table) =
                 split_table_reference(&destination, &self.database)?;
             if !destinations.insert((destination_database.clone(), destination_table.clone())) {
@@ -8399,6 +8871,7 @@ impl Backend {
             }
             writes.push(drop);
         }
+        self.ensure_explicit_write_access(&writes)?;
         self.in_transaction = false;
         let locks = write_lock_requests(&self.storage, &lock_commands)?;
         if let Err(error) = self
@@ -8432,17 +8905,144 @@ impl Backend {
         result
     }
 
-    fn temporary_table_key(database: &str, table: &str) -> (String, String) {
-        (database.to_string(), table.to_ascii_lowercase())
+    fn explicit_table_key(database: &str, table: &str) -> (String, String) {
+        (database.to_ascii_lowercase(), table.to_ascii_lowercase())
     }
 
-    fn resolve_table_reference(&self, value: &str) -> anyhow::Result<(String, String)> {
+    fn clear_explicit_table_locks(&mut self) {
+        self.stats.release_explicit_table_locks(self.connection_id);
+        self.explicit_table_locks.clear();
+        self.explicit_table_references.clear();
+    }
+
+    fn ensure_explicit_table_access(
+        &self,
+        database: &str,
+        table: &str,
+        write: bool,
+    ) -> anyhow::Result<()> {
+        if self.explicit_table_locks.is_empty()
+            || is_virtual_schema_name(database)
+            || table.starts_with("__mydb_tmp_")
+        {
+            return Ok(());
+        }
+        let key = Self::explicit_table_key(database, table);
+        let mode = self
+            .explicit_table_locks
+            .get(&key)
+            .copied()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Table '{}.{}' was not locked with LOCK TABLES",
+                    database,
+                    table
+                )
+            })?;
+        if write && mode != LockMode::Exclusive {
+            anyhow::bail!(
+                "Table '{}.{}' was locked with a READ lock and can't be updated",
+                database,
+                table
+            );
+        }
+        Ok(())
+    }
+
+    fn ensure_explicit_table_reference_access(
+        &self,
+        reference: &str,
+        alias: Option<&str>,
+        database: &str,
+        table: &str,
+    ) -> anyhow::Result<()> {
+        if self.explicit_table_locks.is_empty()
+            || is_virtual_schema_name(database)
+            || table.starts_with("__mydb_tmp_")
+        {
+            return Ok(());
+        }
+        let name = alias
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                split_table_reference(reference, &self.database)
+                    .map(|(_, table)| table)
+                    .unwrap_or_else(|_| reference.to_string())
+            })
+            .trim_matches('`')
+            .to_ascii_lowercase();
+        let expected = Self::explicit_table_key(database, table);
+        if self
+            .explicit_table_references
+            .get(&name)
+            .is_some_and(|actual| Self::explicit_table_key(&actual.0, &actual.1) == expected)
+        {
+            return Ok(());
+        }
+        anyhow::bail!("Table '{}' was not locked with LOCK TABLES", name);
+    }
+
+    fn ensure_explicit_write_access(&self, writes: &[WriteCommand]) -> anyhow::Result<()> {
+        if self.explicit_table_locks.is_empty() {
+            return Ok(());
+        }
+        for write in writes {
+            match write {
+                WriteCommand::CreateTable { database, schema } => {
+                    self.ensure_explicit_table_access(database, &schema.name, true)?;
+                }
+                WriteCommand::DropTable { database, table }
+                | WriteCommand::AlterTable {
+                    database, table, ..
+                }
+                | WriteCommand::Insert {
+                    database, table, ..
+                }
+                | WriteCommand::Upsert {
+                    database, table, ..
+                }
+                | WriteCommand::Update {
+                    database, table, ..
+                }
+                | WriteCommand::ExpressionUpdate {
+                    database, table, ..
+                }
+                | WriteCommand::ReplaceRows {
+                    database, table, ..
+                }
+                | WriteCommand::Delete {
+                    database, table, ..
+                } => self.ensure_explicit_table_access(database, table, true)?,
+                WriteCommand::ForeignKeyChecksDisabled => {}
+                _ => anyhow::bail!(
+                    "Cannot execute this statement while tables are locked with LOCK TABLES"
+                ),
+            }
+        }
+        Ok(())
+    }
+
+    fn resolve_table_reference_unrestricted(
+        &self,
+        value: &str,
+    ) -> anyhow::Result<(String, String)> {
         let (database, table) = split_table_reference(value, &self.database)?;
         let table = self
             .temporary_tables
             .get(&Self::temporary_table_key(&database, &table))
             .cloned()
             .unwrap_or(table);
+        Ok((database, table))
+    }
+
+    fn temporary_table_key(database: &str, table: &str) -> (String, String) {
+        (database.to_string(), table.to_ascii_lowercase())
+    }
+
+    fn resolve_table_reference(&self, value: &str) -> anyhow::Result<(String, String)> {
+        let (database, table) = self.resolve_table_reference_unrestricted(value)?;
+        self.ensure_explicit_table_reference_access(value, None, &database, &table)?;
+        self.ensure_explicit_table_access(&database, &table, false)?;
         Ok((database, table))
     }
 
@@ -8460,6 +9060,7 @@ impl Backend {
         writes: Vec<WriteCommand>,
     ) -> anyhow::Result<QueryOutcome> {
         self.ensure_transaction_writable()?;
+        self.ensure_explicit_write_access(&writes)?;
         let locks = write_lock_requests(&self.storage, &writes)?;
         self.submit_temporary_batch_with_locks(writes, locks).await
     }
@@ -8469,6 +9070,7 @@ impl Backend {
         writes: Vec<WriteCommand>,
     ) -> anyhow::Result<QueryOutcome> {
         self.ensure_transaction_writable()?;
+        self.ensure_explicit_write_access(&writes)?;
         let locks = write_lock_requests(&self.storage, &writes[..1])?;
         self.submit_temporary_batch_with_locks(writes, locks).await
     }
@@ -8479,6 +9081,7 @@ impl Backend {
         locks: Vec<LockRequest>,
     ) -> anyhow::Result<QueryOutcome> {
         self.ensure_transaction_writable()?;
+        self.ensure_explicit_write_access(&writes)?;
         let previous_locks = self.stats.connection_lock_snapshot(self.connection_id);
         if let Err(error) = self
             .stats
@@ -10673,6 +11276,27 @@ impl Backend {
                 ));
             }
             let source = self.join_source(value)?;
+            if self.plain_select_lock_scope {
+                // A top-level nonlocking SELECT holds this marker only for
+                // the statement (the dispatcher restores its prior snapshot).
+                // It is needed so another connection's LOCK TABLES ... WRITE
+                // cannot pass through a plain read, without making internal
+                // reads or locking reads contend with transaction row locks.
+                let locks = read_lock_requests(
+                    &source.database,
+                    &source.table,
+                    &source.schema,
+                    None,
+                    false,
+                );
+                self.stats
+                    .acquire_read_locks_against_explicit(
+                        &locks,
+                        self.connection_id,
+                        self.lock_wait_timeout,
+                    )
+                    .await?;
+            }
             if let Some(query) = view_select_sql(&source.schema) {
                 let identity = (source.database.clone(), source.table.clone());
                 if self.view_stack.contains(&identity) {
@@ -11040,7 +11664,9 @@ impl Backend {
 
     fn join_source(&self, value: &str) -> anyhow::Result<JoinSource> {
         let (reference, alias) = parse_join_source(value)?;
-        let (database, table) = self.resolve_table_reference(&reference)?;
+        let (database, table) = self.resolve_table_reference_unrestricted(&reference)?;
+        self.ensure_explicit_table_reference_access(&reference, Some(&alias), &database, &table)?;
+        self.ensure_explicit_table_access(&database, &table, false)?;
         let schema = self
             .storage
             .get_database(&database)
@@ -11397,6 +12023,7 @@ impl Drop for Backend {
         self.stats.unregister_transaction_buffer(self.connection_id);
         self.transaction_snapshot.clear();
         self.stats.release_all_locks(self.connection_id);
+        self.stats.release_explicit_table_locks(self.connection_id);
     }
 }
 
@@ -21507,6 +22134,14 @@ fn mysql_error_kind(message: &str) -> ErrorKind {
     } else if message.starts_with("Table '") && message.ends_with(" already exists") {
         ErrorKind::ER_TABLE_EXISTS_ERROR
     } else if message.starts_with("Table '")
+        && message.ends_with(" was not locked with LOCK TABLES")
+    {
+        ErrorKind::ER_TABLE_NOT_LOCKED
+    } else if message.starts_with("Table '")
+        && message.ends_with(" was locked with a READ lock and can't be updated")
+    {
+        ErrorKind::ER_CANT_UPDATE_WITH_READLOCK
+    } else if message.starts_with("Table '")
         && (message.ends_with(" does not exist") || message.ends_with(" doesn't exist"))
     {
         ErrorKind::ER_NO_SUCH_TABLE
@@ -21544,6 +22179,10 @@ fn mysql_error_kind(message: &str) -> ErrorKind {
         ErrorKind::ER_SIGNAL_BAD_CONDITION_TYPE
     } else if message == "Invalid condition number" {
         ErrorKind::ER_DA_INVALID_CONDITION_NUMBER
+    } else if message == LOCK_TABLES_IN_STORED_PROGRAM_ERROR {
+        ErrorKind::ER_SP_BADSTATEMENT
+    } else if message == ACTIVE_TABLE_LOCKS_ERROR {
+        ErrorKind::ER_LOCK_OR_ACTIVE_TRANSACTION
     } else {
         ErrorKind::ER_UNKNOWN_ERROR
     }
@@ -29589,6 +30228,187 @@ fn split_csv(value: &str) -> Vec<String> {
         result.push(current.trim().to_string());
     }
     result
+}
+
+fn take_sql_keyword(value: &str) -> Option<(&str, &str)> {
+    let value = value.trim_start_matches(|character: char| character.is_ascii_whitespace());
+    if value.is_empty() {
+        return None;
+    }
+    let end = value
+        .find(|character: char| character.is_ascii_whitespace())
+        .unwrap_or(value.len());
+    Some((&value[..end], &value[end..]))
+}
+
+fn sql_starts_with_table_lock_statement(sql: &str, command: &str) -> bool {
+    let sql = sql.trim().trim_end_matches(';').trim_end();
+    let Some((first, remainder)) = take_sql_keyword(sql) else {
+        return false;
+    };
+    let Some((second, _)) = take_sql_keyword(remainder) else {
+        return false;
+    };
+    first.eq_ignore_ascii_case(command)
+        && (second.eq_ignore_ascii_case("TABLE") || second.eq_ignore_ascii_case("TABLES"))
+}
+
+fn is_lock_tables_statement(upper: &str) -> bool {
+    sql_starts_with_table_lock_statement(upper, "LOCK")
+}
+
+fn is_unlock_tables_statement(upper: &str) -> bool {
+    let sql = upper.trim().trim_end_matches(';').trim_end();
+    let Some((first, remainder)) = take_sql_keyword(sql) else {
+        return false;
+    };
+    let Some((second, trailing)) = take_sql_keyword(remainder) else {
+        return false;
+    };
+    first.eq_ignore_ascii_case("UNLOCK")
+        && (second.eq_ignore_ascii_case("TABLE") || second.eq_ignore_ascii_case("TABLES"))
+        && trailing.trim().is_empty()
+}
+
+fn is_table_lock_restricted_ddl(upper: &str) -> bool {
+    [
+        "CREATE VIEW",
+        "ALTER VIEW",
+        "DROP VIEW",
+        "CREATE PROCEDURE",
+        "ALTER PROCEDURE",
+        "DROP PROCEDURE",
+        "CREATE FUNCTION",
+        "ALTER FUNCTION",
+        "DROP FUNCTION",
+        "CREATE EVENT",
+        "ALTER EVENT",
+        "DROP EVENT",
+        "CREATE TRIGGER",
+        "DROP TRIGGER",
+    ]
+    .iter()
+    .any(|prefix| upper.starts_with(prefix))
+}
+
+fn split_lock_table_clauses(value: &str) -> anyhow::Result<Vec<String>> {
+    let mut clauses = Vec::new();
+    let mut start = 0;
+    let mut quoted = false;
+    let mut index = 0;
+    let bytes = value.as_bytes();
+    while index < bytes.len() {
+        if bytes[index] == b'`' {
+            if quoted && bytes.get(index + 1) == Some(&b'`') {
+                index += 2;
+                continue;
+            }
+            quoted = !quoted;
+        } else if bytes[index] == b',' && !quoted {
+            let clause = value[start..index].trim();
+            if clause.is_empty() {
+                anyhow::bail!("LOCK TABLES has an empty table clause");
+            }
+            clauses.push(clause.to_string());
+            start = index + 1;
+        }
+        index += 1;
+    }
+    if quoted {
+        anyhow::bail!("LOCK TABLES has an unclosed quoted identifier");
+    }
+    let clause = value[start..].trim();
+    if clause.is_empty() {
+        anyhow::bail!("LOCK TABLES has an empty table clause");
+    }
+    clauses.push(clause.to_string());
+    Ok(clauses)
+}
+
+fn take_lock_table_token(value: &str) -> anyhow::Result<(String, &str)> {
+    let value = value.trim_start();
+    if value.is_empty() {
+        anyhow::bail!("LOCK TABLES requires a table name");
+    }
+    let mut quoted = false;
+    let mut end = value.len();
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'`' {
+            if quoted && bytes.get(index + 1) == Some(&b'`') {
+                index += 2;
+                continue;
+            }
+            quoted = !quoted;
+        } else if bytes[index].is_ascii_whitespace() && !quoted {
+            end = index;
+            break;
+        }
+        index += 1;
+    }
+    if quoted {
+        anyhow::bail!("LOCK TABLES has an unclosed quoted identifier");
+    }
+    let token = value[..end].trim();
+    if token.is_empty() {
+        anyhow::bail!("LOCK TABLES requires a table name");
+    }
+    Ok((token.to_string(), value[end..].trim_start()))
+}
+
+fn lock_clause_starts_mode(value: &str) -> bool {
+    let upper = value.to_ascii_uppercase();
+    upper == "READ"
+        || upper == "READ LOCAL"
+        || upper == "WRITE"
+        || upper == "LOW_PRIORITY WRITE"
+        || upper.starts_with("READ ")
+        || upper.starts_with("WRITE ")
+        || upper.starts_with("LOW_PRIORITY ")
+}
+
+fn parse_lock_tables(sql: &str) -> anyhow::Result<Vec<ParsedTableLock>> {
+    let sql = sql.trim().trim_end_matches(';').trim();
+    let (command, remainder) =
+        take_sql_keyword(sql).ok_or_else(|| anyhow::anyhow!("Invalid LOCK TABLES statement"))?;
+    let (table_keyword, remainder) = take_sql_keyword(remainder)
+        .ok_or_else(|| anyhow::anyhow!("Invalid LOCK TABLES statement"))?;
+    if !command.eq_ignore_ascii_case("LOCK")
+        || (!table_keyword.eq_ignore_ascii_case("TABLE")
+            && !table_keyword.eq_ignore_ascii_case("TABLES"))
+    {
+        anyhow::bail!("Invalid LOCK TABLES statement");
+    }
+    let remainder = remainder.trim_start();
+    let mut locks = Vec::new();
+    for clause in split_lock_table_clauses(remainder)? {
+        let (reference, mut tail) = take_lock_table_token(&clause)?;
+        let mut alias = None;
+        if tail
+            .get(..3)
+            .is_some_and(|value| value.eq_ignore_ascii_case("AS "))
+        {
+            let (value, remainder) = take_lock_table_token(tail[3..].trim_start())?;
+            alias = Some(value.trim_matches('`').to_string());
+            tail = remainder;
+        } else if !lock_clause_starts_mode(tail) {
+            let (value, remainder) = take_lock_table_token(tail)?;
+            alias = Some(value.trim_matches('`').to_string());
+            tail = remainder;
+        }
+        let mode = match tail.trim().to_ascii_uppercase().as_str() {
+            "READ" | "READ LOCAL" => LockMode::Shared,
+            "WRITE" | "LOW_PRIORITY WRITE" => LockMode::Exclusive,
+            _ => anyhow::bail!("Invalid LOCK TABLES lock type '{}'", tail.trim()),
+        };
+        locks.push(ParsedTableLock {
+            reference,
+            alias,
+            mode,
+        });
+    }
+    Ok(locks)
 }
 
 fn split_tuples(value: &str) -> anyhow::Result<Vec<String>> {
@@ -45897,6 +46717,196 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(stats.snapshot().active_locks, 0);
+    }
+
+    #[tokio::test]
+    async fn lock_tables_enforces_whitelist_and_serializes_other_sessions() {
+        let (_temp, _storage, mut first, mut second) = transaction_backends().await;
+        first
+            .execute("CREATE TABLE lock_aux (id BIGINT PRIMARY KEY, value BIGINT NOT NULL)")
+            .await
+            .unwrap();
+        first
+            .execute("INSERT INTO lock_aux (id,value) VALUES (1,1)")
+            .await
+            .unwrap();
+        second.lock_wait_timeout = Duration::from_millis(25);
+
+        first.execute("LOCK TABLES actors READ").await.unwrap();
+        assert_eq!(
+            single_value(
+                first
+                    .execute("SELECT value FROM actors WHERE id=1")
+                    .await
+                    .unwrap()
+            ),
+            b"10"
+        );
+        let error = first
+            .execute("UPDATE actors SET value=11 WHERE id=1")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            mysql_error_kind(&error),
+            ErrorKind::ER_CANT_UPDATE_WITH_READLOCK
+        );
+        let error = first
+            .execute("SELECT value FROM lock_aux WHERE id=1")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(mysql_error_kind(&error), ErrorKind::ER_TABLE_NOT_LOCKED);
+        let error = second
+            .execute("UPDATE actors SET value=11 WHERE id=1")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Lock wait timeout exceeded"));
+
+        first.execute("UNLOCK TABLES").await.unwrap();
+        second
+            .execute("UPDATE actors SET value=11 WHERE id=1")
+            .await
+            .unwrap();
+
+        first.execute("LOCK TABLES actors WRITE").await.unwrap();
+        let error = second
+            .execute("SELECT value FROM actors WHERE id=1")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Lock wait timeout exceeded"));
+        first.execute("COMMIT").await.unwrap();
+        let error = second
+            .execute("SELECT value FROM actors WHERE id=1")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Lock wait timeout exceeded"));
+        first.execute("START TRANSACTION").await.unwrap();
+        second
+            .execute("SELECT value FROM actors WHERE id=1")
+            .await
+            .unwrap();
+        first.execute("ROLLBACK").await.unwrap();
+
+        first.execute("LOCK TABLES actors WRITE").await.unwrap();
+        let error = second
+            .execute("LOCK TABLES lock_aux WRITE, actors WRITE")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Lock wait timeout exceeded"));
+        // Failed multi-table acquisition must not leak the lock acquired for
+        // lock_aux before actors blocks.
+        second
+            .execute("UPDATE lock_aux SET value=2 WHERE id=1")
+            .await
+            .unwrap();
+        first.execute("UNLOCK TABLES").await.unwrap();
+
+        first.execute("LOCK TABLES actors AS a READ").await.unwrap();
+        let error = first
+            .execute("SELECT value FROM a WHERE id=1")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(mysql_error_kind(&error), ErrorKind::ER_TABLE_NOT_LOCKED);
+        let error = first
+            .execute("SELECT value FROM actors WHERE id=1")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(mysql_error_kind(&error), ErrorKind::ER_TABLE_NOT_LOCKED);
+        let error = first
+            .execute("DROP TABLE actors")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(mysql_error_kind(&error), ErrorKind::ER_TABLE_NOT_LOCKED);
+        assert_eq!(
+            single_value(
+                first
+                    .execute("SELECT value FROM actors AS a WHERE id=1")
+                    .await
+                    .unwrap()
+            ),
+            b"11"
+        );
+        first.execute("UNLOCK TABLES").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn lock_tables_accepts_mysql_whitespace_synonyms_and_ignores_temporary_tables() {
+        let (_temp, _storage, mut backend, _second) = transaction_backends().await;
+        backend
+            .execute("CREATE TEMPORARY TABLE lock_tmp (id BIGINT PRIMARY KEY)")
+            .await
+            .unwrap();
+        backend
+            .execute("LOCK\tTABLES actors READ, lock_tmp WRITE")
+            .await
+            .unwrap();
+        assert_eq!(backend.explicit_table_locks.len(), 1);
+        backend
+            .execute("INSERT INTO lock_tmp (id) VALUES (1)")
+            .await
+            .unwrap();
+        backend.execute("UNLOCK\nTABLES;").await.unwrap();
+
+        backend
+            .execute("LOCK TABLE actors LOW_PRIORITY WRITE")
+            .await
+            .unwrap();
+        backend.execute("UNLOCK TABLE").await.unwrap();
+        backend
+            .execute("LOCK TABLES actors READ LOCAL")
+            .await
+            .unwrap();
+        backend.execute("UNLOCK TABLES").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn lock_tables_requires_lock_and_select_privileges_per_database() {
+        let (_temp, _storage, mut backend, _second) = transaction_backends().await;
+        backend
+            .execute("CREATE USER table_locker IDENTIFIED BY 'locker-password'")
+            .await
+            .unwrap();
+        backend
+            .execute("GRANT LOCK TABLES ON mydb.* TO table_locker")
+            .await
+            .unwrap();
+        *backend.authenticated_user.lock() = Some("table_locker".into());
+        let error = backend
+            .execute("LOCK TABLES actors READ")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("lacks SELECT privilege"));
+
+        *backend.authenticated_user.lock() = Some("root".into());
+        backend
+            .execute("GRANT SELECT ON mydb.* TO table_locker")
+            .await
+            .unwrap();
+        *backend.authenticated_user.lock() = Some("table_locker".into());
+        backend.execute("LOCK TABLES actors READ").await.unwrap();
+        backend.execute("UNLOCK TABLES").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn lock_tables_are_rejected_inside_stored_program_execution() {
+        let (_temp, _storage, mut backend, _second) = transaction_backends().await;
+        backend.procedure_depth = 1;
+        let error = backend
+            .execute("LOCK TABLES actors READ")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(mysql_error_kind(&error), ErrorKind::ER_SP_BADSTATEMENT);
+        backend.procedure_depth = 0;
     }
 
     #[tokio::test]
