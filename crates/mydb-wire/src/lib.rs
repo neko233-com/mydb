@@ -22429,6 +22429,12 @@ fn mysql_error_kind(message: &str) -> ErrorKind {
         ErrorKind::ER_WARN_TOO_MANY_RECORDS
     } else if message.starts_with("Invalid ") && message.contains(" character string:") {
         ErrorKind::ER_INVALID_CHARACTER_STRING
+    } else if message.starts_with("Unknown collation: '") {
+        ErrorKind::ER_UNKNOWN_COLLATION
+    } else if message.starts_with("Collation '")
+        && message.contains(" is not valid for character set '")
+    {
+        ErrorKind::ER_COLLATION_CHARSET_MISMATCH
     } else if message
         == "Statement aborted because lock(s) could not be acquired immediately and NOWAIT is set."
     {
@@ -28831,6 +28837,38 @@ const MYSQL_COLLATIONS: &[MysqlCollationInfo] = &[
         pad_attribute: "NO PAD",
     },
     MysqlCollationInfo {
+        name: "utf8mb4_general_ci",
+        character_set: "utf8mb4",
+        id: 45,
+        is_default: false,
+        sortlen: 1,
+        pad_attribute: "PAD SPACE",
+    },
+    MysqlCollationInfo {
+        name: "utf8mb4_bin",
+        character_set: "utf8mb4",
+        id: 46,
+        is_default: false,
+        sortlen: 1,
+        pad_attribute: "PAD SPACE",
+    },
+    MysqlCollationInfo {
+        name: "utf8mb4_unicode_ci",
+        character_set: "utf8mb4",
+        id: 224,
+        is_default: false,
+        sortlen: 8,
+        pad_attribute: "PAD SPACE",
+    },
+    MysqlCollationInfo {
+        name: "utf8mb4_unicode_520_ci",
+        character_set: "utf8mb4",
+        id: 246,
+        is_default: false,
+        sortlen: 8,
+        pad_attribute: "PAD SPACE",
+    },
+    MysqlCollationInfo {
         name: "latin1_swedish_ci",
         character_set: "latin1",
         id: 8,
@@ -34265,6 +34303,76 @@ mod tests {
             .execute("SET NAMES latin1 COLLATE utf8mb4_0900_ai_ci")
             .await
             .is_err());
+        backend
+            .execute("SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci")
+            .await
+            .unwrap();
+        assert_eq!(
+            query_rows(
+                &mut backend,
+                "SELECT @@character_set_client,@@character_set_connection,@@character_set_results,@@collation_connection",
+            )
+            .await,
+            vec![vec![
+                Some(b"utf8mb4".to_vec()),
+                Some(b"utf8mb4".to_vec()),
+                Some(b"utf8mb4".to_vec()),
+                Some(b"utf8mb4_unicode_ci".to_vec()),
+            ]]
+        );
+        backend
+            .execute("SET collation_connection='utf8mb4_bin'")
+            .await
+            .unwrap();
+        assert_eq!(
+            query_rows(
+                &mut backend,
+                "SELECT @@character_set_connection,@@collation_connection",
+            )
+            .await,
+            vec![vec![
+                Some(b"utf8mb4".to_vec()),
+                Some(b"utf8mb4_bin".to_vec()),
+            ]]
+        );
+        assert_eq!(
+            query_rows(&mut backend, "SHOW COLLATION LIKE 'utf8mb4_unicode%'",).await,
+            vec![
+                vec![
+                    Some(b"utf8mb4_unicode_ci".to_vec()),
+                    Some(b"utf8mb4".to_vec()),
+                    Some(b"224".to_vec()),
+                    Some(Vec::new()),
+                    Some(b"Yes".to_vec()),
+                    Some(b"8".to_vec()),
+                    Some(b"PAD SPACE".to_vec()),
+                ],
+                vec![
+                    Some(b"utf8mb4_unicode_520_ci".to_vec()),
+                    Some(b"utf8mb4".to_vec()),
+                    Some(b"246".to_vec()),
+                    Some(Vec::new()),
+                    Some(b"Yes".to_vec()),
+                    Some(b"8".to_vec()),
+                    Some(b"PAD SPACE".to_vec()),
+                ],
+            ]
+        );
+        let error = backend
+            .execute("SET NAMES utf8mb4 COLLATE latin1_swedish_ci")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            mysql_error_kind(&error),
+            ErrorKind::ER_COLLATION_CHARSET_MISMATCH
+        );
+        let error = backend
+            .execute("SET NAMES utf8mb4 COLLATE utf8mb4_not_real_ci")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(mysql_error_kind(&error), ErrorKind::ER_UNKNOWN_COLLATION);
         assert_eq!(
             query_rows(
                 &mut backend,
