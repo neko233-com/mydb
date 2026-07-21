@@ -35,10 +35,11 @@ use tracing::{debug, info};
 use mydb_storage::{
     apply_expression_assignments, is_current_timestamp_default, is_memory_schema,
     table_engine_from_sql, AlterTableOperation, Column, ColumnPosition, DataType, EventDefinition,
-    EventMetadata, EventSchedule, ExpressionAssignment, FunctionDefinition, FunctionParameter,
-    Index, NumericOperator, ProcedureDefinition, ProcedureMetadata, ProcedureParameter,
-    ProcedureParameterMode, Row, RowPredicate, StorageEngineManager, TableEngine, TableSchema,
-    TriggerDefinition, TriggerEvent, TriggerTiming, UpdateValueExpression, WriteCommand,
+    EventFinishAction, EventMetadata, EventSchedule, ExpressionAssignment, FunctionDefinition,
+    FunctionParameter, Index, NumericOperator, ProcedureDefinition, ProcedureMetadata,
+    ProcedureParameter, ProcedureParameterMode, Row, RowPredicate, StorageEngineManager,
+    TableEngine, TableSchema, TriggerDefinition, TriggerEvent, TriggerTiming,
+    UpdateValueExpression, WriteCommand,
 };
 
 pub const SERVER_VERSION: &str = "8.0.36-mydb-0.1.0";
@@ -1549,6 +1550,33 @@ fn is_read_only_transaction_write_statement(upper: &str) -> bool {
                 || upper.contains(" LOCK IN SHARE MODE")))
 }
 
+fn event_atomic_statement_forbidden(upper: &str) -> bool {
+    [
+        "BEGIN",
+        "START TRANSACTION",
+        "COMMIT",
+        "ROLLBACK",
+        "SAVEPOINT ",
+        "RELEASE SAVEPOINT ",
+        "LOCK TABLE",
+        "UNLOCK TABLE",
+        "XA ",
+        "CREATE ",
+        "ALTER ",
+        "DROP ",
+        "TRUNCATE ",
+        "RENAME ",
+        "GRANT ",
+        "REVOKE ",
+        "PREPARE ",
+        "DEALLOCATE PREPARE ",
+        "DROP PREPARE ",
+    ]
+    .iter()
+    .any(|prefix| upper == *prefix || upper.starts_with(prefix))
+        || (upper.starts_with("SET ") && upper.contains("AUTOCOMMIT"))
+}
+
 #[derive(Debug, Clone)]
 pub struct SlowQuerySnapshot {
     pub unix_ms: u64,
@@ -1616,6 +1644,12 @@ impl WireStats {
     fn connected(&self) -> u32 {
         self.active_connections.fetch_add(1, Ordering::Relaxed);
         self.total_connections.fetch_add(1, Ordering::Relaxed);
+        self.next_connection_id.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    // Scheduler backends share the same lock/transaction registries but are
+    // not client connections, so they must not affect connection metrics.
+    fn internal_connection_id(&self) -> u32 {
         self.next_connection_id.fetch_add(1, Ordering::Relaxed) + 1
     }
 
@@ -2205,8 +2239,18 @@ struct Backend {
     explicit_table_references: HashMap<String, (String, String)>,
     plain_select_lock_scope: bool,
     procedure_depth: u32,
+    execution_mode: BackendExecutionMode,
     authenticated_user: parking_lot::Mutex<Option<String>>,
     client_address: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BackendExecutionMode {
+    Client,
+    // Event bodies run their DML and completion cursor in one WAL batch.  A
+    // statement that can independently commit or issue DDL would violate that
+    // boundary, so it is rejected before dispatch.
+    EventAtomic,
 }
 
 #[derive(Debug, Clone)]
@@ -2322,6 +2366,7 @@ impl Backend {
             explicit_table_references: HashMap::new(),
             plain_select_lock_scope: false,
             procedure_depth: 0,
+            execution_mode: BackendExecutionMode::Client,
             authenticated_user: parking_lot::Mutex::new(None),
             client_address: "local".to_string(),
         }
@@ -4116,7 +4161,11 @@ impl Backend {
             || original_upper.starts_with("GET ")
             || is_create_procedure_statement(original_sql)
             || is_create_function_statement(original_sql)
-            || is_create_event_statement(original_sql);
+            || is_create_event_statement(original_sql)
+            // ALTER EVENT can replace the DO body.  Preserve user-variable
+            // tokens there exactly as CREATE EVENT does; substituting an
+            // unset @name would persist `NULL` instead of the event body.
+            || original_upper.starts_with("ALTER EVENT ");
         let sql = if keeps_session_syntax {
             original_sql
         } else {
@@ -4131,6 +4180,13 @@ impl Backend {
             (sql, false)
         };
         let upper = sql.to_ascii_uppercase();
+        if self.execution_mode == BackendExecutionMode::EventAtomic
+            && event_atomic_statement_forbidden(&upper)
+        {
+            anyhow::bail!(
+                "Statement is not allowed in an atomic EVENT body because it can end the event transaction"
+            );
+        }
         let session_diagnostics = parse_procedure_get_diagnostics(sql)?;
         let reads_diagnostics = session_diagnostics.is_some()
             || upper.starts_with("SHOW WARNINGS")
@@ -4921,8 +4977,17 @@ impl Backend {
         }
         if is_create_event_statement(sql) {
             self.commit_pending().await?;
-            let (database, event, if_not_exists) =
-                parse_create_event(sql, &self.database, &self.session_time_zone_name())?;
+            let creator = self
+                .authenticated_user
+                .lock()
+                .clone()
+                .unwrap_or_else(|| self.config.username.clone());
+            let (database, mut event, if_not_exists) = parse_create_event(
+                sql,
+                &self.database,
+                &self.session_time_zone_name(),
+                &creator,
+            )?;
             if if_not_exists
                 && self
                     .storage
@@ -4936,11 +5001,44 @@ impl Backend {
                 ));
                 return Ok(QueryOutcome::ok(0));
             }
+            let statement_now = current_statement_utc_time();
+            let mut metadata = event_metadata_with_next_execution(
+                &event,
+                EventMetadata::new(self.session_sql_mode()),
+                statement_now,
+            )?;
+            if event.schedule.execute_at.is_some() {
+                let due = metadata
+                    .next_execution_utc
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("EVENT has no execution cursor"))
+                    .and_then(|value| {
+                        DateTime::parse_from_rfc3339(value)
+                            .map(|value| value.with_timezone(&Utc))
+                            .map_err(|_| anyhow::anyhow!("EVENT has an invalid execution cursor"))
+                    })?;
+                if due <= statement_now {
+                    if event.on_completion.eq_ignore_ascii_case("PRESERVE") {
+                        event.status = "DISABLED".into();
+                        event.create_sql = render_create_event(&event)?;
+                        metadata.next_execution_utc = None;
+                    } else {
+                        self.record_warning(SqlWarning::note(
+                            1588,
+                            format!(
+                                "Event '{}' was not created because its execution time is in the past and ON COMPLETION is NOT PRESERVE",
+                                event.name
+                            ),
+                        ));
+                        return Ok(QueryOutcome::ok(0));
+                    }
+                }
+            }
             return self
                 .submit_ddl(vec![WriteCommand::CreateEventV4 {
                     database,
                     event,
-                    metadata: EventMetadata::new(self.session_sql_mode()),
+                    metadata,
                 }])
                 .await;
         }
@@ -5011,13 +5109,25 @@ impl Backend {
                 &self.database,
                 &existing,
                 &self.session_time_zone_name(),
+                &self
+                    .authenticated_user
+                    .lock()
+                    .clone()
+                    .unwrap_or_else(|| self.config.username.clone()),
             )?;
+            let schedule_changed =
+                event.schedule != existing.schedule || event.time_zone != existing.time_zone;
             let metadata = self
                 .storage
                 .get_database(&database)
                 .and_then(|database| database.get_event_metadata(&existing.name))
                 .unwrap_or_else(|| EventMetadata::new(String::new()))
                 .altered(self.session_sql_mode());
+            let metadata = if schedule_changed {
+                event_metadata_with_next_execution(&event, metadata, current_statement_utc_time())?
+            } else {
+                metadata
+            };
             return self
                 .submit_ddl(vec![WriteCommand::AlterEventV4 {
                     database,
@@ -5782,16 +5892,22 @@ impl Backend {
             .lock()
             .clone()
             .unwrap_or_else(|| self.config.username.clone());
-        // Cross-schema statements are accepted only with an explicitly global grant.
-        let database = if sql.contains('.') {
-            ""
-        } else {
-            &self.database
-        };
+        // Resolve simple DML targets before falling back to the conservative
+        // cross-schema rule. A decimal literal or a same-database qualified
+        // table must not spuriously require a global grant (notably in EVENT
+        // bodies running under their definer).
+        let database =
+            statement_privilege_database(sql, upper, &self.database).unwrap_or_else(|| {
+                if sql.contains('.') {
+                    String::new()
+                } else {
+                    self.database.clone()
+                }
+            });
         if self
             .config
             .auth_catalog
-            .has_privilege(&user, database, privilege)
+            .has_privilege(&user, &database, privilege)
         {
             Ok(())
         } else {
@@ -7070,6 +7186,11 @@ impl Backend {
             writes.insert(0, WriteCommand::ForeignKeyChecksDisabled);
         }
         if memory_writes {
+            if self.execution_mode == BackendExecutionMode::EventAtomic {
+                anyhow::bail!(
+                    "EVENT body cannot modify MEMORY tables because those writes are not transactional"
+                );
+            }
             // MySQL MEMORY is nontransactional: a later ROLLBACK must not undo
             // the statement. The storage actor still serializes it, but its
             // MEMORY-only fast path omits WAL/fsync/checkpoint.
@@ -12327,6 +12448,30 @@ impl Backend {
     }
 }
 
+fn statement_privilege_database(sql: &str, upper: &str, default_database: &str) -> Option<String> {
+    let reference = if upper.starts_with("INSERT ") || upper.starts_with("REPLACE ") {
+        let into = upper.find("INTO ")? + "INTO ".len();
+        let tail = sql[into..].trim_start();
+        let end = tail
+            .find(|character: char| character.is_whitespace() || character == '(')
+            .unwrap_or(tail.len());
+        &tail[..end]
+    } else if upper.starts_with("UPDATE ") {
+        let set = find_top_level_keyword(sql, " SET ", 0)?;
+        sql["UPDATE".len()..set].trim()
+    } else if upper.starts_with("DELETE ") {
+        let from = find_top_level_keyword(sql, "FROM ", 0)? + "FROM ".len();
+        let tail = sql[from..].trim_start();
+        let end = tail.find(char::is_whitespace).unwrap_or(tail.len());
+        &tail[..end]
+    } else {
+        return None;
+    };
+    split_table_reference(reference, default_database)
+        .ok()
+        .map(|(database, _)| database)
+}
+
 impl Drop for Backend {
     fn drop(&mut self) {
         self.transaction_writes.write().clear();
@@ -12644,6 +12789,13 @@ fn write_lock_requests(
                     &mut requests,
                     format!("database:{database}"),
                     LockMode::Exclusive,
+                );
+            }
+            WriteCommand::FinishEventV5 { database, .. } => {
+                add_lock_request(
+                    &mut requests,
+                    format!("database:{database}"),
+                    LockMode::IntentionExclusive,
                 );
             }
             WriteCommand::ForeignKeyChecksDisabled => {}
@@ -17958,20 +18110,161 @@ fn parse_stored_function_call(expression: &str) -> Option<(&str, Vec<String>)> {
     ))
 }
 
-fn stored_function_return_expression(body: &str) -> anyhow::Result<&str> {
-    let body = body.trim().trim_end_matches(';').trim();
-    let expression = body
-        .get("RETURN".len()..)
-        .filter(|_| {
-            body.get(.."RETURN".len())
-                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("RETURN"))
-        })
-        .ok_or_else(|| anyhow::anyhow!("Stored function body must be a scalar RETURN expression"))?
-        .trim();
-    if expression.is_empty() || expression.contains(';') {
-        anyhow::bail!("Stored function body must be a single scalar RETURN expression");
+fn parse_stored_function_return_statement(statement: &str) -> anyhow::Result<Option<&str>> {
+    let statement = statement.trim();
+    if !trigger_control_prefix(&statement.to_ascii_uppercase(), "RETURN") {
+        return Ok(None);
     }
-    Ok(expression)
+    let expression = statement["RETURN".len()..].trim();
+    if expression.is_empty() {
+        anyhow::bail!("Stored function RETURN requires an expression");
+    }
+    Ok(Some(expression))
+}
+
+enum StoredFunctionControl {
+    Return(Option<Vec<u8>>),
+    Leave(String),
+    Iterate(String),
+}
+
+fn execute_stored_function_nodes(
+    nodes: &[TriggerStatementNode],
+    locals: &mut TriggerLocalScopes,
+) -> anyhow::Result<Option<StoredFunctionControl>> {
+    for node in nodes {
+        match node {
+            TriggerStatementNode::Sql(statement) => {
+                let context = trigger_context_with_locals(Row::new(), locals);
+                if execute_trigger_declaration(statement, &context, locals)? {
+                    continue;
+                }
+                if let Some(assignments) = parse_trigger_set_assignments(statement)? {
+                    for (target, expression) in assignments {
+                        if target.starts_with('@') {
+                            anyhow::bail!(
+                                "Stored function SET only supports declared local variables"
+                            );
+                        }
+                        if expression.eq_ignore_ascii_case("DEFAULT") {
+                            anyhow::bail!(
+                                "DEFAULT is not valid for stored function local variables"
+                            );
+                        }
+                        let context = trigger_context_with_locals(Row::new(), locals);
+                        let value = evaluate_scalar_expression(&expression, &context)?;
+                        if !locals.set(&target, value)? {
+                            anyhow::bail!("Unknown local variable '{}'", target);
+                        }
+                    }
+                    continue;
+                }
+                if let Some(expression) = parse_stored_function_return_statement(statement)? {
+                    let value = evaluate_scalar_expression(expression, &context)?;
+                    return Ok(Some(StoredFunctionControl::Return(value)));
+                }
+                anyhow::bail!(
+                    "Stored function body only supports DECLARE, SET, control flow, and RETURN"
+                );
+            }
+            TriggerStatementNode::If {
+                branches,
+                otherwise,
+            } => {
+                let mut selected = otherwise.as_slice();
+                for (condition, statements) in branches {
+                    let context = trigger_context_with_locals(Row::new(), locals);
+                    if evaluate_scalar_condition(condition, &context)? {
+                        selected = statements;
+                        break;
+                    }
+                }
+                if let Some(control) = execute_stored_function_nodes(selected, locals)? {
+                    return Ok(Some(control));
+                }
+            }
+            TriggerStatementNode::Case {
+                selector,
+                branches,
+                otherwise,
+                has_else,
+            } => {
+                let context = trigger_context_with_locals(Row::new(), locals);
+                let selected =
+                    trigger_case_branch(selector, branches, otherwise, *has_else, &context)?;
+                if let Some(control) = execute_stored_function_nodes(selected, locals)? {
+                    return Ok(Some(control));
+                }
+            }
+            TriggerStatementNode::Loop { label, kind, body } => {
+                let mut finished = false;
+                for _ in 0..MAX_TRIGGER_LOOP_ITERATIONS {
+                    let context = trigger_context_with_locals(Row::new(), locals);
+                    if matches!(kind, TriggerLoopKind::While(condition) if !evaluate_scalar_condition(condition, &context)?)
+                    {
+                        finished = true;
+                        break;
+                    }
+                    if let Some(control) = execute_stored_function_nodes(body, locals)? {
+                        match control {
+                            StoredFunctionControl::Return(_) => return Ok(Some(control)),
+                            StoredFunctionControl::Leave(target)
+                                if label
+                                    .as_deref()
+                                    .is_some_and(|label| label.eq_ignore_ascii_case(&target)) =>
+                            {
+                                finished = true;
+                                break;
+                            }
+                            StoredFunctionControl::Iterate(target)
+                                if label
+                                    .as_deref()
+                                    .is_some_and(|label| label.eq_ignore_ascii_case(&target)) =>
+                            {
+                                continue;
+                            }
+                            control => return Ok(Some(control)),
+                        }
+                    }
+                    if let TriggerLoopKind::RepeatUntil(condition) = kind {
+                        let context = trigger_context_with_locals(Row::new(), locals);
+                        if evaluate_scalar_condition(condition, &context)? {
+                            finished = true;
+                            break;
+                        }
+                    }
+                }
+                if !finished {
+                    anyhow::bail!(
+                        "Stored function loop exceeded {} iterations",
+                        MAX_TRIGGER_LOOP_ITERATIONS
+                    );
+                }
+            }
+            TriggerStatementNode::Block { label, body } => {
+                locals.push_scope();
+                let result = execute_stored_function_nodes(body, locals);
+                locals.pop_scope();
+                if let Some(control) = result? {
+                    if matches!(&control, StoredFunctionControl::Leave(target) if label.as_deref().is_some_and(|label| label.eq_ignore_ascii_case(target)))
+                    {
+                        continue;
+                    }
+                    return Ok(Some(control));
+                }
+            }
+            TriggerStatementNode::Leave(label) => {
+                return Ok(Some(StoredFunctionControl::Leave(label.clone())));
+            }
+            TriggerStatementNode::Iterate(label) => {
+                return Ok(Some(StoredFunctionControl::Iterate(label.clone())));
+            }
+            TriggerStatementNode::Handler { .. } => {
+                anyhow::bail!("Stored function handlers are not supported");
+            }
+        }
+    }
+    Ok(None)
 }
 
 fn evaluate_stored_function_call(
@@ -18011,16 +18304,22 @@ fn evaluate_stored_function_call(
         anyhow::bail!("Recursive stored function call is not allowed");
     }
     let result = (|| {
-        let mut locals = Row::new();
+        let mut locals = TriggerLocalScopes::new(false);
         for (parameter, argument) in function.parameters.iter().zip(arguments) {
             let value = evaluate_scalar_expression(&argument, row)?;
-            match coerce_trigger_local_value(&parameter.data_type, value, false)? {
-                Some(value) => locals.push(&parameter.name, value),
-                None => locals.push_null(&parameter.name),
-            }
+            locals.declare(&parameter.name, &parameter.data_type, value)?;
         }
-        let expression = stored_function_return_expression(&function.body)?;
-        let value = evaluate_scalar_expression(expression, &locals)?;
+        let nodes = trigger_body_nodes(&function.body)?;
+        let value = match execute_stored_function_nodes(&nodes, &mut locals)? {
+            Some(StoredFunctionControl::Return(value)) => value,
+            Some(StoredFunctionControl::Leave(label)) => {
+                anyhow::bail!("LEAVE '{}' escaped stored function body", label)
+            }
+            Some(StoredFunctionControl::Iterate(label)) => {
+                anyhow::bail!("ITERATE '{}' escaped stored function body", label)
+            }
+            None => anyhow::bail!("Stored function ended without RETURN"),
+        };
         coerce_trigger_local_value(&function.returns, value, false)
     })();
     STORED_FUNCTION_CALL_STACK.with(|stack| {
@@ -23140,18 +23439,18 @@ fn parse_function_parameter(value: &str) -> anyhow::Result<FunctionParameter> {
 
 fn function_characteristic_start(value: &str) -> usize {
     [
-        " LANGUAGE SQL",
-        " NOT DETERMINISTIC",
-        " DETERMINISTIC",
-        " CONTAINS SQL",
-        " NO SQL",
-        " READS SQL DATA",
-        " MODIFIES SQL DATA",
-        " SQL SECURITY ",
-        " COMMENT ",
+        "LANGUAGE",
+        "NOT",
+        "DETERMINISTIC",
+        "CONTAINS",
+        "NO",
+        "READS",
+        "MODIFIES",
+        "SQL",
+        "COMMENT",
     ]
     .into_iter()
-    .filter_map(|keyword| find_top_level_keyword(value, keyword, 0))
+    .filter_map(|keyword| find_top_level_word(value, keyword))
     .min()
     .unwrap_or(value.len())
 }
@@ -23169,16 +23468,22 @@ fn parse_function_returns_clause(
         })
         .ok_or_else(|| anyhow::anyhow!("CREATE FUNCTION requires RETURNS data type"))?
         .trim_start();
-    let return_position = find_top_level_keyword(remainder, " RETURN ", 0)
-        .ok_or_else(|| anyhow::anyhow!("CREATE FUNCTION requires a RETURN expression"))?;
-    let before_return = remainder[..return_position].trim();
-    let characteristic_start = function_characteristic_start(before_return);
-    let returns = before_return[..characteristic_start].trim();
+    let body_position = [
+        find_top_level_word(remainder, "RETURN"),
+        find_top_level_word(remainder, "BEGIN"),
+    ]
+    .into_iter()
+    .flatten()
+    .min()
+    .ok_or_else(|| anyhow::anyhow!("CREATE FUNCTION requires a RETURN expression or BEGIN body"))?;
+    let before_body = remainder[..body_position].trim();
+    let characteristic_start = function_characteristic_start(before_body);
+    let returns = before_body[..characteristic_start].trim();
     if returns.is_empty() {
         anyhow::bail!("CREATE FUNCTION requires RETURNS data type");
     }
     validate_stored_program_data_type(returns)?;
-    let characteristics = &before_return[characteristic_start..];
+    let characteristics = &before_body[characteristic_start..];
     let (characteristics, tail, _) = parse_procedure_characteristics(
         characteristics,
         ProcedureCharacteristics::default(),
@@ -23190,7 +23495,7 @@ fn parse_function_returns_clause(
     Ok((
         returns.to_string(),
         characteristics,
-        remainder[return_position + 1..].trim_start(),
+        remainder[body_position..].trim_start(),
     ))
 }
 
@@ -23237,7 +23542,7 @@ fn parse_create_function(
         }
     }
     let (returns, _, body) = parse_function_returns_clause(&remainder[close + 1..])?;
-    stored_function_return_expression(body)?;
+    validate_stored_function_body(body, &parameter_names)?;
     Ok((
         database,
         FunctionDefinition {
@@ -23585,6 +23890,7 @@ fn parse_create_event(
     sql: &str,
     current_database: &str,
     time_zone: &str,
+    default_definer: &str,
 ) -> anyhow::Result<(String, EventDefinition, bool)> {
     let upper = sql.to_ascii_uppercase();
     let (event_position, after_position) = if upper.starts_with("CREATE EVENT ") {
@@ -23594,11 +23900,32 @@ fn parse_create_event(
             .ok_or_else(|| anyhow::anyhow!("CREATE EVENT requires EVENT"))?;
         (position, position + " EVENT ".len())
     };
-    let definer = sql[..event_position]
+    let explicit_definer = sql[..event_position]
         .find('=')
-        .map(|position| normalize_procedure_definer(&sql[position + 1..event_position]))
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "root@%".into());
+        .map(|position| {
+            let value = sql[position + 1..event_position].trim();
+            if value.eq_ignore_ascii_case("CURRENT_USER")
+                || value.eq_ignore_ascii_case("CURRENT_USER()")
+            {
+                format!("{}@%", default_definer.trim())
+            } else {
+                normalize_procedure_definer(value)
+            }
+        })
+        .filter(|value| !value.is_empty());
+    let definer = explicit_definer
+        .clone()
+        .unwrap_or_else(|| format!("{}@%", default_definer.trim()));
+    if explicit_definer.is_some()
+        && !definer
+            .split_once('@')
+            .map(|(user, _)| user.eq_ignore_ascii_case(default_definer.trim()))
+            .unwrap_or(false)
+    {
+        anyhow::bail!(
+            "CREATE EVENT with a different DEFINER is not supported without SET_USER_ID privilege"
+        );
+    }
     let mut remainder = sql[after_position..].trim_start();
     let if_not_exists = remainder
         .get(.."IF NOT EXISTS".len())
@@ -23623,6 +23950,8 @@ fn parse_create_event(
         create_sql: String::new(),
     };
     event.create_sql = render_create_event(&event)?;
+    validate_event_body(&event.body)
+        .map_err(|error| anyhow::anyhow!("Invalid CREATE EVENT body '{}': {error}", event.body))?;
     Ok((database, event, if_not_exists))
 }
 
@@ -23640,6 +23969,7 @@ fn parse_alter_event(
     current_database: &str,
     existing: &EventDefinition,
     session_time_zone: &str,
+    default_definer: &str,
 ) -> anyhow::Result<(String, EventDefinition)> {
     let remainder = sql["ALTER EVENT".len()..].trim_start();
     let (reference, tail) = take_show_identifier(remainder)?;
@@ -23657,6 +23987,10 @@ fn parse_alter_event(
         anyhow::bail!("ALTER EVENT requires a change");
     }
     let mut event = existing.clone();
+    // MySQL changes an EVENT's definer to the successful ALTER issuer unless
+    // an explicit DEFINER is supplied. This prevents a lower-privileged EVENT
+    // user from editing a root-defined event that keeps running as root.
+    event.definer = format!("{}@%", default_definer.trim());
     if let Some(schedule) = clauses.schedule {
         event.schedule = schedule;
         event.time_zone = session_time_zone.to_string();
@@ -23674,7 +24008,554 @@ fn parse_alter_event(
         event.body = body;
     }
     event.create_sql = render_create_event(&event)?;
+    validate_event_body(&event.body)
+        .map_err(|error| anyhow::anyhow!("Invalid ALTER EVENT body '{}': {error}", event.body))?;
     Ok((database, event))
+}
+
+fn validate_event_body(body: &str) -> anyhow::Result<()> {
+    let nodes = trigger_body_nodes(body)?;
+    validate_trigger_loop_controls(&nodes, &mut Vec::new())?;
+    let mut scopes = vec![ProcedureValidationScope::default()];
+    validate_procedure_statements(&nodes, &mut scopes)
+}
+
+#[derive(Clone)]
+struct EventRuntimePlan {
+    due: DateTime<Utc>,
+    metadata: EventMetadata,
+    action: EventFinishAction,
+    run_body: bool,
+}
+
+fn event_time_zone(event: &EventDefinition) -> anyhow::Result<MysqlTimeZone> {
+    parse_mysql_time_zone(event.time_zone.as_bytes()).ok_or_else(|| {
+        anyhow::anyhow!(
+            "EVENT {} has an invalid time zone '{}'",
+            event.name,
+            event.time_zone
+        )
+    })
+}
+
+fn event_schedule_expression_utc(
+    expression: &str,
+    zone: MysqlTimeZone,
+) -> anyhow::Result<DateTime<Utc>> {
+    let value = evaluate_scalar_expression(expression, &Row::new())?
+        .ok_or_else(|| anyhow::anyhow!("EVENT schedule expression cannot be NULL"))?;
+    let naive = parse_mysql_naive_datetime(&value)?;
+    mysql_time_zone_naive_to_utc(naive, zone).ok_or_else(|| {
+        anyhow::anyhow!(
+            "EVENT schedule timestamp '{}' is invalid in its time zone",
+            String::from_utf8_lossy(&value)
+        )
+    })
+}
+
+fn event_interval_value(event: &EventDefinition) -> anyhow::Result<String> {
+    let expression = event
+        .schedule
+        .interval_value
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("EVENT {} has no interval value", event.name))?;
+    evaluate_scalar_expression(expression, &Row::new())?
+        .map(|value| String::from_utf8_lossy(&value).trim().to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("EVENT interval value cannot be NULL or empty"))
+}
+
+fn event_schedule_interval_field(event: &EventDefinition) -> anyhow::Result<&str> {
+    event
+        .schedule
+        .interval_field
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("EVENT {} has no interval field", event.name))
+}
+
+fn event_interval_number(value: &str) -> anyhow::Result<i64> {
+    let value = value.trim().trim_start_matches('+');
+    let value = value
+        .parse::<i64>()
+        .map_err(|_| anyhow::anyhow!("Invalid EVENT interval '{}'", value))?;
+    if value <= 0 {
+        anyhow::bail!("EVENT interval must be positive");
+    }
+    Ok(value)
+}
+
+fn event_add_interval(
+    datetime: NaiveDateTime,
+    value: &str,
+    field: &str,
+) -> anyhow::Result<NaiveDateTime> {
+    let field = field.to_ascii_uppercase();
+    if !matches!(
+        field.as_str(),
+        "MICROSECOND"
+            | "SECOND"
+            | "MINUTE"
+            | "HOUR"
+            | "DAY"
+            | "WEEK"
+            | "MONTH"
+            | "QUARTER"
+            | "YEAR"
+    ) {
+        anyhow::bail!(
+            "EVENT interval field '{}' is not supported by the scheduler",
+            field
+        );
+    }
+    mysql_add_datetime_unit(datetime, event_interval_number(value)?, &field)
+        .ok_or_else(|| anyhow::anyhow!("EVENT interval is out of range"))
+}
+
+fn event_initial_execution(
+    event: &EventDefinition,
+    now: DateTime<Utc>,
+) -> anyhow::Result<DateTime<Utc>> {
+    let zone = event_time_zone(event)?;
+    if let Some(execute_at) = event.schedule.execute_at.as_deref() {
+        return event_schedule_expression_utc(execute_at, zone);
+    }
+    // Validate every recurring interval during CREATE/ALTER rather than
+    // accepting a definition which can never be scheduled.
+    let _ = event_add_interval(
+        mysql_time_zone_utc_to_naive(now, zone),
+        &event_interval_value(event)?,
+        event_schedule_interval_field(event)?,
+    )?;
+    event
+        .schedule
+        .starts
+        .as_deref()
+        .map(|starts| event_schedule_expression_utc(starts, zone))
+        .transpose()
+        .map(|starts| starts.unwrap_or(now))
+}
+
+fn event_schedule_end(event: &EventDefinition) -> anyhow::Result<Option<DateTime<Utc>>> {
+    let zone = event_time_zone(event)?;
+    event
+        .schedule
+        .ends
+        .as_deref()
+        .map(|ends| event_schedule_expression_utc(ends, zone))
+        .transpose()
+}
+
+fn event_next_execution(
+    event: &EventDefinition,
+    metadata: &EventMetadata,
+    due: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> anyhow::Result<Option<DateTime<Utc>>> {
+    if event.schedule.execute_at.is_some() {
+        return Ok(None);
+    }
+    let zone = event_time_zone(event)?;
+    let value = metadata
+        .schedule_interval_value
+        .clone()
+        .filter(|value| !value.is_empty())
+        .unwrap_or(event_interval_value(event)?);
+    let field = event_schedule_interval_field(event)?;
+    let mut next = due;
+    for _ in 0..1_000_000 {
+        let local = mysql_time_zone_utc_to_naive(next, zone);
+        let local = event_add_interval(local, &value, field)?;
+        next = mysql_time_zone_naive_to_utc(local, zone)
+            .ok_or_else(|| anyhow::anyhow!("EVENT next execution is invalid in its time zone"))?;
+        if next > now {
+            let end = event_metadata_schedule_end(event, metadata)?;
+            return Ok(end.is_none_or(|end| next <= end).then_some(next));
+        }
+    }
+    anyhow::bail!("EVENT schedule exceeded one million missed intervals")
+}
+
+fn event_metadata_schedule_end(
+    event: &EventDefinition,
+    metadata: &EventMetadata,
+) -> anyhow::Result<Option<DateTime<Utc>>> {
+    match metadata.schedule_ends_utc.as_deref() {
+        Some(value) => DateTime::parse_from_rfc3339(value)
+            .map(|value| Some(value.with_timezone(&Utc)))
+            .map_err(|_| anyhow::anyhow!("EVENT {} has an invalid END cursor", event.name)),
+        None => event_schedule_end(event),
+    }
+}
+
+fn hydrate_event_schedule_runtime(
+    event: &EventDefinition,
+    metadata: &mut EventMetadata,
+) -> anyhow::Result<()> {
+    metadata.schedule_interval_value = if event.schedule.execute_at.is_some() {
+        None
+    } else {
+        Some(event_interval_value(event)?)
+    };
+    metadata.schedule_ends_utc = event_schedule_end(event)?.map(|end| end.to_rfc3339());
+    Ok(())
+}
+
+fn event_completion_action(event: &EventDefinition) -> anyhow::Result<EventFinishAction> {
+    if event.on_completion.eq_ignore_ascii_case("PRESERVE") {
+        let mut disabled = event.clone();
+        disabled.status = "DISABLED".into();
+        disabled.create_sql = render_create_event(&disabled)?;
+        Ok(EventFinishAction::Disable(disabled))
+    } else {
+        Ok(EventFinishAction::Drop)
+    }
+}
+
+fn event_metadata_with_next_execution(
+    event: &EventDefinition,
+    mut metadata: EventMetadata,
+    now: DateTime<Utc>,
+) -> anyhow::Result<EventMetadata> {
+    hydrate_event_schedule_runtime(event, &mut metadata)?;
+    let initial = event_initial_execution(event, now)?;
+    if let Some(end) = event_metadata_schedule_end(event, &metadata)? {
+        if initial > end {
+            anyhow::bail!("EVENT STARTS must not be after ENDS");
+        }
+    }
+    metadata.next_execution_utc = Some(initial.to_rfc3339());
+    Ok(metadata)
+}
+
+fn event_runtime_plan(
+    event: &EventDefinition,
+    metadata: &EventMetadata,
+    now: DateTime<Utc>,
+) -> anyhow::Result<Option<EventRuntimePlan>> {
+    if !event.status.eq_ignore_ascii_case("ENABLED") {
+        return Ok(None);
+    }
+    // A scheduler-completed event has no next cursor. Keep it completed when
+    // a metadata-only ALTER later toggles ENABLE; only a schedule change may
+    // derive a fresh cursor and intentionally reactivate it.
+    if metadata.next_execution_utc.is_none() && metadata.last_executed.is_some() {
+        return Ok(None);
+    }
+    let zone = event_time_zone(event)?;
+    let persisted_cursor = metadata.next_execution_utc.is_some();
+    let schedule_state_missing = (event.schedule.execute_at.is_none()
+        && metadata.schedule_interval_value.is_none())
+        || (event.schedule.ends.is_some() && metadata.schedule_ends_utc.is_none());
+    let due = metadata
+        .next_execution_utc
+        .as_deref()
+        .map(|value| {
+            DateTime::parse_from_rfc3339(value)
+                .map(|value| value.with_timezone(&Utc))
+                .map_err(|_| {
+                    anyhow::anyhow!("EVENT {} has an invalid execution cursor", event.name)
+                })
+        })
+        .transpose()?
+        .unwrap_or(event_initial_execution(event, now)?);
+    let mut next_metadata = metadata.clone();
+    if schedule_state_missing {
+        hydrate_event_schedule_runtime(event, &mut next_metadata)?;
+    }
+    if let Some(end) = event_metadata_schedule_end(event, &next_metadata)? {
+        if due > end {
+            next_metadata.next_execution_utc = None;
+            next_metadata.revision = metadata.revision.saturating_add(1);
+            return Ok(Some(EventRuntimePlan {
+                due,
+                metadata: next_metadata,
+                action: event_completion_action(event)?,
+                run_body: false,
+            }));
+        }
+    }
+    if due > now {
+        if !persisted_cursor || schedule_state_missing {
+            next_metadata.next_execution_utc = Some(due.to_rfc3339());
+            next_metadata.revision = metadata.revision.saturating_add(1);
+            return Ok(Some(EventRuntimePlan {
+                due,
+                metadata: next_metadata,
+                action: EventFinishAction::Keep,
+                run_body: false,
+            }));
+        }
+        return Ok(None);
+    }
+    let next = event_next_execution(event, &next_metadata, due, now)?;
+    next_metadata.last_executed = Some(format_mysql_naive_datetime(
+        mysql_time_zone_utc_to_naive(now, zone),
+        0,
+    ));
+    next_metadata.next_execution_utc = next.map(|next| next.to_rfc3339());
+    next_metadata.revision = metadata.revision.saturating_add(1);
+    Ok(Some(EventRuntimePlan {
+        due,
+        metadata: next_metadata,
+        action: if next.is_some() {
+            EventFinishAction::Keep
+        } else {
+            event_completion_action(event)?
+        },
+        run_body: true,
+    }))
+}
+
+struct ScheduledEvent {
+    database: String,
+    event: EventDefinition,
+    metadata: EventMetadata,
+    plan: EventRuntimePlan,
+}
+
+pub fn spawn_event_scheduler(
+    storage: Arc<StorageEngineManager>,
+    config: Arc<ProtocolConfig>,
+    stats: Arc<WireStats>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        if let Err(error) = run_event_scheduler(storage, config, stats, shutdown).await {
+            tracing::error!("EVENT scheduler stopped: {}", error);
+        }
+    })
+}
+
+async fn run_event_scheduler(
+    storage: Arc<StorageEngineManager>,
+    config: Arc<ProtocolConfig>,
+    stats: Arc<WireStats>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> anyhow::Result<()> {
+    let mut ticker = tokio::time::interval(Duration::from_millis(250));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                if let Err(error) = run_due_events_once_at(&storage, &config, &stats, Utc::now()).await {
+                    tracing::warn!("EVENT scheduler tick failed: {}", error);
+                }
+            }
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn run_due_events_once_at(
+    storage: &Arc<StorageEngineManager>,
+    config: &Arc<ProtocolConfig>,
+    stats: &Arc<WireStats>,
+    now: DateTime<Utc>,
+) -> anyhow::Result<()> {
+    let mut databases = storage.list_databases();
+    databases.sort();
+    databases.dedup();
+    let mut scheduled = Vec::new();
+    for database_name in databases {
+        let Some(database) = storage.get_database(&database_name) else {
+            continue;
+        };
+        let mut events = database.list_events();
+        events.sort_by(|left, right| left.name.cmp(&right.name));
+        for event in events {
+            let metadata = database
+                .get_event_metadata(&event.name)
+                .unwrap_or_else(|| EventMetadata::new(String::new()));
+            let zone = match event_time_zone(&event) {
+                Ok(zone) => zone,
+                Err(error) => {
+                    tracing::warn!(
+                        "EVENT {}.{} has invalid time zone: {}",
+                        database_name,
+                        event.name,
+                        error
+                    );
+                    continue;
+                }
+            };
+            let plan = STATEMENT_CLOCK
+                .scope(
+                    StatementClock {
+                        utc: now,
+                        session_zone: Cell::new(zone),
+                    },
+                    async { event_runtime_plan(&event, &metadata, now) },
+                )
+                .await;
+            match plan {
+                Ok(Some(plan)) => scheduled.push(ScheduledEvent {
+                    database: database_name.clone(),
+                    event,
+                    metadata,
+                    plan,
+                }),
+                Ok(None) => {}
+                Err(error) => tracing::warn!(
+                    "EVENT {}.{} schedule is invalid: {}",
+                    database_name,
+                    event.name,
+                    error
+                ),
+            }
+        }
+    }
+    scheduled.sort_by(|left, right| {
+        left.plan
+            .due
+            .cmp(&right.plan.due)
+            .then_with(|| left.database.cmp(&right.database))
+            .then_with(|| left.event.name.cmp(&right.event.name))
+    });
+    for scheduled in scheduled {
+        if let Err(error) = execute_scheduled_event(storage, config, stats, scheduled, now).await {
+            tracing::warn!("EVENT execution failed: {}", error);
+        }
+    }
+    Ok(())
+}
+
+async fn execute_scheduled_event(
+    storage: &Arc<StorageEngineManager>,
+    config: &Arc<ProtocolConfig>,
+    stats: &Arc<WireStats>,
+    scheduled: ScheduledEvent,
+    now: DateTime<Utc>,
+) -> anyhow::Result<()> {
+    let finish = WriteCommand::FinishEventV5 {
+        database: scheduled.database.clone(),
+        event: scheduled.event.name.clone(),
+        expected_create_sql: scheduled.event.create_sql.clone(),
+        expected_revision: scheduled.metadata.revision,
+        metadata: scheduled.plan.metadata.clone(),
+        action: scheduled.plan.action.clone(),
+    };
+    let connection_id = stats.internal_connection_id();
+    let locks = write_lock_requests(storage, &[finish.clone()])?;
+    stats
+        .acquire_locks(
+            &locks,
+            connection_id,
+            Duration::from_millis(config.lock_wait_timeout_ms),
+        )
+        .await?;
+    let Some(current) = storage
+        .get_database(&scheduled.database)
+        .and_then(|database| database.get_event(&scheduled.event.name))
+    else {
+        stats.release_all_locks(connection_id);
+        return Ok(());
+    };
+    if current.create_sql != scheduled.event.create_sql {
+        stats.release_all_locks(connection_id);
+        return Ok(());
+    }
+    let current_revision = storage
+        .get_database(&scheduled.database)
+        .and_then(|database| database.get_event_metadata(&scheduled.event.name))
+        .map(|metadata| metadata.revision)
+        .unwrap_or(0);
+    if current_revision != scheduled.metadata.revision {
+        stats.release_all_locks(connection_id);
+        return Ok(());
+    }
+
+    let mut backend = Backend::new(
+        storage.clone(),
+        config.clone(),
+        stats.clone(),
+        connection_id,
+    );
+    backend.database = scheduled.database.clone();
+    backend.execution_mode = BackendExecutionMode::EventAtomic;
+    backend.in_transaction = true;
+    backend.autocommit = false;
+    backend.session_variables.insert(
+        "time_zone".into(),
+        Some(scheduled.event.time_zone.clone().into_bytes()),
+    );
+    backend.session_variables.insert(
+        "sql_mode".into(),
+        Some(scheduled.metadata.sql_mode.clone().into_bytes()),
+    );
+    let definer = scheduled
+        .event
+        .definer
+        .split_once('@')
+        .map(|(user, _)| user)
+        .unwrap_or(&scheduled.event.definer)
+        .to_string();
+    *backend.authenticated_user.lock() = Some(definer);
+
+    let body_result = if scheduled.plan.run_body {
+        match (
+            event_time_zone(&scheduled.event),
+            trigger_body_nodes(&scheduled.event.body),
+        ) {
+            (Ok(zone), Ok(nodes)) => {
+                let mut locals = TriggerLocalScopes::new(backend.truncate_fractional_seconds());
+                let mut state = ProcedureExecutionState::default();
+                locals.push_scope();
+                state.push_scope();
+                let functions = StoredFunctionCatalog::from_storage(storage, &scheduled.database);
+                let result = STORED_FUNCTION_CATALOG
+                    .scope(
+                        functions,
+                        STATEMENT_CLOCK.scope(
+                            StatementClock {
+                                utc: now,
+                                session_zone: Cell::new(zone),
+                            },
+                            backend.execute_procedure_nodes(&nodes, &mut locals, &mut state),
+                        ),
+                    )
+                    .await;
+                state.pop_scope();
+                locals.pop_scope();
+                match result {
+                    Ok(None) | Ok(Some(TriggerLoopControl::HandlerExit(0))) => Ok(()),
+                    Ok(Some(control)) => anyhow::bail!(
+                        "EVENT {} has inactive control label '{}'",
+                        scheduled.event.name,
+                        trigger_loop_control_label(&control)
+                    ),
+                    Err(error) => Err(error),
+                }
+            }
+            (Err(error), _) | (_, Err(error)) => Err(error),
+        }
+    } else {
+        Ok(())
+    };
+
+    match body_result {
+        Ok(()) => {
+            backend.transaction_writes.write().push(finish);
+            backend.commit_pending().await?;
+            Ok(())
+        }
+        Err(body_error) => {
+            backend.transaction_writes.write().clear();
+            backend.transaction_snapshot.clear();
+            backend.savepoints.clear();
+            backend.transaction_writes.write().push(finish);
+            match backend.commit_pending().await {
+                Ok(_) => Err(body_error),
+                Err(finish_error) => Err(anyhow::anyhow!(
+                    "EVENT body failed ({body_error}); scheduler state persistence also failed ({finish_error})"
+                )),
+            }
+        }
+    }
 }
 
 fn validate_procedure_statements(
@@ -23902,6 +24783,160 @@ fn procedure_validation_condition(
         .rev()
         .find_map(|scope| scope.conditions.get(&normalized).cloned())
         .ok_or_else(|| anyhow::anyhow!("Condition '{}' is not declared", name))
+}
+
+#[derive(Default)]
+struct StoredFunctionValidationScope {
+    variables: HashSet<String>,
+    declaration_phase: ProcedureDeclarationPhase,
+}
+
+fn stored_function_variable_is_declared(
+    scopes: &[StoredFunctionValidationScope],
+    name: &str,
+) -> bool {
+    let normalized = name.trim_matches('`').to_ascii_lowercase();
+    scopes
+        .iter()
+        .rev()
+        .any(|scope| scope.variables.contains(&normalized))
+}
+
+fn validate_stored_function_body(
+    body: &str,
+    parameter_names: &HashSet<String>,
+) -> anyhow::Result<()> {
+    let body = body.trim().trim_end_matches(';').trim();
+    let upper = body.to_ascii_uppercase();
+    let scalar = parse_stored_function_return_statement(body)?.is_some();
+    let compound = trigger_control_prefix(&upper, "BEGIN") && upper.ends_with("END");
+    if !scalar && !compound {
+        anyhow::bail!(
+            "Stored function body must be a scalar RETURN expression or a BEGIN ... END block"
+        );
+    }
+    let nodes = trigger_body_nodes(body)?;
+    if scalar && nodes.len() != 1 {
+        anyhow::bail!("Stored function scalar body must contain exactly one RETURN statement");
+    }
+    validate_trigger_loop_controls(&nodes, &mut Vec::new())?;
+    let mut scopes = vec![StoredFunctionValidationScope {
+        variables: parameter_names.clone(),
+        ..StoredFunctionValidationScope::default()
+    }];
+    if !validate_stored_function_nodes(&nodes, &mut scopes)? {
+        anyhow::bail!("Stored function body must contain a RETURN statement");
+    }
+    Ok(())
+}
+
+fn validate_stored_function_nodes(
+    nodes: &[TriggerStatementNode],
+    scopes: &mut Vec<StoredFunctionValidationScope>,
+) -> anyhow::Result<bool> {
+    let mut has_return = false;
+    for node in nodes {
+        match node {
+            TriggerStatementNode::Sql(statement) => {
+                if parse_procedure_condition_declaration(statement)?.is_some()
+                    || parse_procedure_cursor_declaration(statement)?.is_some()
+                    || parse_procedure_handler_header(statement)?.is_some()
+                {
+                    anyhow::bail!(
+                        "Stored function condition, cursor, and handler declarations are not supported"
+                    );
+                }
+                if let Some(declaration) = parse_trigger_declaration(statement)? {
+                    let scope = scopes.last_mut().expect("stored function validation scope");
+                    if scope.declaration_phase != ProcedureDeclarationPhase::Variable {
+                        anyhow::bail!(
+                            "Stored function variable DECLARE must precede executable statements"
+                        );
+                    }
+                    for name in declaration.names {
+                        if !scope.variables.insert(name.to_ascii_lowercase()) {
+                            anyhow::bail!("Duplicate variable '{}'", name);
+                        }
+                    }
+                    continue;
+                }
+                scopes
+                    .last_mut()
+                    .expect("stored function validation scope")
+                    .declaration_phase = ProcedureDeclarationPhase::Executable;
+                if let Some(assignments) = parse_trigger_set_assignments(statement)? {
+                    for (target, expression) in assignments {
+                        if target.starts_with('@') {
+                            anyhow::bail!(
+                                "Stored function SET only supports declared local variables"
+                            );
+                        }
+                        if expression.eq_ignore_ascii_case("DEFAULT") {
+                            anyhow::bail!(
+                                "DEFAULT is not valid for stored function local variables"
+                            );
+                        }
+                        if !stored_function_variable_is_declared(scopes, &target) {
+                            anyhow::bail!("Unknown local variable '{}'", target);
+                        }
+                    }
+                    continue;
+                }
+                if parse_stored_function_return_statement(statement)?.is_some() {
+                    has_return = true;
+                    continue;
+                }
+                anyhow::bail!(
+                    "Stored function body only supports DECLARE, SET, control flow, and RETURN"
+                );
+            }
+            TriggerStatementNode::If {
+                branches,
+                otherwise,
+            }
+            | TriggerStatementNode::Case {
+                branches,
+                otherwise,
+                ..
+            } => {
+                scopes
+                    .last_mut()
+                    .expect("stored function validation scope")
+                    .declaration_phase = ProcedureDeclarationPhase::Executable;
+                for (_, branch) in branches {
+                    has_return |= validate_stored_function_nodes(branch, scopes)?;
+                }
+                has_return |= validate_stored_function_nodes(otherwise, scopes)?;
+            }
+            TriggerStatementNode::Loop { body, .. } => {
+                scopes
+                    .last_mut()
+                    .expect("stored function validation scope")
+                    .declaration_phase = ProcedureDeclarationPhase::Executable;
+                has_return |= validate_stored_function_nodes(body, scopes)?;
+            }
+            TriggerStatementNode::Block { body, .. } => {
+                scopes
+                    .last_mut()
+                    .expect("stored function validation scope")
+                    .declaration_phase = ProcedureDeclarationPhase::Executable;
+                scopes.push(StoredFunctionValidationScope::default());
+                let result = validate_stored_function_nodes(body, scopes);
+                scopes.pop();
+                has_return |= result?;
+            }
+            TriggerStatementNode::Leave(_) | TriggerStatementNode::Iterate(_) => {
+                scopes
+                    .last_mut()
+                    .expect("stored function validation scope")
+                    .declaration_phase = ProcedureDeclarationPhase::Executable;
+            }
+            TriggerStatementNode::Handler { .. } => {
+                anyhow::bail!("Stored function handlers are not supported");
+            }
+        }
+    }
+    Ok(has_return)
 }
 
 fn parse_procedure_parameter(value: &str) -> anyhow::Result<ProcedureParameter> {
@@ -32467,6 +33502,11 @@ mod tests {
                 bytes("'2031-01-01 00:00:00'"),
             ]]
         );
+        let altered_create = query_rows(&mut backend, "SHOW CREATE EVENT daily_rollup").await;
+        assert!(
+            String::from_utf8_lossy(altered_create[0][3].as_deref().unwrap())
+                .contains("DO SET @event_ran = 2")
+        );
 
         backend
             .execute("CREATE USER event_writer IDENTIFIED BY 'event-password'")
@@ -32491,6 +33531,11 @@ mod tests {
             .await
             .unwrap();
         *backend.authenticated_user.lock() = Some("root".into());
+        let granted_create = query_rows(&mut backend, "SHOW CREATE EVENT granted_event").await;
+        assert!(
+            String::from_utf8_lossy(granted_create[0][3].as_deref().unwrap())
+                .contains("DEFINER=`event_writer`@`%`")
+        );
         backend
             .execute("DROP EVENT IF EXISTS daily_rollup, granted_event, no_such_event")
             .await
@@ -32501,6 +33546,141 @@ mod tests {
         )
         .await
         .is_empty());
+    }
+
+    #[tokio::test]
+    async fn event_scheduler_runs_due_events_atomically_and_persists_the_cursor() {
+        let (_temp, storage, mut backend, _second) = transaction_backends().await;
+        backend.execute("SET time_zone='+00:00'").await.unwrap();
+        let config = backend.config.clone();
+        let stats = backend.stats.clone();
+        backend
+            .execute(
+                "CREATE EVENT expired_drop ON SCHEDULE AT '2000-01-01 00:00:00' \
+                 DO INSERT INTO actors(id,value) VALUES(99,99)",
+            )
+            .await
+            .unwrap();
+        assert!(storage
+            .get_database("mydb")
+            .unwrap()
+            .get_event("expired_drop")
+            .is_none());
+        backend
+            .execute(
+                "CREATE EVENT expired_preserved ON SCHEDULE AT '2000-01-01 00:00:00' \
+                 ON COMPLETION PRESERVE DO INSERT INTO actors(id,value) VALUES(98,98)",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            storage
+                .get_database("mydb")
+                .unwrap()
+                .get_event("expired_preserved")
+                .unwrap()
+                .status,
+            "DISABLED"
+        );
+        backend
+            .execute(
+                "CREATE FUNCTION event_increment(value BIGINT) RETURNS BIGINT RETURN value + 1",
+            )
+            .await
+            .unwrap();
+        backend
+            .execute(
+                "CREATE EVENT once_preserved ON SCHEDULE AT '2030-01-01 00:00:00' \
+                 ON COMPLETION PRESERVE DO INSERT INTO actors(id,value) VALUES(2,event_increment(19))",
+            )
+            .await
+            .unwrap();
+        backend
+            .execute(
+                "CREATE EVENT once_failed ON SCHEDULE AT '2030-01-01 00:00:00' \
+                 ON COMPLETION PRESERVE DO BEGIN \
+                   INSERT INTO actors(id,value) VALUES(3,30); \
+                   INSERT INTO actors(id,value) VALUES(1,99); \
+                 END",
+            )
+            .await
+            .unwrap();
+        backend
+            .execute(
+                "CREATE EVENT daily_once ON SCHEDULE EVERY 1 DAY \
+                 STARTS '2030-01-01 00:00:00' ON COMPLETION PRESERVE \
+                 DO UPDATE actors SET value=value+1 WHERE id=1",
+            )
+            .await
+            .unwrap();
+        let now = Utc.with_ymd_and_hms(2030, 1, 3, 0, 0, 0).single().unwrap();
+        run_due_events_once_at(&storage, &config, &stats, now)
+            .await
+            .unwrap();
+        assert_eq!(
+            query_rows(&mut backend, "SELECT id,value FROM actors ORDER BY id",).await,
+            vec![
+                vec![Some(b"1".to_vec()), Some(b"11".to_vec())],
+                vec![Some(b"2".to_vec()), Some(b"20".to_vec())],
+            ]
+        );
+        let database = storage.get_database("mydb").unwrap();
+        let preserved = database.get_event("once_preserved").unwrap();
+        assert_eq!(preserved.status, "DISABLED");
+        assert_eq!(
+            database
+                .get_event_metadata("once_preserved")
+                .unwrap()
+                .last_executed
+                .as_deref(),
+            Some("2030-01-03 00:00:00")
+        );
+        assert_eq!(
+            database.get_event("once_failed").unwrap().status,
+            "DISABLED"
+        );
+        assert_eq!(database.get_event("daily_once").unwrap().status, "ENABLED");
+        assert_eq!(
+            database
+                .get_event_metadata("daily_once")
+                .unwrap()
+                .next_execution_utc
+                .as_deref(),
+            Some("2030-01-04T00:00:00+00:00")
+        );
+        backend
+            .execute("ALTER EVENT daily_once COMMENT 'metadata-only alteration'")
+            .await
+            .unwrap();
+        run_due_events_once_at(&storage, &config, &stats, now)
+            .await
+            .unwrap();
+        assert_eq!(
+            query_rows(&mut backend, "SELECT id,value FROM actors ORDER BY id",).await,
+            vec![
+                vec![Some(b"1".to_vec()), Some(b"11".to_vec())],
+                vec![Some(b"2".to_vec()), Some(b"20".to_vec())],
+            ]
+        );
+
+        backend.execute("SET time_zone='+08:00'").await.unwrap();
+        backend
+            .execute(
+                "CREATE EVENT zone_event ON SCHEDULE AT '2030-01-04 08:00:00' \
+                 ON COMPLETION NOT PRESERVE \
+                 DO INSERT INTO actors(id,value) VALUES(4,40)",
+            )
+            .await
+            .unwrap();
+        let utc_midnight = Utc.with_ymd_and_hms(2030, 1, 4, 0, 0, 0).single().unwrap();
+        run_due_events_once_at(&storage, &config, &stats, utc_midnight)
+            .await
+            .unwrap();
+        assert_eq!(
+            query_rows(&mut backend, "SELECT value FROM actors WHERE id=4").await,
+            vec![vec![Some(b"40".to_vec())]]
+        );
+        assert!(database.get_event("zone_event").is_none());
     }
 
     #[tokio::test]
@@ -33217,6 +34397,93 @@ mod tests {
         assert!(status
             .iter()
             .any(|row| { row.get(1).and_then(Option::as_deref) == Some(b"add_one".as_slice()) }));
+        backend
+            .execute(
+                "CREATE FUNCTION classify_value(input BIGINT) RETURNS BIGINT DETERMINISTIC \
+                 BEGIN \
+                   DECLARE adjusted BIGINT DEFAULT input + 1; \
+                   IF input IS NULL THEN RETURN NULL; \
+                   ELSEIF adjusted > 3 THEN SET adjusted = adjusted * 2; \
+                   ELSE SET adjusted = adjusted - 1; \
+                   END IF; \
+                   RETURN adjusted; \
+                 END",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            query_rows(
+                &mut backend,
+                "SELECT classify_value(2), classify_value(0), classify_value(NULL)",
+            )
+            .await,
+            vec![vec![Some(b"2".to_vec()), Some(b"0".to_vec()), None]]
+        );
+        backend
+            .execute(
+                "CREATE FUNCTION loop_sum(limit_value BIGINT) RETURNS BIGINT \
+                 BEGIN \
+                   DECLARE total BIGINT DEFAULT 0; \
+                   DECLARE cursor_value BIGINT DEFAULT 0; \
+                   tally: LOOP \
+                     SET cursor_value = cursor_value + 1; \
+                     IF cursor_value > limit_value THEN LEAVE tally; END IF; \
+                     CASE cursor_value % 2 \
+                       WHEN 0 THEN SET total = total + cursor_value; \
+                       ELSE SET total = total + 1; \
+                     END CASE; \
+                   END LOOP tally; \
+                   RETURN total; \
+                 END",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            query_rows(&mut backend, "SELECT loop_sum(3)").await,
+            vec![vec![Some(b"4".to_vec())]]
+        );
+        backend
+            .execute(
+                "CREATE FUNCTION shadow_value(input BIGINT) RETURNS BIGINT \
+                 BEGIN \
+                   DECLARE value BIGINT DEFAULT input; \
+                   BEGIN \
+                     DECLARE value BIGINT DEFAULT 99; \
+                     SET value = value + 1; \
+                   END; \
+                   RETURN value; \
+                 END",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            query_rows(&mut backend, "SELECT shadow_value(7)").await,
+            vec![vec![Some(b"7".to_vec())]]
+        );
+        let create = query_rows(&mut backend, "SHOW CREATE FUNCTION classify_value").await;
+        assert!(String::from_utf8_lossy(create[0][2].as_deref().unwrap()).contains("BEGIN"));
+        assert!(backend
+            .execute(
+                "CREATE FUNCTION rejected_function_dml() RETURNS BIGINT BEGIN INSERT INTO actors VALUES(99, 'x'); RETURN 1; END",
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("only supports"));
+        assert!(backend
+            .execute(
+                "CREATE FUNCTION rejected_function_declare() RETURNS BIGINT BEGIN SET unknown_value = 1; DECLARE unknown_value BIGINT; RETURN unknown_value; END",
+            )
+            .await
+            .is_err());
+        assert!(backend
+            .execute(
+                "CREATE FUNCTION rejected_function_return() RETURNS BIGINT BEGIN DECLARE value BIGINT; SET value = 1; END",
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("RETURN"));
         backend
             .execute("CREATE FUNCTION recursion_probe(input BIGINT) RETURNS BIGINT RETURN recursion_probe(input)")
             .await

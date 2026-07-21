@@ -217,6 +217,14 @@ async fn run_server(args: Args, config: mydb_config::ServerConfig) -> Result<()>
         config.server.port
     );
 
+    let (scheduler_stop, scheduler_shutdown) = tokio::sync::watch::channel(false);
+    let scheduler = mydb_wire::spawn_event_scheduler(
+        storage.clone(),
+        Arc::new(protocol_config.read().clone()),
+        wire_stats.clone(),
+        scheduler_shutdown,
+    );
+
     let connection_limit = Arc::new(Semaphore::new(config.server.max_connections as usize));
     let idle_timeout = std::time::Duration::from_secs(config.server.interactive_timeout);
 
@@ -268,6 +276,10 @@ async fn run_server(args: Args, config: mydb_config::ServerConfig) -> Result<()>
         });
     }
 
+    let _ = scheduler_stop.send(true);
+    if let Err(error) = scheduler.await {
+        tracing::error!("EVENT scheduler task failed while stopping: {}", error);
+    }
     storage.flush_consistent().await?;
     Ok(())
 }

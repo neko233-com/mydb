@@ -646,6 +646,22 @@ pub struct EventMetadata {
     pub created: String,
     pub last_altered: String,
     pub last_executed: Option<String>,
+    /// Scheduler-owned UTC cursor. Kept separately from the display-oriented
+    /// MySQL timestamps above so recurring events remain deterministic across
+    /// restarts and session time-zone changes.
+    #[serde(default)]
+    pub next_execution_utc: Option<String>,
+    /// Evaluated once at CREATE/ALTER time. MySQL schedule expressions such
+    /// as `EVERY (1 + 1) DAY` are not reevaluated on every scheduler tick.
+    #[serde(default)]
+    pub schedule_interval_value: Option<String>,
+    /// Evaluated UTC END boundary, kept apart from SHOW CREATE's source text.
+    #[serde(default)]
+    pub schedule_ends_utc: Option<String>,
+    /// Monotonic catalog generation for scheduler compare-and-swap. This
+    /// prevents an ALTER -> revert ABA race from applying an old completion.
+    #[serde(default)]
+    pub revision: u64,
     pub sql_mode: String,
 }
 
@@ -656,6 +672,10 @@ impl EventMetadata {
             created: now.clone(),
             last_altered: now,
             last_executed: None,
+            next_execution_utc: None,
+            schedule_interval_value: None,
+            schedule_ends_utc: None,
+            revision: 0,
             sql_mode,
         }
     }
@@ -665,9 +685,92 @@ impl EventMetadata {
             created: self.created.clone(),
             last_altered: Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
             last_executed: self.last_executed.clone(),
+            // A metadata-only ALTER (for example COMMENT or ENABLE/DISABLE)
+            // must not make a recurring event replay from STARTS. The wire
+            // layer explicitly replaces this cursor when ALTER changes the
+            // schedule itself.
+            next_execution_utc: self.next_execution_utc.clone(),
+            schedule_interval_value: self.schedule_interval_value.clone(),
+            schedule_ends_utc: self.schedule_ends_utc.clone(),
+            revision: self.revision.saturating_add(1),
             sql_mode,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EventFinishAction {
+    /// A recurring event remains enabled; only its execution state changes.
+    Keep,
+    /// A one-shot event with ON COMPLETION PRESERVE remains visible but is
+    /// disabled after its final execution.
+    Disable(EventDefinition),
+    /// A one-shot event with ON COMPLETION NOT PRESERVE is removed.
+    Drop,
+}
+
+fn apply_finish_event_to_catalog(
+    events: &mut HashMap<String, EventDefinition>,
+    event_metadata: &mut HashMap<String, EventMetadata>,
+    event: &str,
+    expected_create_sql: &str,
+    expected_revision: u64,
+    metadata: &EventMetadata,
+    action: &EventFinishAction,
+) -> Result<bool> {
+    let Some(stored) = events
+        .keys()
+        .find(|stored| stored.eq_ignore_ascii_case(event))
+        .cloned()
+    else {
+        // The scheduler may race DROP EVENT. A stale completion must never
+        // recreate an event or turn that race into a failed durable batch.
+        return Ok(false);
+    };
+    let current = events.get(&stored).expect("resolved event");
+    if current.create_sql != expected_create_sql {
+        // ALTER EVENT replaced the definition after the scheduler snapshot.
+        // This also makes a previously applied V5 record idempotent on replay.
+        return Ok(false);
+    }
+    if event_metadata
+        .get(&stored)
+        .map(|metadata| metadata.revision)
+        .unwrap_or(0)
+        != expected_revision
+    {
+        // A definition can be changed and later rendered back to identical
+        // SQL. The generation still changes, closing that ABA race.
+        return Ok(false);
+    }
+
+    match action {
+        EventFinishAction::Keep => {
+            if event_metadata.get(&stored) == Some(metadata) {
+                return Ok(false);
+            }
+            event_metadata.insert(stored, metadata.clone());
+        }
+        EventFinishAction::Disable(replacement) => {
+            if !replacement.name.eq_ignore_ascii_case(event) {
+                anyhow::bail!(
+                    "EVENT completion replacement '{}' does not match '{}'",
+                    replacement.name,
+                    event
+                );
+            }
+            if current == replacement && event_metadata.get(&stored) == Some(metadata) {
+                return Ok(false);
+            }
+            events.insert(stored.clone(), replacement.clone());
+            event_metadata.insert(stored, metadata.clone());
+        }
+        EventFinishAction::Drop => {
+            events.remove(&stored);
+            event_metadata.remove(&stored);
+        }
+    }
+    Ok(true)
 }
 
 pub fn table_engine_from_sql(sql: &str) -> TableEngine {
@@ -1473,6 +1576,32 @@ impl Database {
         events.insert(stored.clone(), event);
         self.event_metadata.write().insert(stored, metadata);
         Ok(())
+    }
+
+    /// Atomically records one scheduler completion when the event definition
+    /// still matches the snapshot that was executed. A missing or changed
+    /// event is intentionally a successful no-op: ALTER/DROP may race the
+    /// scheduler, and replay must not revive or overwrite newer DDL.
+    pub fn finish_event(
+        &self,
+        event: &str,
+        expected_create_sql: &str,
+        expected_revision: u64,
+        metadata: EventMetadata,
+        action: EventFinishAction,
+    ) -> Result<bool> {
+        // Keep the same lock order as create/alter/drop_event.
+        let mut events = self.events.write();
+        let mut event_metadata = self.event_metadata.write();
+        apply_finish_event_to_catalog(
+            &mut events,
+            &mut event_metadata,
+            event,
+            expected_create_sql,
+            expected_revision,
+            &metadata,
+            &action,
+        )
     }
 
     pub fn get_event(&self, name: &str) -> Option<EventDefinition> {
@@ -2917,6 +3046,18 @@ pub enum WriteCommand {
         event: EventDefinition,
         metadata: EventMetadata,
     },
+    // Appended after every historical variant so old bincode WAL
+    // discriminants remain stable. This is emitted in the same durable batch
+    // as an event body, making its execution state transition atomic with the
+    // body changes.
+    FinishEventV5 {
+        database: String,
+        event: String,
+        expected_create_sql: String,
+        expected_revision: u64,
+        metadata: EventMetadata,
+        action: EventFinishAction,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -3845,6 +3986,337 @@ impl From<LegacyWriteCommand> for WriteCommand {
     }
 }
 
+// `EventMetadata` gained `next_execution_utc` after EVENT V4 had already
+// shipped. Bincode serializes structs as positional tuples, so
+// `#[serde(default)]` cannot make an omitted field readable: a historical V4
+// record must be decoded through this frozen shape first.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacyEventMetadataV4 {
+    created: String,
+    last_altered: String,
+    last_executed: Option<String>,
+    sql_mode: String,
+}
+
+impl From<LegacyEventMetadataV4> for EventMetadata {
+    fn from(value: LegacyEventMetadataV4) -> Self {
+        Self {
+            created: value.created,
+            last_altered: value.last_altered,
+            last_executed: value.last_executed,
+            next_execution_utc: None,
+            schedule_interval_value: None,
+            schedule_ends_utc: None,
+            revision: 0,
+            sql_mode: value.sql_mode,
+        }
+    }
+}
+
+// This is the exact WriteCommand wire layout through ALTER EVENT V4. Keep the
+// variant order and all non-event field types frozen: bincode enum indexes and
+// struct fields have no self-describing schema.
+#[derive(Debug, Serialize, Deserialize)]
+enum LegacyEventV4WriteCommand {
+    CreateDatabase(String),
+    DropDatabase(String),
+    CreateTable {
+        database: String,
+        schema: TableSchema,
+    },
+    DropTable {
+        database: String,
+        table: String,
+    },
+    AlterTable {
+        database: String,
+        table: String,
+        operation: AlterTableOperation,
+    },
+    Insert {
+        database: String,
+        table: String,
+        row: Row,
+    },
+    Upsert {
+        database: String,
+        table: String,
+        row: Row,
+        update_columns: Vec<String>,
+        ignore: bool,
+    },
+    Update {
+        database: String,
+        table: String,
+        filter: Option<RowPredicate>,
+        assignments: Vec<(String, Option<Vec<u8>>)>,
+    },
+    Delete {
+        database: String,
+        table: String,
+        filter: Option<RowPredicate>,
+    },
+    CleanupOrphanStorage,
+    ExpressionUpdate {
+        database: String,
+        table: String,
+        filter: Option<RowPredicate>,
+        assignments: Vec<ExpressionAssignment>,
+    },
+    ReplaceRows {
+        database: String,
+        table: String,
+        rows: Vec<Row>,
+        affected_rows: u64,
+    },
+    ForeignKeyChecksDisabled,
+    CreateProcedure {
+        database: String,
+        procedure: ProcedureDefinition,
+    },
+    DropProcedure {
+        database: String,
+        procedure: String,
+    },
+    AlterProcedure {
+        database: String,
+        procedure: String,
+        create_sql: String,
+    },
+    CreateProcedureV2 {
+        database: String,
+        procedure: ProcedureDefinition,
+        metadata: ProcedureMetadata,
+    },
+    AlterProcedureV2 {
+        database: String,
+        procedure: String,
+        create_sql: String,
+        metadata: ProcedureMetadata,
+    },
+    CreateFunctionV2 {
+        database: String,
+        function: FunctionDefinition,
+        metadata: ProcedureMetadata,
+    },
+    DropFunction {
+        database: String,
+        function: String,
+    },
+    AlterFunctionV2 {
+        database: String,
+        function: String,
+        create_sql: String,
+        metadata: ProcedureMetadata,
+    },
+    CreateEventV4 {
+        database: String,
+        event: EventDefinition,
+        metadata: LegacyEventMetadataV4,
+    },
+    DropEvent {
+        database: String,
+        event: String,
+    },
+    AlterEventV4 {
+        database: String,
+        event: EventDefinition,
+        metadata: LegacyEventMetadataV4,
+    },
+}
+
+impl From<LegacyEventV4WriteCommand> for WriteCommand {
+    fn from(value: LegacyEventV4WriteCommand) -> Self {
+        match value {
+            LegacyEventV4WriteCommand::CreateDatabase(name) => Self::CreateDatabase(name),
+            LegacyEventV4WriteCommand::DropDatabase(name) => Self::DropDatabase(name),
+            LegacyEventV4WriteCommand::CreateTable { database, schema } => {
+                Self::CreateTable { database, schema }
+            }
+            LegacyEventV4WriteCommand::DropTable { database, table } => {
+                Self::DropTable { database, table }
+            }
+            LegacyEventV4WriteCommand::AlterTable {
+                database,
+                table,
+                operation,
+            } => Self::AlterTable {
+                database,
+                table,
+                operation,
+            },
+            LegacyEventV4WriteCommand::Insert {
+                database,
+                table,
+                row,
+            } => Self::Insert {
+                database,
+                table,
+                row,
+            },
+            LegacyEventV4WriteCommand::Upsert {
+                database,
+                table,
+                row,
+                update_columns,
+                ignore,
+            } => Self::Upsert {
+                database,
+                table,
+                row,
+                update_columns,
+                ignore,
+            },
+            LegacyEventV4WriteCommand::Update {
+                database,
+                table,
+                filter,
+                assignments,
+            } => Self::Update {
+                database,
+                table,
+                filter,
+                assignments,
+            },
+            LegacyEventV4WriteCommand::Delete {
+                database,
+                table,
+                filter,
+            } => Self::Delete {
+                database,
+                table,
+                filter,
+            },
+            LegacyEventV4WriteCommand::CleanupOrphanStorage => Self::CleanupOrphanStorage,
+            LegacyEventV4WriteCommand::ExpressionUpdate {
+                database,
+                table,
+                filter,
+                assignments,
+            } => Self::ExpressionUpdate {
+                database,
+                table,
+                filter,
+                assignments,
+            },
+            LegacyEventV4WriteCommand::ReplaceRows {
+                database,
+                table,
+                rows,
+                affected_rows,
+            } => Self::ReplaceRows {
+                database,
+                table,
+                rows,
+                affected_rows,
+            },
+            LegacyEventV4WriteCommand::ForeignKeyChecksDisabled => Self::ForeignKeyChecksDisabled,
+            LegacyEventV4WriteCommand::CreateProcedure {
+                database,
+                procedure,
+            } => Self::CreateProcedure {
+                database,
+                procedure,
+            },
+            LegacyEventV4WriteCommand::DropProcedure {
+                database,
+                procedure,
+            } => Self::DropProcedure {
+                database,
+                procedure,
+            },
+            LegacyEventV4WriteCommand::AlterProcedure {
+                database,
+                procedure,
+                create_sql,
+            } => Self::AlterProcedure {
+                database,
+                procedure,
+                create_sql,
+            },
+            LegacyEventV4WriteCommand::CreateProcedureV2 {
+                database,
+                procedure,
+                metadata,
+            } => Self::CreateProcedureV2 {
+                database,
+                procedure,
+                metadata,
+            },
+            LegacyEventV4WriteCommand::AlterProcedureV2 {
+                database,
+                procedure,
+                create_sql,
+                metadata,
+            } => Self::AlterProcedureV2 {
+                database,
+                procedure,
+                create_sql,
+                metadata,
+            },
+            LegacyEventV4WriteCommand::CreateFunctionV2 {
+                database,
+                function,
+                metadata,
+            } => Self::CreateFunctionV2 {
+                database,
+                function,
+                metadata,
+            },
+            LegacyEventV4WriteCommand::DropFunction { database, function } => {
+                Self::DropFunction { database, function }
+            }
+            LegacyEventV4WriteCommand::AlterFunctionV2 {
+                database,
+                function,
+                create_sql,
+                metadata,
+            } => Self::AlterFunctionV2 {
+                database,
+                function,
+                create_sql,
+                metadata,
+            },
+            LegacyEventV4WriteCommand::CreateEventV4 {
+                database,
+                event,
+                metadata,
+            } => Self::CreateEventV4 {
+                database,
+                event,
+                metadata: metadata.into(),
+            },
+            LegacyEventV4WriteCommand::DropEvent { database, event } => {
+                Self::DropEvent { database, event }
+            }
+            LegacyEventV4WriteCommand::AlterEventV4 {
+                database,
+                event,
+                metadata,
+            } => Self::AlterEventV4 {
+                database,
+                event,
+                metadata: metadata.into(),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct LegacyEventV4WalBatch {
+    version: u16,
+    commands: Vec<LegacyEventV4WriteCommand>,
+}
+
+impl From<LegacyEventV4WalBatch> for WalBatch {
+    fn from(value: LegacyEventV4WalBatch) -> Self {
+        Self {
+            version: value.version,
+            commands: value.commands.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct LegacyWalBatch {
     version: u16,
@@ -3890,6 +4362,27 @@ struct LegacyWalGroupV2 {
     transactions: Vec<Vec<LegacyWriteCommand>>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct LegacyEventV4WalGroupV2 {
+    version: u16,
+    committed_unix_ms: u64,
+    transactions: Vec<Vec<LegacyEventV4WriteCommand>>,
+}
+
+impl From<LegacyEventV4WalGroupV2> for WalGroupV2 {
+    fn from(value: LegacyEventV4WalGroupV2) -> Self {
+        Self {
+            version: value.version,
+            committed_unix_ms: value.committed_unix_ms,
+            transactions: value
+                .transactions
+                .into_iter()
+                .map(|commands| commands.into_iter().map(Into::into).collect())
+                .collect(),
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct WalGroupRefV2<'a> {
     version: u16,
@@ -3915,17 +4408,22 @@ fn decode_wal_batch(payload: &[u8]) -> Result<WalBatch> {
     let batch: WalBatch = if let Some(encoded) = payload.strip_prefix(WAL_BATCH_BINARY_MAGIC) {
         match bincode::deserialize(encoded) {
             Ok(batch) => batch,
-            Err(current_error) => {
-                let legacy: LegacyWalBatch = bincode::deserialize(encoded).map_err(|legacy_error| {
-                    anyhow::anyhow!(
-                        "cannot decode current WAL batch ({current_error}) or legacy WAL batch ({legacy_error})"
-                    )
-                })?;
-                WalBatch {
-                    version: legacy.version,
-                    commands: legacy.commands.into_iter().map(Into::into).collect(),
+            Err(current_error) => match bincode::deserialize::<LegacyEventV4WalBatch>(encoded) {
+                Ok(legacy) => legacy.into(),
+                Err(event_v4_error) => {
+                    let legacy: LegacyWalBatch = bincode::deserialize(encoded).map_err(
+                            |legacy_error| {
+                                anyhow::anyhow!(
+                                    "cannot decode current WAL batch ({current_error}), EVENT V4 WAL batch ({event_v4_error}), or legacy WAL batch ({legacy_error})"
+                                )
+                            },
+                        )?;
+                    WalBatch {
+                        version: legacy.version,
+                        commands: legacy.commands.into_iter().map(Into::into).collect(),
+                    }
                 }
-            }
+            },
         }
     } else {
         // Version 1 used JSON. Keep it readable for in-place upgrades.
@@ -3957,23 +4455,26 @@ fn decode_wal_group(payload: &[u8]) -> Result<WalGroup> {
     if let Some(encoded) = payload.strip_prefix(WAL_GROUP_BINARY_MAGIC_V2) {
         let group: WalGroupV2 = match bincode::deserialize(encoded) {
             Ok(group) => group,
-            Err(current_error) => {
-                let legacy: LegacyWalGroupV2 =
-                    bincode::deserialize(encoded).map_err(|legacy_error| {
-                        anyhow::anyhow!(
-                            "cannot decode current WAL group ({current_error}) or legacy WAL group ({legacy_error})"
-                        )
-                    })?;
-                WalGroupV2 {
-                    version: legacy.version,
-                    committed_unix_ms: legacy.committed_unix_ms,
-                    transactions: legacy
-                        .transactions
-                        .into_iter()
-                        .map(|commands| commands.into_iter().map(Into::into).collect())
-                        .collect(),
+            Err(current_error) => match bincode::deserialize::<LegacyEventV4WalGroupV2>(encoded) {
+                Ok(legacy) => legacy.into(),
+                Err(event_v4_error) => {
+                    let legacy: LegacyWalGroupV2 =
+                            bincode::deserialize(encoded).map_err(|legacy_error| {
+                                anyhow::anyhow!(
+                                    "cannot decode current WAL group ({current_error}), EVENT V4 WAL group ({event_v4_error}), or legacy WAL group ({legacy_error})"
+                                )
+                            })?;
+                    WalGroupV2 {
+                        version: legacy.version,
+                        committed_unix_ms: legacy.committed_unix_ms,
+                        transactions: legacy
+                            .transactions
+                            .into_iter()
+                            .map(|commands| commands.into_iter().map(Into::into).collect())
+                            .collect(),
+                    }
                 }
-            }
+            },
         };
         if group.version != WAL_GROUP_VERSION {
             anyhow::bail!("unsupported WAL group version {}", group.version);
@@ -5991,6 +6492,10 @@ fn normalize_replay_commands(
         .iter()
         .map(|(name, database)| (name.clone(), database.events.read().clone()))
         .collect::<HashMap<_, _>>();
+    let mut event_metadata = actual
+        .iter()
+        .map(|(name, database)| (name.clone(), database.event_metadata.read().clone()))
+        .collect::<HashMap<_, _>>();
     let mut normalized = Vec::with_capacity(commands.len());
     for command in commands {
         match command {
@@ -6000,6 +6505,7 @@ fn normalize_replay_commands(
                     procedures.insert(name.clone(), HashMap::new());
                     functions.insert(name.clone(), HashMap::new());
                     events.insert(name.clone(), HashMap::new());
+                    event_metadata.insert(name.clone(), HashMap::new());
                     normalized.push(WriteCommand::CreateDatabase(name));
                 }
             }
@@ -6008,6 +6514,7 @@ fn normalize_replay_commands(
                     procedures.remove(&name);
                     functions.remove(&name);
                     events.remove(&name);
+                    event_metadata.remove(&name);
                     normalized.push(WriteCommand::DropDatabase(name));
                 }
             }
@@ -6355,11 +6862,15 @@ fn normalize_replay_commands(
                 let Some(items) = events.get_mut(&database) else {
                     continue;
                 };
+                let metadata_items = event_metadata
+                    .get_mut(&database)
+                    .expect("event metadata catalog follows event catalog");
                 if !items
                     .keys()
                     .any(|name| name.eq_ignore_ascii_case(&event.name))
                 {
                     items.insert(event.name.clone(), event.clone());
+                    metadata_items.insert(event.name.clone(), metadata.clone());
                     normalized.push(WriteCommand::CreateEventV4 {
                         database,
                         event,
@@ -6371,12 +6882,16 @@ fn normalize_replay_commands(
                 let Some(items) = events.get_mut(&database) else {
                     continue;
                 };
+                let metadata_items = event_metadata
+                    .get_mut(&database)
+                    .expect("event metadata catalog follows event catalog");
                 let stored = items
                     .keys()
                     .find(|name| name.eq_ignore_ascii_case(&event))
                     .cloned();
                 if let Some(stored) = stored {
                     items.remove(&stored);
+                    metadata_items.remove(&stored);
                     normalized.push(WriteCommand::DropEvent { database, event });
                 }
             }
@@ -6388,16 +6903,53 @@ fn normalize_replay_commands(
                 let Some(items) = events.get_mut(&database) else {
                     continue;
                 };
+                let metadata_items = event_metadata
+                    .get_mut(&database)
+                    .expect("event metadata catalog follows event catalog");
                 let stored = items
                     .keys()
                     .find(|name| name.eq_ignore_ascii_case(&event.name))
                     .cloned();
                 if let Some(stored) = stored {
-                    items.insert(stored, event.clone());
+                    items.insert(stored.clone(), event.clone());
+                    metadata_items.insert(stored, metadata.clone());
                     normalized.push(WriteCommand::AlterEventV4 {
                         database,
                         event,
                         metadata,
+                    });
+                }
+            }
+            WriteCommand::FinishEventV5 {
+                database,
+                event,
+                expected_create_sql,
+                expected_revision,
+                metadata,
+                action,
+            } => {
+                let Some(items) = events.get_mut(&database) else {
+                    continue;
+                };
+                let metadata_items = event_metadata
+                    .get_mut(&database)
+                    .expect("event metadata catalog follows event catalog");
+                if apply_finish_event_to_catalog(
+                    items,
+                    metadata_items,
+                    &event,
+                    &expected_create_sql,
+                    expected_revision,
+                    &metadata,
+                    &action,
+                )? {
+                    normalized.push(WriteCommand::FinishEventV5 {
+                        database,
+                        event,
+                        expected_create_sql,
+                        expected_revision,
+                        metadata,
+                        action,
                     });
                 }
             }
@@ -6730,6 +7282,25 @@ async fn apply_write_batch(
                 db.alter_event_with_metadata(event, metadata)?;
                 db.save().await?;
             }
+            WriteCommand::FinishEventV5 {
+                database,
+                event,
+                expected_create_sql,
+                expected_revision,
+                metadata,
+                action,
+            } => {
+                let db = databases.read().get(&database).cloned().unwrap();
+                if db.finish_event(
+                    &event,
+                    &expected_create_sql,
+                    expected_revision,
+                    metadata,
+                    action,
+                )? {
+                    db.save().await?;
+                }
+            }
         }
     }
     if !defer_catalog_save {
@@ -6948,6 +7519,7 @@ fn validate_write_batch(
     let mut procedures: HashMap<String, HashMap<String, ProcedureDefinition>> = HashMap::new();
     let mut functions: HashMap<String, HashMap<String, FunctionDefinition>> = HashMap::new();
     let mut events: HashMap<String, HashMap<String, EventDefinition>> = HashMap::new();
+    let mut event_metadata: HashMap<String, HashMap<String, EventMetadata>> = HashMap::new();
     // Keep only keys introduced by this candidate batch. Existing keys stay in
     // the database-owned sets and are checked in place, avoiding an O(database)
     // clone for every actor request as tables grow.
@@ -6962,6 +7534,10 @@ fn validate_write_batch(
         procedures.insert(database_name.clone(), database.procedures.read().clone());
         functions.insert(database_name.clone(), database.functions.read().clone());
         events.insert(database_name.clone(), database.events.read().clone());
+        event_metadata.insert(
+            database_name.clone(),
+            database.event_metadata.read().clone(),
+        );
     }
 
     for command in commands {
@@ -6974,6 +7550,7 @@ fn validate_write_batch(
                 procedures.insert(name.clone(), Default::default());
                 functions.insert(name.clone(), Default::default());
                 events.insert(name.clone(), Default::default());
+                event_metadata.insert(name.clone(), Default::default());
                 reset_databases.insert(name.clone());
             }
             WriteCommand::DropDatabase(name) => {
@@ -6983,6 +7560,7 @@ fn validate_write_batch(
                 procedures.remove(name);
                 functions.remove(name);
                 events.remove(name);
+                event_metadata.remove(name);
                 constraint_keys.retain(|(database, _, _), _| database != name);
                 reset_databases.insert(name.clone());
             }
@@ -7470,11 +8048,16 @@ fn validate_write_batch(
                     .create_sql = create_sql.clone();
             }
             WriteCommand::CreateEventV4 {
-                database, event, ..
+                database,
+                event,
+                metadata,
             } => {
                 let items = events
                     .get_mut(database)
                     .ok_or_else(|| anyhow::anyhow!("Unknown database '{}'", database))?;
+                let metadata_items = event_metadata
+                    .get_mut(database)
+                    .expect("event metadata catalog follows event catalog");
                 if items
                     .keys()
                     .any(|name| name.eq_ignore_ascii_case(&event.name))
@@ -7482,30 +8065,65 @@ fn validate_write_batch(
                     anyhow::bail!("EVENT {} already exists", event.name);
                 }
                 items.insert(event.name.clone(), event.clone());
+                metadata_items.insert(event.name.clone(), metadata.clone());
             }
             WriteCommand::DropEvent { database, event } => {
                 let items = events
                     .get_mut(database)
                     .ok_or_else(|| anyhow::anyhow!("Unknown database '{}'", database))?;
+                let metadata_items = event_metadata
+                    .get_mut(database)
+                    .expect("event metadata catalog follows event catalog");
                 let stored = items
                     .keys()
                     .find(|name| name.eq_ignore_ascii_case(event))
                     .cloned()
                     .ok_or_else(|| anyhow::anyhow!("EVENT {} does not exist", event))?;
                 items.remove(&stored);
+                metadata_items.remove(&stored);
             }
             WriteCommand::AlterEventV4 {
-                database, event, ..
+                database,
+                event,
+                metadata,
             } => {
                 let items = events
                     .get_mut(database)
                     .ok_or_else(|| anyhow::anyhow!("Unknown database '{}'", database))?;
+                let metadata_items = event_metadata
+                    .get_mut(database)
+                    .expect("event metadata catalog follows event catalog");
                 let stored = items
                     .keys()
                     .find(|name| name.eq_ignore_ascii_case(&event.name))
                     .cloned()
                     .ok_or_else(|| anyhow::anyhow!("EVENT {} does not exist", event.name))?;
-                items.insert(stored, event.clone());
+                items.insert(stored.clone(), event.clone());
+                metadata_items.insert(stored, metadata.clone());
+            }
+            WriteCommand::FinishEventV5 {
+                database,
+                event,
+                expected_create_sql,
+                expected_revision,
+                metadata,
+                action,
+            } => {
+                let items = events
+                    .get_mut(database)
+                    .ok_or_else(|| anyhow::anyhow!("Unknown database '{}'", database))?;
+                let metadata_items = event_metadata
+                    .get_mut(database)
+                    .expect("event metadata catalog follows event catalog");
+                let _ = apply_finish_event_to_catalog(
+                    items,
+                    metadata_items,
+                    event,
+                    expected_create_sql,
+                    *expected_revision,
+                    metadata,
+                    action,
+                )?;
             }
         }
     }
@@ -8461,6 +9079,83 @@ mod tests {
     }
 
     #[test]
+    fn event_v4_batch_reads_bincode_without_scheduler_cursor() {
+        let legacy_metadata = LegacyEventMetadataV4 {
+            created: "2026-07-21 12:00:00".into(),
+            last_altered: "2026-07-21 12:00:00".into(),
+            last_executed: Some("2026-07-21 12:01:00".into()),
+            sql_mode: "STRICT_TRANS_TABLES".into(),
+        };
+        let encoded = bincode::serialize(&LegacyEventV4WalBatch {
+            version: WAL_BATCH_VERSION,
+            commands: vec![LegacyEventV4WriteCommand::CreateEventV4 {
+                database: "game".into(),
+                event: event_definition("legacy_event_batch"),
+                metadata: legacy_metadata,
+            }],
+        })
+        .unwrap();
+        let mut payload = WAL_BATCH_BINARY_MAGIC.to_vec();
+        payload.extend(encoded);
+
+        let decoded = decode_wal_batch(&payload).unwrap();
+        let WriteCommand::CreateEventV4 {
+            database,
+            event,
+            metadata,
+        } = &decoded.commands[0]
+        else {
+            panic!("expected legacy CREATE EVENT")
+        };
+        assert_eq!(database, "game");
+        assert_eq!(event.name, "legacy_event_batch");
+        assert_eq!(
+            metadata.last_executed.as_deref(),
+            Some("2026-07-21 12:01:00")
+        );
+        assert_eq!(metadata.next_execution_utc, None);
+        assert_eq!(metadata.sql_mode, "STRICT_TRANS_TABLES");
+    }
+
+    #[test]
+    fn event_v4_group_reads_bincode_without_scheduler_cursor() {
+        let legacy_metadata = LegacyEventMetadataV4 {
+            created: "2026-07-21 13:00:00".into(),
+            last_altered: "2026-07-21 13:00:00".into(),
+            last_executed: None,
+            sql_mode: "ANSI_QUOTES".into(),
+        };
+        let encoded = bincode::serialize(&LegacyEventV4WalGroupV2 {
+            version: WAL_GROUP_VERSION,
+            committed_unix_ms: 7,
+            transactions: vec![vec![LegacyEventV4WriteCommand::AlterEventV4 {
+                database: "game".into(),
+                event: event_definition("legacy_event_group"),
+                metadata: legacy_metadata,
+            }]],
+        })
+        .unwrap();
+        let mut payload = WAL_GROUP_BINARY_MAGIC_V2.to_vec();
+        payload.extend(encoded);
+
+        let decoded = decode_wal_group(&payload).unwrap();
+        assert_eq!(decoded.committed_unix_ms, Some(7));
+        let WriteCommand::AlterEventV4 {
+            database,
+            event,
+            metadata,
+        } = &decoded.transactions[0][0]
+        else {
+            panic!("expected legacy ALTER EVENT")
+        };
+        assert_eq!(database, "game");
+        assert_eq!(event.name, "legacy_event_group");
+        assert_eq!(metadata.last_executed, None);
+        assert_eq!(metadata.next_execution_utc, None);
+        assert_eq!(metadata.sql_mode, "ANSI_QUOTES");
+    }
+
+    #[test]
     fn test_disk_manager_read_write_page() {
         let tmp = tempfile::tempdir().unwrap();
         let dm = DiskManager::new(tmp.path().to_path_buf(), 1024);
@@ -9346,6 +10041,171 @@ mod tests {
             .execute_write(WriteCommand::DropEvent {
                 database: "game".into(),
                 event: "DAILY_EVENT".into(),
+            })
+            .await
+            .unwrap();
+        assert!(restarted
+            .get_database("game")
+            .unwrap()
+            .get_event("daily_event")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn event_finish_is_cas_guarded_and_replay_safe() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = StorageEngineManager::new(temp.path().to_path_buf(), 16384, "4M");
+        manager.init().await.unwrap();
+        manager.create_database("game").await.unwrap();
+
+        let original = event_definition("daily_event");
+        let expected_original_sql = original.create_sql.clone();
+        let created = EventMetadata::new("STRICT_TRANS_TABLES".into());
+        manager
+            .execute_write(WriteCommand::CreateEventV4 {
+                database: "game".into(),
+                event: original.clone(),
+                metadata: created.clone(),
+            })
+            .await
+            .unwrap();
+
+        let mut kept = created.clone();
+        kept.last_executed = Some("2026-07-21 12:00:00".into());
+        kept.next_execution_utc = Some("2026-07-22T12:00:00Z".into());
+        kept.revision = created.revision.saturating_add(1);
+        manager
+            .execute_write(WriteCommand::FinishEventV5 {
+                database: "game".into(),
+                event: "daily_event".into(),
+                expected_create_sql: expected_original_sql.clone(),
+                expected_revision: created.revision,
+                metadata: kept.clone(),
+                action: EventFinishAction::Keep,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            manager
+                .get_database("game")
+                .unwrap()
+                .get_event_metadata("DAILY_EVENT"),
+            Some(kept.clone())
+        );
+
+        let mut altered_event = original.clone();
+        altered_event.comment = "new scheduler definition".into();
+        altered_event.create_sql =
+            "ALTER EVENT daily_event ON SCHEDULE EVERY 1 DAY COMMENT 'new scheduler definition'"
+                .into();
+        let altered = kept.altered("ANSI_QUOTES".into());
+        manager
+            .execute_write(WriteCommand::AlterEventV4 {
+                database: "game".into(),
+                event: altered_event.clone(),
+                metadata: altered.clone(),
+            })
+            .await
+            .unwrap();
+
+        // A scheduler completion based on the old definition is harmless.
+        let mut stale = kept.clone();
+        stale.next_execution_utc = Some("2099-01-01T00:00:00Z".into());
+        manager
+            .execute_write(WriteCommand::FinishEventV5 {
+                database: "game".into(),
+                event: "DAILY_EVENT".into(),
+                expected_create_sql: expected_original_sql,
+                expected_revision: kept.revision,
+                metadata: stale,
+                action: EventFinishAction::Keep,
+            })
+            .await
+            .unwrap();
+        let database = manager.get_database("game").unwrap();
+        assert_eq!(
+            database.get_event("daily_event"),
+            Some(altered_event.clone())
+        );
+        assert_eq!(
+            database.get_event_metadata("daily_event"),
+            Some(altered.clone())
+        );
+
+        // A matching CREATE SQL alone is not enough: an older scheduler
+        // generation cannot overwrite a newer cursor.
+        let mut stale_same_sql = altered.clone();
+        stale_same_sql.next_execution_utc = Some("2099-01-01T00:00:00Z".into());
+        stale_same_sql.revision = altered.revision.saturating_add(1);
+        manager
+            .execute_write(WriteCommand::FinishEventV5 {
+                database: "game".into(),
+                event: "daily_event".into(),
+                expected_create_sql: altered_event.create_sql.clone(),
+                expected_revision: kept.revision,
+                metadata: stale_same_sql,
+                action: EventFinishAction::Keep,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            manager
+                .get_database("game")
+                .unwrap()
+                .get_event_metadata("daily_event"),
+            Some(altered.clone())
+        );
+
+        let mut disabled = altered_event.clone();
+        disabled.status = "DISABLED".into();
+        disabled.create_sql =
+            "ALTER EVENT daily_event ON SCHEDULE EVERY 1 DAY DISABLE COMMENT 'new scheduler definition'"
+                .into();
+        let mut completed = altered.clone();
+        completed.last_executed = Some("2026-07-22 12:00:00".into());
+        completed.next_execution_utc = None;
+        completed.revision = altered.revision.saturating_add(1);
+
+        // Simulate a crash after WAL commit and before catalog apply. Replay
+        // must apply the same CAS transition exactly once.
+        append_fault_batch(
+            &manager,
+            vec![WriteCommand::FinishEventV5 {
+                database: "game".into(),
+                event: "daily_event".into(),
+                expected_create_sql: altered_event.create_sql.clone(),
+                expected_revision: altered.revision,
+                metadata: completed.clone(),
+                action: EventFinishAction::Disable(disabled.clone()),
+            }],
+            true,
+        );
+        manager.wal_replay().await.unwrap();
+        let database = manager.get_database("game").unwrap();
+        assert_eq!(database.get_event("daily_event"), Some(disabled.clone()));
+        assert_eq!(
+            database.get_event_metadata("daily_event"),
+            Some(completed.clone())
+        );
+
+        drop(manager);
+        let restarted = StorageEngineManager::new(temp.path().to_path_buf(), 16384, "4M");
+        restarted.init().await.unwrap();
+        let database = restarted.get_database("game").unwrap();
+        assert_eq!(database.get_event("daily_event"), Some(disabled.clone()));
+        assert_eq!(
+            database.get_event_metadata("daily_event"),
+            Some(completed.clone())
+        );
+
+        restarted
+            .execute_write(WriteCommand::FinishEventV5 {
+                database: "game".into(),
+                event: "daily_event".into(),
+                expected_create_sql: disabled.create_sql.clone(),
+                expected_revision: completed.revision,
+                metadata: completed,
+                action: EventFinishAction::Drop,
             })
             .await
             .unwrap();
