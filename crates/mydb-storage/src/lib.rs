@@ -773,6 +773,202 @@ fn apply_finish_event_to_catalog(
     Ok(true)
 }
 
+/// Resolves an EVENT only if the caller still owns the catalog snapshot it
+/// used to build a metadata-changing DDL command. Unlike scheduler completion,
+/// DDL must report a stale snapshot to its caller so it can retry instead of
+/// silently replacing a newer execution cursor.
+fn resolve_event_for_metadata_cas(
+    events: &HashMap<String, EventDefinition>,
+    event_metadata: &HashMap<String, EventMetadata>,
+    event: &str,
+    expected_create_sql: &str,
+    expected_revision: u64,
+) -> Result<String> {
+    let stored = events
+        .keys()
+        .find(|stored| stored.eq_ignore_ascii_case(event))
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("EVENT {} does not exist", event))?;
+    let current = events.get(&stored).expect("resolved event");
+    let current_revision = event_metadata
+        .get(&stored)
+        .map(|metadata| metadata.revision)
+        .unwrap_or(0);
+    if current.create_sql != expected_create_sql || current_revision != expected_revision {
+        anyhow::bail!(
+            "EVENT {} was modified concurrently; retry the statement",
+            event
+        );
+    }
+    Ok(stored)
+}
+
+fn event_matches_metadata_cas(
+    events: &HashMap<String, EventDefinition>,
+    event_metadata: &HashMap<String, EventMetadata>,
+    event: &str,
+    expected_create_sql: &str,
+    expected_revision: u64,
+) -> bool {
+    let Some(stored) = events
+        .keys()
+        .find(|stored| stored.eq_ignore_ascii_case(event))
+    else {
+        return false;
+    };
+    events
+        .get(stored)
+        .is_some_and(|current| current.create_sql == expected_create_sql)
+        && event_metadata
+            .get(stored)
+            .map(|metadata| metadata.revision)
+            .unwrap_or(0)
+            == expected_revision
+}
+
+fn alter_event_in_catalog_with_metadata_cas(
+    events: &mut HashMap<String, EventDefinition>,
+    event_metadata: &mut HashMap<String, EventMetadata>,
+    event: EventDefinition,
+    expected_create_sql: &str,
+    expected_revision: u64,
+    metadata: EventMetadata,
+) -> Result<()> {
+    let stored = resolve_event_for_metadata_cas(
+        events,
+        event_metadata,
+        &event.name,
+        expected_create_sql,
+        expected_revision,
+    )?;
+    events.insert(stored.clone(), event);
+    event_metadata.insert(stored, metadata);
+    Ok(())
+}
+
+fn rename_event_in_catalog(
+    events: &mut HashMap<String, EventDefinition>,
+    event_metadata: &mut HashMap<String, EventMetadata>,
+    event: &str,
+    new_event: EventDefinition,
+    metadata: EventMetadata,
+) -> Result<()> {
+    if new_event.name.trim().is_empty() {
+        anyhow::bail!("EVENT rename requires a non-empty target name");
+    }
+    let stored = events
+        .keys()
+        .find(|stored| stored.eq_ignore_ascii_case(event))
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("EVENT {} does not exist", event))?;
+    if events
+        .keys()
+        .any(|name| name != &stored && name.eq_ignore_ascii_case(&new_event.name))
+    {
+        anyhow::bail!("EVENT {} already exists", new_event.name);
+    }
+
+    events.remove(&stored);
+    event_metadata.remove(&stored);
+    let target = new_event.name.clone();
+    events.insert(target.clone(), new_event);
+    event_metadata.insert(target, metadata);
+    Ok(())
+}
+
+fn rename_event_in_catalog_with_metadata_cas(
+    events: &mut HashMap<String, EventDefinition>,
+    event_metadata: &mut HashMap<String, EventMetadata>,
+    event: &str,
+    new_event: EventDefinition,
+    expected_create_sql: &str,
+    expected_revision: u64,
+    metadata: EventMetadata,
+) -> Result<()> {
+    resolve_event_for_metadata_cas(
+        events,
+        event_metadata,
+        event,
+        expected_create_sql,
+        expected_revision,
+    )?;
+    rename_event_in_catalog(events, event_metadata, event, new_event, metadata)
+}
+
+fn move_event_between_catalogs(
+    source_events: &mut HashMap<String, EventDefinition>,
+    source_metadata: &mut HashMap<String, EventMetadata>,
+    target_events: &mut HashMap<String, EventDefinition>,
+    target_metadata: &mut HashMap<String, EventMetadata>,
+    event: &str,
+    new_event: EventDefinition,
+    metadata: EventMetadata,
+) -> Result<()> {
+    if new_event.name.trim().is_empty() {
+        anyhow::bail!("EVENT rename requires a non-empty target name");
+    }
+    let stored = source_events
+        .keys()
+        .find(|stored| stored.eq_ignore_ascii_case(event))
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("EVENT {} does not exist", event))?;
+    if let Some(target_stored) = target_events
+        .keys()
+        .find(|name| name.eq_ignore_ascii_case(&new_event.name))
+        .cloned()
+    {
+        // A crash can persist the target catalog before the source catalog.
+        // Treat an exact target image as the same in-flight rename so replay
+        // can finish removing the source; all other collisions stay errors.
+        if target_events.get(&target_stored) != Some(&new_event)
+            || target_metadata.get(&target_stored) != Some(&metadata)
+        {
+            anyhow::bail!("EVENT {} already exists", new_event.name);
+        }
+        source_events.remove(&stored);
+        source_metadata.remove(&stored);
+        return Ok(());
+    }
+
+    source_events.remove(&stored);
+    source_metadata.remove(&stored);
+    let target = new_event.name.clone();
+    target_events.insert(target.clone(), new_event);
+    target_metadata.insert(target, metadata);
+    Ok(())
+}
+
+fn move_event_between_catalogs_with_metadata_cas(
+    source_events: &mut HashMap<String, EventDefinition>,
+    source_metadata: &mut HashMap<String, EventMetadata>,
+    target_events: &mut HashMap<String, EventDefinition>,
+    target_metadata: &mut HashMap<String, EventMetadata>,
+    event: &str,
+    new_event: EventDefinition,
+    expected_create_sql: &str,
+    expected_revision: u64,
+    metadata: EventMetadata,
+) -> Result<()> {
+    // Validate source before touching target. This keeps a stale cross-schema
+    // RENAME from moving an EVENT after FinishEventV5 advanced its cursor.
+    resolve_event_for_metadata_cas(
+        source_events,
+        source_metadata,
+        event,
+        expected_create_sql,
+        expected_revision,
+    )?;
+    move_event_between_catalogs(
+        source_events,
+        source_metadata,
+        target_events,
+        target_metadata,
+        event,
+        new_event,
+        metadata,
+    )
+}
+
 pub fn table_engine_from_sql(sql: &str) -> TableEngine {
     let options = sql
         .rfind(')')
@@ -1576,6 +1772,63 @@ impl Database {
         events.insert(stored.clone(), event);
         self.event_metadata.write().insert(stored, metadata);
         Ok(())
+    }
+
+    /// Replaces an EVENT definition only when the source definition and
+    /// metadata generation still match the DDL snapshot.
+    pub fn alter_event_with_metadata_cas(
+        &self,
+        event: EventDefinition,
+        expected_create_sql: &str,
+        expected_revision: u64,
+        metadata: EventMetadata,
+    ) -> Result<()> {
+        let mut events = self.events.write();
+        let mut event_metadata = self.event_metadata.write();
+        alter_event_in_catalog_with_metadata_cas(
+            &mut events,
+            &mut event_metadata,
+            event,
+            expected_create_sql,
+            expected_revision,
+            metadata,
+        )
+    }
+
+    /// Renames an EVENT inside this schema while moving its metadata under the
+    /// same canonical key as `EventDefinition.name`.
+    pub fn rename_event_with_metadata(
+        &self,
+        event: &str,
+        new_event: EventDefinition,
+        metadata: EventMetadata,
+    ) -> Result<()> {
+        let mut events = self.events.write();
+        let mut event_metadata = self.event_metadata.write();
+        rename_event_in_catalog(&mut events, &mut event_metadata, event, new_event, metadata)
+    }
+
+    /// Renames an EVENT only when its source metadata generation still
+    /// matches the DDL snapshot.
+    pub fn rename_event_with_metadata_cas(
+        &self,
+        event: &str,
+        new_event: EventDefinition,
+        expected_create_sql: &str,
+        expected_revision: u64,
+        metadata: EventMetadata,
+    ) -> Result<()> {
+        let mut events = self.events.write();
+        let mut event_metadata = self.event_metadata.write();
+        rename_event_in_catalog_with_metadata_cas(
+            &mut events,
+            &mut event_metadata,
+            event,
+            new_event,
+            expected_create_sql,
+            expected_revision,
+            metadata,
+        )
     }
 
     /// Atomically records one scheduler completion when the event definition
@@ -2917,6 +3170,108 @@ fn directory_size(path: &Path) -> Result<u64> {
     Ok(bytes)
 }
 
+fn rename_event_between_databases(
+    source: &Database,
+    event: &str,
+    target: &Database,
+    new_event: EventDefinition,
+    metadata: EventMetadata,
+) -> Result<()> {
+    if source.name == target.name {
+        return source.rename_event_with_metadata(event, new_event, metadata);
+    }
+
+    // Direct callers can invoke this outside the single write actor. Take all
+    // catalog locks in schema-name order so two opposite cross-schema renames
+    // cannot deadlock.
+    if source.name <= target.name {
+        let mut source_events = source.events.write();
+        let mut target_events = target.events.write();
+        let mut source_metadata = source.event_metadata.write();
+        let mut target_metadata = target.event_metadata.write();
+        move_event_between_catalogs(
+            &mut source_events,
+            &mut source_metadata,
+            &mut target_events,
+            &mut target_metadata,
+            event,
+            new_event,
+            metadata,
+        )
+    } else {
+        let mut target_events = target.events.write();
+        let mut source_events = source.events.write();
+        let mut target_metadata = target.event_metadata.write();
+        let mut source_metadata = source.event_metadata.write();
+        move_event_between_catalogs(
+            &mut source_events,
+            &mut source_metadata,
+            &mut target_events,
+            &mut target_metadata,
+            event,
+            new_event,
+            metadata,
+        )
+    }
+}
+
+fn rename_event_between_databases_with_metadata_cas(
+    source: &Database,
+    event: &str,
+    target: &Database,
+    new_event: EventDefinition,
+    expected_create_sql: &str,
+    expected_revision: u64,
+    metadata: EventMetadata,
+) -> Result<()> {
+    if source.name == target.name {
+        return source.rename_event_with_metadata_cas(
+            event,
+            new_event,
+            expected_create_sql,
+            expected_revision,
+            metadata,
+        );
+    }
+
+    // Keep same global schema-name lock order as V6. Source CAS runs while
+    // both catalogs are locked, so FinishEventV5 cannot advance source between
+    // validation and move.
+    if source.name <= target.name {
+        let mut source_events = source.events.write();
+        let mut target_events = target.events.write();
+        let mut source_metadata = source.event_metadata.write();
+        let mut target_metadata = target.event_metadata.write();
+        move_event_between_catalogs_with_metadata_cas(
+            &mut source_events,
+            &mut source_metadata,
+            &mut target_events,
+            &mut target_metadata,
+            event,
+            new_event,
+            expected_create_sql,
+            expected_revision,
+            metadata,
+        )
+    } else {
+        let mut target_events = target.events.write();
+        let mut source_events = source.events.write();
+        let mut target_metadata = target.event_metadata.write();
+        let mut source_metadata = source.event_metadata.write();
+        move_event_between_catalogs_with_metadata_cas(
+            &mut source_events,
+            &mut source_metadata,
+            &mut target_events,
+            &mut target_metadata,
+            event,
+            new_event,
+            expected_create_sql,
+            expected_revision,
+            metadata,
+        )
+    }
+}
+
 fn row_matches(row: &Row, filter: Option<&RowPredicate>) -> bool {
     filter
         .map(|predicate| predicate.matches(row))
@@ -3057,6 +3412,35 @@ pub enum WriteCommand {
         expected_revision: u64,
         metadata: EventMetadata,
         action: EventFinishAction,
+    },
+    // Appended after V5 to preserve every existing bincode discriminant.
+    // `new_event` is rendered by the wire layer so SHOW CREATE and the
+    // catalog name stay in sync without storage rewriting SQL text.
+    RenameEventV6 {
+        database: String,
+        event: String,
+        new_database: String,
+        new_event: EventDefinition,
+        metadata: EventMetadata,
+    },
+    // V7/V8 add source compare-and-swap fields without changing historical
+    // bincode layouts. New DDL must use these rather than V4/V6 so a stale
+    // metadata snapshot cannot roll back FinishEventV5's execution cursor.
+    AlterEventV7 {
+        database: String,
+        event: EventDefinition,
+        expected_create_sql: String,
+        expected_revision: u64,
+        metadata: EventMetadata,
+    },
+    RenameEventV8 {
+        database: String,
+        event: String,
+        new_database: String,
+        new_event: EventDefinition,
+        expected_create_sql: String,
+        expected_revision: u64,
+        metadata: EventMetadata,
     },
 }
 
@@ -6920,6 +7304,45 @@ fn normalize_replay_commands(
                     });
                 }
             }
+            WriteCommand::AlterEventV7 {
+                database,
+                event,
+                expected_create_sql,
+                expected_revision,
+                metadata,
+            } => {
+                let Some(items) = events.get_mut(&database) else {
+                    continue;
+                };
+                let metadata_items = event_metadata
+                    .get_mut(&database)
+                    .expect("event metadata catalog follows event catalog");
+                // WAL replay is conservative: a V7 whose source snapshot no
+                // longer matches was superseded by later durable work.
+                if event_matches_metadata_cas(
+                    items,
+                    metadata_items,
+                    &event.name,
+                    &expected_create_sql,
+                    expected_revision,
+                ) {
+                    alter_event_in_catalog_with_metadata_cas(
+                        items,
+                        metadata_items,
+                        event.clone(),
+                        &expected_create_sql,
+                        expected_revision,
+                        metadata.clone(),
+                    )?;
+                    normalized.push(WriteCommand::AlterEventV7 {
+                        database,
+                        event,
+                        expected_create_sql,
+                        expected_revision,
+                        metadata,
+                    });
+                }
+            }
             WriteCommand::FinishEventV5 {
                 database,
                 event,
@@ -6950,6 +7373,231 @@ fn normalize_replay_commands(
                         expected_revision,
                         metadata,
                         action,
+                    });
+                }
+            }
+            WriteCommand::RenameEventV6 {
+                database,
+                event,
+                new_database,
+                new_event,
+                metadata,
+            } => {
+                if database == new_database {
+                    let Some(items) = events.get_mut(&database) else {
+                        continue;
+                    };
+                    let metadata_items = event_metadata
+                        .get_mut(&database)
+                        .expect("event metadata catalog follows event catalog");
+                    if items.keys().any(|name| name.eq_ignore_ascii_case(&event)) {
+                        // A conflicting target indicates later DDL already
+                        // superseded this historical rename; leave it alone.
+                        let target_conflict = items.keys().any(|name| {
+                            name.eq_ignore_ascii_case(&new_event.name)
+                                && !name.eq_ignore_ascii_case(&event)
+                        });
+                        if !target_conflict {
+                            rename_event_in_catalog(
+                                items,
+                                metadata_items,
+                                &event,
+                                new_event.clone(),
+                                metadata.clone(),
+                            )?;
+                            normalized.push(WriteCommand::RenameEventV6 {
+                                database,
+                                event,
+                                new_database,
+                                new_event,
+                                metadata,
+                            });
+                        }
+                    }
+                } else {
+                    let source_present = events.get(&database).is_some_and(|items| {
+                        items.keys().any(|name| name.eq_ignore_ascii_case(&event))
+                    });
+                    let Some(target_items) = events.get(&new_database) else {
+                        continue;
+                    };
+                    let target_metadata_items = event_metadata
+                        .get(&new_database)
+                        .expect("event metadata catalog follows event catalog");
+                    let target_conflict = target_items
+                        .iter()
+                        .find(|(name, _)| name.eq_ignore_ascii_case(&new_event.name));
+                    if !source_present {
+                        // The target may already be durable, or later DDL may
+                        // have removed it. Either way this old move is done.
+                        continue;
+                    }
+                    if let Some((target_name, target_event)) = target_conflict {
+                        if target_event != &new_event
+                            || target_metadata_items.get(target_name) != Some(&metadata)
+                        {
+                            continue;
+                        }
+                    }
+
+                    let mut source_events = events
+                        .remove(&database)
+                        .expect("source event catalog was checked");
+                    let mut source_metadata = event_metadata
+                        .remove(&database)
+                        .expect("source event metadata catalog follows event catalog");
+                    let mut target_events = events
+                        .remove(&new_database)
+                        .expect("target event catalog was checked");
+                    let mut target_metadata = event_metadata
+                        .remove(&new_database)
+                        .expect("target event metadata catalog follows event catalog");
+                    let result = move_event_between_catalogs(
+                        &mut source_events,
+                        &mut source_metadata,
+                        &mut target_events,
+                        &mut target_metadata,
+                        &event,
+                        new_event.clone(),
+                        metadata.clone(),
+                    );
+                    events.insert(database.clone(), source_events);
+                    event_metadata.insert(database.clone(), source_metadata);
+                    events.insert(new_database.clone(), target_events);
+                    event_metadata.insert(new_database.clone(), target_metadata);
+                    result?;
+                    normalized.push(WriteCommand::RenameEventV6 {
+                        database,
+                        event,
+                        new_database,
+                        new_event,
+                        metadata,
+                    });
+                }
+            }
+            WriteCommand::RenameEventV8 {
+                database,
+                event,
+                new_database,
+                new_event,
+                expected_create_sql,
+                expected_revision,
+                metadata,
+            } => {
+                if database == new_database {
+                    let Some(items) = events.get_mut(&database) else {
+                        continue;
+                    };
+                    let metadata_items = event_metadata
+                        .get_mut(&database)
+                        .expect("event metadata catalog follows event catalog");
+                    if event_matches_metadata_cas(
+                        items,
+                        metadata_items,
+                        &event,
+                        &expected_create_sql,
+                        expected_revision,
+                    ) {
+                        // A different target is newer DDL. Leave it untouched
+                        // rather than failing startup over an old WAL record.
+                        let target_conflict = items.keys().any(|name| {
+                            name.eq_ignore_ascii_case(&new_event.name)
+                                && !name.eq_ignore_ascii_case(&event)
+                        });
+                        if !target_conflict {
+                            rename_event_in_catalog_with_metadata_cas(
+                                items,
+                                metadata_items,
+                                &event,
+                                new_event.clone(),
+                                &expected_create_sql,
+                                expected_revision,
+                                metadata.clone(),
+                            )?;
+                            normalized.push(WriteCommand::RenameEventV8 {
+                                database,
+                                event,
+                                new_database,
+                                new_event,
+                                expected_create_sql,
+                                expected_revision,
+                                metadata,
+                            });
+                        }
+                    }
+                } else {
+                    let source_matches = events
+                        .get(&database)
+                        .zip(event_metadata.get(&database))
+                        .is_some_and(|(items, metadata_items)| {
+                            event_matches_metadata_cas(
+                                items,
+                                metadata_items,
+                                &event,
+                                &expected_create_sql,
+                                expected_revision,
+                            )
+                        });
+                    if !source_matches {
+                        // Missing, already-moved, or advanced source: this
+                        // old durable command must not roll catalog state back.
+                        continue;
+                    }
+                    let Some(target_items) = events.get(&new_database) else {
+                        continue;
+                    };
+                    let target_metadata_items = event_metadata
+                        .get(&new_database)
+                        .expect("event metadata catalog follows event catalog");
+                    let target_conflict = target_items
+                        .iter()
+                        .find(|(name, _)| name.eq_ignore_ascii_case(&new_event.name));
+                    if let Some((target_name, target_event)) = target_conflict {
+                        // Exact target is valid target-first crash recovery.
+                        // Any other target was created by newer DDL.
+                        if target_event != &new_event
+                            || target_metadata_items.get(target_name) != Some(&metadata)
+                        {
+                            continue;
+                        }
+                    }
+
+                    let mut source_events = events
+                        .remove(&database)
+                        .expect("source event catalog was checked");
+                    let mut source_metadata = event_metadata
+                        .remove(&database)
+                        .expect("source event metadata catalog follows event catalog");
+                    let mut target_events = events
+                        .remove(&new_database)
+                        .expect("target event catalog was checked");
+                    let mut target_metadata = event_metadata
+                        .remove(&new_database)
+                        .expect("target event metadata catalog follows event catalog");
+                    let result = move_event_between_catalogs_with_metadata_cas(
+                        &mut source_events,
+                        &mut source_metadata,
+                        &mut target_events,
+                        &mut target_metadata,
+                        &event,
+                        new_event.clone(),
+                        &expected_create_sql,
+                        expected_revision,
+                        metadata.clone(),
+                    );
+                    events.insert(database.clone(), source_events);
+                    event_metadata.insert(database.clone(), source_metadata);
+                    events.insert(new_database.clone(), target_events);
+                    event_metadata.insert(new_database.clone(), target_metadata);
+                    result?;
+                    normalized.push(WriteCommand::RenameEventV8 {
+                        database,
+                        event,
+                        new_database,
+                        new_event,
+                        expected_create_sql,
+                        expected_revision,
+                        metadata,
                     });
                 }
             }
@@ -7282,6 +7930,22 @@ async fn apply_write_batch(
                 db.alter_event_with_metadata(event, metadata)?;
                 db.save().await?;
             }
+            WriteCommand::AlterEventV7 {
+                database,
+                event,
+                expected_create_sql,
+                expected_revision,
+                metadata,
+            } => {
+                let db = databases.read().get(&database).cloned().unwrap();
+                db.alter_event_with_metadata_cas(
+                    event,
+                    &expected_create_sql,
+                    expected_revision,
+                    metadata,
+                )?;
+                db.save().await?;
+            }
             WriteCommand::FinishEventV5 {
                 database,
                 event,
@@ -7299,6 +7963,79 @@ async fn apply_write_batch(
                     action,
                 )? {
                     db.save().await?;
+                }
+            }
+            WriteCommand::RenameEventV6 {
+                database,
+                event,
+                new_database,
+                new_event,
+                metadata,
+            } => {
+                let source = databases
+                    .read()
+                    .get(&database)
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("Unknown database '{}'", database))?;
+                if database == new_database {
+                    source.rename_event_with_metadata(&event, new_event, metadata)?;
+                    source.save().await?;
+                } else {
+                    let target = databases
+                        .read()
+                        .get(&new_database)
+                        .cloned()
+                        .ok_or_else(|| anyhow::anyhow!("Unknown database '{}'", new_database))?;
+                    rename_event_between_databases(&source, &event, &target, new_event, metadata)?;
+                    // Persist the destination first. A crash can leave a
+                    // duplicate source, but never loses the EVENT; replay
+                    // recognizes that exact target image and removes source.
+                    target.save().await?;
+                    source.save().await?;
+                }
+            }
+            WriteCommand::RenameEventV8 {
+                database,
+                event,
+                new_database,
+                new_event,
+                expected_create_sql,
+                expected_revision,
+                metadata,
+            } => {
+                let source = databases
+                    .read()
+                    .get(&database)
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("Unknown database '{}'", database))?;
+                if database == new_database {
+                    source.rename_event_with_metadata_cas(
+                        &event,
+                        new_event,
+                        &expected_create_sql,
+                        expected_revision,
+                        metadata,
+                    )?;
+                    source.save().await?;
+                } else {
+                    let target = databases
+                        .read()
+                        .get(&new_database)
+                        .cloned()
+                        .ok_or_else(|| anyhow::anyhow!("Unknown database '{}'", new_database))?;
+                    rename_event_between_databases_with_metadata_cas(
+                        &source,
+                        &event,
+                        &target,
+                        new_event,
+                        &expected_create_sql,
+                        expected_revision,
+                        metadata,
+                    )?;
+                    // Same target-first ordering as V6. On a crash replay
+                    // recognizes exact target state, then removes source.
+                    target.save().await?;
+                    source.save().await?;
                 }
             }
         }
@@ -8101,6 +8838,28 @@ fn validate_write_batch(
                 items.insert(stored.clone(), event.clone());
                 metadata_items.insert(stored, metadata.clone());
             }
+            WriteCommand::AlterEventV7 {
+                database,
+                event,
+                expected_create_sql,
+                expected_revision,
+                metadata,
+            } => {
+                let items = events
+                    .get_mut(database)
+                    .ok_or_else(|| anyhow::anyhow!("Unknown database '{}'", database))?;
+                let metadata_items = event_metadata
+                    .get_mut(database)
+                    .expect("event metadata catalog follows event catalog");
+                alter_event_in_catalog_with_metadata_cas(
+                    items,
+                    metadata_items,
+                    event.clone(),
+                    expected_create_sql,
+                    *expected_revision,
+                    metadata.clone(),
+                )?;
+            }
             WriteCommand::FinishEventV5 {
                 database,
                 event,
@@ -8124,6 +8883,112 @@ fn validate_write_batch(
                     metadata,
                     action,
                 )?;
+            }
+            WriteCommand::RenameEventV6 {
+                database,
+                event,
+                new_database,
+                new_event,
+                metadata,
+            } => {
+                if database == new_database {
+                    let items = events
+                        .get_mut(database)
+                        .ok_or_else(|| anyhow::anyhow!("Unknown database '{}'", database))?;
+                    let metadata_items = event_metadata
+                        .get_mut(database)
+                        .expect("event metadata catalog follows event catalog");
+                    rename_event_in_catalog(
+                        items,
+                        metadata_items,
+                        event,
+                        new_event.clone(),
+                        metadata.clone(),
+                    )?;
+                } else {
+                    let mut source_events = events
+                        .remove(database)
+                        .ok_or_else(|| anyhow::anyhow!("Unknown database '{}'", database))?;
+                    let mut source_metadata = event_metadata
+                        .remove(database)
+                        .expect("event metadata catalog follows event catalog");
+                    let mut target_events = events
+                        .remove(new_database)
+                        .ok_or_else(|| anyhow::anyhow!("Unknown database '{}'", new_database))?;
+                    let mut target_metadata = event_metadata
+                        .remove(new_database)
+                        .expect("event metadata catalog follows event catalog");
+                    let result = move_event_between_catalogs(
+                        &mut source_events,
+                        &mut source_metadata,
+                        &mut target_events,
+                        &mut target_metadata,
+                        event,
+                        new_event.clone(),
+                        metadata.clone(),
+                    );
+                    events.insert(database.clone(), source_events);
+                    event_metadata.insert(database.clone(), source_metadata);
+                    events.insert(new_database.clone(), target_events);
+                    event_metadata.insert(new_database.clone(), target_metadata);
+                    result?;
+                }
+            }
+            WriteCommand::RenameEventV8 {
+                database,
+                event,
+                new_database,
+                new_event,
+                expected_create_sql,
+                expected_revision,
+                metadata,
+            } => {
+                if database == new_database {
+                    let items = events
+                        .get_mut(database)
+                        .ok_or_else(|| anyhow::anyhow!("Unknown database '{}'", database))?;
+                    let metadata_items = event_metadata
+                        .get_mut(database)
+                        .expect("event metadata catalog follows event catalog");
+                    rename_event_in_catalog_with_metadata_cas(
+                        items,
+                        metadata_items,
+                        event,
+                        new_event.clone(),
+                        expected_create_sql,
+                        *expected_revision,
+                        metadata.clone(),
+                    )?;
+                } else {
+                    let mut source_events = events
+                        .remove(database)
+                        .ok_or_else(|| anyhow::anyhow!("Unknown database '{}'", database))?;
+                    let mut source_metadata = event_metadata
+                        .remove(database)
+                        .expect("event metadata catalog follows event catalog");
+                    let mut target_events = events
+                        .remove(new_database)
+                        .ok_or_else(|| anyhow::anyhow!("Unknown database '{}'", new_database))?;
+                    let mut target_metadata = event_metadata
+                        .remove(new_database)
+                        .expect("event metadata catalog follows event catalog");
+                    let result = move_event_between_catalogs_with_metadata_cas(
+                        &mut source_events,
+                        &mut source_metadata,
+                        &mut target_events,
+                        &mut target_metadata,
+                        event,
+                        new_event.clone(),
+                        expected_create_sql,
+                        *expected_revision,
+                        metadata.clone(),
+                    );
+                    events.insert(database.clone(), source_events);
+                    event_metadata.insert(database.clone(), source_metadata);
+                    events.insert(new_database.clone(), target_events);
+                    event_metadata.insert(new_database.clone(), target_metadata);
+                    result?;
+                }
             }
         }
     }
@@ -10214,6 +11079,399 @@ mod tests {
             .unwrap()
             .get_event("daily_event")
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn event_metadata_ddl_cas_rejects_stale_alter_and_cross_schema_rename() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = StorageEngineManager::new(temp.path().to_path_buf(), 16384, "4M");
+        manager.init().await.unwrap();
+        manager.create_database("source").await.unwrap();
+        manager.create_database("destination").await.unwrap();
+
+        let original = event_definition("daily_event");
+        let created = EventMetadata::new("STRICT_TRANS_TABLES".into());
+        manager
+            .execute_write(WriteCommand::CreateEventV4 {
+                database: "source".into(),
+                event: original.clone(),
+                metadata: created.clone(),
+            })
+            .await
+            .unwrap();
+
+        // The scheduler owns a newer cursor before DDL reaches storage.
+        let mut finished = created.clone();
+        finished.last_executed = Some("2026-07-21 12:00:00".into());
+        finished.next_execution_utc = Some("2026-07-22T12:00:00Z".into());
+        finished.revision = created.revision.saturating_add(1);
+        manager
+            .execute_write(WriteCommand::FinishEventV5 {
+                database: "source".into(),
+                event: "daily_event".into(),
+                expected_create_sql: original.create_sql.clone(),
+                expected_revision: created.revision,
+                metadata: finished.clone(),
+                action: EventFinishAction::Keep,
+            })
+            .await
+            .unwrap();
+
+        let mut stale_alter = original.clone();
+        stale_alter.comment = "stale alter".into();
+        stale_alter.create_sql = "ALTER EVENT daily_event COMMENT 'stale alter'".into();
+        let error = manager
+            .execute_write(WriteCommand::AlterEventV7 {
+                database: "source".into(),
+                event: stale_alter,
+                expected_create_sql: original.create_sql.clone(),
+                expected_revision: created.revision,
+                metadata: created.altered("ANSI_QUOTES".into()),
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("modified concurrently"));
+        assert!(error.to_string().contains("retry"));
+
+        let stale_rename = event_definition("daily_archive");
+        let error = manager
+            .execute_write(WriteCommand::RenameEventV8 {
+                database: "source".into(),
+                event: "daily_event".into(),
+                new_database: "destination".into(),
+                new_event: stale_rename,
+                expected_create_sql: original.create_sql.clone(),
+                expected_revision: created.revision,
+                metadata: created.altered("ANSI_QUOTES".into()),
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("modified concurrently"));
+        assert!(error.to_string().contains("retry"));
+
+        let source = manager.get_database("source").unwrap();
+        assert_eq!(source.get_event("daily_event"), Some(original.clone()));
+        assert_eq!(
+            source.get_event_metadata("daily_event"),
+            Some(finished.clone())
+        );
+        assert!(manager
+            .get_database("destination")
+            .unwrap()
+            .get_event("daily_archive")
+            .is_none());
+
+        // Fresh V7/V8 snapshots still work and retain FinishEventV5 cursor
+        // data when wire builds metadata with EventMetadata::altered.
+        let mut altered = original.clone();
+        altered.comment = "fresh alter".into();
+        altered.create_sql = "ALTER EVENT daily_event COMMENT 'fresh alter'".into();
+        let altered_metadata = finished.altered("ANSI_QUOTES".into());
+        manager
+            .execute_write(WriteCommand::AlterEventV7 {
+                database: "source".into(),
+                event: altered.clone(),
+                expected_create_sql: original.create_sql.clone(),
+                expected_revision: finished.revision,
+                metadata: altered_metadata.clone(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            manager
+                .get_database("source")
+                .unwrap()
+                .get_event_metadata("daily_event"),
+            Some(altered_metadata.clone())
+        );
+
+        let renamed = event_definition("daily_archive");
+        let renamed_metadata = altered_metadata.altered("ANSI_QUOTES".into());
+        manager
+            .execute_write(WriteCommand::RenameEventV8 {
+                database: "source".into(),
+                event: "daily_event".into(),
+                new_database: "destination".into(),
+                new_event: renamed.clone(),
+                expected_create_sql: altered.create_sql.clone(),
+                expected_revision: altered_metadata.revision,
+                metadata: renamed_metadata.clone(),
+            })
+            .await
+            .unwrap();
+        assert!(manager
+            .get_database("source")
+            .unwrap()
+            .get_event("daily_event")
+            .is_none());
+        let destination = manager.get_database("destination").unwrap();
+        assert_eq!(destination.get_event("daily_archive"), Some(renamed));
+        assert_eq!(
+            destination.get_event_metadata("daily_archive"),
+            Some(renamed_metadata.clone())
+        );
+        assert_eq!(renamed_metadata.last_executed, finished.last_executed);
+        assert_eq!(
+            renamed_metadata.next_execution_utc,
+            finished.next_execution_utc
+        );
+    }
+
+    #[tokio::test]
+    async fn event_rename_moves_catalog_metadata_and_rejects_conflicts() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = StorageEngineManager::new(temp.path().to_path_buf(), 16384, "4M");
+        manager.init().await.unwrap();
+        manager.create_database("source").await.unwrap();
+        manager.create_database("destination").await.unwrap();
+
+        let original = event_definition("Daily_Event");
+        let mut created = EventMetadata::new("STRICT_TRANS_TABLES".into());
+        created.next_execution_utc = Some("2026-07-22T12:00:00Z".into());
+        created.schedule_interval_value = Some("1".into());
+        manager
+            .execute_write(WriteCommand::CreateEventV4 {
+                database: "source".into(),
+                event: original,
+                metadata: created.clone(),
+            })
+            .await
+            .unwrap();
+
+        let moved = event_definition("daily_archive");
+        let moved_metadata = created.altered("ANSI_QUOTES".into());
+        manager
+            .execute_write(WriteCommand::RenameEventV6 {
+                database: "source".into(),
+                event: "daily_event".into(),
+                new_database: "destination".into(),
+                new_event: moved.clone(),
+                metadata: moved_metadata.clone(),
+            })
+            .await
+            .unwrap();
+        assert!(manager
+            .get_database("source")
+            .unwrap()
+            .get_event("daily_event")
+            .is_none());
+        let destination = manager.get_database("destination").unwrap();
+        assert_eq!(destination.get_event("DAILY_ARCHIVE"), Some(moved.clone()));
+        assert_eq!(
+            destination.get_event_metadata("daily_archive"),
+            Some(moved_metadata.clone())
+        );
+
+        // Case-only changes are a valid in-place rename and must update both
+        // the catalog key and EventDefinition.name consistently.
+        let case_renamed = event_definition("DAILY_ARCHIVE");
+        let case_metadata = moved_metadata.altered("ANSI_QUOTES".into());
+        manager
+            .execute_write(WriteCommand::RenameEventV6 {
+                database: "destination".into(),
+                event: "daily_archive".into(),
+                new_database: "destination".into(),
+                new_event: case_renamed.clone(),
+                metadata: case_metadata.clone(),
+            })
+            .await
+            .unwrap();
+        let destination = manager.get_database("destination").unwrap();
+        assert!(destination.events.read().contains_key("DAILY_ARCHIVE"));
+        assert!(!destination.events.read().contains_key("daily_archive"));
+        assert_eq!(
+            destination.get_event("daily_archive").unwrap().name,
+            "DAILY_ARCHIVE"
+        );
+        assert_eq!(
+            destination.get_event_metadata("daily_archive"),
+            Some(case_metadata.clone())
+        );
+        assert_eq!(case_metadata.revision, moved_metadata.revision + 1);
+
+        let second = event_definition("second_event");
+        let second_metadata = EventMetadata::new("STRICT_TRANS_TABLES".into());
+        manager
+            .execute_write(WriteCommand::CreateEventV4 {
+                database: "source".into(),
+                event: second.clone(),
+                metadata: second_metadata.clone(),
+            })
+            .await
+            .unwrap();
+        let collision = event_definition("collision_event");
+        manager
+            .execute_write(WriteCommand::CreateEventV4 {
+                database: "destination".into(),
+                event: collision.clone(),
+                metadata: EventMetadata::new("STRICT_TRANS_TABLES".into()),
+            })
+            .await
+            .unwrap();
+        let result = manager
+            .execute_write(WriteCommand::RenameEventV6 {
+                database: "source".into(),
+                event: "SECOND_EVENT".into(),
+                new_database: "destination".into(),
+                new_event: event_definition("COLLISION_EVENT"),
+                metadata: second_metadata.altered("ANSI_QUOTES".into()),
+            })
+            .await;
+        assert!(result.is_err());
+        assert!(manager
+            .get_database("source")
+            .unwrap()
+            .get_event("second_event")
+            .is_some());
+        assert_eq!(
+            manager
+                .get_database("destination")
+                .unwrap()
+                .get_event("collision_event"),
+            Some(collision)
+        );
+
+        let missing_source = manager
+            .execute_write(WriteCommand::RenameEventV6 {
+                database: "source".into(),
+                event: "missing_event".into(),
+                new_database: "destination".into(),
+                new_event: event_definition("never_created"),
+                metadata: EventMetadata::new("STRICT_TRANS_TABLES".into()),
+            })
+            .await;
+        assert!(missing_source.is_err());
+        let missing_database = manager
+            .execute_write(WriteCommand::RenameEventV6 {
+                database: "source".into(),
+                event: "second_event".into(),
+                new_database: "missing_database".into(),
+                new_event: event_definition("never_moved"),
+                metadata: second_metadata.altered("ANSI_QUOTES".into()),
+            })
+            .await;
+        assert!(missing_database.is_err());
+        assert!(manager
+            .get_database("source")
+            .unwrap()
+            .get_event("second_event")
+            .is_some());
+
+        drop(manager);
+        let restarted = StorageEngineManager::new(temp.path().to_path_buf(), 16384, "4M");
+        restarted.init().await.unwrap();
+        let destination = restarted.get_database("destination").unwrap();
+        assert!(destination.events.read().contains_key("DAILY_ARCHIVE"));
+        assert_eq!(destination.get_event("daily_archive"), Some(case_renamed));
+        assert_eq!(
+            destination.get_event_metadata("daily_archive"),
+            Some(case_metadata)
+        );
+    }
+
+    #[tokio::test]
+    async fn event_rename_replays_committed_cross_schema_wal() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = StorageEngineManager::new(temp.path().to_path_buf(), 16384, "4M");
+        manager.init().await.unwrap();
+        manager.create_database("source").await.unwrap();
+        manager.create_database("destination").await.unwrap();
+
+        let original = event_definition("replay_source");
+        let created = EventMetadata::new("STRICT_TRANS_TABLES".into());
+        manager
+            .execute_write(WriteCommand::CreateEventV4 {
+                database: "source".into(),
+                event: original,
+                metadata: created.clone(),
+            })
+            .await
+            .unwrap();
+        let renamed = event_definition("replay_target");
+        let metadata = created.altered("ANSI_QUOTES".into());
+        append_fault_batch(
+            &manager,
+            vec![WriteCommand::RenameEventV6 {
+                database: "source".into(),
+                event: "REPLAY_SOURCE".into(),
+                new_database: "destination".into(),
+                new_event: renamed.clone(),
+                metadata: metadata.clone(),
+            }],
+            true,
+        );
+        manager.wal_replay().await.unwrap();
+        assert!(manager
+            .get_database("source")
+            .unwrap()
+            .get_event("replay_source")
+            .is_none());
+        let destination = manager.get_database("destination").unwrap();
+        assert_eq!(destination.get_event("replay_target"), Some(renamed));
+        assert_eq!(
+            destination.get_event_metadata("replay_target"),
+            Some(metadata)
+        );
+    }
+
+    #[tokio::test]
+    async fn event_rename_recovery_finishes_target_first_catalog_save() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = StorageEngineManager::new(temp.path().to_path_buf(), 16384, "4M");
+        manager.init().await.unwrap();
+        manager.create_database("source").await.unwrap();
+        manager.create_database("destination").await.unwrap();
+
+        let original = event_definition("partial_source");
+        let created = EventMetadata::new("STRICT_TRANS_TABLES".into());
+        manager
+            .execute_write(WriteCommand::CreateEventV4 {
+                database: "source".into(),
+                event: original,
+                metadata: created.clone(),
+            })
+            .await
+            .unwrap();
+        let renamed = event_definition("partial_target");
+        let metadata = created.altered("ANSI_QUOTES".into());
+        let command = WriteCommand::RenameEventV6 {
+            database: "source".into(),
+            event: "partial_source".into(),
+            new_database: "destination".into(),
+            new_event: renamed.clone(),
+            metadata: metadata.clone(),
+        };
+        append_fault_batch(&manager, vec![command], true);
+
+        // Model a crash after destination catalog persistence but before the
+        // source catalog is saved. The durable V6 record must converge the
+        // duplicate into one destination event at startup.
+        let source = manager.get_database("source").unwrap();
+        let destination = manager.get_database("destination").unwrap();
+        rename_event_between_databases(
+            &source,
+            "partial_source",
+            &destination,
+            renamed.clone(),
+            metadata.clone(),
+        )
+        .unwrap();
+        destination.save().await.unwrap();
+        drop(manager);
+
+        let restarted = StorageEngineManager::new(temp.path().to_path_buf(), 16384, "4M");
+        restarted.init().await.unwrap();
+        assert!(restarted
+            .get_database("source")
+            .unwrap()
+            .get_event("partial_source")
+            .is_none());
+        let destination = restarted.get_database("destination").unwrap();
+        assert_eq!(destination.get_event("partial_target"), Some(renamed));
+        assert_eq!(
+            destination.get_event_metadata("partial_target"),
+            Some(metadata)
+        );
     }
 
     #[tokio::test]
