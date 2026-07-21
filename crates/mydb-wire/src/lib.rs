@@ -1733,6 +1733,18 @@ impl Backend {
             ("character_set_client".into(), Some(b"utf8mb4".to_vec())),
             ("character_set_connection".into(), Some(b"utf8mb4".to_vec())),
             ("character_set_results".into(), Some(b"utf8mb4".to_vec())),
+            (
+                "collation_connection".into(),
+                Some(b"utf8mb4_0900_ai_ci".to_vec()),
+            ),
+            (
+                "collation_database".into(),
+                Some(b"utf8mb4_0900_ai_ci".to_vec()),
+            ),
+            (
+                "collation_server".into(),
+                Some(b"utf8mb4_0900_ai_ci".to_vec()),
+            ),
             ("sql_mode".into(), Some(Vec::new())),
             ("time_zone".into(), Some(b"SYSTEM".to_vec())),
             ("unique_checks".into(), Some(b"1".to_vec())),
@@ -2151,6 +2163,19 @@ impl Backend {
                     .insert("time_zone".into(), Some(value));
                 let _ = STATEMENT_CLOCK.try_with(|clock| clock.session_zone.set(zone));
             }
+            "collation_connection" => {
+                let value =
+                    value.ok_or_else(|| anyhow::anyhow!("collation_connection cannot be NULL"))?;
+                let collation = normalize_mysql_collation(std::str::from_utf8(&value)?)?;
+                let info = mysql_collation_info(&collation)
+                    .expect("validated MySQL collation must have metadata");
+                self.session_variables.insert(
+                    "character_set_connection".into(),
+                    Some(info.character_set.as_bytes().to_vec()),
+                );
+                self.session_variables
+                    .insert("collation_connection".into(), Some(collation.into_bytes()));
+            }
             "warning_count" | "error_count" => {
                 anyhow::bail!("Variable '{}' is a read only variable", name);
             }
@@ -2177,13 +2202,8 @@ impl Backend {
             return Ok(QueryOutcome::ok(0));
         }
         if upper.starts_with("NAMES ") || upper.starts_with("CHARACTER SET ") {
-            let requested = body
-                .split_whitespace()
-                .next_back()
-                .unwrap_or("utf8mb4")
-                .trim_matches(['\'', '"'])
-                .to_string();
-            let value = normalize_mysql_charset(&requested)?.into_bytes();
+            let (character_set, collation) = parse_set_names_clause(body)?;
+            let value = character_set.into_bytes();
             for name in [
                 "character_set_client",
                 "character_set_connection",
@@ -2192,6 +2212,8 @@ impl Backend {
                 self.session_variables
                     .insert(name.to_string(), Some(value.clone()));
             }
+            self.session_variables
+                .insert("collation_connection".into(), Some(collation.into_bytes()));
             return Ok(QueryOutcome::ok(0));
         }
         for assignment in split_csv(body) {
@@ -3450,6 +3472,46 @@ impl Backend {
                 names.into_iter().map(|v| vec![Some(v)]).collect(),
             ));
         }
+        if upper.starts_with("SHOW CHARACTER SET") || upper.starts_with("SHOW CHARSET") {
+            let prefix = if upper.starts_with("SHOW CHARACTER SET") {
+                "SHOW CHARACTER SET"
+            } else {
+                "SHOW CHARSET"
+            };
+            let filter = parse_show_metadata_filter(sql[prefix.len()..].trim())?;
+            let columns = vec![
+                "Charset".to_string(),
+                "Description".to_string(),
+                "Default collation".to_string(),
+                "Maxlen".to_string(),
+            ];
+            return Ok(QueryOutcome::byte_rows(
+                columns.clone(),
+                apply_show_filter(&columns, mysql_character_set_rows(), filter, 0)?,
+            ));
+        }
+        if upper.starts_with("SHOW COLLATION") {
+            let filter = parse_show_metadata_filter(sql["SHOW COLLATION".len()..].trim())?;
+            let columns = vec![
+                "Collation".to_string(),
+                "Charset".to_string(),
+                "Id".to_string(),
+                "Default".to_string(),
+                "Compiled".to_string(),
+                "Sortlen".to_string(),
+                "Pad_attribute".to_string(),
+            ];
+            return Ok(QueryOutcome::byte_rows(
+                columns.clone(),
+                apply_show_filter(&columns, mysql_collation_rows(), filter, 0)?,
+            ));
+        }
+        if upper == "SHOW PRIVILEGES" {
+            return Ok(QueryOutcome::byte_rows(
+                vec!["Privilege", "Context", "Comment"],
+                mysql_privilege_rows(),
+            ));
+        }
         if upper.starts_with("SHOW TRIGGERS") {
             return self.show_triggers(sql);
         }
@@ -3661,27 +3723,7 @@ impl Backend {
                     "XA",
                     "Savepoints",
                 ],
-                vec![
-                    vec![
-                        Some("InnoDB".into()),
-                        Some("DEFAULT".into()),
-                        Some(
-                            "Neko233 game-optimized transactional engine (InnoDB compatibility alias)"
-                                .into(),
-                        ),
-                        Some("YES".into()),
-                        Some("YES".into()),
-                        Some("YES".into()),
-                    ],
-                    vec![
-                        Some("MEMORY".into()),
-                        Some("YES".into()),
-                        Some("Hash based, stored in memory, useful for temporary tables".into()),
-                        Some("NO".into()),
-                        Some("NO".into()),
-                        Some("NO".into()),
-                    ],
-                ],
+                mysql_engine_rows_as_strings(),
             ));
         }
         if upper.starts_with("SHOW VARIABLES") {
@@ -12719,6 +12761,56 @@ fn information_schema_virtual_tables(
                 .map(str::to_string)
                 .collect(),
                 rows: routines_rows,
+            },
+        ),
+        (
+            "character_sets".into(),
+            VirtualTable {
+                columns: [
+                    "CHARACTER_SET_NAME",
+                    "DEFAULT_COLLATE_NAME",
+                    "DESCRIPTION",
+                    "MAXLEN",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+                rows: mysql_character_set_information_schema_rows(),
+            },
+        ),
+        (
+            "collations".into(),
+            VirtualTable {
+                columns: [
+                    "COLLATION_NAME",
+                    "CHARACTER_SET_NAME",
+                    "ID",
+                    "IS_DEFAULT",
+                    "IS_COMPILED",
+                    "SORTLEN",
+                    "PAD_ATTRIBUTE",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+                rows: mysql_collation_rows(),
+            },
+        ),
+        (
+            "engines".into(),
+            VirtualTable {
+                columns: [
+                    "ENGINE",
+                    "SUPPORT",
+                    "COMMENT",
+                    "TRANSACTIONS",
+                    "XA",
+                    "SAVEPOINTS",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+                rows: mysql_engine_rows(),
             },
         ),
         (
@@ -25622,6 +25714,364 @@ fn normalize_mysql_charset(value: &str) -> anyhow::Result<String> {
     Ok(canonical.to_string())
 }
 
+#[derive(Clone, Copy)]
+struct MysqlCharacterSetInfo {
+    name: &'static str,
+    description: &'static str,
+    default_collation: &'static str,
+    maxlen: u8,
+}
+
+#[derive(Clone, Copy)]
+struct MysqlCollationInfo {
+    name: &'static str,
+    character_set: &'static str,
+    id: u16,
+    is_default: bool,
+    sortlen: u8,
+    pad_attribute: &'static str,
+}
+
+const MYSQL_CHARACTER_SETS: &[MysqlCharacterSetInfo] = &[
+    MysqlCharacterSetInfo {
+        name: "binary",
+        description: "Binary pseudo charset",
+        default_collation: "binary",
+        maxlen: 1,
+    },
+    MysqlCharacterSetInfo {
+        name: "ascii",
+        description: "US ASCII",
+        default_collation: "ascii_general_ci",
+        maxlen: 1,
+    },
+    MysqlCharacterSetInfo {
+        name: "utf8mb3",
+        description: "UTF-8 Unicode",
+        default_collation: "utf8mb3_general_ci",
+        maxlen: 3,
+    },
+    MysqlCharacterSetInfo {
+        name: "utf8mb4",
+        description: "UTF-8 Unicode",
+        default_collation: "utf8mb4_0900_ai_ci",
+        maxlen: 4,
+    },
+    MysqlCharacterSetInfo {
+        name: "latin1",
+        description: "cp1252 West European",
+        default_collation: "latin1_swedish_ci",
+        maxlen: 1,
+    },
+    MysqlCharacterSetInfo {
+        name: "gbk",
+        description: "GBK Simplified Chinese",
+        default_collation: "gbk_chinese_ci",
+        maxlen: 2,
+    },
+    MysqlCharacterSetInfo {
+        name: "big5",
+        description: "Big5 Traditional Chinese",
+        default_collation: "big5_chinese_ci",
+        maxlen: 2,
+    },
+    MysqlCharacterSetInfo {
+        name: "sjis",
+        description: "Shift-JIS Japanese",
+        default_collation: "sjis_japanese_ci",
+        maxlen: 2,
+    },
+    MysqlCharacterSetInfo {
+        name: "euckr",
+        description: "EUC-KR Korean",
+        default_collation: "euckr_korean_ci",
+        maxlen: 2,
+    },
+    MysqlCharacterSetInfo {
+        name: "utf16",
+        description: "UTF-16 Unicode",
+        default_collation: "utf16_general_ci",
+        maxlen: 4,
+    },
+    MysqlCharacterSetInfo {
+        name: "utf16le",
+        description: "UTF-16LE Unicode",
+        default_collation: "utf16le_general_ci",
+        maxlen: 4,
+    },
+];
+
+const MYSQL_COLLATIONS: &[MysqlCollationInfo] = &[
+    MysqlCollationInfo {
+        name: "binary",
+        character_set: "binary",
+        id: 63,
+        is_default: true,
+        sortlen: 1,
+        pad_attribute: "NO PAD",
+    },
+    MysqlCollationInfo {
+        name: "ascii_general_ci",
+        character_set: "ascii",
+        id: 11,
+        is_default: true,
+        sortlen: 1,
+        pad_attribute: "PAD SPACE",
+    },
+    MysqlCollationInfo {
+        name: "utf8mb3_general_ci",
+        character_set: "utf8mb3",
+        id: 33,
+        is_default: true,
+        sortlen: 1,
+        pad_attribute: "PAD SPACE",
+    },
+    MysqlCollationInfo {
+        name: "utf8mb4_0900_ai_ci",
+        character_set: "utf8mb4",
+        id: 255,
+        is_default: true,
+        sortlen: 0,
+        pad_attribute: "NO PAD",
+    },
+    MysqlCollationInfo {
+        name: "latin1_swedish_ci",
+        character_set: "latin1",
+        id: 8,
+        is_default: true,
+        sortlen: 1,
+        pad_attribute: "PAD SPACE",
+    },
+    MysqlCollationInfo {
+        name: "gbk_chinese_ci",
+        character_set: "gbk",
+        id: 28,
+        is_default: true,
+        sortlen: 1,
+        pad_attribute: "PAD SPACE",
+    },
+    MysqlCollationInfo {
+        name: "big5_chinese_ci",
+        character_set: "big5",
+        id: 1,
+        is_default: true,
+        sortlen: 1,
+        pad_attribute: "PAD SPACE",
+    },
+    MysqlCollationInfo {
+        name: "sjis_japanese_ci",
+        character_set: "sjis",
+        id: 13,
+        is_default: true,
+        sortlen: 1,
+        pad_attribute: "PAD SPACE",
+    },
+    MysqlCollationInfo {
+        name: "euckr_korean_ci",
+        character_set: "euckr",
+        id: 19,
+        is_default: true,
+        sortlen: 1,
+        pad_attribute: "PAD SPACE",
+    },
+    MysqlCollationInfo {
+        name: "utf16_general_ci",
+        character_set: "utf16",
+        id: 54,
+        is_default: true,
+        sortlen: 1,
+        pad_attribute: "PAD SPACE",
+    },
+    MysqlCollationInfo {
+        name: "utf16le_general_ci",
+        character_set: "utf16le",
+        id: 56,
+        is_default: true,
+        sortlen: 1,
+        pad_attribute: "PAD SPACE",
+    },
+];
+
+fn mysql_collation_info(value: &str) -> Option<MysqlCollationInfo> {
+    MYSQL_COLLATIONS.iter().copied().find(|info| {
+        info.name
+            .eq_ignore_ascii_case(value.trim_matches(['\'', '"']))
+    })
+}
+
+fn normalize_mysql_collation(value: &str) -> anyhow::Result<String> {
+    let value = value.trim().trim_matches(['\'', '"']);
+    mysql_collation_info(value)
+        .map(|info| info.name.to_string())
+        .ok_or_else(|| anyhow::anyhow!("Unknown collation: '{}'", value))
+}
+
+fn parse_set_names_clause(value: &str) -> anyhow::Result<(String, String)> {
+    let upper = value.to_ascii_uppercase();
+    let prefix = if upper.starts_with("NAMES ") {
+        "NAMES"
+    } else if upper.starts_with("CHARACTER SET ") {
+        "CHARACTER SET"
+    } else {
+        anyhow::bail!("Invalid SET NAMES statement");
+    };
+    let remainder = value[prefix.len()..].trim();
+    let (character_set, requested_collation) =
+        if let Some(position) = find_top_level_keyword(remainder, " COLLATE ", 0) {
+            (
+                remainder[..position].trim(),
+                Some(remainder[position + " COLLATE ".len()..].trim()),
+            )
+        } else {
+            (remainder, None)
+        };
+    let character_set = if character_set.eq_ignore_ascii_case("DEFAULT") {
+        "utf8mb4".to_string()
+    } else {
+        normalize_mysql_charset(character_set.trim_matches(['\'', '"']))?
+    };
+    let collation = match requested_collation {
+        Some(value) => normalize_mysql_collation(value)?,
+        None => MYSQL_CHARACTER_SETS
+            .iter()
+            .find(|info| info.name == character_set)
+            .map(|info| info.default_collation.to_string())
+            .ok_or_else(|| anyhow::anyhow!("Unknown character set '{}'", character_set))?,
+    };
+    let info = mysql_collation_info(&collation).expect("validated MySQL collation must exist");
+    if info.character_set != character_set {
+        anyhow::bail!(
+            "Collation '{}' is not valid for character set '{}'",
+            collation,
+            character_set
+        );
+    }
+    Ok((character_set, collation))
+}
+
+fn mysql_character_set_rows() -> Vec<Vec<Option<Vec<u8>>>> {
+    MYSQL_CHARACTER_SETS
+        .iter()
+        .map(|info| {
+            vec![
+                bytes(info.name),
+                bytes(info.description),
+                bytes(info.default_collation),
+                bytes(&info.maxlen.to_string()),
+            ]
+        })
+        .collect()
+}
+
+fn mysql_character_set_information_schema_rows() -> Vec<Vec<Option<Vec<u8>>>> {
+    MYSQL_CHARACTER_SETS
+        .iter()
+        .map(|info| {
+            vec![
+                bytes(info.name),
+                bytes(info.default_collation),
+                bytes(info.description),
+                bytes(&info.maxlen.to_string()),
+            ]
+        })
+        .collect()
+}
+
+fn mysql_collation_rows() -> Vec<Vec<Option<Vec<u8>>>> {
+    MYSQL_COLLATIONS
+        .iter()
+        .map(|info| {
+            vec![
+                bytes(info.name),
+                bytes(info.character_set),
+                bytes(&info.id.to_string()),
+                bytes(if info.is_default { "Yes" } else { "" }),
+                bytes("Yes"),
+                bytes(&info.sortlen.to_string()),
+                bytes(info.pad_attribute),
+            ]
+        })
+        .collect()
+}
+
+fn mysql_engine_rows_as_strings() -> Vec<Vec<Option<String>>> {
+    vec![
+        vec![
+            Some("InnoDB".into()),
+            Some("DEFAULT".into()),
+            Some("Neko233 game-optimized transactional engine (InnoDB compatibility alias)".into()),
+            Some("YES".into()),
+            Some("NO".into()),
+            Some("YES".into()),
+        ],
+        vec![
+            Some("MEMORY".into()),
+            Some("YES".into()),
+            Some("Hash based, stored in memory, useful for temporary tables".into()),
+            Some("NO".into()),
+            Some("NO".into()),
+            Some("NO".into()),
+        ],
+    ]
+}
+
+fn mysql_engine_rows() -> Vec<Vec<Option<Vec<u8>>>> {
+    mysql_engine_rows_as_strings()
+        .into_iter()
+        .map(|row| {
+            row.into_iter()
+                .map(|value| value.map(String::into_bytes))
+                .collect()
+        })
+        .collect()
+}
+
+fn mysql_privilege_rows() -> Vec<Vec<Option<Vec<u8>>>> {
+    [
+        ("Alter", "Tables", "To alter the table"),
+        (
+            "Create",
+            "Databases,Tables,or Indexes",
+            "To create new databases and tables",
+        ),
+        ("Create User", "Server Admin", "To create new users"),
+        ("Delete", "Tables", "To delete existing rows"),
+        (
+            "Drop",
+            "Databases,Tables",
+            "To drop databases, tables, and views",
+        ),
+        ("Execute", "Stored Routines", "To execute stored routines"),
+        (
+            "File",
+            "File access on server",
+            "To read and write files on the server",
+        ),
+        (
+            "Grant option",
+            "Databases,Tables",
+            "To give to other users those privileges you possess",
+        ),
+        ("Index", "Tables", "To create or drop indexes"),
+        ("Insert", "Tables", "To insert data into tables"),
+        (
+            "Process",
+            "Server Admin",
+            "To view the plain text of currently executing queries",
+        ),
+        (
+            "Reload",
+            "Server Admin",
+            "To reload or refresh server state",
+        ),
+        ("Select", "Tables", "To retrieve rows from table"),
+        ("Update", "Tables", "To update existing rows"),
+    ]
+    .into_iter()
+    .map(|(privilege, context, comment)| vec![bytes(privilege), bytes(context), bytes(comment)])
+    .collect()
+}
+
 fn split_load_data_records<'a>(
     data: &'a [u8],
     spec: &LoadDataSpec,
@@ -30073,6 +30523,76 @@ mod tests {
 
         let bound = bind_parameters("SELECT @counter + ?", &["2".to_string()]);
         assert_eq!(single_value(backend.execute(&bound).await.unwrap()), b"7");
+    }
+
+    #[tokio::test]
+    async fn charset_collation_and_engine_metadata_match_supported_capabilities() {
+        let (_temp, _storage, mut backend, _second) = transaction_backends().await;
+        assert_eq!(
+            query_rows(&mut backend, "SHOW CHARACTER SET LIKE 'utf8mb4'").await,
+            vec![vec![
+                Some(b"utf8mb4".to_vec()),
+                Some(b"UTF-8 Unicode".to_vec()),
+                Some(b"utf8mb4_0900_ai_ci".to_vec()),
+                Some(b"4".to_vec()),
+            ]]
+        );
+        assert_eq!(
+            query_rows(&mut backend, "SHOW COLLATION LIKE 'latin1%'").await,
+            vec![vec![
+                Some(b"latin1_swedish_ci".to_vec()),
+                Some(b"latin1".to_vec()),
+                Some(b"8".to_vec()),
+                Some(b"Yes".to_vec()),
+                Some(b"Yes".to_vec()),
+                Some(b"1".to_vec()),
+                Some(b"PAD SPACE".to_vec()),
+            ]]
+        );
+        backend
+            .execute("SET NAMES latin1 COLLATE latin1_swedish_ci")
+            .await
+            .unwrap();
+        assert_eq!(
+            query_rows(
+                &mut backend,
+                "SELECT @@character_set_client,@@character_set_connection,@@character_set_results,@@collation_connection",
+            )
+            .await,
+            vec![vec![
+                Some(b"latin1".to_vec()),
+                Some(b"latin1".to_vec()),
+                Some(b"latin1".to_vec()),
+                Some(b"latin1_swedish_ci".to_vec()),
+            ]]
+        );
+        assert!(backend
+            .execute("SET NAMES latin1 COLLATE utf8mb4_0900_ai_ci")
+            .await
+            .is_err());
+        assert_eq!(
+            query_rows(
+                &mut backend,
+                "SELECT CHARACTER_SET_NAME,DEFAULT_COLLATE_NAME FROM information_schema.character_sets WHERE CHARACTER_SET_NAME='utf8mb4'",
+            )
+            .await,
+            vec![vec![
+                Some(b"utf8mb4".to_vec()),
+                Some(b"utf8mb4_0900_ai_ci".to_vec()),
+            ]]
+        );
+        assert_eq!(
+            query_rows(
+                &mut backend,
+                "SELECT XA FROM information_schema.engines WHERE ENGINE='InnoDB'",
+            )
+            .await,
+            vec![vec![Some(b"NO".to_vec())]]
+        );
+        let privileges = query_rows(&mut backend, "SHOW PRIVILEGES").await;
+        assert!(privileges
+            .iter()
+            .any(|row| { row.first().and_then(Option::as_deref) == Some(b"Select".as_slice()) }));
     }
 
     #[tokio::test]
