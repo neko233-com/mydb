@@ -34,11 +34,11 @@ use tracing::{debug, info};
 
 use mydb_storage::{
     apply_expression_assignments, is_current_timestamp_default, is_memory_schema,
-    table_engine_from_sql, AlterTableOperation, Column, ColumnPosition, DataType,
-    ExpressionAssignment, FunctionDefinition, FunctionParameter, Index, NumericOperator,
-    ProcedureDefinition, ProcedureMetadata, ProcedureParameter, ProcedureParameterMode, Row,
-    RowPredicate, StorageEngineManager, TableEngine, TableSchema, TriggerDefinition, TriggerEvent,
-    TriggerTiming, UpdateValueExpression, WriteCommand,
+    table_engine_from_sql, AlterTableOperation, Column, ColumnPosition, DataType, EventDefinition,
+    EventMetadata, EventSchedule, ExpressionAssignment, FunctionDefinition, FunctionParameter,
+    Index, NumericOperator, ProcedureDefinition, ProcedureMetadata, ProcedureParameter,
+    ProcedureParameterMode, Row, RowPredicate, StorageEngineManager, TableEngine, TableSchema,
+    TriggerDefinition, TriggerEvent, TriggerTiming, UpdateValueExpression, WriteCommand,
 };
 
 pub const SERVER_VERSION: &str = "8.0.36-mydb-0.1.0";
@@ -1316,6 +1316,7 @@ fn parse_privilege_list(value: &str) -> anyhow::Result<HashSet<String>> {
         "FILE",
         "PROCESS",
         "RELOAD",
+        "EVENT",
     ];
     let values = value
         .split(',')
@@ -2059,6 +2060,14 @@ impl Backend {
             .and_then(Option::as_deref)
             .map(|value| String::from_utf8_lossy(value).into_owned())
             .unwrap_or_default()
+    }
+
+    fn session_time_zone_name(&self) -> String {
+        self.session_variables
+            .get("time_zone")
+            .and_then(Option::as_deref)
+            .map(|value| String::from_utf8_lossy(value).into_owned())
+            .unwrap_or_else(|| "SYSTEM".into())
     }
 
     fn truncate_fractional_seconds(&self) -> bool {
@@ -3325,7 +3334,8 @@ impl Backend {
             || original_upper.starts_with("CALL ")
             || original_upper.starts_with("GET ")
             || is_create_procedure_statement(original_sql)
-            || is_create_function_statement(original_sql);
+            || is_create_function_statement(original_sql)
+            || is_create_event_statement(original_sql);
         let sql = if keeps_session_syntax {
             original_sql
         } else {
@@ -3567,6 +3577,9 @@ impl Backend {
         if upper.starts_with("SHOW TRIGGERS") {
             return self.show_triggers(sql);
         }
+        if upper.starts_with("SHOW EVENTS") {
+            return self.show_events(sql);
+        }
         if upper.starts_with("SHOW PROCEDURE STATUS") {
             let mut rows = Vec::new();
             for database_name in self.storage.list_databases() {
@@ -3746,6 +3759,44 @@ impl Backend {
                     Some("utf8mb4_0900_ai_ci".into()),
                     Some("utf8mb4_0900_ai_ci".into()),
                     None,
+                ]],
+            ));
+        }
+        if upper.starts_with("SHOW CREATE EVENT ") {
+            let reference = sql
+                .split_whitespace()
+                .last()
+                .unwrap_or("")
+                .trim_matches('`');
+            let (database, name) = split_table_reference(reference, &self.database)?;
+            let event = self
+                .storage
+                .get_database(&database)
+                .and_then(|database| database.get_event(&name))
+                .ok_or_else(|| anyhow::anyhow!("EVENT {}.{} does not exist", database, name))?;
+            let metadata = self
+                .storage
+                .get_database(&database)
+                .and_then(|database| database.get_event_metadata(&event.name))
+                .unwrap_or_else(|| EventMetadata::new(String::new()));
+            return Ok(QueryOutcome::rows(
+                vec![
+                    "Event",
+                    "sql_mode",
+                    "time_zone",
+                    "Create Event",
+                    "character_set_client",
+                    "collation_connection",
+                    "Database Collation",
+                ],
+                vec![vec![
+                    Some(event.name),
+                    Some(metadata.sql_mode),
+                    Some(event.time_zone),
+                    Some(event.create_sql),
+                    Some("utf8mb4".into()),
+                    Some("utf8mb4_0900_ai_ci".into()),
+                    Some("utf8mb4_0900_ai_ci".into()),
                 ]],
             ));
         }
@@ -4019,6 +4070,31 @@ impl Backend {
                 }])
                 .await;
         }
+        if is_create_event_statement(sql) {
+            self.commit_pending().await?;
+            let (database, event, if_not_exists) =
+                parse_create_event(sql, &self.database, &self.session_time_zone_name())?;
+            if if_not_exists
+                && self
+                    .storage
+                    .get_database(&database)
+                    .and_then(|database| database.get_event(&event.name))
+                    .is_some()
+            {
+                self.record_warning(SqlWarning::note(
+                    1537,
+                    format!("EVENT {} already exists", event.name),
+                ));
+                return Ok(QueryOutcome::ok(0));
+            }
+            return self
+                .submit_ddl(vec![WriteCommand::CreateEventV4 {
+                    database,
+                    event,
+                    metadata: EventMetadata::new(self.session_sql_mode()),
+                }])
+                .await;
+        }
         if upper.starts_with("ALTER PROCEDURE ") {
             self.commit_pending().await?;
             let remainder = sql["ALTER PROCEDURE".len()..].trim_start();
@@ -4073,6 +4149,34 @@ impl Backend {
                 }])
                 .await;
         }
+        if upper.starts_with("ALTER EVENT ") {
+            self.commit_pending().await?;
+            let (database, name) = parse_alter_event_reference(sql, &self.database)?;
+            let existing = self
+                .storage
+                .get_database(&database)
+                .and_then(|database| database.get_event(&name))
+                .ok_or_else(|| anyhow::anyhow!("EVENT {}.{} does not exist", database, name))?;
+            let (database, event) = parse_alter_event(
+                sql,
+                &self.database,
+                &existing,
+                &self.session_time_zone_name(),
+            )?;
+            let metadata = self
+                .storage
+                .get_database(&database)
+                .and_then(|database| database.get_event_metadata(&existing.name))
+                .unwrap_or_else(|| EventMetadata::new(String::new()))
+                .altered(self.session_sql_mode());
+            return self
+                .submit_ddl(vec![WriteCommand::AlterEventV4 {
+                    database,
+                    event,
+                    metadata,
+                }])
+                .await;
+        }
         if upper.starts_with("DROP PROCEDURE ") {
             self.commit_pending().await?;
             let if_exists = upper.starts_with("DROP PROCEDURE IF EXISTS ");
@@ -4121,6 +4225,44 @@ impl Backend {
             return self
                 .submit_ddl(vec![WriteCommand::DropFunction { database, function }])
                 .await;
+        }
+        if upper.starts_with("DROP EVENT ") {
+            self.commit_pending().await?;
+            let if_exists = upper.starts_with("DROP EVENT IF EXISTS ");
+            let remainder = if if_exists {
+                sql["DROP EVENT IF EXISTS ".len()..].trim()
+            } else {
+                sql["DROP EVENT ".len()..].trim()
+            };
+            let references = split_csv(remainder)
+                .into_iter()
+                .filter(|reference| !reference.trim().is_empty())
+                .collect::<Vec<_>>();
+            if references.is_empty() {
+                anyhow::bail!("DROP EVENT requires at least one event");
+            }
+            let mut writes = Vec::new();
+            for reference in references {
+                let (database, event) =
+                    split_table_reference(reference.trim().trim_matches('`'), &self.database)?;
+                let exists = self
+                    .storage
+                    .get_database(&database)
+                    .and_then(|database| database.get_event(&event))
+                    .is_some();
+                if !exists {
+                    if if_exists {
+                        continue;
+                    }
+                    anyhow::bail!("EVENT {}.{} does not exist", database, event);
+                }
+                writes.push(WriteCommand::DropEvent { database, event });
+            }
+            return if writes.is_empty() {
+                Ok(QueryOutcome::ok(0))
+            } else {
+                self.submit_ddl(writes).await
+            };
         }
         if upper.starts_with("DROP TRIGGER ") {
             self.commit_pending().await?;
@@ -4751,6 +4893,11 @@ impl Backend {
             || upper.starts_with("DROP ROLE")
         {
             Some("GRANT OPTION")
+        } else if is_create_event_statement(sql)
+            || upper.starts_with("ALTER EVENT ")
+            || upper.starts_with("DROP EVENT ")
+        {
+            Some("EVENT")
         } else if upper.starts_with("CREATE ") {
             Some("CREATE")
         } else if upper.starts_with("DROP ") {
@@ -8589,6 +8736,86 @@ impl Backend {
         ))
     }
 
+    fn show_events(&self, sql: &str) -> anyhow::Result<QueryOutcome> {
+        let (database_name, filter) = parse_show_events_options(sql, &self.database)?;
+        let database = self
+            .storage
+            .get_database(&database_name)
+            .ok_or_else(|| anyhow::anyhow!("Unknown database '{}'", database_name))?;
+        let columns = [
+            "Db",
+            "Name",
+            "Definer",
+            "Time zone",
+            "Type",
+            "Execute at",
+            "Interval value",
+            "Interval field",
+            "Starts",
+            "Ends",
+            "Status",
+            "Originator",
+            "character_set_client",
+            "collation_connection",
+            "Database Collation",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+        let mut events = database.list_events();
+        events.sort_by_key(|event| event.name.to_ascii_lowercase());
+        let rows = events
+            .into_iter()
+            .map(|event| {
+                vec![
+                    bytes(&database_name),
+                    bytes(&event.name),
+                    bytes(&event.definer),
+                    bytes(&event.time_zone),
+                    bytes(if event.schedule.execute_at.is_some() {
+                        "ONE TIME"
+                    } else {
+                        "RECURRING"
+                    }),
+                    event
+                        .schedule
+                        .execute_at
+                        .as_ref()
+                        .map(|value| value.as_bytes().to_vec()),
+                    event
+                        .schedule
+                        .interval_value
+                        .as_ref()
+                        .map(|value| value.as_bytes().to_vec()),
+                    event
+                        .schedule
+                        .interval_field
+                        .as_ref()
+                        .map(|value| value.as_bytes().to_vec()),
+                    event
+                        .schedule
+                        .starts
+                        .as_ref()
+                        .map(|value| value.as_bytes().to_vec()),
+                    event
+                        .schedule
+                        .ends
+                        .as_ref()
+                        .map(|value| value.as_bytes().to_vec()),
+                    bytes(&event.status),
+                    bytes("0"),
+                    bytes("utf8mb4"),
+                    bytes("utf8mb4_0900_ai_ci"),
+                    bytes("utf8mb4_0900_ai_ci"),
+                ]
+            })
+            .collect::<Vec<_>>();
+        Ok(QueryOutcome::byte_rows(
+            columns.clone(),
+            apply_show_filter(&columns, rows, filter, 1)?,
+        ))
+    }
+
     fn show_tables(&self, sql: &str) -> anyhow::Result<QueryOutcome> {
         let (full, database_name, filter) = parse_show_tables_options(sql, &self.database)?;
         let database = self
@@ -12365,6 +12592,7 @@ fn information_schema_virtual_tables(
     let mut triggers_rows = Vec::new();
     let mut routines_rows = Vec::new();
     let mut parameters_rows = Vec::new();
+    let mut events_rows = Vec::new();
     let (user_privileges_rows, schema_privileges_rows) =
         information_schema_privilege_rows(auth_catalog, viewer);
     let mut databases = storage.list_databases();
@@ -12375,6 +12603,64 @@ fn information_schema_virtual_tables(
         let Some(database) = storage.get_database(&database_name) else {
             continue;
         };
+        for event in database.list_events() {
+            let metadata = database
+                .get_event_metadata(&event.name)
+                .unwrap_or_else(|| EventMetadata::new(String::new()));
+            events_rows.push(vec![
+                bytes("def"),
+                bytes(&database_name),
+                bytes(&event.name),
+                bytes(&event.definer),
+                bytes(&event.time_zone),
+                bytes("SQL"),
+                bytes(&event.body),
+                bytes(if event.schedule.execute_at.is_some() {
+                    "ONE TIME"
+                } else {
+                    "RECURRING"
+                }),
+                event
+                    .schedule
+                    .execute_at
+                    .as_ref()
+                    .map(|value| value.as_bytes().to_vec()),
+                event
+                    .schedule
+                    .interval_value
+                    .as_ref()
+                    .map(|value| value.as_bytes().to_vec()),
+                event
+                    .schedule
+                    .interval_field
+                    .as_ref()
+                    .map(|value| value.as_bytes().to_vec()),
+                bytes(&metadata.sql_mode),
+                event
+                    .schedule
+                    .starts
+                    .as_ref()
+                    .map(|value| value.as_bytes().to_vec()),
+                event
+                    .schedule
+                    .ends
+                    .as_ref()
+                    .map(|value| value.as_bytes().to_vec()),
+                bytes(&event.status),
+                bytes(&event.on_completion),
+                bytes(&metadata.created),
+                bytes(&metadata.last_altered),
+                metadata
+                    .last_executed
+                    .as_ref()
+                    .map(|value| value.as_bytes().to_vec()),
+                bytes(&event.comment),
+                bytes("0"),
+                bytes("utf8mb4"),
+                bytes("utf8mb4_0900_ai_ci"),
+                bytes("utf8mb4_0900_ai_ci"),
+            ]);
+        }
         for procedure in database.list_procedures() {
             let characteristics = procedure_characteristics(&procedure);
             let metadata = database
@@ -12786,6 +13072,7 @@ fn information_schema_virtual_tables(
         }
     }
     schemata_rows.sort_by(|left, right| left[1].cmp(&right[1]));
+    events_rows.sort_by(|left, right| left[1].cmp(&right[1]).then_with(|| left[2].cmp(&right[2])));
     Ok(HashMap::from([
         (
             "schemata".into(),
@@ -13165,32 +13452,38 @@ fn information_schema_virtual_tables(
         ),
         (
             "events".into(),
-            empty_information_schema_table(&[
-                "EVENT_CATALOG",
-                "EVENT_SCHEMA",
-                "EVENT_NAME",
-                "DEFINER",
-                "TIME_ZONE",
-                "EVENT_BODY",
-                "EVENT_DEFINITION",
-                "EVENT_TYPE",
-                "EXECUTE_AT",
-                "INTERVAL_VALUE",
-                "INTERVAL_FIELD",
-                "SQL_MODE",
-                "STARTS",
-                "ENDS",
-                "STATUS",
-                "ON_COMPLETION",
-                "CREATED",
-                "LAST_ALTERED",
-                "LAST_EXECUTED",
-                "EVENT_COMMENT",
-                "ORIGINATOR",
-                "CHARACTER_SET_CLIENT",
-                "COLLATION_CONNECTION",
-                "DATABASE_COLLATION",
-            ]),
+            VirtualTable {
+                columns: [
+                    "EVENT_CATALOG",
+                    "EVENT_SCHEMA",
+                    "EVENT_NAME",
+                    "DEFINER",
+                    "TIME_ZONE",
+                    "EVENT_BODY",
+                    "EVENT_DEFINITION",
+                    "EVENT_TYPE",
+                    "EXECUTE_AT",
+                    "INTERVAL_VALUE",
+                    "INTERVAL_FIELD",
+                    "SQL_MODE",
+                    "STARTS",
+                    "ENDS",
+                    "STATUS",
+                    "ON_COMPLETION",
+                    "CREATED",
+                    "LAST_ALTERED",
+                    "LAST_EXECUTED",
+                    "EVENT_COMMENT",
+                    "ORIGINATOR",
+                    "CHARACTER_SET_CLIENT",
+                    "COLLATION_CONNECTION",
+                    "DATABASE_COLLATION",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+                rows: events_rows,
+            },
         ),
         (
             "parameters".into(),
@@ -13238,6 +13531,7 @@ const SUPPORTED_AUTH_PRIVILEGES: &[&str] = &[
     "FILE",
     "PROCESS",
     "RELOAD",
+    "EVENT",
 ];
 
 // Keep these in MySQL's grant-table order. `mysql.user` contains global
@@ -21041,6 +21335,10 @@ fn mysql_error_kind(message: &str) -> ErrorKind {
         ErrorKind::ER_WRONG_NUMBER_OF_COLUMNS_IN_SELECT
     } else if message == "Result consisted of more than one row" {
         ErrorKind::ER_TOO_MANY_ROWS
+    } else if message.starts_with("EVENT ") && message.ends_with(" does not exist") {
+        ErrorKind::ER_EVENT_DOES_NOT_EXIST
+    } else if message.starts_with("EVENT ") && message.ends_with(" already exists") {
+        ErrorKind::ER_EVENT_ALREADY_EXISTS
     } else if (message.starts_with("SAVEPOINT ")
         || message.starts_with("PROCEDURE ")
         || message.starts_with("FUNCTION "))
@@ -21267,6 +21565,12 @@ fn is_create_function_statement(sql: &str) -> bool {
     let upper = sql.to_ascii_uppercase();
     upper.starts_with("CREATE FUNCTION ")
         || (upper.starts_with("CREATE DEFINER") && upper.contains(" FUNCTION "))
+}
+
+fn is_create_event_statement(sql: &str) -> bool {
+    let upper = sql.to_ascii_uppercase();
+    upper.starts_with("CREATE EVENT ")
+        || (upper.starts_with("CREATE DEFINER") && upper.contains(" EVENT "))
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -21819,6 +22123,407 @@ fn parse_alter_function(
         name,
         render_create_function(function, &characteristics),
     ))
+}
+
+#[derive(Default)]
+struct EventClauses {
+    schedule: Option<EventSchedule>,
+    on_completion: Option<String>,
+    status: Option<String>,
+    comment: Option<String>,
+    body: Option<String>,
+}
+
+fn event_clause_prefix(value: &str, prefix: &str) -> bool {
+    value == prefix
+        || value.starts_with(prefix)
+            && value
+                .as_bytes()
+                .get(prefix.len())
+                .is_some_and(u8::is_ascii_whitespace)
+}
+
+fn event_schedule_tail(value: &str) -> (&str, &str) {
+    let end = [
+        " ON COMPLETION ",
+        " ENABLE",
+        " DISABLE",
+        " COMMENT ",
+        " DO ",
+        " RENAME TO ",
+    ]
+    .into_iter()
+    .filter_map(|marker| find_top_level_keyword(value, marker, 0))
+    .min()
+    .unwrap_or(value.len());
+    (value[..end].trim(), value[end..].trim_start())
+}
+
+fn take_event_schedule_token(value: &str) -> anyhow::Result<(&str, &str)> {
+    let value = value.trim_start();
+    if value.is_empty() {
+        anyhow::bail!("EVENT schedule requires a value");
+    }
+    let bytes = value.as_bytes();
+    let end = if matches!(bytes[0], b'\'' | b'"') {
+        let quote = bytes[0];
+        let mut index = 1;
+        loop {
+            let Some(byte) = bytes.get(index) else {
+                anyhow::bail!("EVENT schedule has an unclosed quoted value");
+            };
+            if *byte == b'\\' {
+                index += 2;
+                continue;
+            }
+            if *byte == quote {
+                if bytes.get(index + 1) == Some(&quote) {
+                    index += 2;
+                    continue;
+                }
+                break index + 1;
+            }
+            index += 1;
+        }
+    } else if bytes[0] == b'(' {
+        matching_parenthesis(value, 0)
+            .ok_or_else(|| anyhow::anyhow!("EVENT schedule has an unclosed expression"))?
+            + 1
+    } else {
+        value.find(char::is_whitespace).unwrap_or(value.len())
+    };
+    Ok((&value[..end], &value[end..]))
+}
+
+fn event_interval_field(value: &str) -> anyhow::Result<String> {
+    let field = value.trim_matches('`').to_ascii_uppercase();
+    const FIELDS: &[&str] = &[
+        "YEAR",
+        "QUARTER",
+        "MONTH",
+        "DAY",
+        "HOUR",
+        "MINUTE",
+        "WEEK",
+        "SECOND",
+        "MICROSECOND",
+        "YEAR_MONTH",
+        "DAY_HOUR",
+        "DAY_MINUTE",
+        "DAY_SECOND",
+        "HOUR_MINUTE",
+        "HOUR_SECOND",
+        "MINUTE_SECOND",
+        "SECOND_MICROSECOND",
+        "MINUTE_MICROSECOND",
+        "HOUR_MICROSECOND",
+        "DAY_MICROSECOND",
+    ];
+    if !FIELDS.contains(&field.as_str()) {
+        anyhow::bail!("Unsupported EVENT interval field '{}'", value);
+    }
+    Ok(field)
+}
+
+fn parse_event_schedule(value: &str) -> anyhow::Result<(EventSchedule, &str)> {
+    let (schedule, tail) = event_schedule_tail(value);
+    let upper = schedule.to_ascii_uppercase();
+    if event_clause_prefix(&upper, "AT") {
+        let execute_at = schedule["AT".len()..].trim();
+        if execute_at.is_empty() {
+            anyhow::bail!("EVENT ON SCHEDULE AT requires a timestamp expression");
+        }
+        if find_top_level_keyword(execute_at, " STARTS ", 0).is_some()
+            || find_top_level_keyword(execute_at, " ENDS ", 0).is_some()
+        {
+            anyhow::bail!("EVENT ON SCHEDULE AT does not accept STARTS or ENDS");
+        }
+        return Ok((
+            EventSchedule {
+                execute_at: Some(execute_at.to_string()),
+                interval_value: None,
+                interval_field: None,
+                starts: None,
+                ends: None,
+            },
+            tail,
+        ));
+    }
+    if !event_clause_prefix(&upper, "EVERY") {
+        anyhow::bail!("EVENT ON SCHEDULE requires AT or EVERY");
+    }
+    let (interval_value, remainder) =
+        take_event_schedule_token(schedule["EVERY".len()..].trim_start())?;
+    let (interval_field, mut remainder) = take_event_schedule_token(remainder)?;
+    let interval_field = event_interval_field(interval_field)?;
+    let mut starts = None;
+    let mut ends = None;
+    loop {
+        remainder = remainder.trim_start();
+        if remainder.is_empty() {
+            break;
+        }
+        let upper = remainder.to_ascii_uppercase();
+        if event_clause_prefix(&upper, "STARTS") {
+            if starts.is_some() {
+                anyhow::bail!("Duplicate EVENT STARTS clause");
+            }
+            let after = remainder["STARTS".len()..].trim_start();
+            let end = find_top_level_keyword(after, " ENDS ", 0).unwrap_or(after.len());
+            let expression = after[..end].trim();
+            if expression.is_empty() {
+                anyhow::bail!("EVENT STARTS requires a timestamp expression");
+            }
+            starts = Some(expression.to_string());
+            remainder = &after[end..];
+        } else if event_clause_prefix(&upper, "ENDS") {
+            if ends.is_some() {
+                anyhow::bail!("Duplicate EVENT ENDS clause");
+            }
+            let expression = remainder["ENDS".len()..].trim();
+            if expression.is_empty() {
+                anyhow::bail!("EVENT ENDS requires a timestamp expression");
+            }
+            ends = Some(expression.to_string());
+            remainder = "";
+        } else {
+            anyhow::bail!("Unexpected EVENT schedule clause '{}'", remainder);
+        }
+    }
+    Ok((
+        EventSchedule {
+            execute_at: None,
+            interval_value: Some(interval_value.to_string()),
+            interval_field: Some(interval_field),
+            starts,
+            ends,
+        },
+        tail,
+    ))
+}
+
+fn parse_event_clauses(
+    mut remainder: &str,
+    require_schedule: bool,
+    require_body: bool,
+) -> anyhow::Result<EventClauses> {
+    let mut clauses = EventClauses::default();
+    while !remainder.trim().is_empty() {
+        remainder = remainder.trim_start();
+        let upper = remainder.to_ascii_uppercase();
+        if event_clause_prefix(&upper, "ON SCHEDULE") {
+            if clauses.schedule.is_some() {
+                anyhow::bail!("Duplicate EVENT ON SCHEDULE clause");
+            }
+            let (schedule, tail) =
+                parse_event_schedule(remainder["ON SCHEDULE".len()..].trim_start())?;
+            clauses.schedule = Some(schedule);
+            remainder = tail;
+        } else if event_clause_prefix(&upper, "ON COMPLETION NOT PRESERVE") {
+            if clauses.on_completion.is_some() {
+                anyhow::bail!("Duplicate EVENT ON COMPLETION clause");
+            }
+            clauses.on_completion = Some("NOT PRESERVE".into());
+            remainder = &remainder["ON COMPLETION NOT PRESERVE".len()..];
+        } else if event_clause_prefix(&upper, "ON COMPLETION PRESERVE") {
+            if clauses.on_completion.is_some() {
+                anyhow::bail!("Duplicate EVENT ON COMPLETION clause");
+            }
+            clauses.on_completion = Some("PRESERVE".into());
+            remainder = &remainder["ON COMPLETION PRESERVE".len()..];
+        } else if event_clause_prefix(&upper, "DISABLE ON SLAVE") {
+            anyhow::bail!("EVENT DISABLE ON SLAVE is not supported without replication");
+        } else if event_clause_prefix(&upper, "ENABLE") {
+            if clauses.status.is_some() {
+                anyhow::bail!("Duplicate EVENT status clause");
+            }
+            clauses.status = Some("ENABLED".into());
+            remainder = &remainder["ENABLE".len()..];
+        } else if event_clause_prefix(&upper, "DISABLE") {
+            if clauses.status.is_some() {
+                anyhow::bail!("Duplicate EVENT status clause");
+            }
+            clauses.status = Some("DISABLED".into());
+            remainder = &remainder["DISABLE".len()..];
+        } else if event_clause_prefix(&upper, "COMMENT") {
+            if clauses.comment.is_some() {
+                anyhow::bail!("Duplicate EVENT COMMENT clause");
+            }
+            let (comment, end) = parse_quoted_sql_bytes(remainder, "COMMENT".len())?;
+            clauses.comment = Some(String::from_utf8_lossy(&comment).into_owned());
+            remainder = &remainder[end..];
+        } else if event_clause_prefix(&upper, "RENAME TO") {
+            anyhow::bail!("ALTER EVENT RENAME TO is not supported");
+        } else if event_clause_prefix(&upper, "DO") {
+            if clauses.body.is_some() {
+                anyhow::bail!("Duplicate EVENT DO clause");
+            }
+            let body = remainder["DO".len()..].trim();
+            if body.is_empty() {
+                anyhow::bail!("EVENT DO requires an event body");
+            }
+            clauses.body = Some(body.to_string());
+            remainder = "";
+        } else {
+            anyhow::bail!("Unexpected EVENT clause '{}'", remainder);
+        }
+    }
+    if require_schedule && clauses.schedule.is_none() {
+        anyhow::bail!("CREATE EVENT requires ON SCHEDULE");
+    }
+    if require_body && clauses.body.is_none() {
+        anyhow::bail!("CREATE EVENT requires DO");
+    }
+    Ok(clauses)
+}
+
+fn render_create_event(event: &EventDefinition) -> anyhow::Result<String> {
+    let schedule = if let Some(execute_at) = event.schedule.execute_at.as_deref() {
+        format!("AT {execute_at}")
+    } else {
+        let interval_value = event
+            .schedule
+            .interval_value
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("EVENT {} has no schedule", event.name))?;
+        let interval_field = event
+            .schedule
+            .interval_field
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("EVENT {} has no interval field", event.name))?;
+        let mut schedule = format!("EVERY {interval_value} {interval_field}");
+        if let Some(starts) = event.schedule.starts.as_deref() {
+            schedule.push_str(" STARTS ");
+            schedule.push_str(starts);
+        }
+        if let Some(ends) = event.schedule.ends.as_deref() {
+            schedule.push_str(" ENDS ");
+            schedule.push_str(ends);
+        }
+        schedule
+    };
+    let status = match event.status.as_str() {
+        "ENABLED" => "ENABLE",
+        "DISABLED" => "DISABLE",
+        status => anyhow::bail!("Unsupported EVENT status '{}'", status),
+    };
+    let on_completion = match event.on_completion.as_str() {
+        "PRESERVE" => "PRESERVE",
+        "NOT PRESERVE" => "NOT PRESERVE",
+        on_completion => anyhow::bail!("Unsupported EVENT ON COMPLETION '{}'", on_completion),
+    };
+    let mut output = format!(
+        "CREATE DEFINER={} EVENT `{}` ON SCHEDULE {} ON COMPLETION {} {}",
+        render_procedure_definer(&event.definer),
+        event.name.replace('`', "``"),
+        schedule,
+        on_completion,
+        status,
+    );
+    if !event.comment.is_empty() {
+        output.push_str(" COMMENT '");
+        output.push_str(&event.comment.replace('\\', "\\\\").replace('\'', "''"));
+        output.push('\'');
+    }
+    output.push_str(" DO ");
+    output.push_str(&event.body);
+    Ok(output)
+}
+
+fn parse_create_event(
+    sql: &str,
+    current_database: &str,
+    time_zone: &str,
+) -> anyhow::Result<(String, EventDefinition, bool)> {
+    let upper = sql.to_ascii_uppercase();
+    let (event_position, after_position) = if upper.starts_with("CREATE EVENT ") {
+        (6, "CREATE EVENT".len())
+    } else {
+        let position = find_top_level_keyword(sql, " EVENT ", 0)
+            .ok_or_else(|| anyhow::anyhow!("CREATE EVENT requires EVENT"))?;
+        (position, position + " EVENT ".len())
+    };
+    let definer = sql[..event_position]
+        .find('=')
+        .map(|position| normalize_procedure_definer(&sql[position + 1..event_position]))
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "root@%".into());
+    let mut remainder = sql[after_position..].trim_start();
+    let if_not_exists = remainder
+        .get(.."IF NOT EXISTS".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("IF NOT EXISTS"));
+    if if_not_exists {
+        remainder = remainder["IF NOT EXISTS".len()..].trim_start();
+    }
+    let (reference, tail) = take_show_identifier(remainder)?;
+    let (database, name) = split_table_reference(&reference, current_database)?;
+    let clauses = parse_event_clauses(tail, true, true)?;
+    let mut event = EventDefinition {
+        name,
+        definer,
+        time_zone: time_zone.to_string(),
+        body: clauses.body.expect("required EVENT body"),
+        schedule: clauses.schedule.expect("required EVENT schedule"),
+        status: clauses.status.unwrap_or_else(|| "ENABLED".into()),
+        on_completion: clauses
+            .on_completion
+            .unwrap_or_else(|| "NOT PRESERVE".into()),
+        comment: clauses.comment.unwrap_or_default(),
+        create_sql: String::new(),
+    };
+    event.create_sql = render_create_event(&event)?;
+    Ok((database, event, if_not_exists))
+}
+
+fn parse_alter_event_reference(
+    sql: &str,
+    current_database: &str,
+) -> anyhow::Result<(String, String)> {
+    let remainder = sql["ALTER EVENT".len()..].trim_start();
+    let (reference, _) = take_show_identifier(remainder)?;
+    split_table_reference(&reference, current_database)
+}
+
+fn parse_alter_event(
+    sql: &str,
+    current_database: &str,
+    existing: &EventDefinition,
+    session_time_zone: &str,
+) -> anyhow::Result<(String, EventDefinition)> {
+    let remainder = sql["ALTER EVENT".len()..].trim_start();
+    let (reference, tail) = take_show_identifier(remainder)?;
+    let (database, name) = split_table_reference(&reference, current_database)?;
+    if !name.eq_ignore_ascii_case(&existing.name) {
+        anyhow::bail!("ALTER EVENT target does not match existing event");
+    }
+    let clauses = parse_event_clauses(tail, false, false)?;
+    if clauses.schedule.is_none()
+        && clauses.on_completion.is_none()
+        && clauses.status.is_none()
+        && clauses.comment.is_none()
+        && clauses.body.is_none()
+    {
+        anyhow::bail!("ALTER EVENT requires a change");
+    }
+    let mut event = existing.clone();
+    if let Some(schedule) = clauses.schedule {
+        event.schedule = schedule;
+        event.time_zone = session_time_zone.to_string();
+    }
+    if let Some(on_completion) = clauses.on_completion {
+        event.on_completion = on_completion;
+    }
+    if let Some(status) = clauses.status {
+        event.status = status;
+    }
+    if let Some(comment) = clauses.comment {
+        event.comment = comment;
+    }
+    if let Some(body) = clauses.body {
+        event.body = body;
+    }
+    event.create_sql = render_create_event(&event)?;
+    Ok((database, event))
 }
 
 fn validate_procedure_statements(
@@ -27187,6 +27892,11 @@ fn mysql_privilege_rows() -> Vec<Vec<Option<Vec<u8>>>> {
             "Databases,Tables",
             "To drop databases, tables, and views",
         ),
+        (
+            "Event",
+            "Databases",
+            "To create, alter, drop, or display events",
+        ),
         ("Execute", "Stored Routines", "To execute stored routines"),
         (
             "File",
@@ -29435,6 +30145,27 @@ fn parse_show_triggers_options(
     Ok((database, parse_show_metadata_filter(remainder)?))
 }
 
+fn parse_show_events_options(
+    sql: &str,
+    current_database: &str,
+) -> anyhow::Result<(String, Option<ShowMetadataFilter>)> {
+    const PREFIX: &str = "SHOW EVENTS";
+    let mut remainder = sql
+        .get(PREFIX.len()..)
+        .filter(|_| sql[..PREFIX.len()].eq_ignore_ascii_case(PREFIX))
+        .ok_or_else(|| anyhow::anyhow!("Invalid SHOW EVENTS"))?
+        .trim()
+        .trim_end_matches(';')
+        .trim();
+    let mut database = current_database.to_string();
+    if let Some(after) = strip_show_from_or_in(remainder) {
+        let (value, tail) = take_show_identifier(after)?;
+        database = value;
+        remainder = tail;
+    }
+    Ok((database, parse_show_metadata_filter(remainder)?))
+}
+
 fn parse_show_tables_options(
     sql: &str,
     current_database: &str,
@@ -30134,6 +30865,121 @@ mod tests {
         assert!(schema_privileges.iter().all(|row| {
             row.get(3).and_then(Option::as_deref) != Some(b"GRANT OPTION".as_slice())
         }));
+    }
+
+    #[tokio::test]
+    async fn event_definitions_support_mysql_ddl_show_and_information_schema_metadata() {
+        let (_temp, _storage, mut backend, _second) = transaction_backends().await;
+        backend
+            .execute("SET time_zone='+08:00',sql_mode='ANSI'")
+            .await
+            .unwrap();
+        backend
+            .execute(
+                "CREATE EVENT IF NOT EXISTS daily_rollup \
+                 ON SCHEDULE EVERY 1 DAY STARTS '2030-01-01 00:00:00' \
+                 ENDS '2030-12-31 00:00:00' ON COMPLETION PRESERVE DISABLE \
+                 COMMENT 'nightly rollup' DO BEGIN SET @event_ran = 1; END",
+            )
+            .await
+            .unwrap();
+        let show = backend
+            .execute("SHOW EVENTS FROM mydb LIKE 'daily%'")
+            .await
+            .unwrap();
+        let QueryOutcome::Rows { columns, rows } = show else {
+            panic!("expected SHOW EVENTS rows");
+        };
+        assert_eq!(columns[0], "Db");
+        assert_eq!(columns[1], "Name");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][1], Some(b"daily_rollup".to_vec()));
+        assert_eq!(rows[0][4], Some(b"RECURRING".to_vec()));
+        assert_eq!(rows[0][10], Some(b"DISABLED".to_vec()));
+
+        let create = backend
+            .execute("SHOW CREATE EVENT daily_rollup")
+            .await
+            .unwrap();
+        let QueryOutcome::Rows { rows, .. } = create else {
+            panic!("expected SHOW CREATE EVENT rows");
+        };
+        let create_sql = String::from_utf8(rows[0][3].clone().unwrap()).unwrap();
+        assert!(create_sql.contains("CREATE DEFINER="));
+        assert!(create_sql.contains("EVENT `daily_rollup`"));
+        assert!(create_sql.contains("ON COMPLETION PRESERVE DISABLE"));
+
+        assert_eq!(
+            query_rows(
+                &mut backend,
+                "SELECT EVENT_TYPE,STATUS,ON_COMPLETION,EVENT_COMMENT,TIME_ZONE \
+                 FROM information_schema.events WHERE EVENT_NAME='daily_rollup'",
+            )
+            .await,
+            vec![vec![
+                bytes("RECURRING"),
+                bytes("DISABLED"),
+                bytes("PRESERVE"),
+                bytes("nightly rollup"),
+                bytes("+08:00"),
+            ]]
+        );
+
+        backend
+            .execute(
+                "ALTER EVENT daily_rollup ON SCHEDULE AT '2031-01-01 00:00:00' \
+                 ENABLE COMMENT 'one time' DO SET @event_ran = 2",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            query_rows(
+                &mut backend,
+                "SELECT EVENT_TYPE,STATUS,EVENT_COMMENT,EXECUTE_AT \
+                 FROM information_schema.events WHERE EVENT_NAME='daily_rollup'",
+            )
+            .await,
+            vec![vec![
+                bytes("ONE TIME"),
+                bytes("ENABLED"),
+                bytes("one time"),
+                bytes("'2031-01-01 00:00:00'"),
+            ]]
+        );
+
+        backend
+            .execute("CREATE USER event_writer IDENTIFIED BY 'event-password'")
+            .await
+            .unwrap();
+        backend
+            .execute("CREATE USER event_reader IDENTIFIED BY 'reader-password'")
+            .await
+            .unwrap();
+        backend
+            .execute("GRANT EVENT ON mydb.* TO event_writer")
+            .await
+            .unwrap();
+        *backend.authenticated_user.lock() = Some("event_reader".into());
+        assert!(backend
+            .execute("CREATE EVENT denied_event ON SCHEDULE AT '2031-01-01 00:00:00' DO SET @x=1")
+            .await
+            .is_err());
+        *backend.authenticated_user.lock() = Some("event_writer".into());
+        backend
+            .execute("CREATE EVENT granted_event ON SCHEDULE AT '2031-01-01 00:00:00' DO SET @x=1")
+            .await
+            .unwrap();
+        *backend.authenticated_user.lock() = Some("root".into());
+        backend
+            .execute("DROP EVENT IF EXISTS daily_rollup, granted_event, no_such_event")
+            .await
+            .unwrap();
+        assert!(query_rows(
+            &mut backend,
+            "SELECT EVENT_NAME FROM information_schema.events WHERE EVENT_SCHEMA='mydb'",
+        )
+        .await
+        .is_empty());
     }
 
     #[tokio::test]
