@@ -1318,6 +1318,7 @@ fn parse_privilege_list(value: &str) -> anyhow::Result<HashSet<String>> {
         "PROCESS",
         "RELOAD",
         "LOCK TABLES",
+        "CONNECTION_ADMIN",
         "EVENT",
     ];
     let values = value
@@ -1364,6 +1365,7 @@ pub struct WireStats {
     // transaction_locks.  Every operation that needs both registries takes
     // transaction_locks before explicit_table_locks.
     explicit_table_locks: parking_lot::Mutex<HashMap<String, LockState>>,
+    global_transaction_defaults: parking_lot::Mutex<TransactionDefaults>,
     waits_for: parking_lot::Mutex<HashMap<u32, HashSet<u32>>>,
     pending_transactions:
         parking_lot::Mutex<HashMap<u32, Weak<parking_lot::RwLock<Vec<WriteCommand>>>>>,
@@ -1398,19 +1400,127 @@ enum TransactionIsolation {
     Serializable,
 }
 
-fn start_transaction_read_only(upper: &str) -> anyhow::Result<bool> {
+impl TransactionIsolation {
+    fn mysql_name(self) -> &'static str {
+        match self {
+            Self::ReadUncommitted => "READ-UNCOMMITTED",
+            Self::ReadCommitted => "READ-COMMITTED",
+            Self::RepeatableRead => "REPEATABLE-READ",
+            Self::Serializable => "SERIALIZABLE",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct TransactionCharacteristics {
+    isolation: Option<TransactionIsolation>,
+    read_only: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TransactionDefaults {
+    isolation: TransactionIsolation,
+    read_only: bool,
+}
+
+impl Default for TransactionDefaults {
+    fn default() -> Self {
+        Self {
+            isolation: TransactionIsolation::default(),
+            read_only: false,
+        }
+    }
+}
+
+fn start_transaction_access_mode(upper: &str) -> anyhow::Result<Option<bool>> {
     let read_only = upper.contains("READ ONLY");
     let read_write = upper.contains("READ WRITE");
     if read_only && read_write {
         anyhow::bail!("START TRANSACTION cannot specify both READ ONLY and READ WRITE");
     }
-    Ok(read_only)
+    Ok(read_only.then_some(true).or(read_write.then_some(false)))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SetTransactionScope {
+    Next,
+    Session,
+    Global,
+}
+
+fn parse_transaction_isolation(value: &str) -> anyhow::Result<TransactionIsolation> {
+    let value = normalize_sql_whitespace(value).replace('-', " ");
+    match value.to_ascii_uppercase().as_str() {
+        "READ UNCOMMITTED" => Ok(TransactionIsolation::ReadUncommitted),
+        "READ COMMITTED" => Ok(TransactionIsolation::ReadCommitted),
+        "REPEATABLE READ" => Ok(TransactionIsolation::RepeatableRead),
+        "SERIALIZABLE" => Ok(TransactionIsolation::Serializable),
+        _ => anyhow::bail!("Unknown transaction isolation level '{}'", value),
+    }
+}
+
+fn parse_transaction_characteristics(value: &str) -> anyhow::Result<TransactionCharacteristics> {
+    let mut characteristics = TransactionCharacteristics::default();
+    let clauses = split_csv(value);
+    if clauses.is_empty() {
+        anyhow::bail!("SET TRANSACTION requires transaction characteristics");
+    }
+    for clause in clauses {
+        let clause = normalize_sql_whitespace(&clause);
+        let upper = clause.to_ascii_uppercase();
+        if let Some(isolation) = upper.strip_prefix("ISOLATION LEVEL ") {
+            if characteristics.isolation.is_some() {
+                anyhow::bail!("Duplicate transaction isolation level");
+            }
+            characteristics.isolation = Some(parse_transaction_isolation(isolation)?);
+        } else if upper == "READ ONLY" {
+            if characteristics.read_only.replace(true).is_some() {
+                anyhow::bail!("Duplicate transaction access mode");
+            }
+        } else if upper == "READ WRITE" {
+            if characteristics.read_only.replace(false).is_some() {
+                anyhow::bail!("Duplicate transaction access mode");
+            }
+        } else {
+            anyhow::bail!("Invalid transaction characteristic '{}'", clause);
+        }
+    }
+    Ok(characteristics)
+}
+
+fn parse_set_transaction_statement(
+    value: &str,
+) -> Option<anyhow::Result<(SetTransactionScope, TransactionCharacteristics)>> {
+    let (first, remainder) = take_sql_keyword(value)?;
+    let (scope, remainder) = if first.eq_ignore_ascii_case("TRANSACTION") {
+        (SetTransactionScope::Next, remainder)
+    } else if first.eq_ignore_ascii_case("SESSION") || first.eq_ignore_ascii_case("LOCAL") {
+        let (keyword, remainder) = take_sql_keyword(remainder)?;
+        if !keyword.eq_ignore_ascii_case("TRANSACTION") {
+            return None;
+        }
+        (SetTransactionScope::Session, remainder)
+    } else if first.eq_ignore_ascii_case("GLOBAL") {
+        let (keyword, remainder) = take_sql_keyword(remainder)?;
+        if !keyword.eq_ignore_ascii_case("TRANSACTION") {
+            return None;
+        }
+        (SetTransactionScope::Global, remainder)
+    } else {
+        return None;
+    };
+    Some(
+        parse_transaction_characteristics(remainder.trim())
+            .map(|characteristics| (scope, characteristics)),
+    )
 }
 
 const LOCK_TABLES_IN_STORED_PROGRAM_ERROR: &str =
     "LOCK TABLES is not allowed in stored procedures or functions";
 const ACTIVE_TABLE_LOCKS_ERROR: &str =
     "Can't execute the given command because you have active locked tables or an active transaction";
+const CANT_CHANGE_TRANSACTION_CHARACTERISTICS_ERROR: &str =
+    "Transaction characteristics can't be changed while a transaction is in progress";
 
 fn is_read_only_transaction_write_statement(upper: &str) -> bool {
     [
@@ -1429,9 +1539,14 @@ fn is_read_only_transaction_write_statement(upper: &str) -> bool {
         "ANALYZE ",
         "OPTIMIZE ",
         "REPAIR ",
+        "LOCK TABLE",
     ]
     .iter()
     .any(|prefix| upper.starts_with(prefix))
+        || (upper.starts_with("SELECT ")
+            && (upper.contains(" FOR UPDATE")
+                || upper.contains(" FOR SHARE")
+                || upper.contains(" LOCK IN SHARE MODE")))
 }
 
 #[derive(Debug, Clone)]
@@ -2060,6 +2175,8 @@ struct Backend {
     transaction_writes: Arc<parking_lot::RwLock<Vec<WriteCommand>>>,
     transaction_isolation: TransactionIsolation,
     transaction_read_only: bool,
+    session_transaction_defaults: TransactionDefaults,
+    next_transaction_characteristics: TransactionCharacteristics,
     transaction_snapshot: HashMap<(String, String), Vec<Row>>,
     lock_wait_timeout: std::time::Duration,
     foreign_key_checks: bool,
@@ -2165,6 +2282,7 @@ impl Backend {
         let lock_wait_timeout = std::time::Duration::from_millis(config.lock_wait_timeout_ms);
         let transaction_writes = Arc::new(parking_lot::RwLock::new(Vec::new()));
         stats.register_transaction_buffer(connection_id, &transaction_writes);
+        let transaction_defaults = *stats.global_transaction_defaults.lock();
         Self {
             database: config.default_database.clone(),
             storage,
@@ -2175,8 +2293,10 @@ impl Backend {
             in_transaction: false,
             autocommit: true,
             transaction_writes,
-            transaction_isolation: TransactionIsolation::default(),
+            transaction_isolation: transaction_defaults.isolation,
             transaction_read_only: false,
+            session_transaction_defaults: transaction_defaults,
+            next_transaction_characteristics: TransactionCharacteristics::default(),
             transaction_snapshot: HashMap::new(),
             lock_wait_timeout,
             foreign_key_checks: true,
@@ -2234,7 +2354,10 @@ impl Backend {
 
         // MySQL keeps connection characteristics, including current database, on reset.
         self.autocommit = true;
-        self.transaction_isolation = TransactionIsolation::default();
+        self.session_transaction_defaults = *self.stats.global_transaction_defaults.lock();
+        self.next_transaction_characteristics = TransactionCharacteristics::default();
+        self.transaction_isolation = self.session_transaction_defaults.isolation;
+        self.transaction_read_only = false;
         self.lock_wait_timeout = std::time::Duration::from_millis(self.config.lock_wait_timeout_ms);
         self.foreign_key_checks = true;
         self.prepared.clear();
@@ -2265,6 +2388,11 @@ impl Backend {
             .and_then(|value| value.as_deref())
             .and_then(parse_mysql_time_zone)
             .unwrap_or(MysqlTimeZone::System);
+        let implicit_next_transaction =
+            !self.in_transaction && self.autocommit && Self::is_implicit_transaction_statement(sql);
+        if implicit_next_transaction {
+            self.activate_transaction_defaults(None);
+        }
         let outcome = STORED_FUNCTION_CATALOG
             .scope(
                 function_catalog,
@@ -2277,6 +2405,9 @@ impl Backend {
                 ),
             )
             .await;
+        if implicit_next_transaction && !self.in_transaction && self.autocommit {
+            self.reset_transaction_characteristics();
+        }
         if outcome.as_ref().err().is_some_and(|error| {
             error
                 .to_string()
@@ -2287,7 +2418,7 @@ impl Backend {
             self.savepoints.clear();
             self.stats.release_all_locks(self.connection_id);
             self.in_transaction = false;
-            self.transaction_read_only = false;
+            self.reset_transaction_characteristics();
         }
         if let Ok(outcome) = &outcome {
             match outcome {
@@ -2423,6 +2554,112 @@ impl Backend {
             .unwrap_or_else(|| "SYSTEM".into())
     }
 
+    fn transaction_defaults_for_next(&mut self) -> TransactionDefaults {
+        let mut defaults = self.session_transaction_defaults;
+        if let Some(isolation) = self.next_transaction_characteristics.isolation.take() {
+            defaults.isolation = isolation;
+        }
+        if let Some(read_only) = self.next_transaction_characteristics.read_only.take() {
+            defaults.read_only = read_only;
+        }
+        defaults
+    }
+
+    fn activate_transaction_defaults(&mut self, access_mode: Option<bool>) {
+        let mut defaults = self.transaction_defaults_for_next();
+        if let Some(read_only) = access_mode {
+            defaults.read_only = read_only;
+        }
+        self.transaction_isolation = defaults.isolation;
+        self.transaction_read_only = defaults.read_only;
+    }
+
+    fn reset_transaction_characteristics(&mut self) {
+        self.transaction_isolation = self.session_transaction_defaults.isolation;
+        self.transaction_read_only = false;
+    }
+
+    fn apply_transaction_characteristics(
+        &mut self,
+        scope: SetTransactionScope,
+        characteristics: TransactionCharacteristics,
+    ) -> anyhow::Result<()> {
+        match scope {
+            SetTransactionScope::Next => {
+                if self.in_transaction {
+                    anyhow::bail!(CANT_CHANGE_TRANSACTION_CHARACTERISTICS_ERROR);
+                }
+                if let Some(isolation) = characteristics.isolation {
+                    self.next_transaction_characteristics.isolation = Some(isolation);
+                }
+                if let Some(read_only) = characteristics.read_only {
+                    self.next_transaction_characteristics.read_only = Some(read_only);
+                }
+            }
+            SetTransactionScope::Session => {
+                if let Some(isolation) = characteristics.isolation {
+                    self.session_transaction_defaults.isolation = isolation;
+                    if !self.in_transaction {
+                        self.transaction_isolation = isolation;
+                    }
+                }
+                if let Some(read_only) = characteristics.read_only {
+                    self.session_transaction_defaults.read_only = read_only;
+                }
+            }
+            SetTransactionScope::Global => {
+                let user = self
+                    .authenticated_user
+                    .lock()
+                    .clone()
+                    .unwrap_or_else(|| self.config.username.clone());
+                if !self
+                    .config
+                    .auth_catalog
+                    .has_privilege(&user, "", "CONNECTION_ADMIN")
+                {
+                    anyhow::bail!(
+                        "Access denied; user '{}' lacks CONNECTION_ADMIN privilege",
+                        user
+                    );
+                }
+                let mut defaults = self.stats.global_transaction_defaults.lock();
+                if let Some(isolation) = characteristics.isolation {
+                    defaults.isolation = isolation;
+                }
+                if let Some(read_only) = characteristics.read_only {
+                    defaults.read_only = read_only;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn is_implicit_transaction_statement(sql: &str) -> bool {
+        let upper =
+            normalize_sql_whitespace(sql.trim().trim_end_matches(';').trim()).to_ascii_uppercase();
+        ![
+            "SET ",
+            "USE ",
+            "SHOW ",
+            "DESCRIBE ",
+            "DESC ",
+            "BEGIN",
+            "START TRANSACTION",
+            "COMMIT",
+            "ROLLBACK",
+            "SAVEPOINT ",
+            "RELEASE SAVEPOINT ",
+            "LOCK TABLE",
+            "UNLOCK TABLE",
+            "PREPARE ",
+            "DEALLOCATE PREPARE ",
+            "DROP PREPARE ",
+        ]
+        .iter()
+        .any(|prefix| upper == *prefix || upper.starts_with(prefix))
+    }
+
     fn truncate_fractional_seconds(&self) -> bool {
         self.session_sql_mode()
             .split(',')
@@ -2455,8 +2692,26 @@ impl Backend {
     }
 
     fn system_variable_value(&self, name: &str) -> anyhow::Result<Option<Vec<u8>>> {
-        let name = normalize_system_variable_name(name);
+        let (scope, name) = parse_system_variable_reference(name);
         let value = match name.as_str() {
+            "transaction_isolation" | "tx_isolation" => {
+                let isolation = match scope {
+                    SystemVariableScope::Session => self.session_transaction_defaults.isolation,
+                    SystemVariableScope::Global => {
+                        self.stats.global_transaction_defaults.lock().isolation
+                    }
+                };
+                Some(isolation.mysql_name().as_bytes().to_vec())
+            }
+            "transaction_read_only" | "tx_read_only" => {
+                let read_only = match scope {
+                    SystemVariableScope::Session => self.session_transaction_defaults.read_only,
+                    SystemVariableScope::Global => {
+                        self.stats.global_transaction_defaults.lock().read_only
+                    }
+                };
+                Some(if read_only { b"1" } else { b"0" }.to_vec())
+            }
             "version" => Some(SERVER_VERSION.as_bytes().to_vec()),
             "version_comment" => Some(b"MyDB Server (Neko233 engine)".to_vec()),
             "default_storage_engine" | "storage_engine" => Some(b"InnoDB".to_vec()),
@@ -2513,7 +2768,59 @@ impl Backend {
         name: &str,
         value: Option<Vec<u8>>,
     ) -> anyhow::Result<()> {
-        let name = normalize_system_variable_name(name);
+        let raw_name = name.trim();
+        let (variable_scope, name) = parse_system_variable_reference(raw_name);
+        if matches!(name.as_str(), "transaction_isolation" | "tx_isolation")
+            || matches!(name.as_str(), "transaction_read_only" | "tx_read_only")
+        {
+            let explicit_scope = raw_name
+                .trim_start_matches("@@")
+                .trim_start()
+                .to_ascii_uppercase()
+                .starts_with("SESSION.")
+                || raw_name
+                    .trim_start_matches("@@")
+                    .trim_start()
+                    .to_ascii_uppercase()
+                    .starts_with("GLOBAL.")
+                || raw_name
+                    .trim_start_matches("@@")
+                    .trim_start()
+                    .to_ascii_uppercase()
+                    .starts_with("LOCAL.");
+            let scope = if raw_name.starts_with("@@")
+                && variable_scope == SystemVariableScope::Session
+                && !explicit_scope
+            {
+                SetTransactionScope::Next
+            } else if variable_scope == SystemVariableScope::Global {
+                SetTransactionScope::Global
+            } else {
+                SetTransactionScope::Session
+            };
+            let global_defaults = *self.stats.global_transaction_defaults.lock();
+            let mut characteristics = TransactionCharacteristics::default();
+            match name.as_str() {
+                "transaction_isolation" | "tx_isolation" => {
+                    characteristics.isolation = Some(match value.as_deref() {
+                        Some(value) => parse_transaction_isolation(std::str::from_utf8(value)?)?,
+                        None => global_defaults.isolation,
+                    });
+                }
+                "transaction_read_only" | "tx_read_only" => {
+                    characteristics.read_only = Some(
+                        value
+                            .as_deref()
+                            .map_or(global_defaults.read_only, |value| mysql_truthy(Some(value))),
+                    );
+                }
+                _ => unreachable!(),
+            }
+            return self.apply_transaction_characteristics(scope, characteristics);
+        }
+        if variable_scope == SystemVariableScope::Global {
+            anyhow::bail!("Global system variable '{}' is not supported", name);
+        }
         match name.as_str() {
             "autocommit" => {
                 let enabled = mysql_truthy(value.as_deref());
@@ -2527,12 +2834,13 @@ impl Backend {
                     self.stats.release_all_locks(self.connection_id);
                     self.autocommit = true;
                     self.in_transaction = false;
-                    self.transaction_read_only = false;
+                    self.reset_transaction_characteristics();
                 } else if !enabled && self.autocommit {
                     self.savepoints.clear();
                     self.autocommit = false;
                     self.in_transaction = true;
                     self.transaction_snapshot.clear();
+                    self.activate_transaction_defaults(None);
                 }
             }
             "foreign_key_checks" => {
@@ -2603,16 +2911,9 @@ impl Backend {
     async fn execute_set_statement(&mut self, sql: &str) -> anyhow::Result<QueryOutcome> {
         let body = sql["SET ".len()..].trim();
         let upper = body.to_ascii_uppercase();
-        if upper.contains("TRANSACTION ISOLATION LEVEL") {
-            self.transaction_isolation = if upper.contains("READ UNCOMMITTED") {
-                TransactionIsolation::ReadUncommitted
-            } else if upper.contains("READ COMMITTED") {
-                TransactionIsolation::ReadCommitted
-            } else if upper.contains("SERIALIZABLE") {
-                TransactionIsolation::Serializable
-            } else {
-                TransactionIsolation::RepeatableRead
-            };
+        if let Some(transaction) = parse_set_transaction_statement(body) {
+            let (scope, characteristics) = transaction?;
+            self.apply_transaction_characteristics(scope, characteristics)?;
             return Ok(QueryOutcome::ok(0));
         }
         if upper.starts_with("NAMES ") || upper.starts_with("CHARACTER SET ") {
@@ -2664,7 +2965,11 @@ impl Backend {
     }
 
     fn ensure_transaction_writable(&self) -> anyhow::Result<()> {
-        if self.transaction_read_only {
+        if self.transaction_read_only
+            || (!self.in_transaction
+                && self.autocommit
+                && self.session_transaction_defaults.read_only)
+        {
             anyhow::bail!(READ_ONLY_TRANSACTION_ERROR);
         }
         Ok(())
@@ -2674,6 +2979,7 @@ impl Backend {
         if self.procedure_depth > 0 {
             anyhow::bail!(LOCK_TABLES_IN_STORED_PROGRAM_ERROR);
         }
+        self.ensure_transaction_writable()?;
         let parsed = parse_lock_tables(sql)?;
         let user = self
             .authenticated_user
@@ -3882,10 +4188,10 @@ impl Backend {
         }
 
         if upper == "BEGIN" || upper.starts_with("START TRANSACTION") {
-            let read_only = if upper.starts_with("START TRANSACTION") {
-                start_transaction_read_only(&upper)?
+            let access_mode = if upper.starts_with("START TRANSACTION") {
+                start_transaction_access_mode(&upper)?
             } else {
-                false
+                None
             };
             self.commit_pending().await?;
             // START TRANSACTION implicitly releases table locks acquired with
@@ -3894,7 +4200,7 @@ impl Backend {
             self.transaction_snapshot.clear();
             self.savepoints.clear();
             self.in_transaction = true;
-            self.transaction_read_only = read_only;
+            self.activate_transaction_defaults(access_mode);
             return Ok(QueryOutcome::ok(0));
         }
         if upper == "COMMIT" {
@@ -3908,7 +4214,7 @@ impl Backend {
             self.savepoints.clear();
             self.stats.release_all_locks(self.connection_id);
             self.in_transaction = false;
-            self.transaction_read_only = false;
+            self.reset_transaction_characteristics();
             return Ok(QueryOutcome::ok(0));
         }
         if upper.starts_with("SAVEPOINT ") {
@@ -4427,6 +4733,11 @@ impl Backend {
         }
         if let Some(filter) = parse_show_scoped_metadata_filter(sql, "VARIABLES") {
             let filter = filter?;
+            let transaction_defaults = if upper.starts_with("SHOW GLOBAL VARIABLES") {
+                *self.stats.global_transaction_defaults.lock()
+            } else {
+                self.session_transaction_defaults
+            };
             let columns = vec!["Variable_name".to_string(), "Value".to_string()];
             let rows = vec![
                 vec![bytes("version"), bytes(SERVER_VERSION)],
@@ -4443,6 +4754,18 @@ impl Backend {
                 vec![
                     bytes("sql_notes"),
                     bytes(if self.sql_notes_enabled() {
+                        "ON"
+                    } else {
+                        "OFF"
+                    }),
+                ],
+                vec![
+                    bytes("transaction_isolation"),
+                    bytes(transaction_defaults.isolation.mysql_name()),
+                ],
+                vec![
+                    bytes("transaction_read_only"),
+                    bytes(if transaction_defaults.read_only {
                         "ON"
                     } else {
                         "OFF"
@@ -8901,7 +9224,7 @@ impl Backend {
         self.transaction_snapshot.clear();
         self.savepoints.clear();
         self.stats.release_all_locks(self.connection_id);
-        self.transaction_read_only = false;
+        self.reset_transaction_characteristics();
         result
     }
 
@@ -22183,6 +22506,8 @@ fn mysql_error_kind(message: &str) -> ErrorKind {
         ErrorKind::ER_SP_BADSTATEMENT
     } else if message == ACTIVE_TABLE_LOCKS_ERROR {
         ErrorKind::ER_LOCK_OR_ACTIVE_TRANSACTION
+    } else if message == CANT_CHANGE_TRANSACTION_CHARACTERISTICS_ERROR {
+        ErrorKind::ER_CANT_CHANGE_TX_ISOLATION
     } else {
         ErrorKind::ER_UNKNOWN_ERROR
     }
@@ -30459,30 +30784,47 @@ fn unquote(value: &str) -> String {
     String::from_utf8_lossy(&unescape_mysql_literal(value)).into_owned()
 }
 
-fn normalize_system_variable_name(value: &str) -> String {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SystemVariableScope {
+    Session,
+    Global,
+}
+
+fn parse_system_variable_reference(value: &str) -> (SystemVariableScope, String) {
     let mut value = value.trim();
     if let Some(stripped) = value.strip_prefix("@@") {
         value = stripped;
     }
-    for prefix in ["SESSION.", "GLOBAL.", "LOCAL."] {
+    let mut scope = SystemVariableScope::Session;
+    for (prefix, candidate_scope) in [
+        ("SESSION.", SystemVariableScope::Session),
+        ("GLOBAL.", SystemVariableScope::Global),
+        ("LOCAL.", SystemVariableScope::Session),
+    ] {
         if value
             .get(..prefix.len())
             .is_some_and(|actual| actual.eq_ignore_ascii_case(prefix))
         {
             value = &value[prefix.len()..];
+            scope = candidate_scope;
             break;
         }
     }
-    for prefix in ["SESSION ", "GLOBAL ", "LOCAL "] {
+    for (prefix, candidate_scope) in [
+        ("SESSION ", SystemVariableScope::Session),
+        ("GLOBAL ", SystemVariableScope::Global),
+        ("LOCAL ", SystemVariableScope::Session),
+    ] {
         if value
             .get(..prefix.len())
             .is_some_and(|actual| actual.eq_ignore_ascii_case(prefix))
         {
             value = value[prefix.len()..].trim_start();
+            scope = candidate_scope;
             break;
         }
     }
-    value.trim_matches('`').to_ascii_lowercase()
+    (scope, value.trim_matches('`').to_ascii_lowercase())
 }
 
 fn mysql_truthy(value: Option<&[u8]>) -> bool {
@@ -46466,6 +46808,159 @@ mod tests {
             .await
             .unwrap();
         backend.execute("ROLLBACK").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn transaction_characteristics_follow_mysql_global_session_and_next_scopes() {
+        let (_temp, storage, mut backend, _second) = transaction_backends().await;
+
+        backend
+            .execute("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED, READ ONLY")
+            .await
+            .unwrap();
+        assert_eq!(
+            backend.session_transaction_defaults.isolation,
+            TransactionIsolation::ReadCommitted
+        );
+        assert!(backend.session_transaction_defaults.read_only);
+        backend.execute("START TRANSACTION").await.unwrap();
+        assert_eq!(
+            backend.transaction_isolation,
+            TransactionIsolation::ReadCommitted
+        );
+        assert!(backend.transaction_read_only);
+        backend.execute("COMMIT").await.unwrap();
+        backend.execute("BEGIN").await.unwrap();
+        assert_eq!(
+            backend.transaction_isolation,
+            TransactionIsolation::ReadCommitted
+        );
+        assert!(backend.transaction_read_only);
+        backend.execute("ROLLBACK").await.unwrap();
+
+        backend
+            .execute("SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ WRITE")
+            .await
+            .unwrap();
+        backend
+            .execute("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE, READ ONLY")
+            .await
+            .unwrap();
+        backend
+            .execute("START TRANSACTION READ WRITE")
+            .await
+            .unwrap();
+        assert_eq!(
+            backend.transaction_isolation,
+            TransactionIsolation::Serializable
+        );
+        assert!(!backend.transaction_read_only);
+        backend.execute("COMMIT").await.unwrap();
+        backend.execute("START TRANSACTION").await.unwrap();
+        assert_eq!(
+            backend.transaction_isolation,
+            TransactionIsolation::RepeatableRead
+        );
+        assert!(!backend.transaction_read_only);
+        let error = backend
+            .execute("SET TRANSACTION READ ONLY")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            mysql_error_kind(&error),
+            ErrorKind::ER_CANT_CHANGE_TX_ISOLATION
+        );
+        backend
+            .execute("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED")
+            .await
+            .unwrap();
+        assert_eq!(
+            backend.transaction_isolation,
+            TransactionIsolation::RepeatableRead
+        );
+        backend.execute("ROLLBACK").await.unwrap();
+
+        backend
+            .execute("SET transaction_isolation='READ-COMMITTED'")
+            .await
+            .unwrap();
+        assert_eq!(
+            single_value(
+                backend
+                    .execute("SELECT @@session.transaction_isolation")
+                    .await
+                    .unwrap()
+            ),
+            b"READ-COMMITTED"
+        );
+        backend
+            .execute("SET @@transaction_read_only=1")
+            .await
+            .unwrap();
+        backend.execute("START TRANSACTION").await.unwrap();
+        assert_eq!(
+            backend.transaction_isolation,
+            TransactionIsolation::ReadCommitted
+        );
+        assert!(backend.transaction_read_only);
+        backend.execute("ROLLBACK").await.unwrap();
+        backend.execute("START TRANSACTION").await.unwrap();
+        assert!(!backend.transaction_read_only);
+        backend.execute("ROLLBACK").await.unwrap();
+
+        backend
+            .execute("SET GLOBAL TRANSACTION ISOLATION LEVEL READ UNCOMMITTED, READ ONLY")
+            .await
+            .unwrap();
+        assert_eq!(
+            single_value(
+                backend
+                    .execute("SELECT @@global.transaction_isolation")
+                    .await
+                    .unwrap()
+            ),
+            b"READ-UNCOMMITTED"
+        );
+        assert_eq!(
+            single_value(
+                backend
+                    .execute("SELECT @@global.transaction_read_only")
+                    .await
+                    .unwrap()
+            ),
+            b"1"
+        );
+        assert_eq!(
+            backend.session_transaction_defaults.isolation,
+            TransactionIsolation::ReadCommitted
+        );
+        let mut newly_connected =
+            Backend::new(storage, backend.config.clone(), backend.stats.clone(), 3);
+        assert_eq!(
+            newly_connected.session_transaction_defaults.isolation,
+            TransactionIsolation::ReadUncommitted
+        );
+        assert!(newly_connected.session_transaction_defaults.read_only);
+        assert_eq!(
+            newly_connected
+                .execute("INSERT INTO actors (id,value) VALUES (2,20)")
+                .await
+                .unwrap_err()
+                .to_string(),
+            READ_ONLY_TRANSACTION_ERROR
+        );
+        let show = newly_connected
+            .execute("SHOW GLOBAL VARIABLES LIKE 'transaction_read_only'")
+            .await
+            .unwrap();
+        let QueryOutcome::Rows { rows, .. } = show else {
+            panic!("expected SHOW VARIABLES rows")
+        };
+        assert_eq!(
+            rows,
+            vec![vec![bytes("transaction_read_only"), bytes("ON")]]
+        );
     }
 
     #[tokio::test]
