@@ -3382,6 +3382,18 @@ impl Backend {
 
         self.require_statement_privilege(sql, &upper)?;
 
+        if upper.starts_with("USE ") {
+            let database = sql["USE".len()..].trim().trim_matches('`');
+            if database.is_empty() || database.split_whitespace().count() != 1 {
+                anyhow::bail!("USE requires exactly one database name");
+            }
+            if self.storage.get_database(database).is_some() || is_virtual_schema_name(database) {
+                self.database = database.to_string();
+                return Ok(QueryOutcome::ok(0));
+            }
+            anyhow::bail!("Unknown database '{}'", database);
+        }
+
         if upper == "BEGIN" || upper.starts_with("START TRANSACTION") {
             self.commit_pending().await?;
             self.transaction_snapshot.clear();
@@ -3677,22 +3689,27 @@ impl Backend {
             return self.show_table_status(sql);
         }
         if upper.starts_with("SHOW COLUMNS FROM ")
+            || upper.starts_with("SHOW COLUMNS IN ")
             || upper.starts_with("SHOW FULL COLUMNS FROM ")
+            || upper.starts_with("SHOW FULL COLUMNS IN ")
             || upper.starts_with("SHOW FIELDS FROM ")
+            || upper.starts_with("SHOW FIELDS IN ")
             || upper.starts_with("SHOW FULL FIELDS FROM ")
+            || upper.starts_with("SHOW FULL FIELDS IN ")
         {
             return self.show_columns(sql);
         }
         if upper.starts_with("DESCRIBE ") || upper.starts_with("DESC ") {
-            let table = sql
-                .split_whitespace()
-                .last()
-                .unwrap_or("")
-                .trim_matches('`');
-            let schema = self.table_schema(table)?;
+            let (table, filter) = parse_describe_options(sql)?;
+            let schema = self.table_schema(&table)?;
             let rows = schema
                 .columns
                 .iter()
+                .filter(|column| {
+                    filter.as_ref().is_none_or(|pattern| {
+                        scalar_like_matches(column.name.as_bytes(), pattern.as_bytes())
+                    })
+                })
                 .map(|column| {
                     vec![
                         Some(column.name.clone()),
@@ -8665,10 +8682,33 @@ impl Backend {
 
     fn table_schema(&self, table: &str) -> anyhow::Result<TableSchema> {
         let (database, table) = self.resolve_table_reference(table)?;
+        if let Some(virtual_table) = self.virtual_table(&database, &table)? {
+            return Ok(virtual_table_schema(&table, &virtual_table.columns));
+        }
         self.storage
             .get_database(&database)
             .and_then(|db| db.get_table(&table))
             .ok_or_else(|| anyhow::anyhow!("Table '{}.{}' does not exist", database, table))
+    }
+
+    fn virtual_table(&self, database: &str, table: &str) -> anyhow::Result<Option<VirtualTable>> {
+        if !is_virtual_schema_name(database) {
+            return Ok(None);
+        }
+        let viewer = self
+            .authenticated_user
+            .lock()
+            .clone()
+            .unwrap_or_else(|| self.config.username.clone());
+        let tables = if database.eq_ignore_ascii_case("information_schema") {
+            information_schema_virtual_tables(&self.storage, &self.config.auth_catalog, &viewer)?
+        } else {
+            mysql_virtual_tables(&self.config.auth_catalog, &viewer)
+        };
+        Ok(tables
+            .into_iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(table))
+            .map(|(_, table)| table))
     }
 
     fn find_trigger(&self, database: &str, name: &str) -> Option<(String, TriggerDefinition)> {
@@ -8818,6 +8858,54 @@ impl Backend {
 
     fn show_tables(&self, sql: &str) -> anyhow::Result<QueryOutcome> {
         let (full, database_name, filter) = parse_show_tables_options(sql, &self.database)?;
+        if is_virtual_schema_name(&database_name) {
+            let viewer = self
+                .authenticated_user
+                .lock()
+                .clone()
+                .unwrap_or_else(|| self.config.username.clone());
+            let mut names = if database_name.eq_ignore_ascii_case("information_schema") {
+                information_schema_virtual_tables(
+                    &self.storage,
+                    &self.config.auth_catalog,
+                    &viewer,
+                )?
+                .into_keys()
+                .collect::<Vec<_>>()
+            } else {
+                mysql_virtual_tables(&self.config.auth_catalog, &viewer)
+                    .into_keys()
+                    .collect::<Vec<_>>()
+            };
+            names.sort_by_key(|name| name.to_ascii_lowercase());
+            let columns = if full {
+                vec![
+                    format!("Tables_in_{database_name}"),
+                    "Table_type".to_string(),
+                ]
+            } else {
+                vec![format!("Tables_in_{database_name}")]
+            };
+            let table_type = if database_name.eq_ignore_ascii_case("information_schema") {
+                "SYSTEM VIEW"
+            } else {
+                "BASE TABLE"
+            };
+            let rows = names
+                .into_iter()
+                .map(|name| {
+                    if full {
+                        vec![bytes(&name), bytes(table_type)]
+                    } else {
+                        vec![bytes(&name)]
+                    }
+                })
+                .collect();
+            return Ok(QueryOutcome::byte_rows(
+                columns.clone(),
+                apply_show_filter(&columns, rows, filter, 0)?,
+            ));
+        }
         let database = self
             .storage
             .get_database(&database_name)
@@ -10937,7 +11025,11 @@ impl Backend {
 
     async fn select_virtual_schema(&mut self, sql: &str) -> anyhow::Result<Option<QueryOutcome>> {
         let upper = sql.to_ascii_uppercase();
-        if !upper.contains("INFORMATION_SCHEMA") && !upper.contains("MYSQL") {
+        let current_virtual_schema = is_virtual_schema_name(&self.database);
+        if !upper.contains("INFORMATION_SCHEMA")
+            && !upper.contains("MYSQL")
+            && !current_virtual_schema
+        {
             return Ok(None);
         }
         let viewer = self
@@ -10973,6 +11065,10 @@ impl Backend {
         metadata.sort_by_key(|(schema, name, _)| std::cmp::Reverse(schema.len() + name.len()));
         for (schema, name, table) in metadata {
             let replacement = format!("__mydb_{schema}_{name}");
+            if schema.eq_ignore_ascii_case(&self.database) {
+                scope.insert(name.clone(), table.clone());
+                matched = true;
+            }
             for source in [format!("{schema}.{name}"), format!("`{schema}`.`{name}`")] {
                 let (next, replacements) =
                     replace_ascii_case_insensitive(&rewritten, &source, &replacement);
@@ -12570,6 +12666,10 @@ struct InformationSchemaConstraint {
     check_clause: Option<String>,
     update_rule: Option<String>,
     delete_rule: Option<String>,
+}
+
+fn is_virtual_schema_name(value: &str) -> bool {
+    value.eq_ignore_ascii_case("information_schema") || value.eq_ignore_ascii_case("mysql")
 }
 
 fn information_schema_virtual_tables(
@@ -21066,7 +21166,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for Backend {
         database: &'a str,
         writer: InitWriter<'a, W>,
     ) -> io::Result<()> {
-        if self.storage.get_database(database).is_some() {
+        if self.storage.get_database(database).is_some() || is_virtual_schema_name(database) {
             self.database = database.to_string();
             self.clear_statement_messages();
             self.session_diagnostics = ProcedureDiagnosticsArea {
@@ -30233,6 +30333,47 @@ fn parse_show_columns_options(
     Ok((full, reference, parse_show_metadata_filter(remainder)?))
 }
 
+fn parse_describe_options(sql: &str) -> anyhow::Result<(String, Option<String>)> {
+    let prefix = if sql
+        .get(.."DESCRIBE".len())
+        .is_some_and(|value| value.eq_ignore_ascii_case("DESCRIBE"))
+    {
+        "DESCRIBE"
+    } else if sql
+        .get(.."DESC".len())
+        .is_some_and(|value| value.eq_ignore_ascii_case("DESC"))
+    {
+        "DESC"
+    } else {
+        anyhow::bail!("Invalid DESCRIBE")
+    };
+    let remainder = sql[prefix.len()..].trim().trim_end_matches(';').trim();
+    let (table, remainder) = take_show_identifier(remainder)?;
+    let remainder = remainder.trim().trim_end_matches(';').trim();
+    if remainder.is_empty() {
+        return Ok((table, None));
+    }
+    if remainder
+        .get(.."LIKE ".len())
+        .is_some_and(|value| value.eq_ignore_ascii_case("LIKE "))
+    {
+        return match parse_show_metadata_filter(remainder)? {
+            None => Ok((table, None)),
+            Some(ShowMetadataFilter::Like(pattern)) => Ok((table, Some(pattern))),
+            Some(ShowMetadataFilter::Where(_)) => anyhow::bail!("DESCRIBE supports only LIKE"),
+        };
+    }
+    let (column, tail) = take_show_identifier(remainder)?;
+    if !tail.trim().is_empty() {
+        anyhow::bail!("Invalid DESCRIBE column filter");
+    }
+    let pattern = match parse_sql_value(&column)? {
+        SqlValue::Null => anyhow::bail!("DESCRIBE column filter cannot be NULL"),
+        SqlValue::Bytes(value) => String::from_utf8(value)?,
+    };
+    Ok((table, Some(pattern)))
+}
+
 fn parse_show_index_reference(sql: &str) -> anyhow::Result<String> {
     let tokens = sql
         .trim_end_matches(';')
@@ -30800,6 +30941,66 @@ mod tests {
             .await,
             vec![vec![bytes("catalog_reader")]]
         );
+        backend.execute("USE mysql").await.unwrap();
+        assert_eq!(
+            query_rows(
+                &mut backend,
+                "SELECT User FROM user WHERE User='catalog_reader'",
+            )
+            .await,
+            vec![vec![bytes("catalog_reader")]]
+        );
+        assert_eq!(
+            query_rows(&mut backend, "SHOW TABLES LIKE 'user'").await,
+            vec![vec![bytes("user")]]
+        );
+        assert_eq!(
+            query_rows(&mut backend, "SHOW COLUMNS FROM user").await[0][0],
+            bytes("Host")
+        );
+        for statement in [
+            "SHOW COLUMNS IN user LIKE 'User'",
+            "SHOW FIELDS IN user LIKE 'User'",
+        ] {
+            let rows = query_rows(&mut backend, statement).await;
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0][0], bytes("User"));
+        }
+        for statement in [
+            "SHOW FULL COLUMNS IN user LIKE 'User'",
+            "SHOW FULL FIELDS IN user LIKE 'User'",
+        ] {
+            let rows = query_rows(&mut backend, statement).await;
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0][0], bytes("User"));
+            assert_eq!(rows[0].len(), 9);
+        }
+        assert_eq!(
+            query_rows(&mut backend, "DESCRIBE user").await[1][0],
+            bytes("User")
+        );
+        assert_eq!(
+            query_rows(&mut backend, "DESCRIBE user User").await[0][0],
+            bytes("User")
+        );
+        assert_eq!(
+            query_rows(&mut backend, "DESC `mysql`.`user` LIKE 'Us%'").await[0][0],
+            bytes("User")
+        );
+        backend.execute("USE information_schema").await.unwrap();
+        assert_eq!(
+            query_rows(
+                &mut backend,
+                "SELECT TABLE_NAME FROM tables WHERE TABLE_SCHEMA='mydb' AND TABLE_NAME='actors'",
+            )
+            .await,
+            vec![vec![bytes("actors")]]
+        );
+        assert_eq!(
+            query_rows(&mut backend, "SHOW FULL TABLES LIKE 'events'").await,
+            vec![vec![bytes("events"), bytes("SYSTEM VIEW")]]
+        );
+        backend.execute("USE mydb").await.unwrap();
 
         let tables = mysql_virtual_tables(&backend.config.auth_catalog, "root");
         let mut expected_user_columns = vec!["Host".to_string(), "User".to_string()];
