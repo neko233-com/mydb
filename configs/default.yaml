@@ -38,7 +38,7 @@ storage:
   log_file_size: "256M"
   # 页大小
   page_size: 16384
-  # group commit 收集窗口（微秒；0 = 不等待）
+  # 吞吐默认收集窗口（微秒；0 = 低延迟自然批量）
   group_commit_window_us: 250
 
 memory:

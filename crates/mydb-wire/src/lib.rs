@@ -5961,7 +5961,7 @@ impl Backend {
                 {
                     anyhow::bail!("Duplicate column name in CREATE TABLE AS SELECT");
                 }
-                let schema = ctas_schema(&table, &columns, &values);
+                let schema = ctas_schema(&table, &columns, &values, definition.engine);
                 let rows = query_rows_to_storage_rows(&columns, values);
                 let mut writes = Vec::with_capacity(rows.len() + 1);
                 writes.push(WriteCommand::CreateTable {
@@ -10609,7 +10609,7 @@ impl Backend {
                 anyhow::bail!("Duplicate column name in CREATE TABLE AS SELECT");
             }
             let physical = self.allocate_temporary_table_name(&logical);
-            let schema = ctas_schema(&physical, &columns, &values);
+            let schema = ctas_schema(&physical, &columns, &values, definition.engine);
             let rows = query_rows_to_storage_rows(&columns, values);
             let mut writes = Vec::with_capacity(rows.len() + 1);
             writes.push(WriteCommand::CreateTable {
@@ -24125,6 +24125,8 @@ fn mysql_error_kind(message: &str) -> ErrorKind {
         ErrorKind::ER_BAD_NULL_ERROR
     } else if message.starts_with("Field '") && message.ends_with(" doesn't have a default value") {
         ErrorKind::ER_NO_DEFAULT_FOR_FIELD
+    } else if message.starts_with("Unknown storage engine '") && message.ends_with('\'') {
+        ErrorKind::ER_UNKNOWN_STORAGE_ENGINE
     } else if message.starts_with("Unknown database '") {
         ErrorKind::ER_BAD_DB_ERROR
     } else if message.starts_with("Table '") && message.ends_with(" already exists") {
@@ -24365,6 +24367,7 @@ struct CreateTableAsSelect {
     name: String,
     query: String,
     if_not_exists: bool,
+    engine: TableEngine,
 }
 
 fn is_create_trigger_statement(sql: &str) -> bool {
@@ -29858,26 +29861,50 @@ fn parse_create_table_as_select(sql: &str) -> anyhow::Result<Option<CreateTableA
     if prefix.contains('(') {
         return Ok(None);
     }
-    let tokens = prefix.split_whitespace().collect::<Vec<_>>();
-    if tokens.len() < 3
-        || !tokens[0].eq_ignore_ascii_case("CREATE")
-        || !tokens[1].eq_ignore_ascii_case("TABLE")
+    let mut tokens = prefix.split_whitespace();
+    if !tokens
+        .next()
+        .is_some_and(|token| token.eq_ignore_ascii_case("CREATE"))
+        || !tokens
+            .next()
+            .is_some_and(|token| token.eq_ignore_ascii_case("TABLE"))
     {
         return Ok(None);
     }
-    let name = tokens
-        .last()
+    let mut if_not_exists = false;
+    let mut name = tokens.next();
+    if name.is_some_and(|token| token.eq_ignore_ascii_case("IF")) {
+        if !tokens
+            .next()
+            .is_some_and(|token| token.eq_ignore_ascii_case("NOT"))
+            || !tokens
+                .next()
+                .is_some_and(|token| token.eq_ignore_ascii_case("EXISTS"))
+        {
+            anyhow::bail!("Invalid CREATE TABLE IF NOT EXISTS clause");
+        }
+        if_not_exists = true;
+        name = tokens.next();
+    }
+    let name = name
         .ok_or_else(|| anyhow::anyhow!("CREATE TABLE requires a table name"))?
         .trim_matches('`')
         .to_string();
+    let options = tokens.collect::<Vec<_>>().join(" ");
     Ok(Some(CreateTableAsSelect {
         name,
         query: query.to_string(),
-        if_not_exists: prefix.to_ascii_uppercase().contains(" IF NOT EXISTS "),
+        if_not_exists,
+        engine: table_engine_from_sql(&options)?,
     }))
 }
 
-fn ctas_schema(table: &str, columns: &[String], rows: &[Vec<Option<Vec<u8>>>]) -> TableSchema {
+fn ctas_schema(
+    table: &str,
+    columns: &[String],
+    rows: &[Vec<Option<Vec<u8>>>],
+    engine: TableEngine,
+) -> TableSchema {
     let columns = columns
         .iter()
         .enumerate()
@@ -29926,8 +29953,13 @@ fn ctas_schema(table: &str, columns: &[String], rows: &[Vec<Option<Vec<u8>>>]) -
         })
         .collect::<Vec<_>>();
     let create_sql = format!(
-        "CREATE TABLE `{}` (\n{}\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+        "CREATE TABLE `{}` (\n{}\n) ENGINE={} DEFAULT CHARSET=utf8mb4",
         table.replace('`', "``"),
+        if engine == TableEngine::Memory {
+            "MEMORY"
+        } else {
+            "InnoDB"
+        },
         columns
             .iter()
             .map(|column| format!(
@@ -29948,7 +29980,7 @@ fn ctas_schema(table: &str, columns: &[String], rows: &[Vec<Option<Vec<u8>>>]) -
         next_page_number: 0,
         generation: 0,
         create_sql: Some(create_sql),
-        engine: TableEngine::Neko233,
+        engine,
     }
 }
 
@@ -30104,7 +30136,7 @@ fn parse_create_table(sql: &str) -> anyhow::Result<TableSchema> {
         next_page_number: 0,
         generation: 0,
         create_sql: Some(sql.trim().trim_end_matches(';').to_string()),
-        engine: table_engine_from_sql(sql),
+        engine: table_engine_from_sql(sql)?,
     })
 }
 
@@ -38288,6 +38320,99 @@ mod tests {
             .any(|row| { row.first().and_then(Option::as_deref) == Some(b"Select".as_slice()) }));
     }
 
+    #[test]
+    fn table_engine_parser_accepts_only_innodb_and_memory() {
+        assert_eq!(
+            table_engine_from_sql(
+                "CREATE TABLE engine_innodb (id BIGINT PRIMARY KEY) ENGINE = iNnOdB;"
+            )
+            .expect("InnoDB alias should parse"),
+            TableEngine::Neko233
+        );
+        assert_eq!(
+            table_engine_from_sql(
+                "CREATE TABLE engine_memory (id BIGINT PRIMARY KEY) ENGINE = MeMoRy;"
+            )
+            .expect("MEMORY should parse"),
+            TableEngine::Memory
+        );
+        assert_eq!(
+            table_engine_from_sql("CREATE TABLE engine_default (id BIGINT PRIMARY KEY)")
+                .expect("default engine should parse"),
+            TableEngine::Neko233
+        );
+        assert_eq!(
+            table_engine_from_sql("CREATE TABLE engine_unknown (id BIGINT) ENGINE = MyISAM")
+                .expect_err("unknown engine must fail")
+                .to_string(),
+            "Unknown storage engine 'MyISAM'"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_table_engine_aliases_are_strict_and_mysql_mapped() {
+        let (_temp, storage, mut backend, _second) = transaction_backends().await;
+        backend
+            .execute("CREATE TABLE engine_innodb (id BIGINT PRIMARY KEY) ENGINE = iNnOdB")
+            .await
+            .expect("InnoDB alias DDL should succeed");
+        assert_eq!(
+            storage
+                .get_database("mydb")
+                .and_then(|database| database.get_table("engine_innodb"))
+                .expect("InnoDB alias table should exist")
+                .engine,
+            TableEngine::Neko233
+        );
+
+        backend
+            .execute("CREATE TABLE engine_memory (id BIGINT PRIMARY KEY) ENGINE = MeMoRy")
+            .await
+            .expect("MEMORY DDL should succeed");
+        assert_eq!(
+            storage
+                .get_database("mydb")
+                .and_then(|database| database.get_table("engine_memory"))
+                .expect("MEMORY table should exist")
+                .engine,
+            TableEngine::Memory
+        );
+
+        backend
+            .execute("CREATE TABLE engine_ctas ENGINE = InNoDb AS SELECT 7 AS id")
+            .await
+            .expect("CTAS InnoDB alias DDL should succeed");
+        assert_eq!(
+            storage
+                .get_database("mydb")
+                .and_then(|database| database.get_table("engine_ctas"))
+                .expect("CTAS InnoDB alias table should exist")
+                .engine,
+            TableEngine::Neko233
+        );
+
+        for (table, engine) in [("engine_myisam", "MyISAM"), ("engine_internal", "Neko233")] {
+            let error = backend
+                .execute(&format!(
+                    "CREATE TABLE {table} (id BIGINT PRIMARY KEY) ENGINE = {engine}"
+                ))
+                .await
+                .expect_err("unknown storage engine must fail");
+            assert_eq!(
+                error.to_string(),
+                format!("Unknown storage engine '{engine}'")
+            );
+            assert_eq!(
+                mysql_error_kind(&error.to_string()),
+                ErrorKind::ER_UNKNOWN_STORAGE_ENGINE
+            );
+            assert!(storage
+                .get_database("mydb")
+                .and_then(|database| database.get_table(table))
+                .is_none());
+        }
+    }
+
     #[tokio::test]
     async fn set_character_set_uses_database_collation_and_supports_charset_alias() {
         let (_temp, _storage, mut backend, _second) = transaction_backends().await;
@@ -39025,20 +39150,21 @@ mod tests {
 
         let second_physical = second.temporary_tables.values().next().cloned().unwrap();
         drop(second);
-        for _ in 0..20 {
-            tokio::task::yield_now().await;
-            if storage
-                .get_database("mydb")
-                .and_then(|database| database.get_table(&second_physical))
-                .is_none()
-            {
-                break;
+        let cleaned = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if storage
+                    .get_database("mydb")
+                    .and_then(|database| database.get_table(&second_physical))
+                    .is_none()
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
             }
-        }
-        assert!(storage
-            .get_database("mydb")
-            .and_then(|database| database.get_table(&second_physical))
-            .is_none());
+        })
+        .await
+        .is_ok();
+        assert!(cleaned, "temporary table cleanup should complete after drop");
 
         backend
             .execute("CREATE TEMPORARY TABLE drop_pending (id BIGINT PRIMARY KEY)")
