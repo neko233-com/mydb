@@ -194,7 +194,7 @@ try {
     }
 
     function Get-Metric([string]$MetricsText, [string]$Name) {
-        $match = [regex]::Match($MetricsText, "(?m)^$([regex]::Escape($Name))\\s+([0-9]+(?:\\.[0-9]+)?)$")
+        $match = [regex]::Match($MetricsText, "(?m)^$([regex]::Escape($Name))\s+([0-9]+(?:\.[0-9]+)?)$")
         if ($match.Success) { return $match.Groups[1].Value }
         return "n/a"
     }
