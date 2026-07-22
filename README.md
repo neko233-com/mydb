@@ -488,13 +488,15 @@ bash scripts/docker-smoke.sh
 > ⚠️ 以下为开发机 Docker 限速回归数据，不代表物理生产硬件正式验收结论。
 >
 > MySQL 数字为历史参考值，非本次 Docker 脚本同轮重测结果。
+>
+> 本轮数据：`44d23f5`，2026-07-22，Docker WSL2（0.5 CPU / 512MiB）。
 
 | 场景 | MyDB | MySQL 8.0.46（历史参考） | 参考比 |
 |------|------|--------------|------|
-| 单表写 (fsync-per-commit) | 见性能报告 | 3318 ops/s | - |
-| 8 actor / 8表 写 P99 延迟 | 见性能报告 | 495.9 ms | - |
-| 8 actor / 8表 Group Commit | 见性能报告 | 7315 ops/s | - |
-| 读 P50 延迟 | 见性能报告 | - | - |
+| 单表写 (fsync-per-commit) | 331 ops/s | 3318 ops/s | 0.1x |
+| 8 actor / 8表 写 P99 延迟 | 98.4 ms | 495.9 ms | 历史参考 5x |
+| 8 actor / 8表 Group Commit | 225 ops/s | 7315 ops/s | 0.03x |
+| 读 P50 延迟 | 673 μs | - | - |
 
 MyDB 设计目标是**同资源、同持久化级别下达到 MySQL 10x 写性能**，不以关闭持久化换取数字。
 
