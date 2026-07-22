@@ -193,17 +193,17 @@ try {
         Write-Warning "Could not collect MyDB metrics: $($_.Exception.Message)"
     }
 
-    function Get-Metric([string]$Name) {
-        $match = [regex]::Match($metrics, "(?m)^$([regex]::Escape($Name))\\s+([0-9]+(?:\\.[0-9]+)?)$")
+    function Get-Metric([string]$MetricsText, [string]$Name) {
+        $match = [regex]::Match($MetricsText, "(?m)^$([regex]::Escape($Name))\\s+([0-9]+(?:\\.[0-9]+)?)$")
         if ($match.Success) { return $match.Groups[1].Value }
         return "n/a"
     }
 
-    $groupCommits = Get-Metric -Name "mydb_group_commits_total"
-    $groupedRequests = Get-Metric -Name "mydb_grouped_requests_total"
-    $checkpoints = Get-Metric -Name "mydb_checkpoints_total"
-    $walSyncMicros = Get-Metric -Name "mydb_wal_sync_microseconds_total"
-    $checkpointMicros = Get-Metric -Name "mydb_checkpoint_microseconds_total"
+    $groupCommits = Get-Metric -MetricsText $metrics -Name "mydb_group_commits_total"
+    $groupedRequests = Get-Metric -MetricsText $metrics -Name "mydb_grouped_requests_total"
+    $checkpoints = Get-Metric -MetricsText $metrics -Name "mydb_checkpoints_total"
+    $walSyncMicros = Get-Metric -MetricsText $metrics -Name "mydb_wal_sync_microseconds_total"
+    $checkpointMicros = Get-Metric -MetricsText $metrics -Name "mydb_checkpoint_microseconds_total"
 
     $singleMyDbOps = [math]::Round($single.mydb.operations_per_second, 0)
     $singleMySqlOps = [math]::Round($single.mysql.operations_per_second, 0)
