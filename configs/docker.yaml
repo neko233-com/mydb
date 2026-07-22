@@ -21,7 +21,7 @@ storage:
   buffer_pool_size: "256M"
   log_file_size: "64M"
   page_size: 16384
-  group_commit_window_us: 0
+  group_commit_window_us: 250
 
 memory:
   max_memory: "384M"

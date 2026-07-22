@@ -5073,16 +5073,29 @@ struct PendingWrite {
 struct ActorCheckpointState {
     tables: HashSet<(String, String)>,
     transactions: Vec<u64>,
-    groups_since_checkpoint: usize,
+    committed_requests_since_checkpoint: usize,
 }
 
 impl ActorCheckpointState {
+    fn record_successful_group(&mut self, group_id: u64, requests: usize) {
+        self.transactions.push(group_id);
+        self.committed_requests_since_checkpoint = self
+            .committed_requests_since_checkpoint
+            .saturating_add(requests);
+    }
+
+    fn checkpoint_due(&self) -> bool {
+        self.committed_requests_since_checkpoint >= CHECKPOINT_COMMIT_INTERVAL
+    }
+
     fn clear(&mut self) {
         self.tables.clear();
         self.transactions.clear();
-        self.groups_since_checkpoint = 0;
+        self.committed_requests_since_checkpoint = 0;
     }
 }
+
+const CHECKPOINT_COMMIT_INTERVAL: usize = 1024;
 
 struct ActorCoordination {
     snapshot_barrier: Arc<tokio::sync::RwLock<()>>,
@@ -5798,10 +5811,6 @@ async fn write_actor(
     actor_coordination: Arc<ActorCoordination>,
 ) {
     const MAX_GROUP_COMMIT_REQUESTS: usize = 128;
-    // WAL fsync is the durability boundary. Folding the WAL-backed memtable
-    // less often keeps foreground actor writes from repeatedly paying the COW
-    // checkpoint cost while bounding restart replay to a small number of groups.
-    const CHECKPOINT_GROUP_INTERVAL: usize = 64;
     let mut deferred = None;
     let mut wal_encode_buf = Vec::with_capacity(4096);
     let mut shutdown = actor_coordination.shutdown.clone();
@@ -6043,6 +6052,7 @@ async fn write_actor(
             if staged.is_empty() {
                 continue;
             }
+            let committed_requests = staged.len();
 
             if commands_are_memory_dml(&staged[0].commands, &databases) {
                 // MEMORY is deliberately nontransactional and non-durable in
@@ -6284,10 +6294,9 @@ async fn write_actor(
             let mut checkpoint = actor_coordination.checkpoint_state.lock();
             checkpoint.tables.extend(deferred_tables);
             if group_succeeded {
-                checkpoint.transactions.push(group_id);
+                checkpoint.record_successful_group(group_id, committed_requests);
             }
-            checkpoint.groups_since_checkpoint += 1;
-            if checkpoint.groups_since_checkpoint >= CHECKPOINT_GROUP_INTERVAL {
+            if checkpoint.checkpoint_due() {
                 let checkpoint_started = Instant::now();
                 match checkpoint_actor_state(
                     &databases,
@@ -10032,6 +10041,21 @@ mod tests {
         assert_eq!(BufferPool::parse_size("512M"), 512 * 1024 * 1024);
         assert_eq!(BufferPool::parse_size("64K"), 64 * 1024);
         assert_eq!(BufferPool::parse_size("1024"), 1024);
+    }
+
+    #[test]
+    fn actor_checkpoint_threshold_tracks_committed_requests() {
+        let mut state = ActorCheckpointState::default();
+        state.record_successful_group(7, CHECKPOINT_COMMIT_INTERVAL - 1);
+        assert!(!state.checkpoint_due());
+
+        state.record_successful_group(8, 1);
+        assert!(state.checkpoint_due());
+        assert_eq!(state.transactions, vec![7, 8]);
+
+        state.clear();
+        assert!(!state.checkpoint_due());
+        assert!(state.transactions.is_empty());
     }
 
     #[test]

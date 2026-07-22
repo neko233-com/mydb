@@ -11,7 +11,7 @@ async fn test_default_config() {
     assert_eq!(config.server.max_connections, 1000);
     assert_eq!(config.storage.engine, "neko233");
     assert_eq!(config.storage.buffer_pool_size, "1G");
-    assert_eq!(config.storage.group_commit_window_us, 0);
+    assert_eq!(config.storage.group_commit_window_us, 250);
     assert_eq!(config.logging.level, "info");
     assert!(config.security.local_infile);
     assert_eq!(config.security.max_load_data_size, 1024 * 1024 * 1024);

@@ -198,7 +198,7 @@ fn default_page_size() -> u32 {
 }
 
 fn default_group_commit_window_us() -> u64 {
-    0
+    250
 }
 fn default_max_memory() -> String {
     "1G".to_string()

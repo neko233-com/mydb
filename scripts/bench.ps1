@@ -1,55 +1,138 @@
 param(
     [switch]$SkipBuild,
-    [switch]$SkipDocker,
-    [string]$Url = "mysql://root:root@127.0.0.1:3306",
-    [int]$WaitTimeoutSec = 120
+    [string]$Url = "mysql://root:root@127.0.0.1:13307",
+    [string]$MySqlUrl = "mysql://root:root@127.0.0.1:3306",
+    [int]$WaitTimeoutSec = 120,
+    [ValidateRange(1, 5)]
+    [int]$Samples = 3
 )
 
 $ErrorActionPreference = "Stop"
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $ProjectRoot
 
-try {
-    $BenchUri = [Uri]$Url
-} catch {
-    Write-Host "FAILED: Invalid benchmark URL: $Url" -ForegroundColor Red
-    exit 1
-}
-$BenchHost = $BenchUri.Host
-$BenchPort = if ($BenchUri.IsDefaultPort) { 3306 } else { $BenchUri.Port }
-if ([string]::IsNullOrWhiteSpace($BenchHost) -or $BenchPort -le 0) {
-    Write-Host "FAILED: Benchmark URL must include a host and port: $Url" -ForegroundColor Red
-    exit 1
-}
-
-$LogDir = "$ProjectRoot\target\bench\logs"
-$TmpDir = "$ProjectRoot\target\bench"
-New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
-New-Item -ItemType Directory -Force -Path $TmpDir | Out-Null
-
-function Write-Step($msg) {
-    Write-Host "`n=== $msg ===" -ForegroundColor Cyan
-}
-
-function Invoke-External($name, $exe, [string[]]$argList, $logTag) {
-    Write-Step $name
-    $outLog = "$LogDir\$logTag.stdout"
-    $errLog = "$LogDir\$logTag.stderr"
-    $p = Start-Process -FilePath $exe -ArgumentList $argList -Wait -NoNewWindow `
-        -RedirectStandardOutput $outLog -RedirectStandardError $errLog -PassThru
-    if ($p.ExitCode -ne 0) {
-        Write-Host "FAILED: $name (exit $($p.ExitCode))" -ForegroundColor Red
-        if (Test-Path $errLog) {
-            Write-Host "--- stderr (last 30 lines) ---" -ForegroundColor Red
-            Get-Content $errLog -Tail 30
-        }
-        if (Test-Path $outLog) {
-            Write-Host "--- stdout (last 10 lines) ---" -ForegroundColor Red
-            Get-Content $outLog -Tail 10
-        }
-        exit $p.ExitCode
+function Parse-BenchUrl([string]$Value, [string]$Name) {
+    try {
+        $uri = [Uri]$Value
+    } catch {
+        throw "$Name is not a valid URL: $Value"
     }
-    Write-Host "$name OK" -ForegroundColor Green
+    $port = if ($uri.IsDefaultPort) { 3306 } else { $uri.Port }
+    if ([string]::IsNullOrWhiteSpace($uri.Host) -or $port -le 0) {
+        throw "$Name must include a host and port: $Value"
+    }
+    return [pscustomobject]@{ Url = $Value; Host = $uri.Host; Port = $port }
+}
+
+$MyDbTarget = Parse-BenchUrl $Url "Url"
+$MySqlTarget = Parse-BenchUrl $MySqlUrl "MySqlUrl"
+if ($MyDbTarget.Host -eq $MySqlTarget.Host -and $MyDbTarget.Port -eq $MySqlTarget.Port) {
+    throw "MyDB and MySQL benchmark endpoints must differ"
+}
+
+$RunId = Get-Date -Format "yyyyMMdd-HHmmss"
+$BenchRoot = Join-Path $ProjectRoot "target\bench"
+$LogDir = Join-Path $BenchRoot "logs"
+$DataDir = Join-Path $BenchRoot "native-$RunId"
+$CheckpointCommitInterval = 1024
+New-Item -ItemType Directory -Force -Path $BenchRoot, $LogDir | Out-Null
+
+function Write-Step([string]$Message) {
+    Write-Host "`n=== $Message ===" -ForegroundColor Cyan
+}
+
+function Invoke-External([string]$Name, [string]$Exe, [string[]]$ArgList, [string]$LogTag) {
+    Write-Step $Name
+    $outLog = Join-Path $LogDir "$LogTag.stdout"
+    $errLog = Join-Path $LogDir "$LogTag.stderr"
+    $process = Start-Process -FilePath $Exe -ArgumentList $ArgList -Wait -NoNewWindow -PassThru `
+        -RedirectStandardOutput $outLog -RedirectStandardError $errLog
+    if ($process.ExitCode -ne 0) {
+        if (Test-Path $errLog) { Get-Content $errLog -Tail 40 }
+        if (Test-Path $outLog) { Get-Content $outLog -Tail 20 }
+        throw "$Name failed with exit code $($process.ExitCode)"
+    }
+}
+
+function Wait-Tcp([string]$ServerHost, [int]$ServerPort) {
+    Write-Step "Waiting for $ServerHost`:$ServerPort"
+    $deadline = (Get-Date).AddSeconds($WaitTimeoutSec)
+    while ((Get-Date) -lt $deadline) {
+        $tcp = $null
+        try {
+            $tcp = [System.Net.Sockets.TcpClient]::new()
+            $connect = $tcp.BeginConnect($ServerHost, $ServerPort, $null, $null)
+            if ($connect.AsyncWaitHandle.WaitOne(500, $false) -and $tcp.Connected) {
+                $tcp.EndConnect($connect)
+                return
+            }
+        } catch {
+        } finally {
+            if ($null -ne $tcp) { $tcp.Dispose() }
+        }
+        Start-Sleep -Milliseconds 200
+    }
+    throw "Timed out waiting for $ServerHost`:$ServerPort"
+}
+
+function Convert-BenchOutput([object[]]$Output, [string]$Tag) {
+    $raw = $Output | Out-String
+    [System.IO.File]::WriteAllText((Join-Path $BenchRoot "$Tag.raw"), $raw, [System.Text.UTF8Encoding]::new($false))
+    $start = $raw.IndexOf('{')
+    $end = $raw.LastIndexOf('}')
+    if ($start -lt 0 -or $end -le $start) {
+        throw "Benchmark $Tag produced no JSON result: $raw"
+    }
+    $json = $raw.Substring($start, $end - $start + 1)
+    [System.IO.File]::WriteAllText((Join-Path $BenchRoot "$Tag.json"), $json, [System.Text.UTF8Encoding]::new($false))
+    try {
+        return $json | ConvertFrom-Json
+    } catch {
+        throw "Benchmark $Tag returned invalid JSON: $($_.Exception.Message)"
+    }
+}
+
+function Invoke-Bench([string]$Target, [string[]]$BenchArgs, [string]$Tag) {
+    Write-Host "[$Target] $Tag" -ForegroundColor DarkGray
+    $output = & $BenchExe @BenchArgs 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        $output | ForEach-Object { Write-Host $_ }
+        throw "$Target benchmark $Tag failed with exit code $LASTEXITCODE"
+    }
+    return Convert-BenchOutput -Output $output -Tag $Tag
+}
+
+function Get-Median([object[]]$Values) {
+    $numbers = @($Values | ForEach-Object { [double]$_ } | Sort-Object)
+    $middle = [int][Math]::Floor($numbers.Count / 2)
+    if ($numbers.Count % 2 -eq 1) {
+        return $numbers[$middle]
+    }
+    return ($numbers[$middle - 1] + $numbers[$middle]) / 2
+}
+
+function Summarize([object[]]$Results) {
+    return [pscustomobject]@{
+        operations_per_second = Get-Median -Values @($Results | ForEach-Object { $_.operations_per_second })
+        write_transactions_p50_us = Get-Median -Values @($Results | ForEach-Object { $_.write_transactions_p50_us })
+        write_transactions_p95_us = Get-Median -Values @($Results | ForEach-Object { $_.write_transactions_p95_us })
+        write_transactions_p99_us = Get-Median -Values @($Results | ForEach-Object { $_.write_transactions_p99_us })
+        reads_p50_us = Get-Median -Values @($Results | ForEach-Object { $_.reads_p50_us })
+        verified_rows = Get-Median -Values @($Results | ForEach-Object { $_.verified_rows })
+    }
+}
+
+function Invoke-Scenario([string]$Name, [string[]]$ScenarioArgs) {
+    $mydbResults = @()
+    $mysqlResults = @()
+    for ($sample = 1; $sample -le $Samples; $sample++) {
+        $mydbResults += Invoke-Bench "MyDB" (@("--url", $MyDbTarget.Url, "--reconnect-every-transactions", "0", "--payload-bytes", "256") + $ScenarioArgs) "mydb-$Name-$sample"
+        $mysqlResults += Invoke-Bench "MySQL" (@("--url", $MySqlTarget.Url, "--reconnect-every-transactions", "0", "--payload-bytes", "256") + $ScenarioArgs) "mysql-$Name-$sample"
+    }
+    return [pscustomobject]@{
+        mydb = Summarize -Results $mydbResults
+        mysql = Summarize -Results $mysqlResults
+    }
 }
 
 if (-not $SkipBuild) {
@@ -59,211 +142,137 @@ if (-not $SkipBuild) {
     Invoke-External "cargo build --release" "cargo.exe" @("build", "--release", "-p", "mydb-server", "-p", "mydb-bench") "04_build"
 }
 
-if (-not $SkipDocker) {
-    foreach ($name in @("MYDB_ROOT_PASSWORD", "MYDB_ADMIN_PASSWORD")) {
-        if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) {
-            Write-Host "FAILED: $name must be set before Docker benchmark" -ForegroundColor Red
-            exit 1
-        }
-    }
-    if ([string]::IsNullOrWhiteSpace($env:MYDB_HOST_PORT)) {
-        $env:MYDB_HOST_PORT = "$BenchPort"
-    } elseif ([int]$env:MYDB_HOST_PORT -ne $BenchPort) {
-        Write-Host "FAILED: MYDB_HOST_PORT must match the benchmark URL port $BenchPort" -ForegroundColor Red
-        exit 1
-    }
-
-    Write-Step "docker compose up -d --build"
-    docker compose up -d --build
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host "FAILED: docker compose up" -ForegroundColor Red
-        exit 1
-    }
-
-    Write-Step "Waiting for MyDB on $BenchHost`:$BenchPort..."
-    $deadline = (Get-Date).AddSeconds($WaitTimeoutSec)
-    $ready = $false
-    while ((Get-Date) -lt $deadline) {
-        try {
-            $tcp = New-Object System.Net.Sockets.TcpClient
-            $iar = $tcp.BeginConnect($BenchHost, $BenchPort, $null, $null)
-            if ($iar.AsyncWaitHandle.WaitOne(2000, $false) -and $tcp.Connected) {
-                $tcp.EndConnect($iar)
-                $tcp.Close()
-                $ready = $true
-                break
-            }
-            $tcp.Close()
-        } catch {}
-        Start-Sleep -Seconds 2
-    }
-    if (-not $ready) {
-        Write-Host "FAILED: MyDB did not start within ${WaitTimeoutSec}s" -ForegroundColor Red
-        docker compose logs --tail=30
-        exit 1
-    }
-    Write-Host "MyDB is ready" -ForegroundColor Green
-    Start-Sleep -Seconds 3
+$BenchExe = Join-Path $ProjectRoot "target\release\mydb-bench.exe"
+$ServerExe = Join-Path $ProjectRoot "target\release\mydb-server.exe"
+if (-not (Test-Path $BenchExe) -or -not (Test-Path $ServerExe)) {
+    throw "Release binaries are missing; run without -SkipBuild"
 }
 
-$BenchExe = if ($IsWindows -or (-not $IsLinux -and -not $IsMacOS)) {
-    "$ProjectRoot\target\release\mydb-bench.exe"
-} else {
-    "$ProjectRoot/target/release/mydb-bench"
-}
+$httpPort = $MyDbTarget.Port + 1000
+if ($httpPort -gt 65535) { throw "MyDB port leaves no valid HTTP benchmark port" }
+$previousHttpPort = $env:MYDB_HTTP_PORT
+$previousDataDir = $env:MYDB_DATA_DIR
+$previousWindow = $env:MYDB_GROUP_COMMIT_WINDOW_US
+$previousRootPassword = $env:MYDB_ROOT_PASSWORD
+$previousAdminPassword = $env:MYDB_ADMIN_PASSWORD
+$serverProcess = $null
 
-if (-not (Test-Path $BenchExe)) {
-    Write-Host "Benchmark binary not found: $BenchExe" -ForegroundColor Red
-    Write-Host "Run with -SkipBuild only after building with -SkipBuild=$false first." -ForegroundColor Red
-    exit 1
-}
+try {
+    $env:MYDB_HTTP_PORT = "$httpPort"
+    $env:MYDB_DATA_DIR = $DataDir
+    $env:MYDB_GROUP_COMMIT_WINDOW_US = "250"
+    $env:MYDB_ROOT_PASSWORD = "root"
+    $env:MYDB_ADMIN_PASSWORD = "root"
+    $serverOut = Join-Path $LogDir "native-$RunId.stdout"
+    $serverErr = Join-Path $LogDir "native-$RunId.stderr"
 
-function Run-Bench($scenario, [string[]]$benchArgs, $outFile) {
-    Write-Step "Benchmark: $scenario"
-    $jsonPath = "$TmpDir\$outFile"
-    $allOutput = & $BenchExe @benchArgs 2>&1
-    $allOutput | Out-File -FilePath "$jsonPath.raw" -Encoding utf8
-    $jsonText = ($allOutput | Out-String)
-    $start = $jsonText.IndexOf('{')
-    $end = $jsonText.LastIndexOf('}')
-    if ($start -lt 0 -or $end -le $start) {
-        Write-Host "FAILED: Could not extract JSON from benchmark output" -ForegroundColor Red
-        $allOutput | ForEach-Object { Write-Host $_ }
-        exit 1
-    }
-    $jsonText = $jsonText.Substring($start, $end - $start + 1)
+    Write-Step "Starting native unlimited MyDB"
+    $serverProcess = Start-Process -FilePath $ServerExe -ArgumentList @("--config", "configs/default.yaml", "--port", "$($MyDbTarget.Port)", "--data-dir", $DataDir) `
+        -WorkingDirectory $ProjectRoot -WindowStyle Hidden -PassThru -RedirectStandardOutput $serverOut -RedirectStandardError $serverErr
+    Wait-Tcp $MyDbTarget.Host $MyDbTarget.Port
+    Wait-Tcp $MySqlTarget.Host $MySqlTarget.Port
+
+    $mysqlProbe = Invoke-Bench "MySQL" @("--url", $MySqlTarget.Url, "--probe-server") "mysql-probe"
+    Write-Step "Warmup"
+    $warmup = @("--actors", "8", "--table-count", "8", "--transaction-size", "10", "--writes-per-actor", "100", "--reads-per-actor", "0", "--write-mode", "actor-batch")
+    [void](Invoke-Bench "MyDB" (@("--url", $MyDbTarget.Url, "--reconnect-every-transactions", "0", "--payload-bytes", "256") + $warmup) "mydb-warmup")
+    [void](Invoke-Bench "MySQL" (@("--url", $MySqlTarget.Url, "--reconnect-every-transactions", "0", "--payload-bytes", "256") + $warmup) "mysql-warmup")
+
+    Write-Step "Benchmark: single-table fsync-per-commit"
+    $single = Invoke-Scenario "single" @("--actors", "1", "--table-count", "1", "--transaction-size", "1", "--writes-per-actor", "1000", "--reads-per-actor", "0")
+    Write-Step "Benchmark: 8-actor / 8-table P99 latency"
+    $concurrentP99 = Invoke-Scenario "concurrent-p99" @("--actors", "8", "--table-count", "8", "--transaction-size", "10", "--writes-per-actor", "500", "--reads-per-actor", "50")
+    Write-Step "Benchmark: 8-actor / 8-table group throughput"
+    $concurrentTp = Invoke-Scenario "concurrent-tp" @("--actors", "8", "--table-count", "8", "--transaction-size", "1", "--writes-per-actor", "1000", "--reads-per-actor", "0")
+
+    $metrics = ""
     try {
-        $jsonText | ConvertFrom-Json | Out-Null
+        $metrics = (Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:$httpPort/metrics" -TimeoutSec 5).Content
+        [System.IO.File]::WriteAllText((Join-Path $BenchRoot "mydb-metrics-$RunId.prom"), $metrics, [System.Text.UTF8Encoding]::new($false))
     } catch {
-        Write-Host "FAILED: Invalid benchmark JSON: $($_.Exception.Message)" -ForegroundColor Red
-        exit 1
+        Write-Warning "Could not collect MyDB metrics: $($_.Exception.Message)"
     }
-    $jsonText | Out-File -FilePath $jsonPath -Encoding utf8
-    Write-Host "Result saved to $jsonPath" -ForegroundColor Gray
-}
 
-$commonArgs = @("--url", $Url, "--reconnect-every-transactions", "0", "--payload-bytes", "256")
+    function Get-Metric([string]$Name) {
+        $match = [regex]::Match($metrics, "(?m)^$([regex]::Escape($Name))\\s+([0-9]+(?:\\.[0-9]+)?)$")
+        if ($match.Success) { return $match.Groups[1].Value }
+        return "n/a"
+    }
 
-Run-Bench "single-table fsync-per-commit" ($commonArgs + @(
-    "--actors", "1", "--table-count", "1", "--transaction-size", "1",
-    "--writes-per-actor", "1000", "--reads-per-actor", "0"
-)) "single.json"
+    $singleMyDbOps = [math]::Round($single.mydb.operations_per_second, 0)
+    $singleMySqlOps = [math]::Round($single.mysql.operations_per_second, 0)
+    $p99MyDbMs = [math]::Round($concurrentP99.mydb.write_transactions_p99_us / 1000.0, 1)
+    $p99MySqlMs = [math]::Round($concurrentP99.mysql.write_transactions_p99_us / 1000.0, 1)
+    $tpMyDbOps = [math]::Round($concurrentTp.mydb.operations_per_second, 0)
+    $tpMySqlOps = [math]::Round($concurrentTp.mysql.operations_per_second, 0)
+    $readMyDbUs = [math]::Round($concurrentP99.mydb.reads_p50_us, 0)
+    $readMySqlUs = [math]::Round($concurrentP99.mysql.reads_p50_us, 0)
+    $singleRatio = [math]::Round($single.mydb.operations_per_second / $single.mysql.operations_per_second, 2)
+    $p99Ratio = [math]::Round($concurrentP99.mysql.write_transactions_p99_us / $concurrentP99.mydb.write_transactions_p99_us, 2)
+    $tpRatio = [math]::Round($concurrentTp.mydb.operations_per_second / $concurrentTp.mysql.operations_per_second, 2)
+    $commitHash = (git rev-parse --short HEAD).Trim()
+    $dateStr = Get-Date -Format "yyyy-MM-dd"
+    $cpu = "{0}; {1} logical CPUs" -f $env:PROCESSOR_IDENTIFIER, [Environment]::ProcessorCount
 
-Run-Bench "8-actor / 8-table P99 latency (10 rows/tx, 50 reads)" ($commonArgs + @(
-    "--actors", "8", "--table-count", "8", "--transaction-size", "10",
-    "--writes-per-actor", "500", "--reads-per-actor", "50"
-)) "concurrent_p99.json"
-
-Run-Bench "8-actor / 8-table group commit throughput (1 row/tx)" ($commonArgs + @(
-    "--actors", "8", "--table-count", "8", "--transaction-size", "1",
-    "--writes-per-actor", "1000", "--reads-per-actor", "0"
-)) "concurrent_tp.json"
-
-function Get-Metric($jsonFile, $field) {
-    $text = Get-Content "$TmpDir\$jsonFile" -Raw
-    $obj = $text | ConvertFrom-Json
-    return $obj.$field
-}
-
-$singleOps = [math]::Round((Get-Metric "single.json" "operations_per_second"), 0)
-$concP99ms = [math]::Round((Get-Metric "concurrent_p99.json" "write_transactions_p99_us") / 1000.0, 1)
-$concOps = [math]::Round((Get-Metric "concurrent_tp.json" "operations_per_second"), 0)
-$readP50us = [math]::Round((Get-Metric "concurrent_p99.json" "reads_p50_us"), 0)
-
-$commitHash = (git rev-parse --short HEAD).Trim()
-$isDirty = -not [string]::IsNullOrWhiteSpace((git status --porcelain | Out-String))
-$revision = if ($isDirty) { "${commitHash}-dirty" } else { $commitHash }
-$dateStr = Get-Date -Format "yyyy-MM-dd"
-
-$mysqlSingleOps = 3318
-$mysqlConcP99 = 495.9
-$mysqlConcOps = 7315
-
-$singleRatio = [math]::Round($singleOps / $mysqlSingleOps, 2)
-$concP99Ratio = [math]::Round($mysqlConcP99 / $concP99ms, 1)
-$concOpsRatio = [math]::Round($concOps / $mysqlConcOps, 2)
-
-$bt = [char]96
-$b3 = "$bt$bt$bt"
-
-$report = @"
+    $bt = [char]96
+    $report = @"
 # MyDB 性能报告
 
-> ⚠️ 以下为开发机 Docker 限速回归数据，不代表物理生产硬件正式验收结论。正式性能验收需在 Ubuntu 24.04 物理机、双方同配置、I/O 限速条件下进行。
+> 本报告由 ${bt}scripts/bench.ps1${bt} 生成。MyDB 与 MySQL 均为同机实际服务、相同 ${bt}mydb-bench${bt} 负载；每项取 $Samples 次采样中位数。
 >
-> MySQL 数字是历史参考值；本脚本不启动或重测 MySQL，因此比例不是同轮环境对比结论。
->
-> 本文件由 ${bt}scripts/bench.ps1${bt} 自动生成，每次发布前必须重新运行。
+> MyDB 使用本机 release 进程、独立临时数据目录、无 Docker CPU/内存限制；MySQL 使用 ${bt}$($MySqlTarget.Host):$($MySqlTarget.Port)${bt} 的实际服务。基准仅创建并删除唯一命名的 ${bt}mydb_game_bench_*${bt} 临时库。
 
 ---
 
 ## 测试方法
 
-基准工具：${bt}mydb-bench${bt}（${bt}crates/mydb-bench${bt}）
-
-对比参考：MySQL 8.0.46（历史数据，${bt}innodb_flush_log_at_trx_commit=1${bt}）
-
 | 场景 | actors | tables | transaction_size | writes_per_actor | 说明 |
-|------|--------|--------|-----------------|------------------|------|
-| 单表写 (fsync-per-commit) | 1 | 1 | 1 | 1000 | 单连接单行 INSERT，每次 COMMIT 一次 fsync |
-| 8 actor / 8表 写 P99 延迟 | 8 | 8 | 10 | 500 | 高并发游戏负载，P99 尾延迟 |
-| 8 actor / 8表 Group Commit | 8 | 8 | 1 | 1000 | 并发写入自然批量聚合吞吐 |
-| 读 P50 延迟 | 8 | 8 | - | 50 reads/actor | 单连接点查主键延迟 |
+|------|--------|--------|------------------|------------------|------|
+| 单表写 | 1 | 1 | 1 | 1000 | 单连接单行事务，每次 COMMIT 持久化 |
+| 并发 P99 | 8 | 8 | 10 | 500 | 8 并发写、50 点查/actor |
+| 并发吞吐 | 8 | 8 | 1 | 1000 | 8000 次单行事务，测真实 group commit |
 
----
+## 当前实测
 
-## 当前版本性能
-
-### Git Revision: ${bt}${revision}${bt}
+### Git Revision: ${bt}$commitHash${bt}
 ### 测试日期: $dateStr
-### 测试环境: Docker（WSL2 后端，0.5 CPU / 512MiB 限速）
+### 测试环境: 本机 Windows；$cpu
+### MySQL: $($mysqlProbe.version) — $($mysqlProbe.version_comment)
+### MySQL 持久化设置: ${bt}innodb_flush_log_at_trx_commit=$($mysqlProbe.innodb_flush_log_at_trx_commit)${bt}, ${bt}sync_binlog=$($mysqlProbe.sync_binlog)${bt}, ${bt}transaction_isolation=$($mysqlProbe.transaction_isolation)${bt}
+### MyDB 设置: ${bt}group_commit_window_us=250${bt}, checkpoint 每 $CheckpointCommitInterval 个已提交请求
 
-| 场景 | MyDB | MySQL 8.0.46（历史参考） | 参考比 |
-|------|------|--------------|------|
-| 单表写 (fsync-per-commit) | ${singleOps} ops/s | ${mysqlSingleOps} ops/s | ${singleRatio}x |
-| 8 actor / 8表 写 P99 延迟 | ${concP99ms} ms | ${mysqlConcP99} ms | **${concP99Ratio}x faster** |
-| 8 actor / 8表 Group Commit | ${concOps} ops/s | ${mysqlConcOps} ops/s | ${concOpsRatio}x |
-| 读 P50 延迟 | ${readP50us} μs | - | - |
+| 场景 | MyDB | MySQL | MyDB / MySQL |
+|------|------|-------|---------------|
+| 单表写 | $singleMyDbOps ops/s | $singleMySqlOps ops/s | ${singleRatio}x |
+| 8 actor / 8表 写 P99 | $p99MyDbMs ms | $p99MySqlMs ms | ${p99Ratio}x（低更好） |
+| 8 actor / 8表 吞吐 | $tpMyDbOps ops/s | $tpMySqlOps ops/s | ${tpRatio}x |
+| 读 P50 | $readMyDbUs μs | $readMySqlUs μs | - |
 
----
+## MyDB 观测
 
-## 发布前更新流程
+- write groups: $(Get-Metric "mydb_group_commits_total")
+- grouped requests: $(Get-Metric "mydb_grouped_requests_total")
+- checkpoints: $(Get-Metric "mydb_checkpoints_total")
+- WAL sync total: $(Get-Metric "mydb_wal_sync_microseconds_total") μs
+- checkpoint total: $(Get-Metric "mydb_checkpoint_microseconds_total") μs
 
-${b3}bash
-# 自动化（推荐）
-pwsh -File scripts/bench.ps1
+## 性能原则
 
-# 或手动：
-# 1. cargo clippy --workspace --all-targets -- -D warnings
-# 2. cargo test --workspace
-# 3. cargo build --release -p mydb-server -p mydb-bench
-# 4. docker compose up -d --build
-# 5. cargo run -p mydb-bench --release -- --url mysql://root:root@127.0.0.1:3306 --actors 1 --table-count 1 --transaction-size 1 --writes-per-actor 1000 --reads-per-actor 0
-# 6. cargo run -p mydb-bench --release -- --url mysql://root:root@127.0.0.1:3306 --actors 8 --table-count 8 --transaction-size 10 --writes-per-actor 500 --reads-per-actor 50
-# 7. cargo run -p mydb-bench --release -- --url mysql://root:root@127.0.0.1:3306 --actors 8 --table-count 8 --transaction-size 1 --writes-per-actor 1000 --reads-per-actor 0
-${b3}
-
----
-
-## 设计目标
-
-MyDB 设计目标是**同资源、同持久化级别下达到 MySQL 10x 写性能**，不以关闭持久化换取数字。
-
-关键性能原则：
-- 每次提交仅一次 ${bt}sync_data()${bt} 顺序 fsync
-- 锁内不做序列化/分配
-- 自然批量优先，不人为引入延迟
-- 热路径零堆分配
+- 已确认提交必须由一次 ${bt}sync_data()${bt} WAL durability boundary 覆盖；不以关闭持久化换吞吐。
+- 默认 250μs Group Commit 窗口优先并发吞吐；${bt}0${bt} 是显式低延迟档，报告必须写明所用档位。
+- checkpoint 按已提交请求数触发，不与合批大小耦合；崩溃恢复、${bt}flush_consistent${bt}、shutdown 仍强制落盘。
+- MySQL 比较必须同机、实际运行、相同负载，并记录 MySQL 版本与持久化设置；禁止硬编码历史比值。
 "@
-
-$reportPath = "$ProjectRoot\性能报告.md"
-[System.IO.File]::WriteAllText($reportPath, $report, [System.Text.UTF8Encoding]::new($false))
-Write-Host "`nPerformance report written to: $reportPath" -ForegroundColor Green
-
-Write-Host "`n========== BENCHMARK SUMMARY ==========" -ForegroundColor Yellow
-Write-Host "Revision:            $revision ($dateStr)"
-Write-Host "Single-table write:  $singleOps ops/s (MySQL: $mysqlSingleOps, ratio: ${singleRatio}x)"
-Write-Host "8-actor P99 latency:  $concP99ms ms (MySQL historical: $mysqlConcP99 ms, reference: ${concP99Ratio}x faster)"
-Write-Host "8-actor throughput:   $concOps ops/s (MySQL historical: $mysqlConcOps, reference: ${concOpsRatio}x)"
-Write-Host "Read P50 latency:     $readP50us us"
-Write-Host "========================================" -ForegroundColor Yellow
+    [System.IO.File]::WriteAllText((Join-Path $ProjectRoot "性能报告.md"), $report, [System.Text.UTF8Encoding]::new($false))
+    Write-Host "`nPerformance report written to: $ProjectRoot\性能报告.md" -ForegroundColor Green
+    Write-Host "MyDB/MySQL throughput: $tpMyDbOps / $tpMySqlOps ops/s" -ForegroundColor Yellow
+} finally {
+    if ($null -ne $serverProcess -and -not $serverProcess.HasExited) {
+        Stop-Process -Id $serverProcess.Id -Force
+    }
+    $env:MYDB_HTTP_PORT = $previousHttpPort
+    $env:MYDB_DATA_DIR = $previousDataDir
+    $env:MYDB_GROUP_COMMIT_WINDOW_US = $previousWindow
+    $env:MYDB_ROOT_PASSWORD = $previousRootPassword
+    $env:MYDB_ADMIN_PASSWORD = $previousAdminPassword
+}
