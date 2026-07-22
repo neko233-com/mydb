@@ -199,6 +199,12 @@ try {
         return "n/a"
     }
 
+    $groupCommits = Get-Metric -Name "mydb_group_commits_total"
+    $groupedRequests = Get-Metric -Name "mydb_grouped_requests_total"
+    $checkpoints = Get-Metric -Name "mydb_checkpoints_total"
+    $walSyncMicros = Get-Metric -Name "mydb_wal_sync_microseconds_total"
+    $checkpointMicros = Get-Metric -Name "mydb_checkpoint_microseconds_total"
+
     $singleMyDbOps = [math]::Round($single.mydb.operations_per_second, 0)
     $singleMySqlOps = [math]::Round($single.mysql.operations_per_second, 0)
     $p99MyDbMs = [math]::Round($concurrentP99.mydb.write_transactions_p99_us / 1000.0, 1)
@@ -250,11 +256,11 @@ try {
 
 ## MyDB 观测
 
-- write groups: $(Get-Metric "mydb_group_commits_total")
-- grouped requests: $(Get-Metric "mydb_grouped_requests_total")
-- checkpoints: $(Get-Metric "mydb_checkpoints_total")
-- WAL sync total: $(Get-Metric "mydb_wal_sync_microseconds_total") μs
-- checkpoint total: $(Get-Metric "mydb_checkpoint_microseconds_total") μs
+- write groups: $groupCommits
+- grouped requests: $groupedRequests
+- checkpoints: $checkpoints
+- WAL sync total: $walSyncMicros μs
+- checkpoint total: $checkpointMicros μs
 
 ## 性能原则
 
