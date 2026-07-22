@@ -14,7 +14,7 @@ use parking_lot::RwLock;
 use rust_decimal::{Decimal, RoundingStrategy};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{debug, error, info};
 
 use mydb_wal::{WalReader, WalRecord, WalRecordType, WalWriter};
@@ -411,10 +411,6 @@ impl DiskManager {
     /// Write a page batch into one segment and issue one durable flush.
     pub fn write_pages(&self, table_name: &str, pages: &[Page]) -> Result<()> {
         self.write_pages_inner(table_name, pages, true)
-    }
-
-    fn write_pages_buffered(&self, table_name: &str, pages: &[Page]) -> Result<()> {
-        self.write_pages_inner(table_name, pages, false)
     }
 
     fn write_pages_inner(&self, table_name: &str, pages: &[Page], sync: bool) -> Result<()> {
@@ -993,20 +989,78 @@ fn move_event_between_catalogs_with_metadata_cas(
     )
 }
 
-pub fn table_engine_from_sql(sql: &str) -> TableEngine {
-    let options = sql
-        .rfind(')')
-        .map(|index| &sql[index + 1..])
-        .unwrap_or(sql)
-        .replace('=', " ");
-    let tokens = options.split_whitespace().collect::<Vec<_>>();
-    if tokens.windows(2).any(|pair| {
-        pair[0].eq_ignore_ascii_case("ENGINE") && pair[1].eq_ignore_ascii_case("MEMORY")
-    }) {
-        TableEngine::Memory
-    } else {
-        TableEngine::Neko233
+pub fn table_engine_from_sql(sql: &str) -> Result<TableEngine> {
+    let options = sql.rfind(')').map(|index| &sql[index + 1..]).unwrap_or(sql);
+    let tokens = table_option_tokens(options);
+    for (index, (token, quoted)) in tokens.iter().enumerate() {
+        if *quoted || !token.eq_ignore_ascii_case("ENGINE") {
+            continue;
+        }
+        let value_index = if tokens.get(index + 1).is_some_and(|(value, _)| value == "=") {
+            index + 1
+        } else {
+            index
+        };
+        let engine = tokens
+            .get(value_index + 1)
+            .map(|(value, _)| value.as_str())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("Unknown storage engine ''"))?;
+        if engine.eq_ignore_ascii_case("INNODB") {
+            return Ok(TableEngine::Neko233);
+        }
+        if engine.eq_ignore_ascii_case("MEMORY") {
+            return Ok(TableEngine::Memory);
+        }
+        anyhow::bail!("Unknown storage engine '{}'", engine);
     }
+    Ok(TableEngine::Neko233)
+}
+
+fn table_option_tokens(value: &str) -> Vec<(String, bool)> {
+    let mut tokens = Vec::new();
+    let mut characters = value.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character.is_whitespace() || character == ';' {
+            continue;
+        }
+        if character == '=' {
+            tokens.push(("=".to_string(), false));
+            continue;
+        }
+        if matches!(character, '\'' | '"' | '`') {
+            let mut token = String::new();
+            while let Some(next) = characters.next() {
+                if next == character {
+                    if characters.peek().copied() == Some(character) {
+                        token.push(next);
+                        characters.next();
+                        continue;
+                    }
+                    break;
+                }
+                if next == '\\' && character != '`' {
+                    if let Some(escaped) = characters.next() {
+                        token.push(escaped);
+                    }
+                    continue;
+                }
+                token.push(next);
+            }
+            tokens.push((token, true));
+            continue;
+        }
+        let mut token = String::from(character);
+        while let Some(next) = characters.peek().copied() {
+            if next.is_whitespace() || matches!(next, '=' | ';') {
+                break;
+            }
+            token.push(next);
+            characters.next();
+        }
+        tokens.push((token, false));
+    }
+    tokens
 }
 
 /// MySQL's MEMORY engine keeps table metadata but loses every row on restart.
@@ -1016,7 +1070,7 @@ pub fn is_memory_schema(schema: &TableSchema) -> bool {
         || schema
             .create_sql
             .as_deref()
-            .is_some_and(|sql| table_engine_from_sql(sql) == TableEngine::Memory)
+            .is_some_and(|sql| matches!(table_engine_from_sql(sql), Ok(TableEngine::Memory)))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1970,7 +2024,7 @@ impl Database {
             return Ok(last_insert_id);
         }
 
-        let mut first_row_in_pending: usize = 0;
+        let first_row_in_pending: usize;
         let mut needs_init_indexes = false;
         let mut existing_rows_count: usize = 0;
         {
@@ -2023,34 +2077,6 @@ impl Database {
         );
 
         Ok(last_insert_id)
-    }
-
-    fn rebuild_table_page_index(&self, table_name: &str, schema: &TableSchema, pages: &[Page]) {
-        let mut page_index = self.row_page_index.write();
-        let mut value_index = self.row_value_index.write();
-        for column in indexed_columns(schema) {
-            for key in page_index
-                .keys()
-                .filter(|(t, c, _)| t == table_name && c == column)
-                .cloned()
-                .collect::<Vec<_>>()
-            {
-                page_index.remove(&key);
-            }
-            for key in value_index
-                .keys()
-                .filter(|(t, c, _)| t == table_name && c == column)
-                .cloned()
-                .collect::<Vec<_>>()
-            {
-                value_index.remove(&key);
-            }
-        }
-        drop(page_index);
-        drop(value_index);
-        for page in pages {
-            self.add_row_page_index(table_name, schema, page);
-        }
     }
 
     fn scan_table_from_disk_only(&self, table_name: &str) -> Result<Vec<Row>> {
@@ -2560,8 +2586,16 @@ impl Database {
             table.generation = marker.new_generation;
         }
         self.pending_rewrites.write().remove(table_name);
-        self.buffer_pool.clear();
-        self.rebuild_all_indexes()?;
+        let namespace = self.page_namespace(table_name);
+        self.buffer_pool.clear_namespace(&namespace);
+        for page in &pages {
+            self.buffer_pool
+                .insert_table_page(&namespace, page.clone());
+        }
+        self.replace_table_logical_indexes(table_name, &schema, &rows);
+        for page in &pages {
+            self.add_row_page_index(table_name, &schema, page);
+        }
         Ok(())
     }
 
@@ -4909,20 +4943,22 @@ fn decode_wal_batch(payload: &[u8]) -> Result<WalBatch> {
     Ok(batch)
 }
 
-fn encode_wal_group(transactions: &[&[WriteCommand]]) -> Result<Vec<u8>> {
+fn encode_wal_group_into(buf: &mut Vec<u8>, transactions: &[&[WriteCommand]]) -> Result<()> {
     let committed_unix_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    let encoded = bincode_fast().serialize(&WalGroupRefV2 {
-        version: WAL_GROUP_VERSION,
-        committed_unix_ms,
-        transactions,
-    })?;
-    let mut payload = Vec::with_capacity(WAL_GROUP_BINARY_MAGIC_V3.len() + encoded.len());
-    payload.extend_from_slice(WAL_GROUP_BINARY_MAGIC_V3);
-    payload.extend_from_slice(&encoded);
-    Ok(payload)
+    buf.clear();
+    buf.extend_from_slice(WAL_GROUP_BINARY_MAGIC_V3);
+    bincode_fast().serialize_into(
+        &mut *buf,
+        &WalGroupRefV2 {
+            version: WAL_GROUP_VERSION,
+            committed_unix_ms,
+            transactions,
+        },
+    )?;
+    Ok(())
 }
 
 fn decode_wal_group(payload: &[u8]) -> Result<WalGroup> {
@@ -5052,6 +5088,7 @@ struct ActorCoordination {
     snapshot_barrier: Arc<tokio::sync::RwLock<()>>,
     checkpoint_state: parking_lot::Mutex<ActorCheckpointState>,
     group_commit_window: Duration,
+    shutdown: watch::Receiver<bool>,
 }
 
 pub struct StorageStats {
@@ -5139,8 +5176,19 @@ pub struct StorageEngineManager {
     wal_writer: Arc<parking_lot::Mutex<WalWriter>>,
     data_dir: PathBuf,
     writer_tx: mpsc::Sender<ActorRequest>,
+    actor_shutdown: watch::Sender<bool>,
+    actor_thread: Option<std::thread::JoinHandle<()>>,
     stats: Arc<StorageStats>,
     actor_coordination: Arc<ActorCoordination>,
+}
+
+impl Drop for StorageEngineManager {
+    fn drop(&mut self) {
+        let _ = self.actor_shutdown.send(true);
+        if let Some(actor_thread) = self.actor_thread.take() {
+            let _ = actor_thread.join();
+        }
+    }
 }
 
 impl StorageEngineManager {
@@ -5151,7 +5199,7 @@ impl StorageEngineManager {
     pub fn try_new(data_dir: PathBuf, page_size: usize, buffer_pool_size: &str) -> Result<Self> {
         // Keep embedding callers on the historical immediate-commit path.
         // mydb-server supplies its configured collection window explicitly.
-        Self::try_new_with_actor_mode(data_dir, page_size, buffer_pool_size, Duration::ZERO, false)
+        Self::try_new_with_actor_mode(data_dir, page_size, buffer_pool_size, Duration::ZERO)
     }
 
     pub fn try_new_with_group_commit_window(
@@ -5160,13 +5208,7 @@ impl StorageEngineManager {
         buffer_pool_size: &str,
         group_commit_window: Duration,
     ) -> Result<Self> {
-        Self::try_new_with_actor_mode(
-            data_dir,
-            page_size,
-            buffer_pool_size,
-            group_commit_window,
-            true,
-        )
+        Self::try_new_with_actor_mode(data_dir, page_size, buffer_pool_size, group_commit_window)
     }
 
     fn try_new_with_actor_mode(
@@ -5174,7 +5216,6 @@ impl StorageEngineManager {
         page_size: usize,
         buffer_pool_size: &str,
         group_commit_window: Duration,
-        dedicated_actor: bool,
     ) -> Result<Self> {
         let buffer_pool = Arc::new(BufferPool::new(page_size, buffer_pool_size));
 
@@ -5184,10 +5225,12 @@ impl StorageEngineManager {
 
         let databases = Arc::new(RwLock::new(HashMap::new()));
         let stats = Arc::new(StorageStats::default());
+        let (actor_shutdown, actor_shutdown_rx) = watch::channel(false);
         let actor_coordination = Arc::new(ActorCoordination {
             snapshot_barrier: Arc::new(tokio::sync::RwLock::new(())),
             checkpoint_state: parking_lot::Mutex::new(ActorCheckpointState::default()),
             group_commit_window,
+            shutdown: actor_shutdown_rx,
         });
         let (writer_tx, writer_rx) = mpsc::channel(8192);
         let actor_databases = databases.clone();
@@ -5205,23 +5248,12 @@ impl StorageEngineManager {
             actor_stats,
             actor_actor_coordination,
         );
-        if dedicated_actor {
-            let actor_runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?;
-            std::thread::Builder::new()
-                .name("mydb-write-actor".into())
-                .spawn(move || actor_runtime.block_on(actor))?;
-        } else if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(actor);
-        } else {
-            let actor_runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?;
-            std::thread::Builder::new()
-                .name("mydb-write-actor".into())
-                .spawn(move || actor_runtime.block_on(actor))?;
-        }
+        let actor_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let actor_thread = std::thread::Builder::new()
+            .name("mydb-write-actor".into())
+            .spawn(move || actor_runtime.block_on(actor))?;
 
         Ok(Self {
             databases,
@@ -5229,6 +5261,8 @@ impl StorageEngineManager {
             wal_writer,
             data_dir,
             writer_tx,
+            actor_shutdown,
+            actor_thread: Some(actor_thread),
             stats,
             actor_coordination,
         })
@@ -5392,9 +5426,9 @@ impl StorageEngineManager {
                     }
                 }
             }
-            let mut applied_record =
-                WalRecord::new(0, WalRecordType::Applied, tx_id, "", Vec::new());
-            self.wal_writer.lock().append(&mut applied_record)?;
+            let mut wal = self.wal_writer.lock();
+            wal.append_raw(WalRecordType::Applied as u8, tx_id, "", &[])?;
+            drop(wal);
             recovered += 1;
         }
         if recovered > 0 {
@@ -5769,10 +5803,27 @@ async fn write_actor(
     // checkpoint cost while bounding restart replay to a small number of groups.
     const CHECKPOINT_GROUP_INTERVAL: usize = 64;
     let mut deferred = None;
-    loop {
+    let mut wal_encode_buf = Vec::with_capacity(4096);
+    let mut shutdown = actor_coordination.shutdown.clone();
+    'actor: loop {
+        if *shutdown.borrow() {
+            break;
+        }
         let request = match deferred.take() {
             Some(request) => Some(request),
-            None => receiver.recv().await,
+            None => {
+                tokio::select! {
+                    biased;
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() {
+                            None
+                        } else {
+                            continue;
+                        }
+                    }
+                    request = receiver.recv() => request,
+                }
+            }
         };
         let Some(request) = request else {
             break;
@@ -5786,11 +5837,16 @@ async fn write_actor(
         };
         // A backup takes the exclusive side only at group boundaries. Tokio's
         // fair lock prevents a continuous write stream from starving it.
-        let _snapshot_read_guard = actor_coordination
-            .snapshot_barrier
-            .clone()
-            .read_owned()
-            .await;
+        let _snapshot_read_guard = tokio::select! {
+            biased;
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break 'actor;
+                }
+                continue;
+            }
+            guard = actor_coordination.snapshot_barrier.clone().read_owned() => guard,
+        };
         let mut pending = VecDeque::with_capacity(MAX_GROUP_COMMIT_REQUESTS);
         pending.push_back(PendingWrite {
             commands: first.commands,
@@ -5813,21 +5869,45 @@ async fn write_actor(
                 Err(_) => break,
             }
         }
-        // The actor runs on its own runtime, so ready network tasks can arrive
-        // after the initial nonblocking drain. Wait a bounded interval to turn
-        // concurrent commits into one durable WAL fsync. A zero window keeps
-        // the legacy immediate-commit behavior for latency-sensitive setups.
         if !actor_coordination.group_commit_window.is_zero() {
             let group_deadline =
                 tokio::time::Instant::now() + actor_coordination.group_commit_window;
             while pending.len() < MAX_GROUP_COMMIT_REQUESTS && deferred.is_none() {
-                match tokio::time::timeout_at(group_deadline, receiver.recv()).await {
-                    Ok(Some(ActorRequest::Write(request))) => pending.push_back(PendingWrite {
-                        commands: request.commands,
-                        prepared: request.prepared,
-                        last_insert_id: 0,
-                        reply: request.reply,
-                    }),
+                let next_request = tokio::select! {
+                    biased;
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() {
+                            break 'actor;
+                        }
+                        continue;
+                    }
+                    request = tokio::time::timeout_at(group_deadline, receiver.recv()) => request,
+                };
+                match next_request {
+                    Ok(Some(ActorRequest::Write(request))) => {
+                        pending.push_back(PendingWrite {
+                            commands: request.commands,
+                            prepared: request.prepared,
+                            last_insert_id: 0,
+                            reply: request.reply,
+                        });
+                        while pending.len() < MAX_GROUP_COMMIT_REQUESTS && deferred.is_none() {
+                            match receiver.try_recv() {
+                                Ok(ActorRequest::Write(request)) => {
+                                    pending.push_back(PendingWrite {
+                                        commands: request.commands,
+                                        prepared: request.prepared,
+                                        last_insert_id: 0,
+                                        reply: request.reply,
+                                    });
+                                }
+                                Ok(request @ ActorRequest::Prepare(_)) => {
+                                    deferred = Some(request);
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                    }
                     Ok(Some(request @ ActorRequest::Prepare(_))) => {
                         deferred = Some(request);
                     }
@@ -6015,28 +6095,28 @@ async fn write_actor(
                 .iter()
                 .map(|request| request.commands.as_slice())
                 .collect();
-            let payload = match encode_wal_group(&transactions) {
-                Ok(payload) => payload,
-                Err(error) => {
-                    let message = error.to_string();
-                    for request in staged {
-                        stats.queue_depth.fetch_sub(1, Ordering::Relaxed);
-                        let result = Err(anyhow::anyhow!("WAL encode failed: {message}"));
-                        record_write_result(&stats, &result);
-                        let _ = request.reply.send(result);
-                    }
-                    continue;
+            if let Err(error) = encode_wal_group_into(&mut wal_encode_buf, &transactions) {
+                let message = error.to_string();
+                for request in staged {
+                    stats.queue_depth.fetch_sub(1, Ordering::Relaxed);
+                    let result = Err(anyhow::anyhow!("WAL encode failed: {message}"));
+                    record_write_result(&stats, &result);
+                    let _ = request.reply.send(result);
                 }
-            };
+                continue;
+            }
             let wal_result = (|| -> Result<u64> {
                 let mut wal = wal_writer.lock();
                 let group_id = wal.next_lsn();
                 for request in &mut staged {
                     request.tx_id = group_id;
                 }
-                let mut group =
-                    WalRecord::new(0, WalRecordType::GroupCommit, group_id, "", payload);
-                let lsn = wal.append(&mut group)?;
+                let lsn = wal.append_raw(
+                    WalRecordType::GroupCommit as u8,
+                    group_id,
+                    "",
+                    &wal_encode_buf,
+                )?;
                 debug_assert_eq!(lsn, group_id);
                 wal.sync()?;
                 Ok(group_id)
@@ -6350,8 +6430,7 @@ fn checkpoint_actor_state(
     }
     let mut wal = wal_writer.lock();
     for tx_id in transactions {
-        let mut applied = WalRecord::new(0, WalRecordType::Applied, *tx_id, "", Vec::new());
-        wal.append(&mut applied)?;
+        wal.append_raw(WalRecordType::Applied as u8, *tx_id, "", &[])?;
     }
     wal.sync()
 }
@@ -9892,14 +9971,9 @@ mod tests {
         let mut wal = manager.wal_writer.lock();
         let tx_id = wal.next_lsn();
         let transaction_refs = transactions.iter().map(Vec::as_slice).collect::<Vec<_>>();
-        let mut group = WalRecord::new(
-            0,
-            WalRecordType::GroupCommit,
-            tx_id,
-            "",
-            encode_wal_group(&transaction_refs).unwrap(),
-        );
-        wal.append(&mut group).unwrap();
+        let mut buf = Vec::new();
+        encode_wal_group_into(&mut buf, &transaction_refs).unwrap();
+        wal.append_raw(WalRecordType::GroupCommit as u8, tx_id, "", &buf).unwrap();
         wal.sync().unwrap();
         tx_id
     }
@@ -10204,6 +10278,7 @@ mod tests {
             .execute_write(insert_command("corrupt_pages", "1"))
             .await
             .unwrap();
+        manager.flush().unwrap();
         drop(manager);
 
         let segment = temp.path().join("game/corrupt_pages/pages.dat");
@@ -10254,9 +10329,10 @@ mod tests {
         assert_eq!(decoded.transactions.len(), 1);
         assert_eq!(decoded.committed_unix_ms, None);
 
-        let current = encode_wal_group(&[&[insert_command("a", "2")]]).unwrap();
-        assert!(current.starts_with(WAL_GROUP_BINARY_MAGIC_V3));
-        assert!(decode_wal_group(&current)
+        let mut buf = Vec::new();
+        encode_wal_group_into(&mut buf, &[&[insert_command("a", "2")]]).unwrap();
+        assert!(buf.starts_with(WAL_GROUP_BINARY_MAGIC_V3));
+        assert!(decode_wal_group(&buf)
             .unwrap()
             .committed_unix_ms
             .is_some());
@@ -10394,7 +10470,6 @@ mod tests {
         right.unwrap();
         assert_eq!(manager.stats().group_commits, groups_before + 1);
         drop(manager);
-        tokio::task::yield_now().await;
 
         let restarted = StorageEngineManager::new(temp.path().to_path_buf(), 16384, "4M");
         restarted.init().await.unwrap();

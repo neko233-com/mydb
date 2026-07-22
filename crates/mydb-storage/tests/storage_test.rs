@@ -695,6 +695,7 @@ async fn test_actor_batch_packs_rows_into_shared_pages() {
         })
         .collect();
     manager.execute_batch(commands).await.unwrap();
+    manager.flush_consistent().await.unwrap();
 
     assert_eq!(manager.scan_table("game", "events").unwrap().len(), 100);
     let page_files = std::fs::read_dir(tmp.path().join("game/events"))
@@ -800,6 +801,7 @@ async fn test_storage_cleanup_only_removes_unreferenced_page_directories() {
         })
         .await
         .unwrap();
+    manager.flush_consistent().await.unwrap();
 
     let database = manager.get_database("game").unwrap();
     database.tables.write().remove("orphaned");
