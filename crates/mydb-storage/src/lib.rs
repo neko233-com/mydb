@@ -14,7 +14,7 @@ use parking_lot::RwLock;
 use rust_decimal::{Decimal, RoundingStrategy};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{oneshot, Notify};
 use tracing::{debug, error, info};
 
 use mydb_wal::{WalReader, WalRecord, WalRecordType, WalWriter};
@@ -4269,21 +4269,10 @@ pub struct WriteResult {
     pub last_insert_id: u64,
 }
 
-struct WriteRequest {
-    commands: Vec<WriteCommand>,
-    prepared: bool,
-    reply: oneshot::Sender<Result<WriteResult>>,
-}
-
 struct PrepareRequest {
     commands: Vec<WriteCommand>,
     prepared_prefix_len: usize,
     reply: oneshot::Sender<Result<PreparedTransactionBatch>>,
-}
-
-enum ActorRequest {
-    Write(WriteRequest),
-    Prepare(PrepareRequest),
 }
 
 #[derive(Debug)]
@@ -5069,6 +5058,16 @@ struct PendingWrite {
     reply: oneshot::Sender<Result<WriteResult>>,
 }
 
+/// Leader/follower commit coordination state. A single `Mutex` guards both the
+/// pending write queue and the `active` leadership flag so that enqueue and
+/// leader-exit are atomic with respect to each other: a writer only refrains
+/// from becoming leader when it is guaranteed the current leader will drain
+/// its write, which prevents any queued write from being orphaned.
+struct CommitState {
+    queue: VecDeque<PendingWrite>,
+    active: bool,
+}
+
 #[derive(Default)]
 struct ActorCheckpointState {
     tables: HashSet<(String, String)>,
@@ -5101,7 +5100,6 @@ struct ActorCoordination {
     snapshot_barrier: Arc<tokio::sync::RwLock<()>>,
     checkpoint_state: parking_lot::Mutex<ActorCheckpointState>,
     group_commit_window: Duration,
-    shutdown: watch::Receiver<bool>,
 }
 
 pub struct StorageStats {
@@ -5188,18 +5186,34 @@ pub struct StorageEngineManager {
     buffer_pool: Arc<BufferPool>,
     wal_writer: Arc<parking_lot::Mutex<WalWriter>>,
     data_dir: PathBuf,
-    writer_tx: mpsc::Sender<ActorRequest>,
-    actor_shutdown: watch::Sender<bool>,
-    actor_thread: Option<std::thread::JoinHandle<()>>,
+    commit_state: parking_lot::Mutex<CommitState>,
+    commit_notify: Notify,
     stats: Arc<StorageStats>,
     actor_coordination: Arc<ActorCoordination>,
 }
 
 impl Drop for StorageEngineManager {
     fn drop(&mut self) {
-        let _ = self.actor_shutdown.send(true);
-        if let Some(actor_thread) = self.actor_thread.take() {
-            let _ = actor_thread.join();
+        // Best-effort final checkpoint so committed groups are folded into the
+        // data files. Only runs when no commit leader is in flight; otherwise
+        // the in-progress leader (or a subsequent reopen via WAL replay) covers
+        // durability, since every group is fsync'd to WAL before it applies.
+        if let Some(mut state) = self.commit_state.try_lock() {
+            if state.queue.is_empty() {
+                state.active = true;
+                drop(state);
+                let checkpoint = self.actor_coordination.checkpoint_state.lock();
+                if !checkpoint.transactions.is_empty() {
+                    if let Err(error) = checkpoint_actor_state(
+                        &self.databases,
+                        &self.wal_writer,
+                        &checkpoint.tables,
+                        &checkpoint.transactions,
+                    ) {
+                        error!("final checkpoint failed; WAL remains authoritative: {error}");
+                    }
+                }
+            }
         }
     }
 }
@@ -5212,7 +5226,7 @@ impl StorageEngineManager {
     pub fn try_new(data_dir: PathBuf, page_size: usize, buffer_pool_size: &str) -> Result<Self> {
         // Keep embedding callers on the historical immediate-commit path.
         // mydb-server supplies its configured collection window explicitly.
-        Self::try_new_with_actor_mode(data_dir, page_size, buffer_pool_size, Duration::ZERO)
+        Self::try_new_with_coordinator(data_dir, page_size, buffer_pool_size, Duration::ZERO)
     }
 
     pub fn try_new_with_group_commit_window(
@@ -5221,65 +5235,42 @@ impl StorageEngineManager {
         buffer_pool_size: &str,
         group_commit_window: Duration,
     ) -> Result<Self> {
-        Self::try_new_with_actor_mode(data_dir, page_size, buffer_pool_size, group_commit_window)
+        Self::try_new_with_coordinator(data_dir, page_size, buffer_pool_size, group_commit_window)
     }
 
-    fn try_new_with_actor_mode(
+    fn try_new_with_coordinator(
         data_dir: PathBuf,
         page_size: usize,
         buffer_pool_size: &str,
         group_commit_window: Duration,
     ) -> Result<Self> {
-        let buffer_pool = Arc::new(BufferPool::new(page_size, buffer_pool_size));
+    let buffer_pool = Arc::new(BufferPool::new(page_size, buffer_pool_size));
 
-        // Initialize WAL
-        let wal_dir = data_dir.join("wal");
-        let wal_writer = Arc::new(parking_lot::Mutex::new(WalWriter::open(wal_dir, None)?));
+    let wal_dir = data_dir.join("wal");
+    let wal_writer = Arc::new(parking_lot::Mutex::new(WalWriter::open(wal_dir, None)?));
 
-        let databases = Arc::new(RwLock::new(HashMap::new()));
-        let stats = Arc::new(StorageStats::default());
-        let (actor_shutdown, actor_shutdown_rx) = watch::channel(false);
-        let actor_coordination = Arc::new(ActorCoordination {
-            snapshot_barrier: Arc::new(tokio::sync::RwLock::new(())),
-            checkpoint_state: parking_lot::Mutex::new(ActorCheckpointState::default()),
-            group_commit_window,
-            shutdown: actor_shutdown_rx,
-        });
-        let (writer_tx, writer_rx) = mpsc::channel(8192);
-        let actor_databases = databases.clone();
-        let actor_buffer_pool = buffer_pool.clone();
-        let actor_wal_writer = wal_writer.clone();
-        let actor_data_dir = data_dir.clone();
-        let actor_stats = stats.clone();
-        let actor_actor_coordination = actor_coordination.clone();
-        let actor = write_actor(
-            writer_rx,
-            actor_databases,
-            actor_buffer_pool,
-            actor_wal_writer,
-            actor_data_dir,
-            actor_stats,
-            actor_actor_coordination,
-        );
-        let actor_runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
-        let actor_thread = std::thread::Builder::new()
-            .name("mydb-write-actor".into())
-            .spawn(move || actor_runtime.block_on(actor))?;
+    let databases = Arc::new(RwLock::new(HashMap::new()));
+    let stats = Arc::new(StorageStats::default());
+    let actor_coordination = Arc::new(ActorCoordination {
+        snapshot_barrier: Arc::new(tokio::sync::RwLock::new(())),
+        checkpoint_state: parking_lot::Mutex::new(ActorCheckpointState::default()),
+        group_commit_window,
+    });
 
-        Ok(Self {
-            databases,
-            buffer_pool,
-            wal_writer,
-            data_dir,
-            writer_tx,
-            actor_shutdown,
-            actor_thread: Some(actor_thread),
-            stats,
-            actor_coordination,
-        })
-    }
+    Ok(Self {
+        databases,
+        buffer_pool,
+        wal_writer,
+        data_dir,
+        commit_state: parking_lot::Mutex::new(CommitState {
+            queue: VecDeque::new(),
+            active: false,
+        }),
+        commit_notify: Notify::new(),
+        stats,
+        actor_coordination,
+    })
+}
 
     pub async fn init(&self) -> Result<()> {
         // Create directories
@@ -5482,22 +5473,36 @@ impl StorageEngineManager {
     ) -> Result<WriteResult> {
         let (reply, result) = oneshot::channel();
         self.stats.queue_depth.fetch_add(1, Ordering::Relaxed);
-        if self
-            .writer_tx
-            .send(ActorRequest::Write(WriteRequest {
+        // Enqueue and try to claim leadership under a single lock so a writer
+        // never enqueues a write the active leader will not drain.
+        let became_leader = {
+            let mut state = self.commit_state.lock();
+            state.queue.push_back(PendingWrite {
                 commands,
                 prepared,
+                last_insert_id: 0,
                 reply,
-            }))
-            .await
-            .is_err()
-        {
-            self.stats.queue_depth.fetch_sub(1, Ordering::Relaxed);
-            anyhow::bail!("write actor stopped");
+            });
+            if state.active {
+                false
+            } else {
+                state.active = true;
+                true
+            }
+        };
+        self.commit_notify.notify_one();
+        if became_leader {
+            // Box the leader future so its (large) async state machine, and in
+            // turn `commit_batch`/`apply_write_batch`, live on the heap instead
+            // of the caller's stack. The actor previously ran the commit on a
+            // dedicated thread's stack; without the actor we must avoid blowing
+            // the caller task's (1 MB on Windows) stack when a deep write path
+            // such as trigger-expanded batches nests inside it.
+            Box::pin(self.run_leader()).await;
         }
         result
             .await
-            .map_err(|_| anyhow::anyhow!("write actor stopped"))?
+            .map_err(|_| anyhow::anyhow!("storage commit stopped"))?
     }
 
     pub async fn prepare_transaction_batch(
@@ -5507,22 +5512,147 @@ impl StorageEngineManager {
     ) -> Result<PreparedTransactionBatch> {
         let (reply, result) = oneshot::channel();
         self.stats.queue_depth.fetch_add(1, Ordering::Relaxed);
-        if self
-            .writer_tx
-            .send(ActorRequest::Prepare(PrepareRequest {
+        // Prepare is pure catalog validation with no WAL/ordering dependency,
+        // so it runs directly on the caller instead of round-tripping an actor.
+        prepare_transaction_request(
+            PrepareRequest {
                 commands,
                 prepared_prefix_len,
                 reply,
-            }))
-            .await
-            .is_err()
-        {
-            self.stats.queue_depth.fetch_sub(1, Ordering::Relaxed);
-            anyhow::bail!("write actor stopped");
-        }
+            },
+            &self.databases,
+            &self.stats,
+        );
         result
             .await
-            .map_err(|_| anyhow::anyhow!("write actor stopped"))?
+            .map_err(|_| anyhow::anyhow!("storage commit stopped"))?
+    }
+
+    /// Drives the commit loop on the caller's task until the pending queue is
+    /// drained. There is no dedicated writer thread: the first writer to find
+    /// `commit_state.active == false` becomes the leader, drains and commits
+    /// every queued write (one WAL fsync per group), and only releases
+    /// leadership once the queue is empty, so ordering stays strictly FIFO.
+    async fn run_leader(&self) {
+        const MAX_GROUP_COMMIT_REQUESTS: usize = 128;
+        let mut wal_encode_buf = Vec::with_capacity(4096);
+        loop {
+            let batch = self.collect_batch(MAX_GROUP_COMMIT_REQUESTS).await;
+            if batch.is_empty() {
+                return;
+            }
+            // Box `commit_batch` so its state machine (which embeds the large
+            // `apply_write_batch` future) is heap-allocated rather than inlined
+            // on the caller's stack, preventing stack overflow on deep write
+            // paths such as trigger-expanded batches.
+            Box::pin(commit_batch(
+                self.databases.clone(),
+                self.buffer_pool.clone(),
+                self.wal_writer.clone(),
+                self.data_dir.clone(),
+                self.stats.clone(),
+                self.actor_coordination.clone(),
+                batch,
+                &mut wal_encode_buf,
+            ))
+            .await;
+        }
+    }
+
+    /// Takes the whole pending queue (or waits up to the group-commit window
+    /// for more arrivals) and returns it for the leader to commit. Returns an
+    /// empty queue only when leadership is released because there is no work.
+    async fn collect_batch(&self, max: usize) -> VecDeque<PendingWrite> {
+        let window = self.actor_coordination.group_commit_window;
+        loop {
+            // Decide synchronously and drop the commit_state guard before any
+            // await, so the future stays Send for tokio::spawn callers and we
+            // never hold a lock across a suspension point.
+            let taken = {
+                let mut state = self.commit_state.lock();
+                if !state.queue.is_empty() {
+                    Some(std::mem::take(&mut state.queue))
+                } else if window.is_zero() {
+                    state.active = false;
+                    None
+                } else {
+                    None
+                }
+            };
+            match taken {
+                Some(mut batch) => {
+                    if !window.is_zero() && batch.len() < max {
+                        let deadline = Instant::now() + window;
+                        loop {
+                            let remaining = deadline.saturating_duration_since(Instant::now());
+                            if remaining.is_zero() {
+                                break;
+                            }
+                            let notified = self.commit_notify.notified();
+                            tokio::pin!(notified);
+                            match tokio::time::timeout(remaining, notified).await {
+                                Ok(()) => {
+                                    let mut state = self.commit_state.lock();
+                                    while let Some(write) = state.queue.pop_front() {
+                                        batch.push_back(write);
+                                        if batch.len() >= max {
+                                            break;
+                                        }
+                                    }
+                                    drop(state);
+                                    if batch.len() >= max {
+                                        break;
+                                    }
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                    } else if window.is_zero() && batch.len() < max {
+                        // Replicate the actor's blocking-recv + tight-drain: the
+                        // actor grabbed the first write then immediately drained
+                        // all concurrently-arrived ones into one group. The
+                        // leader already holds its own write, so instead yield
+                        // one scheduling slot to let concurrent followers enqueue
+                        // and drain them into this same group. This keeps
+                        // concurrent writes coalescing into a single fsync even
+                        // in the low-latency (zero-window) mode. A `yield_now`
+                        // when no other task is runnable is a near-free scheduler
+                        // round-trip, so the single-writer path is unaffected.
+                        tokio::task::yield_now().await;
+                        let mut state = self.commit_state.lock();
+                        while let Some(write) = state.queue.pop_front() {
+                            batch.push_back(write);
+                            if batch.len() >= max {
+                                break;
+                            }
+                        }
+                        drop(state);
+                    }
+                    return batch;
+                }
+                None => {
+                    if window.is_zero() {
+                        return VecDeque::new();
+                    }
+                    let notified = self.commit_notify.notified();
+                    tokio::pin!(notified);
+                    match tokio::time::timeout(window, notified).await {
+                        Ok(()) => continue,
+                        Err(_) => {
+                            let mut state = self.commit_state.lock();
+                            if state.queue.is_empty() {
+                                state.active = false;
+                                drop(state);
+                                return VecDeque::new();
+                            }
+                            let batch = std::mem::take(&mut state.queue);
+                            drop(state);
+                            return batch;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     pub fn get_database(&self, name: &str) -> Option<Arc<Database>> {
@@ -5801,130 +5931,19 @@ fn prepare_transaction_request(
     let _ = request.reply.send(result);
 }
 
-async fn write_actor(
-    mut receiver: mpsc::Receiver<ActorRequest>,
+#[allow(clippy::too_many_arguments)]
+async fn commit_batch(
     databases: Arc<RwLock<HashMap<String, Arc<Database>>>>,
     buffer_pool: Arc<BufferPool>,
     wal_writer: Arc<parking_lot::Mutex<WalWriter>>,
     data_dir: PathBuf,
     stats: Arc<StorageStats>,
-    actor_coordination: Arc<ActorCoordination>,
+    coordination: Arc<ActorCoordination>,
+    mut pending: VecDeque<PendingWrite>,
+    wal_encode_buf: &mut Vec<u8>,
 ) {
-    const MAX_GROUP_COMMIT_REQUESTS: usize = 128;
-    let mut deferred = None;
-    let mut wal_encode_buf = Vec::with_capacity(4096);
-    let mut shutdown = actor_coordination.shutdown.clone();
-    'actor: loop {
-        if *shutdown.borrow() {
-            break;
-        }
-        let request = match deferred.take() {
-            Some(request) => Some(request),
-            None => {
-                tokio::select! {
-                    biased;
-                    changed = shutdown.changed() => {
-                        if changed.is_err() || *shutdown.borrow() {
-                            None
-                        } else {
-                            continue;
-                        }
-                    }
-                    request = receiver.recv() => request,
-                }
-            }
-        };
-        let Some(request) = request else {
-            break;
-        };
-        let first = match request {
-            ActorRequest::Write(request) => request,
-            ActorRequest::Prepare(request) => {
-                prepare_transaction_request(request, &databases, &stats);
-                continue;
-            }
-        };
-        // A backup takes the exclusive side only at group boundaries. Tokio's
-        // fair lock prevents a continuous write stream from starving it.
-        let _snapshot_read_guard = tokio::select! {
-            biased;
-            changed = shutdown.changed() => {
-                if changed.is_err() || *shutdown.borrow() {
-                    break 'actor;
-                }
-                continue;
-            }
-            guard = actor_coordination.snapshot_barrier.clone().read_owned() => guard,
-        };
-        let mut pending = VecDeque::with_capacity(MAX_GROUP_COMMIT_REQUESTS);
-        pending.push_back(PendingWrite {
-            commands: first.commands,
-            prepared: first.prepared,
-            last_insert_id: 0,
-            reply: first.reply,
-        });
-        while pending.len() < MAX_GROUP_COMMIT_REQUESTS {
-            match receiver.try_recv() {
-                Ok(ActorRequest::Write(request)) => pending.push_back(PendingWrite {
-                    commands: request.commands,
-                    prepared: request.prepared,
-                    last_insert_id: 0,
-                    reply: request.reply,
-                }),
-                Ok(request @ ActorRequest::Prepare(_)) => {
-                    deferred = Some(request);
-                    break;
-                }
-                Err(_) => break,
-            }
-        }
-        if !actor_coordination.group_commit_window.is_zero() {
-            let group_deadline =
-                tokio::time::Instant::now() + actor_coordination.group_commit_window;
-            while pending.len() < MAX_GROUP_COMMIT_REQUESTS && deferred.is_none() {
-                let next_request = tokio::select! {
-                    biased;
-                    changed = shutdown.changed() => {
-                        if changed.is_err() || *shutdown.borrow() {
-                            break 'actor;
-                        }
-                        continue;
-                    }
-                    request = tokio::time::timeout_at(group_deadline, receiver.recv()) => request,
-                };
-                match next_request {
-                    Ok(Some(ActorRequest::Write(request))) => {
-                        pending.push_back(PendingWrite {
-                            commands: request.commands,
-                            prepared: request.prepared,
-                            last_insert_id: 0,
-                            reply: request.reply,
-                        });
-                        while pending.len() < MAX_GROUP_COMMIT_REQUESTS && deferred.is_none() {
-                            match receiver.try_recv() {
-                                Ok(ActorRequest::Write(request)) => {
-                                    pending.push_back(PendingWrite {
-                                        commands: request.commands,
-                                        prepared: request.prepared,
-                                        last_insert_id: 0,
-                                        reply: request.reply,
-                                    });
-                                }
-                                Ok(request @ ActorRequest::Prepare(_)) => {
-                                    deferred = Some(request);
-                                }
-                                Err(_) => break,
-                            }
-                        }
-                    }
-                    Ok(Some(request @ ActorRequest::Prepare(_))) => {
-                        deferred = Some(request);
-                    }
-                    Ok(None) | Err(_) => break,
-                }
-            }
-        }
-        while !pending.is_empty() {
+    let _snapshot_read_guard = coordination.snapshot_barrier.clone().read_owned().await;
+    while !pending.is_empty() {
             let prepare_started = Instant::now();
             let mut staged: Vec<PreparedWrite> = Vec::new();
             let mut cumulative = Vec::new();
@@ -6105,7 +6124,7 @@ async fn write_actor(
                 .iter()
                 .map(|request| request.commands.as_slice())
                 .collect();
-            if let Err(error) = encode_wal_group_into(&mut wal_encode_buf, &transactions) {
+            if let Err(error) = encode_wal_group_into(&mut *wal_encode_buf, &transactions) {
                 let message = error.to_string();
                 for request in staged {
                     stats.queue_depth.fetch_sub(1, Ordering::Relaxed);
@@ -6125,7 +6144,7 @@ async fn write_actor(
                     WalRecordType::GroupCommit as u8,
                     group_id,
                     "",
-                    &wal_encode_buf,
+                    wal_encode_buf,
                 )?;
                 debug_assert_eq!(lsn, group_id);
                 wal.sync()?;
@@ -6291,7 +6310,7 @@ async fn write_actor(
                 record_write_result(&stats, &result);
                 let _ = reply.send(result);
             }
-            let mut checkpoint = actor_coordination.checkpoint_state.lock();
+            let mut checkpoint = coordination.checkpoint_state.lock();
             checkpoint.tables.extend(deferred_tables);
             if group_succeeded {
                 checkpoint.record_successful_group(group_id, committed_requests);
@@ -6319,16 +6338,6 @@ async fn write_actor(
                 );
             }
         }
-    }
-    let checkpoint = actor_coordination.checkpoint_state.lock();
-    if let Err(error) = checkpoint_actor_state(
-        &databases,
-        &wal_writer,
-        &checkpoint.tables,
-        &checkpoint.transactions,
-    ) {
-        error!("final actor checkpoint failed; WAL remains authoritative: {error}");
-    }
 }
 
 fn commands_are_memory_dml(
