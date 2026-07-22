@@ -59,11 +59,11 @@ mydb/
 ### 存储引擎：Neko233
 
 - **Actor FIFO 写入**：单写 Actor 保证顺序一致性，无锁竞争
-- **Leader/Follower Group Commit**：自然批量（fsync 期间请求自动聚合），零延迟默认；`group_commit_window_us` 可配置额外合并窗口（牺牲延迟换吞吐）
+- **Leader/Follower Group Commit**：吞吐默认 250μs 收集窗口；`group_commit_window_us=0` 切换为低延迟自然批量
 - **WAL 单块写入**：预分配文件（8MB 粒度）+ 64KB 可复用缓冲区，`append_raw` 直写热路径，单 `write_all` 原子追加，CRC32 校验
 - **bincode fixint 编码**：WAL 记录使用小端固定长度整数编码，序列化/反序列化比 varint 更快
 - **WAL-backed Memtable**：INSERT 追加到内存表（pending_rewrites），不直接写数据页
-- **Copy-on-Write Checkpoint**：每 64 个提交组执行一次，staging→backup→rename 原子替换，仅重建受影响表的索引和缓存
+- **Copy-on-Write Checkpoint**：每 1024 个已提交请求折叠一次，staging→backup→rename 原子替换，仅重建受影响表的索引和缓存
 - **幂等 Redo**：崩溃恢复时 WAL 重放幂等，预分配零字节尾部通过 CRC 校验安全截断
 - **CRC 校验**：WAL 和数据页均带 CRC，检测损坏并安全拒绝启动
 - **提交热路径**：一次 `sync_data()` 顺序 fsync = 持久性保证，锁内仅 write+fsync，无额外 syscall
@@ -166,7 +166,7 @@ server:
 storage:
   data_dir: "/var/lib/mydb"
   buffer_pool_size: "1G"
-  group_commit_window_us: 0     # 0 = 自然批量（推荐），N 微秒额外合并窗口（牺牲延迟换吞吐量）
+  group_commit_window_us: 250   # 吞吐默认；0 = 低延迟自然批量
 
 security:
   authentication: "mysql_native_password"
@@ -483,22 +483,18 @@ bash scripts/docker-smoke.sh
 
 ## 📊 性能
 
-> 完整性能报告、测试方法、历史版本数据和发布前验证流程见 [性能报告.md](性能报告.md)。
+> 完整测试方法、运行指标和发布前验证见 [性能报告.md](性能报告.md)。以下均为同一台本机的实测中位数（每项 3 次），不是历史参考值。
 >
-> ⚠️ 以下为开发机 Docker 限速回归数据，不代表物理生产硬件正式验收结论。
->
-> MySQL 数字为历史参考值，非本次 Docker 脚本同轮重测结果。
->
-> 本轮数据：`44d23f5`，2026-07-22，Docker WSL2（0.5 CPU / 512MiB）。
+> 本轮数据：`d6bebfa`，2026-07-22，本机 Windows；MySQL 8.0.45，`innodb_flush_log_at_trx_commit=1`、`sync_binlog=1`。
 
-| 场景 | MyDB | MySQL 8.0.46（历史参考） | 参考比 |
-|------|------|--------------|------|
-| 单表写 (fsync-per-commit) | 331 ops/s | 3318 ops/s | 0.1x |
-| 8 actor / 8表 写 P99 延迟 | 98.4 ms | 495.9 ms | 历史参考 5x |
-| 8 actor / 8表 Group Commit | 225 ops/s | 7315 ops/s | 0.03x |
-| 读 P50 延迟 | 673 μs | - | - |
+| 场景 | MyDB | MySQL 8.0.45 | MyDB / MySQL |
+|------|------|--------------|--------------|
+| 单表写（fsync-per-commit） | 65 ops/s | 105 ops/s | 0.62x |
+| 8 actor / 8表 写 P99 延迟 | 67.2 ms | 46.6 ms | 0.69x（低更好） |
+| 8 actor / 8表 Group Commit | 359 ops/s | 496 ops/s | 0.72x |
+| 读 P50 延迟 | 190 μs | 120 μs | - |
 
-MyDB 设计目标是**同资源、同持久化级别下达到 MySQL 10x 写性能**，不以关闭持久化换取数字。
+性能优化不以关闭 WAL 持久化或弱化恢复语义换取数字。默认 250μs Group Commit 窗口优先并发吞吐，checkpoint 按 1024 个已提交请求触发；不声明未经实测证明的固定倍数。
 
 ---
 
