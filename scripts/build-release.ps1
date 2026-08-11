@@ -96,10 +96,14 @@ if (Test-Path "LICENSE") { Copy-Item "LICENSE" "$buildDir/" }
 # 打包
 Write-Info "Packaging..."
 $packageFile = "target/release/package/${packageName}.zip"
-
-Push-Location $buildDir
-7z a "../${packageName}.zip" .
-Pop-Location
+$sevenZip = Get-Command 7z -ErrorAction SilentlyContinue
+if ($null -ne $sevenZip) {
+    Push-Location $buildDir
+    & $sevenZip.Source a "../${packageName}.zip" .
+    Pop-Location
+} else {
+    Compress-Archive -Path (Join-Path $buildDir '*') -DestinationPath (Join-Path (Split-Path $buildDir -Parent) "${packageName}.zip") -CompressionLevel Optimal
+}
 
 $packagePath = "target/release/${packageName}.zip"
 $packageSize = (Get-Item $packagePath).Length / 1MB
