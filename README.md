@@ -525,14 +525,14 @@ bash scripts/docker-smoke.sh
 
 > 完整测试方法、运行指标和发布前验证见 [性能报告.md](性能报告.md)。以下均为同一台本机的实测中位数（每项 3 次），不是历史参考值。
 >
-> 本轮数据：`d6bebfa`，2026-07-22，本机 Windows；MySQL 8.0.45，`innodb_flush_log_at_trx_commit=1`、`sync_binlog=1`。
+> 本轮数据：`56ef073`，2026-08-11，本机 Windows；MySQL 8.0.45，`innodb_flush_log_at_trx_commit=1`、`sync_binlog=1`。
 
 | 场景 | MyDB | MySQL 8.0.45 | MyDB / MySQL |
 |------|------|--------------|--------------|
-| 单表写（fsync-per-commit） | 65 ops/s | 105 ops/s | 0.62x |
-| 8 actor / 8表 写 P99 延迟 | 67.2 ms | 46.6 ms | 0.69x（低更好） |
-| 8 actor / 8表 Group Commit | 359 ops/s | 496 ops/s | 0.72x |
-| 读 P50 延迟 | 190 μs | 120 μs | - |
+| 单表写（fsync-per-commit） | 85 ops/s | 125 ops/s | 0.69x |
+| 8 actor / 8表 写 P99 延迟 | 27 ms | 49.4 ms | 1.83x（低更好） |
+| 8 actor / 8表 Group Commit | 317 ops/s | 432 ops/s | 0.73x |
+| 读 P50 延迟 | 175 μs | 84 μs | - |
 
 性能优化不以关闭 WAL 持久化或弱化恢复语义换取数字。默认 250μs Group Commit 窗口优先并发吞吐，checkpoint 按 1024 个已提交请求触发；不声明未经实测证明的固定倍数。
 
