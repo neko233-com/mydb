@@ -28,35 +28,6 @@ use crate::packet_reader::PacketReader;
 use crate::packet_writer::PacketWriter;
 use crate::{AsyncMysqlIntermediary, AsyncMysqlShim, IntermediaryOptions};
 
-pub async fn plain_run_with_options<B, R, W>(
-    shim: B,
-    writer: W,
-    opts: IntermediaryOptions,
-    init_params: (ClientHandshake, u8, CapabilityFlags, PacketReader<R>),
-) -> Result<(), B::Error>
-where
-    B: AsyncMysqlShim<W> + Send + Sync,
-    R: AsyncRead + Send + Unpin,
-    W: AsyncWrite + Send + Unpin,
-{
-    let (handshake, seq, client_capabilities, reader) = init_params;
-    let reader = PacketReader::new(reader);
-    let writer = PacketWriter::new(writer);
-
-    let process_use_statement_on_query = opts.process_use_statement_on_query;
-    let reject_connection_on_dbname_absence = opts.reject_connection_on_dbname_absence;
-    let mut mi = AsyncMysqlIntermediary {
-        client_capabilities,
-        process_use_statement_on_query,
-        reject_connection_on_dbname_absence,
-        shim,
-        reader,
-        writer,
-    };
-    mi.init_after_ssl(handshake, seq).await?;
-    mi.run().await
-}
-
 pub async fn secure_run_with_options<B, R, W>(
     shim: B,
     writer: W,

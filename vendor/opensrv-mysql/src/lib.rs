@@ -37,7 +37,7 @@ use tokio_rustls::rustls::ServerConfig;
 
 pub use crate::myc::constants::{CapabilityFlags, ColumnFlags, ColumnType, StatusFlags};
 #[cfg(feature = "tls")]
-pub use crate::tls::{plain_run_with_options, secure_run_with_options};
+pub use crate::tls::secure_run_with_options;
 
 mod commands;
 mod errorcodes;
@@ -68,6 +68,9 @@ pub struct Column {
     ///
     /// Note that this is *technically* the column's alias.
     pub column: String,
+    /// Column length (in bytes) reported through COLUMN_DEFINITION41.
+    /// 0 means "use default".
+    pub collen: u32,
     /// This column's type>
     pub coltype: ColumnType,
     /// Any flags associated with this column.
@@ -293,7 +296,7 @@ where
             )
             .await?;
 
-        let reader = PacketReader::new(input_stream);
+        let reader = input_stream;
         let writer = PacketWriter::new(output_stream);
 
         let mut mi = AsyncMysqlIntermediary {
@@ -339,6 +342,9 @@ where
             | CapabilityFlags::CLIENT_LOCAL_FILES
             | CapabilityFlags::CLIENT_MULTI_RESULTS
             | CapabilityFlags::CLIENT_PS_MULTI_RESULTS
+            | CapabilityFlags::CLIENT_TRANSACTIONS
+            | CapabilityFlags::CLIENT_SESSION_TRACK
+            | CapabilityFlags::CLIENT_CONNECT_ATTRS
             | CapabilityFlags::CLIENT_DEPRECATE_EOF;
 
         #[cfg(feature = "tls")]
@@ -355,10 +361,9 @@ where
         writer.write_all(&scramble[0..AUTH_PLUGIN_DATA_PART_1_LENGTH])?; // auth-plugin-data-part-1
         writer.write_all(&[0x00])?;
 
-        writer.write_all(&server_capabilities_vec[..2])?; // The lower 2 bytes of the Capabilities Flags, 0x42
-                                                          // self.writer.write_all(&[0x00, 0x42])?;
-        writer.write_all(&[0x21])?; // UTF8_GENERAL_CI
-        writer.write_all(&[0x00, 0x00])?; // status_flags
+        writer.write_all(&server_capabilities_vec[..2])?; // The lower 2 bytes of the Capabilities Flags
+        writer.write_all(&[0x21])?; // UTF8_GENERAL_CI collation (handshake charset)
+        writer.write_all(&[0x02, 0x00])?; // status_flags: SERVER_STATUS_AUTOCOMMIT
         writer.write_all(&server_capabilities_vec[2..4])?; // The upper 2 bytes of the Capabilities Flags
 
         if default_auth_plugin.is_empty() {
@@ -414,7 +419,6 @@ where
                 }
             })?
             .1;
-
         writer.set_seq(seq + 1);
 
         #[cfg(not(feature = "tls"))]
@@ -436,8 +440,7 @@ where
 
     pub async fn init_after_ssl(
         &mut self,
-        #[cfg(feature = "tls")] mut handshake: ClientHandshake,
-        #[cfg(not(feature = "tls"))] handshake: ClientHandshake,
+        #[cfg_attr(not(feature = "tls"), allow(unused_mut))] mut handshake: ClientHandshake,
         mut seq: u8,
     ) -> Result<(), B::Error> {
         #[cfg(feature = "tls")]
@@ -499,11 +502,13 @@ where
             if let Some(username) = &handshake.username {
                 let auth_plugin_expect = self.shim.auth_plugin_for_username(username).await;
 
-                // auth switch
-                if !auth_plugin_expect.is_empty()
-                    && auth_response.is_empty()
-                    && handshake.auth_plugin != auth_plugin_expect.as_bytes()
-                {
+                // auth switch: whenever the client's auth plugin differs from
+                // what the server expects (including when it sent non-empty
+                // auth data with a plugin we don't natively support, e.g.
+                // caching_sha2_password from MySQL 8.x / JDBC / DataGrip).
+                let plugin_mismatch = !handshake.auth_plugin.is_empty()
+                    && handshake.auth_plugin != auth_plugin_expect.as_bytes();
+                if !auth_plugin_expect.is_empty() && plugin_mismatch {
                     self.writer.set_seq(seq + 1);
                     self.writer.write_all(&[0xfe])?;
                     self.writer.write_all(auth_plugin_expect.as_bytes())?;
@@ -572,7 +577,10 @@ where
                     writers::write_ok_packet(
                         &mut self.writer,
                         self.client_capabilities,
-                        OkResponse::default(),
+                        OkResponse {
+                            status_flags: StatusFlags::SERVER_STATUS_AUTOCOMMIT,
+                            ..Default::default()
+                        },
                     )
                     .await?;
                 }
@@ -590,7 +598,7 @@ where
         let mut stmts: HashMap<u32, _> = HashMap::new();
         while let Some((seq, packet)) = self.reader.next_async().await? {
             self.writer.set_seq(seq + 1);
-            let res = commands::parse(&packet);
+            let res = commands::parse(&packet, self.client_capabilities);
             match res {
                 Ok(cmd) => {
                     match cmd.1 {
@@ -664,6 +672,7 @@ where
                                 let cols = &[Column {
                                     table: String::new(),
                                     column: String::from_utf8_lossy(var_with_at).to_string(),
+                                    collen: 0,
                                     coltype: myc::constants::ColumnType::MYSQL_TYPE_LONG,
                                     colflags: myc::constants::ColumnFlags::UNSIGNED_FLAG,
                                 }];
@@ -787,6 +796,7 @@ where
                             // see https://github.com/datafuselabs/databend/issues/4439
                             let ok_packet = OkResponse {
                                 header: 0xfe,
+                                status_flags: StatusFlags::SERVER_STATUS_AUTOCOMMIT,
                                 ..Default::default()
                             };
                             writers::write_ok_packet(
@@ -838,4 +848,32 @@ where
         }
         Ok(())
     }
+}
+
+pub async fn plain_run_with_options<B, R, W>(
+    shim: B,
+    writer: W,
+    opts: IntermediaryOptions,
+    init_params: (ClientHandshake, u8, CapabilityFlags, PacketReader<R>),
+) -> Result<(), B::Error>
+where
+    B: AsyncMysqlShim<W> + Send + Sync,
+    R: AsyncRead + Send + Unpin,
+    W: AsyncWrite + Send + Unpin,
+{
+    let (handshake, seq, client_capabilities, reader) = init_params;
+    let writer = PacketWriter::new(writer);
+
+    let process_use_statement_on_query = opts.process_use_statement_on_query;
+    let reject_connection_on_dbname_absence = opts.reject_connection_on_dbname_absence;
+    let mut mi = AsyncMysqlIntermediary {
+        client_capabilities,
+        process_use_statement_on_query,
+        reject_connection_on_dbname_absence,
+        shim,
+        reader,
+        writer,
+    };
+    mi.init_after_ssl(handshake, seq).await?;
+    mi.run().await
 }

@@ -13,10 +13,13 @@
 // limitations under the License.
 
 use std::io;
-use std::io::prelude::*;
+use std::io::Read;
+use std::ops::Deref;
 
 use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
+
+use crate::U24_MAX;
 
 const PACKET_BUFFER_SIZE: usize = 4_096;
 const PACKET_LARGE_BUFFER_SIZE: usize = 1_048_576;
@@ -196,9 +199,6 @@ impl AsRef<[u8]> for Packet {
         &self.0
     }
 }
-
-use crate::U24_MAX;
-use std::ops::Deref;
 
 impl Deref for Packet {
     type Target = [u8];

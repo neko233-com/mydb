@@ -918,8 +918,12 @@ impl AuthCatalog {
                 blocked_until: now,
             });
             state.failures = state.failures.saturating_add(1);
-            if state.failures >= 5 {
-                let seconds = 1_u64 << (state.failures - 5).min(6);
+            // Lenient brute-force protection: allow 20 attempts before a 2-second
+            // cooldown, doubling each time up to ~64 seconds. This avoids locking
+            // out legitimate users from GUI tools that may re-try connections
+            // (DataGrip/IDEA, MySQL Workbench, etc.).
+            if state.failures >= 20 {
+                let seconds = 2_u64 << (state.failures - 20).min(5);
                 state.blocked_until = now + Duration::from_secs(seconds);
             }
         }
@@ -1447,6 +1451,8 @@ fn normalize_auth_names(names: &[String]) -> anyhow::Result<Vec<String>> {
     Ok(names)
 }
 
+const EMPTY_PASSWORD_SHA1_HEX: &str = "da39a3ee5e6b4b0d3255bfef95601890afd80709";
+
 fn password_sha1_hex(password: &str) -> String {
     Sha1::digest(password.as_bytes())
         .iter()
@@ -1455,6 +1461,10 @@ fn password_sha1_hex(password: &str) -> String {
 }
 
 fn verify_mysql_native_password_sha1(hash: &str, salt: &[u8], response: &[u8]) -> bool {
+    // Empty auth response means the client is authenticating with an empty password.
+    if response.is_empty() {
+        return hash == EMPTY_PASSWORD_SHA1_HEX;
+    }
     let Ok(stage1) = (0..hash.len())
         .step_by(2)
         .map(|index| u8::from_str_radix(&hash[index..index + 2], 16))
@@ -1814,6 +1824,9 @@ pub struct WireStats {
     // transaction_locks.  Every operation that needs both registries takes
     // transaction_locks before explicit_table_locks.
     explicit_table_locks: parking_lot::Mutex<HashMap<String, LockState>>,
+    // GET_LOCK / RELEASE_LOCK user-level named locks, shared across every
+    // connection so contending sessions observe each other's leases.
+    named_locks: parking_lot::Mutex<HashMap<String, u32>>,
     global_transaction_defaults: parking_lot::Mutex<TransactionDefaults>,
     waits_for: parking_lot::Mutex<HashMap<u32, HashSet<u32>>>,
     pending_transactions:
@@ -2479,6 +2492,63 @@ impl WireStats {
         self.lock_changed.notify_waiters();
     }
 
+    /// Try to take the named lock for `connection_id`. Returns `true` when the
+    /// lock is now held by this connection (it was free, or already held by
+    /// this connection — GET_LOCK is idempotent per session). Returns `false`
+    /// when another connection owns the lock.
+    fn acquire_named_lock(&self, name: &str, connection_id: u32) -> bool {
+        let mut locks = self.named_locks.lock();
+        match locks.get(name).copied() {
+            None => {
+                locks.insert(name.to_string(), connection_id);
+                true
+            }
+            Some(owner) if owner == connection_id => true,
+            Some(_) => false,
+        }
+    }
+
+    /// Release the named lock if owned by `connection_id`.
+    /// - `Some(true)` — released successfully.
+    /// - `Some(false)` — held by a different connection, nothing changed.
+    /// - `None` — the lock does not currently exist.
+    fn release_named_lock(&self, name: &str, connection_id: u32) -> Option<bool> {
+        let mut locks = self.named_locks.lock();
+        match locks.get(name).copied() {
+            None => None,
+            Some(owner) if owner == connection_id => {
+                locks.remove(name);
+                Some(true)
+            }
+            Some(_) => Some(false),
+        }
+    }
+
+    /// Release every named lock owned by `connection_id`; returns the count
+    /// released. Used by RELEASE_ALL_LOCKS() and on connection teardown.
+    fn release_all_named_locks(&self, connection_id: u32) -> usize {
+        let mut locks = self.named_locks.lock();
+        let before = locks.len();
+        locks.retain(|_, owner| *owner != connection_id);
+        before - locks.len()
+    }
+
+    /// Mirrors MySQL `IS_FREE_LOCK`: `true` when the name is not held by
+    /// another connection (free, or already held by this one).
+    fn is_free_named_lock(&self, name: &str, connection_id: u32) -> bool {
+        let locks = self.named_locks.lock();
+        match locks.get(name) {
+            None => true,
+            Some(&owner) => owner == connection_id,
+        }
+    }
+
+    /// Mirrors MySQL `IS_USED_LOCK`: the owning connection id, or `None` when
+    /// the lock is free.
+    fn named_lock_holder(&self, name: &str) -> Option<u32> {
+        self.named_locks.lock().get(name).copied()
+    }
+
     fn explicit_table_lock_snapshot(&self, connection_id: u32) -> HashMap<String, LockMode> {
         self.explicit_table_locks
             .lock()
@@ -2681,6 +2751,9 @@ struct Backend {
     execution_mode: BackendExecutionMode,
     authenticated_user: parking_lot::Mutex<Option<String>>,
     client_address: String,
+    // Names this connection currently holds, for RELEASE_ALL_LOCKS() counting
+    // and to avoid re-registering the lease on a re-entrant GET_LOCK.
+    held_named_locks: HashSet<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2690,6 +2763,130 @@ enum BackendExecutionMode {
     // statement that can independently commit or issue DDL would violate that
     // boundary, so it is rejected before dispatch.
     EventAtomic,
+}
+
+/// A single user-level named-lock function call discovered in a SELECT
+/// projection. The lease registry lives in `WireStats`; `Backend` only tracks
+/// which names it owns so `RELEASE_ALL_LOCKS()` and teardown can clean up.
+#[derive(Debug)]
+enum NamedLockCall {
+    GetLock { name: String, timeout: f64 },
+    ReleaseLock { name: String },
+    ReleaseAllLocks,
+    IsFreeLock { name: String },
+    IsUsedLock { name: String },
+}
+
+/// Detect a `SELECT` that consists solely of named-lock function calls
+/// (GET_LOCK / RELEASE_LOCK / RELEASE_ALL_LOCKS / IS_FREE_LOCK / IS_USED_LOCK).
+/// Returns `None` to let real queries fall through to the normal planner.
+fn parse_named_lock_select(sql: &str) -> Option<Vec<(NamedLockCall, String)>> {
+    if !sql.to_ascii_uppercase().starts_with("SELECT ") {
+        return None;
+    }
+    let rest = sql["SELECT ".len()..].trim();
+    // Named-lock selects never carry a FROM clause.
+    if rest.to_ascii_uppercase().contains(" FROM ") {
+        return None;
+    }
+    let segments = split_top_level_commas(rest);
+    if segments.is_empty() {
+        return None;
+    }
+    let mut calls = Vec::with_capacity(segments.len());
+    for segment in segments {
+        let segment = segment.trim();
+        if let Some(call) = parse_single_lock_call(segment) {
+            calls.push((call, segment.to_string()));
+        } else {
+            return None;
+        }
+    }
+    Some(calls)
+}
+
+fn parse_single_lock_call(seg: &str) -> Option<NamedLockCall> {
+    let pattern = r#"^\s*(GET_LOCK|RELEASE_LOCK|RELEASE_ALL_LOCKS|IS_FREE_LOCK|IS_USED_LOCK)\s*\(\s*(?:('([^']*)'|"([^"]*)"|X'([0-9A-Fa-f]*)')(?:\s*,\s*([0-9]+(?:\.[0-9]+)?))?)?\s*\)\s*(?:\s+AS\s+[A-Za-z_][A-Za-z0-9_]*|\s+[A-Za-z_][A-Za-z0-9_]*)?\s*$"#;
+    let regex = cached_mysql_regex(pattern, "i").ok()?;
+    let caps = regex.captures(seg)?;
+    let func = caps.get(1).unwrap().as_str().to_ascii_uppercase();
+    let name = caps
+        .get(3)
+        .or_else(|| caps.get(4))
+        .map(|m| m.as_str().to_string())
+        .or_else(|| caps.get(5).map(|m| decode_hex_lock_name(m.as_str())))
+        .unwrap_or_default();
+    let timeout = caps
+        .get(6)
+        .and_then(|m| m.as_str().parse::<f64>().ok())
+        .unwrap_or(0.0);
+    match func.as_str() {
+        "GET_LOCK" => Some(NamedLockCall::GetLock { name, timeout }),
+        "RELEASE_LOCK" => Some(NamedLockCall::ReleaseLock { name }),
+        "RELEASE_ALL_LOCKS" => Some(NamedLockCall::ReleaseAllLocks),
+        "IS_FREE_LOCK" => Some(NamedLockCall::IsFreeLock { name }),
+        "IS_USED_LOCK" => Some(NamedLockCall::IsUsedLock { name }),
+        _ => None,
+    }
+}
+
+/// MySQL text-protocol string parameters arrive as `X'..'` hex literals once a
+/// prepared statement has bound its `?` placeholders. Decode the hex back to the
+/// original lock-name bytes so the registry key matches what the client sent.
+fn decode_hex_lock_name(hex: &str) -> String {
+    String::from_utf8_lossy(&hex_to_bytes(hex)).into_owned()
+}
+
+fn hex_to_bytes(hex: &str) -> Vec<u8> {
+    let chars: Vec<u8> = hex.bytes().collect();
+    let mut out = Vec::with_capacity(chars.len() / 2);
+    let mut index = 0;
+    while index + 1 < chars.len() {
+        let hi = (chars[index] as char).to_digit(16);
+        let lo = (chars[index + 1] as char).to_digit(16);
+        match (hi, lo) {
+            (Some(h), Some(l)) => out.push(((h << 4) | l) as u8),
+            _ => break,
+        }
+        index += 2;
+    }
+    out
+}
+
+/// Split a SQL list by top-level commas, ignoring commas inside quotes or
+/// parenthesised expressions.
+fn split_top_level_commas(sql: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth: i32 = 0;
+    let mut in_single = false;
+    let mut in_double = false;
+    let bytes = sql.as_bytes();
+    let mut start = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'\'' if !in_double => {
+                if in_single && i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                    continue;
+                }
+                in_single = !in_single;
+            }
+            b'"' if !in_single => {
+                if in_double && i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                    continue;
+                }
+                in_double = !in_double;
+            }
+            b'(' if !in_single && !in_double => depth += 1,
+            b')' if !in_single && !in_double => depth -= 1,
+            b',' if depth == 0 && !in_single && !in_double => {
+                parts.push(&sql[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&sql[start..]);
+    parts
 }
 
 #[derive(Debug, Clone)]
@@ -2736,8 +2933,11 @@ impl Backend {
                 "collation_server".into(),
                 Some(b"utf8mb4_0900_ai_ci".to_vec()),
             ),
+            ("character_set_server".into(), Some(b"utf8mb4".to_vec())),
             ("sql_mode".into(), Some(Vec::new())),
             ("time_zone".into(), Some(b"SYSTEM".to_vec())),
+            ("system_time_zone".into(), Some(b"UTC".to_vec())),
+            ("autocommit".into(), Some(b"1".to_vec())),
             ("unique_checks".into(), Some(b"1".to_vec())),
             ("sql_notes".into(), Some(b"1".to_vec())),
             ("max_error_count".into(), Some(b"1024".to_vec())),
@@ -2745,6 +2945,29 @@ impl Backend {
                 "socket".into(),
                 Some(b"/var/run/mysqld/mysqld.sock".to_vec()),
             ),
+            ("version_comment".into(), Some(b"MyDB".to_vec())),
+            ("license".into(), Some(b"GPL".to_vec())),
+            ("auto_increment_increment".into(), Some(b"1".to_vec())),
+            ("auto_increment_offset".into(), Some(b"1".to_vec())),
+            ("max_allowed_packet".into(), Some(b"67108864".to_vec())),
+            ("net_buffer_length".into(), Some(b"16384".to_vec())),
+            ("performance_schema".into(), Some(b"0".to_vec())),
+            ("have_openssl".into(), Some(b"DISABLED".to_vec())),
+            ("have_ssl".into(), Some(b"DISABLED".to_vec())),
+            ("sql_safe_updates".into(), Some(b"0".to_vec())),
+            ("tx_isolation".into(), Some(b"REPEATABLE-READ".to_vec())),
+            ("tx_read_only".into(), Some(b"0".to_vec())),
+            ("transaction_read_only".into(), Some(b"0".to_vec())),
+            (
+                "transaction_isolation".into(),
+                Some(b"REPEATABLE-READ".to_vec()),
+            ),
+            ("lower_case_table_names".into(), Some(b"1".to_vec())),
+            ("init_connect".into(), Some(b"".to_vec())),
+            ("interactive_timeout".into(), Some(b"28800".to_vec())),
+            ("wait_timeout".into(), Some(b"28800".to_vec())),
+            ("net_write_timeout".into(), Some(b"60".to_vec())),
+            ("net_read_timeout".into(), Some(b"30".to_vec())),
         ])
     }
 
@@ -2754,14 +2977,7 @@ impl Backend {
         stats: Arc<WireStats>,
         connection_id: u32,
     ) -> Self {
-        let mut salt = [0u8; 20];
-        for byte in &mut salt {
-            let mut value = rand::random::<u8>();
-            if value == 0 || value == b'$' {
-                value = value.wrapping_add(1);
-            }
-            *byte = value;
-        }
+        let salt = generate_auth_salt();
         let lock_wait_timeout = std::time::Duration::from_millis(config.lock_wait_timeout_ms);
         let transaction_writes = Arc::new(parking_lot::RwLock::new(Vec::new()));
         stats.register_transaction_buffer(connection_id, &transaction_writes);
@@ -2808,6 +3024,7 @@ impl Backend {
             execution_mode: BackendExecutionMode::Client,
             authenticated_user: parking_lot::Mutex::new(None),
             client_address: "local".to_string(),
+            held_named_locks: HashSet::new(),
         }
     }
 
@@ -2817,6 +3034,8 @@ impl Backend {
         self.savepoints.clear();
         self.stats.release_all_locks(self.connection_id);
         self.stats.release_explicit_table_locks(self.connection_id);
+        self.stats.release_all_named_locks(self.connection_id);
+        self.held_named_locks.clear();
         self.explicit_table_locks.clear();
         self.explicit_table_references.clear();
         self.plain_select_lock_scope = false;
@@ -2860,6 +3079,71 @@ impl Backend {
         self.session_diagnostics = ProcedureDiagnosticsArea::default();
         self.procedure_depth = 0;
         Ok(())
+    }
+
+    async fn execute_named_locks(
+        &mut self,
+        calls: &[(NamedLockCall, String)],
+    ) -> anyhow::Result<QueryOutcome> {
+        let mut columns = Vec::with_capacity(calls.len());
+        let mut values: Vec<Option<String>> = Vec::with_capacity(calls.len());
+        for (call, label) in calls {
+            match call {
+                NamedLockCall::GetLock { name, timeout } => {
+                    let acquired = if self.stats.acquire_named_lock(name, self.connection_id) {
+                        true
+                    } else {
+                        let deadline = Instant::now() + Duration::from_secs_f64(*timeout);
+                        let mut done = false;
+                        loop {
+                            if Instant::now() >= deadline {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                            if self.stats.acquire_named_lock(name, self.connection_id) {
+                                done = true;
+                                break;
+                            }
+                        }
+                        done
+                    };
+                    if acquired {
+                        self.held_named_locks.insert(name.clone());
+                    }
+                    columns.push(label.clone());
+                    values.push(Some(if acquired { "1" } else { "0" }.to_string()));
+                }
+                NamedLockCall::ReleaseLock { name } => {
+                    let result = self.stats.release_named_lock(name, self.connection_id);
+                    if result == Some(true) {
+                        self.held_named_locks.remove(name);
+                    }
+                    columns.push(label.clone());
+                    values.push(match result {
+                        Some(true) => Some("1".to_string()),
+                        Some(false) => Some("0".to_string()),
+                        None => None,
+                    });
+                }
+                NamedLockCall::ReleaseAllLocks => {
+                    let count = self.stats.release_all_named_locks(self.connection_id);
+                    self.held_named_locks.clear();
+                    columns.push(label.clone());
+                    values.push(Some(count.to_string()));
+                }
+                NamedLockCall::IsFreeLock { name } => {
+                    let free = self.stats.is_free_named_lock(name, self.connection_id);
+                    columns.push(label.clone());
+                    values.push(Some(if free { "1" } else { "0" }.to_string()));
+                }
+                NamedLockCall::IsUsedLock { name } => {
+                    let holder = self.stats.named_lock_holder(name);
+                    columns.push(label.clone());
+                    values.push(holder.map(|id| id.to_string()));
+                }
+            }
+        }
+        Ok(QueryOutcome::rows(columns, vec![values]))
     }
 
     async fn execute(&mut self, sql: &str) -> anyhow::Result<QueryOutcome> {
@@ -4625,9 +4909,11 @@ impl Backend {
 
     async fn execute_inner(&mut self, sql: &str) -> anyhow::Result<QueryOutcome> {
         self.stats.queries.fetch_add(1, Ordering::Relaxed);
+        let _prof = std::env::var_os("MYDB_PROFILE").is_some();
+        let _prof_t0 = Instant::now();
         let sql = sql.trim().trim_end_matches(';').trim();
         let sql = expand_mysql_version_comments(sql);
-        let normalized = normalize_sql_whitespace(sql.trim());
+        let normalized = normalize_sql_whitespace(strip_leading_sql_comments(sql.trim()));
         let original_sql = normalized.as_str();
         let original_upper = original_sql.to_ascii_uppercase();
         let projection_labels = select_session_projection_labels(original_sql);
@@ -4692,6 +4978,9 @@ impl Backend {
         {
             return Ok(QueryOutcome::ok(0));
         }
+        if let Some(calls) = parse_named_lock_select(&normalized) {
+            return self.execute_named_locks(&calls).await;
+        }
         if upper.starts_with("ALTER TABLE ")
             && (upper.ends_with(" DISABLE KEYS") || upper.ends_with(" ENABLE KEYS"))
         {
@@ -4700,6 +4989,9 @@ impl Backend {
         }
 
         self.require_statement_privilege(sql, &upper)?;
+        if _prof {
+            eprintln!("PROFILE PREFIX {}us", _prof_t0.elapsed().as_micros());
+        }
 
         if is_lock_tables_statement(&upper) {
             return self.lock_tables(sql).await;
@@ -4737,11 +5029,17 @@ impl Backend {
             self.savepoints.clear();
             self.in_transaction = true;
             self.activate_transaction_defaults(access_mode);
+            if _prof {
+                eprintln!("PROFILE START {}us", _prof_t0.elapsed().as_micros());
+            }
             return Ok(QueryOutcome::ok(0));
         }
         if upper == "COMMIT" {
             self.in_transaction = false;
             let affected = self.commit_pending().await?;
+            if _prof {
+                eprintln!("PROFILE COMMIT {}us", _prof_t0.elapsed().as_micros());
+            }
             return Ok(QueryOutcome::ok(affected));
         }
         if upper == "ROLLBACK" {
@@ -6207,7 +6505,11 @@ impl Backend {
                     row,
                 })
                 .collect();
-            return self.submit_writes(writes, predicted).await;
+            let _r = self.submit_writes(writes, predicted).await;
+            if _prof {
+                eprintln!("PROFILE INSERT {}us", _prof_t0.elapsed().as_micros());
+            }
+            return _r;
         }
         if upper.starts_with("LOAD DATA ") {
             let spec = parse_load_data(sql, &self.database)?;
@@ -6441,9 +6743,7 @@ impl Backend {
             return Ok(QueryOutcome::ok(0));
         }
         // ---- Replication surface (single-node compatible) ----
-        if upper.starts_with("SHOW MASTER STATUS")
-            || upper.starts_with("SHOW BINARY LOG STATUS")
-        {
+        if upper.starts_with("SHOW MASTER STATUS") || upper.starts_with("SHOW BINARY LOG STATUS") {
             return Ok(QueryOutcome::byte_rows(
                 vec![
                     "File",
@@ -6482,7 +6782,10 @@ impl Backend {
         }
         if upper.starts_with("SHOW REPLICA STATUS") || upper.starts_with("SHOW SLAVE STATUS") {
             return Ok(QueryOutcome::byte_rows(
-                REPLICA_STATUS_COLUMNS.iter().map(|c| c.to_string()).collect(),
+                REPLICA_STATUS_COLUMNS
+                    .iter()
+                    .map(|c| c.to_string())
+                    .collect(),
                 vec![REPLICA_STATUS_COLUMNS.iter().map(|_| None).collect()],
             ));
         }
@@ -11330,6 +11633,7 @@ impl Backend {
         }
         if find_top_level_keyword(sql, " FROM ", 0).is_none() {
             let expression = sql[6..].trim();
+            let expression = strip_trailing_limit_clause(expression);
             let items = split_csv(expression);
             let mut columns = Vec::new();
             let mut row = Vec::new();
@@ -13108,10 +13412,7 @@ impl Backend {
                 "mysql",
                 mysql_virtual_tables(&self.config.auth_catalog, &viewer),
             ),
-            (
-                "performance_schema",
-                performance_schema_virtual_tables(),
-            ),
+            ("performance_schema", performance_schema_virtual_tables()),
             ("sys", sys_virtual_tables()),
         ];
         let mut scope = HashMap::new();
@@ -13129,7 +13430,11 @@ impl Backend {
         for (schema, name, table) in metadata {
             // cte_table() lowercases the reference before lookup, so the scope
             // key must be case-folded to match regardless of virtual-table key case.
-            let replacement = format!("__mydb_{}_{}", schema.to_ascii_lowercase(), name.to_ascii_lowercase());
+            let replacement = format!(
+                "__mydb_{}_{}",
+                schema.to_ascii_lowercase(),
+                name.to_ascii_lowercase()
+            );
             if schema.eq_ignore_ascii_case(&self.database) {
                 scope.insert(name.to_ascii_lowercase(), table.clone());
                 matched = true;
@@ -13364,6 +13669,16 @@ impl Backend {
     }
 }
 
+fn generate_auth_salt() -> [u8; 20] {
+    const AUTH_SALT_ALPHABET: &[u8] =
+        b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    let mut salt = [0u8; 20];
+    for byte in &mut salt {
+        *byte = AUTH_SALT_ALPHABET[rand::random::<u8>() as usize % AUTH_SALT_ALPHABET.len()];
+    }
+    salt
+}
+
 fn statement_privilege_database(sql: &str, upper: &str, default_database: &str) -> Option<String> {
     let reference = if upper.starts_with("INSERT ") || upper.starts_with("REPLACE ") {
         let into = upper.find("INTO ")? + "INTO ".len();
@@ -13408,6 +13723,7 @@ impl Drop for Backend {
         self.transaction_snapshot.clear();
         self.stats.release_all_locks(self.connection_id);
         self.stats.release_explicit_table_locks(self.connection_id);
+        self.stats.release_all_named_locks(self.connection_id);
     }
 }
 
@@ -23754,6 +24070,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for Backend {
             .map(|index| MysqlColumn {
                 table: String::new(),
                 column: format!("param{}", index + 1),
+                collen: 0,
                 coltype: ColumnType::MYSQL_TYPE_VAR_STRING,
                 colflags: ColumnFlags::empty(),
             })
@@ -23862,6 +24179,17 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for Backend {
         database: &'a str,
         writer: InitWriter<'a, W>,
     ) -> io::Result<()> {
+        if database.is_empty() {
+            // An empty initial database is valid: it means "no default schema",
+            // exactly as a client that connects without selecting one expects.
+            self.database = String::new();
+            self.clear_statement_messages();
+            self.session_diagnostics = ProcedureDiagnosticsArea {
+                row_count: 0,
+                conditions: Vec::new(),
+            };
+            return writer.ok().await;
+        }
         if self.storage.get_database(database).is_some() || is_virtual_schema_name(database) {
             self.database = database.to_string();
             self.clear_statement_messages();
@@ -23967,6 +24295,7 @@ impl Backend {
                     .map(|name| MysqlColumn {
                         table: String::new(),
                         column: name.clone(),
+                        collen: 0,
                         coltype: ColumnType::MYSQL_TYPE_VAR_STRING,
                         colflags: ColumnFlags::empty(),
                     })
@@ -23991,6 +24320,7 @@ impl Backend {
                             .map(|name| MysqlColumn {
                                 table: String::new(),
                                 column: name.clone(),
+                                collen: 0,
                                 coltype: ColumnType::MYSQL_TYPE_VAR_STRING,
                                 colflags: ColumnFlags::empty(),
                             })
@@ -26773,6 +27103,7 @@ fn procedure_parameter_column(name: &str, data_type: &str) -> MysqlColumn {
     MysqlColumn {
         table: String::new(),
         column: name.to_string(),
+        collen: 0,
         coltype,
         colflags,
     }
@@ -32956,6 +33287,17 @@ fn find_top_level_operator(value: &str, operator: &str) -> Option<usize> {
     find_top_level_keyword(value, operator, 0)
 }
 
+/// Removes a trailing top-level `LIMIT n`, `LIMIT n OFFSET m` or `LIMIT n, m`
+/// clause from a projection expression so that `SELECT expr LIMIT 1` is parsed
+/// as the bare expression. Operates on top-level tokens only (ignores strings,
+/// parentheses and quoted identifiers).
+fn strip_trailing_limit_clause(expression: &str) -> &str {
+    match find_top_level_keyword(expression, " LIMIT ", 0) {
+        Some(pos) => expression[..pos].trim(),
+        None => expression,
+    }
+}
+
 fn split_equality(value: &str) -> anyhow::Result<(&str, &str)> {
     value
         .split_once('=')
@@ -33742,11 +34084,18 @@ fn session_value_sql(value: Option<Vec<u8>>) -> String {
     if value.is_empty() {
         return "X''".to_string();
     }
-    if let Ok(number) = std::str::from_utf8(&value) {
-        let number = number.trim();
+    if let Ok(text) = std::str::from_utf8(&value) {
+        let number = text.trim();
         if !number.is_empty() && number.parse::<f64>().is_ok() {
             return number.to_string();
         }
+        // String-valued system/user variables must be inlined as a single-quoted
+        // SQL string literal (with embedded quotes doubled and backslashes escaped),
+        // NOT as a 0x<hex> binary literal. A binary literal changes the value's
+        // type and corrupts `SELECT @@string_var` projections: the result row would
+        // carry the hex text instead of the original string.
+        let escaped = text.replace('\\', "\\\\").replace('\'', "''");
+        return format!("'{}'", escaped);
     }
     let mut output = String::with_capacity(2 + value.len() * 2);
     output.push_str("0x");
@@ -34798,6 +35147,34 @@ fn normalize_sql_whitespace(sql: &str) -> String {
     output
 }
 
+fn strip_leading_sql_comments(mut sql: &str) -> &str {
+    loop {
+        sql = sql.trim_start();
+        if let Some(rest) = sql.strip_prefix("/*") {
+            let Some(end) = rest.find("*/") else {
+                return sql;
+            };
+            sql = &rest[end + 2..];
+            continue;
+        }
+        if let Some(rest) = sql.strip_prefix("--") {
+            let Some(end) = rest.find('\n') else {
+                return "";
+            };
+            sql = &rest[end + 1..];
+            continue;
+        }
+        if let Some(rest) = sql.strip_prefix('#') {
+            let Some(end) = rest.find('\n') else {
+                return "";
+            };
+            sql = &rest[end + 1..];
+            continue;
+        }
+        return sql;
+    }
+}
+
 fn bind_parameters(query: &str, values: &[String]) -> String {
     let mut result = String::with_capacity(query.len() + values.len() * 8);
     let mut values = values.iter();
@@ -34848,6 +35225,94 @@ fn hex_literal(value: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_named_lock_select_detects_calls() {
+        let parsed = parse_named_lock_select("SELECT GET_LOCK('migration', 0)").unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert!(matches!(
+            parsed[0].0,
+            NamedLockCall::GetLock { timeout, .. } if timeout == 0.0
+        ));
+
+        let parsed = parse_named_lock_select("SELECT RELEASE_LOCK('migration')").unwrap();
+        assert!(matches!(parsed[0].0, NamedLockCall::ReleaseLock { .. }));
+
+        let parsed = parse_named_lock_select("SELECT RELEASE_ALL_LOCKS()").unwrap();
+        assert!(matches!(parsed[0].0, NamedLockCall::ReleaseAllLocks));
+
+        let parsed = parse_named_lock_select("SELECT IS_FREE_LOCK('migration')").unwrap();
+        assert!(matches!(parsed[0].0, NamedLockCall::IsFreeLock { .. }));
+
+        let parsed = parse_named_lock_select("SELECT IS_USED_LOCK('migration')").unwrap();
+        assert!(matches!(parsed[0].0, NamedLockCall::IsUsedLock { .. }));
+
+        // Case-insensitive and with alias.
+        let parsed = parse_named_lock_select("select get_lock('m', 2) AS locked").unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert!(matches!(
+            parsed[0].0,
+            NamedLockCall::GetLock { timeout, .. } if timeout == 2.0
+        ));
+
+        // Real queries fall through.
+        assert!(parse_named_lock_select("SELECT * FROM actors").is_none());
+        assert!(parse_named_lock_select("SELECT 1").is_none());
+        assert!(parse_named_lock_select("UPDATE actors SET value = 1").is_none());
+    }
+
+    #[test]
+    fn named_lock_registry_behaves_like_mysql() {
+        let stats = WireStats::default();
+        // Free lock can be acquired.
+        assert!(stats.acquire_named_lock("a", 1));
+        // Same connection re-acquiring is a no-op success.
+        assert!(stats.acquire_named_lock("a", 1));
+        // IS_FREE_LOCK false while held by another connection.
+        assert!(!stats.is_free_named_lock("a", 2));
+        // IS_USED_LOCK reports the owner.
+        assert_eq!(stats.named_lock_holder("a"), Some(1));
+        // Another connection cannot acquire it.
+        assert!(!stats.acquire_named_lock("a", 2));
+        // Release by a non-owner reports false.
+        assert_eq!(stats.release_named_lock("a", 2), Some(false));
+        // Release by the owner removes it.
+        assert_eq!(stats.release_named_lock("a", 1), Some(true));
+        assert_eq!(stats.named_lock_holder("a"), None);
+        // Releasing a non-existent lock returns None.
+        assert_eq!(stats.release_named_lock("a", 1), None);
+        // After release it is free again.
+        assert!(stats.is_free_named_lock("a", 2));
+        // RELEASE_ALL_LOCKS counts and clears only the caller's leases.
+        assert!(stats.acquire_named_lock("b", 1));
+        assert!(stats.acquire_named_lock("c", 2));
+        assert_eq!(stats.release_all_named_locks(1), 1);
+        assert_eq!(stats.named_lock_holder("b"), None);
+        assert_eq!(stats.named_lock_holder("c"), Some(2));
+    }
+
+    #[test]
+    fn parse_named_lock_select_decodes_hex_bound_param() {
+        // go-sql-driver binds string `?` params as X'..' hex literals. The
+        // lock name "db233:entity:test" is 64 62 33 33 3a ... in hex.
+        let parsed =
+            parse_named_lock_select("SELECT GET_LOCK(X'64623233333a656e746974793a74657374', 5)")
+                .unwrap();
+        match &parsed[0].0 {
+            NamedLockCall::GetLock { name, timeout } => {
+                assert_eq!(name, "db233:entity:test");
+                assert_eq!(*timeout, 5.0);
+            }
+            other => panic!("unexpected call {other:?}"),
+        }
+        // Mixed quote styles also parse.
+        let parsed =
+            parse_named_lock_select("SELECT RELEASE_LOCK(X'64623233333a74657374')").unwrap();
+        assert!(matches!(
+            &parsed[0].0,
+            NamedLockCall::ReleaseLock { name } if name == "db233:test"
+        ));
+    }
 
     async fn transaction_backends() -> (
         tempfile::TempDir,
@@ -35203,7 +35668,10 @@ mod tests {
         backend.execute("RENAME USER 'u2' TO 'u3'").await.unwrap();
         // system schemas exist and are queryable
         assert!(matches!(
-            backend.execute("SHOW TABLES FROM performance_schema").await.unwrap(),
+            backend
+                .execute("SHOW TABLES FROM performance_schema")
+                .await
+                .unwrap(),
             QueryOutcome::Rows { .. }
         ));
         assert!(matches!(
@@ -36466,6 +36934,12 @@ mod tests {
         let response: Vec<u8> = stage1.iter().zip(stage3).map(|(a, b)| a ^ b).collect();
         assert!(verify_mysql_native_password("root", salt, &response));
         assert!(!verify_mysql_native_password("wrong", salt, &response));
+    }
+
+    #[test]
+    fn authentication_salt_is_ascii_compatible_with_jdbc_clients() {
+        let salt = generate_auth_salt();
+        assert!(salt.iter().all(|byte| byte.is_ascii_alphanumeric()));
     }
 
     #[tokio::test]
@@ -39164,7 +39638,10 @@ mod tests {
         })
         .await
         .is_ok();
-        assert!(cleaned, "temporary table cleanup should complete after drop");
+        assert!(
+            cleaned,
+            "temporary table cleanup should complete after drop"
+        );
 
         backend
             .execute("CREATE TEMPORARY TABLE drop_pending (id BIGINT PRIMARY KEY)")
@@ -54696,6 +55173,20 @@ mod tests {
                 "SELECT COLUMN_NAME, DATA_TYPE\n  FROM information_schema.COLUMNS\n WHERE note = 'a  b'"
             ),
             "SELECT COLUMN_NAME, DATA_TYPE FROM information_schema.COLUMNS WHERE note = 'a  b'"
+        );
+    }
+
+    #[test]
+    fn strips_connector_leading_comments_before_dispatch() {
+        assert_eq!(
+            strip_leading_sql_comments(
+                "/* mysql-connector-j */ SELECT 1"
+            ),
+            "SELECT 1"
+        );
+        assert_eq!(
+            strip_leading_sql_comments("-- client comment\nSELECT 1"),
+            "SELECT 1"
         );
     }
 

@@ -15,10 +15,10 @@
 use std::io::{self, Write};
 
 use byteorder::{LittleEndian, WriteBytesExt};
+use tokio::io::AsyncWrite;
 
 use crate::myc::constants::{CapabilityFlags, StatusFlags};
 use crate::myc::io::WriteMysqlExt;
-//use crate::packet::PacketWriter;
 use crate::packet_writer::PacketWriter;
 use crate::{Column, ErrorKind, OkResponse};
 
@@ -82,8 +82,6 @@ pub async fn write_err_raw<W: AsyncWrite + Unpin>(
     w.end_packet().await
 }
 
-use tokio::io::AsyncWrite;
-
 pub(crate) async fn write_prepare_ok<'a, PI, CI, W>(
     id: u32,
     params: PI,
@@ -111,12 +109,24 @@ where
     w.end_packet().await?;
 
     if pi.len() > 0 {
-        write_column_definitions_41(pi, w, client_capabilities, false, StatusFlags::empty())
-            .await?;
+        write_column_definitions_41(
+            pi,
+            w,
+            client_capabilities,
+            false,
+            StatusFlags::SERVER_STATUS_AUTOCOMMIT,
+        )
+        .await?;
     }
     if ci.len() > 0 {
-        write_column_definitions_41(ci, w, client_capabilities, false, StatusFlags::empty())
-            .await?;
+        write_column_definitions_41(
+            ci,
+            w,
+            client_capabilities,
+            false,
+            StatusFlags::SERVER_STATUS_AUTOCOMMIT,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -144,7 +154,8 @@ where
         w.write_lenenc_str(b"")?;
         w.write_lenenc_int(0xC)?;
         w.write_u16::<LittleEndian>(UTF8_GENERAL_CI)?;
-        w.write_u32::<LittleEndian>(1024)?;
+        let column_length = if c.collen == 0 { 1024 } else { c.collen };
+        w.write_u32::<LittleEndian>(column_length)?;
         w.write_u8(c.coltype as u8)?;
         w.write_u16::<LittleEndian>(c.colflags.bits())?;
         w.write_all(&[0x00])?; // decimals
@@ -157,8 +168,10 @@ where
     }
 
     if !client_capabilities.contains(CapabilityFlags::CLIENT_DEPRECATE_EOF) {
+        // Classic EOF packet terminates the column-definition phase.
         write_eof_packet(w, status_flags).await
-    } else if !status_flags.is_empty() {
+    } else if is_com_field_list {
+        // COM_FIELD_LIST retains its EOF/OK terminator under CLIENT_DEPRECATE_EOF.
         write_ok_packet(
             w,
             client_capabilities,
@@ -170,6 +183,9 @@ where
         )
         .await
     } else {
+        // COM_QUERY and COM_STMT_PREPARE omit the terminator when
+        // CLIENT_DEPRECATE_EOF is negotiated. go-sql-driver skips this packet
+        // for prepared parameters and would otherwise queue it for execute.
         Ok(())
     }
 }
