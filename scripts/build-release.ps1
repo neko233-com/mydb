@@ -103,11 +103,10 @@ $packageSize = (Get-Item $packagePath).Length / 1MB
 
 Write-Success "Package created: $packagePath ($([math]::Round($packageSize, 2)) MB)"
 
-# 检查 tag 是否已存在
+# 发布不可覆盖：同一版本只允许一次二进制发布，避免悄悄替换用户已下载的包。
 $existingRelease = gh release view $Tag 2>&1
 if ($LASTEXITCODE -eq 0) {
-    Write-Warn "Release $Tag already exists. Deleting..."
-    gh release delete $Tag -y
+    Write-Error "Release $Tag already exists. Refusing to delete or replace it."
 }
 
 # 创建 release

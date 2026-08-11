@@ -10,7 +10,7 @@
 
 </div>
 
-MyDB 是一款用 Rust 编写的单机高性能数据库，定位为 **SQLite 的替代者**。它以 MySQL 协议暴露接口，已验证范围内的现有 MySQL 驱动/工具可直接接入；内部采用自研 Neko233 Actor 顺序写、Group Commit、WAL 与 Copy-on-Write 存储内核，专为游戏行业写多读少、低交互延迟和低资源常驻场景优化。
+MyDB 是一款用 Rust 编写的单机高性能数据库，定位为 **SQLite 的替代者**。它以 MySQL 协议暴露接口，已验证范围内的现有 MySQL 驱动/工具可直接接入；内部采用自研 Neko233 Leader/Follower 组提交、Group Commit、WAL 与 Copy-on-Write 存储内核，专为游戏行业写多读少、低交互延迟和低资源常驻场景优化。
 
 > **设计边界**：MyDB 是**单机数据库**，复制拓扑、读写分离、分布式 XA 协调等非单机能力**设计上不支持**。
 
@@ -21,7 +21,7 @@ MyDB 是一款用 Rust 编写的单机高性能数据库，定位为 **SQLite �
 | 特性 | 说明 |
 |------|------|
 | 🔌 **MySQL 兼容** | MySQL 8 协议、CLI/驱动直连；SQL 覆盖以已验收兼容矩阵为准 |
-| ⚡ **Actor 顺序写** | 所有写批次进入有界 FIFO，适合玩家状态和游戏事件更新 |
+| ⚡ **Leader/Follower 组提交** | 调用方线程协作的严格 FIFO 写，适合玩家状态和游戏事件更新 |
 | 💾 **事务支持** | `BEGIN`/`COMMIT`/`ROLLBACK`/`SAVEPOINT`，断线自动回滚 |
 | 📊 **Prometheus 监控** | `/metrics` 原生导出连接、查询、锁、WAL、存储等指标 |
 | 🔧 **内置 Agent** | HTTP API 提供健康诊断、慢 SQL 分析、SQL 静态检查 |
@@ -58,7 +58,7 @@ mydb/
 
 ### 存储引擎：Neko233
 
-- **Actor FIFO 写入**：单写 Actor 保证顺序一致性，无锁竞争
+- **Leader/Follower FIFO 写入**：首个空闲写者成为 leader 串行 drain 写队列、每组单次 WAL fsync，保证顺序一致性，无专用写线程
 - **Leader/Follower Group Commit**：吞吐默认 250μs 收集窗口；`group_commit_window_us=0` 切换为低延迟自然批量
 - **WAL 单块写入**：预分配文件（8MB 粒度）+ 64KB 可复用缓冲区，`append_raw` 直写热路径，单 `write_all` 原子追加，CRC32 校验
 - **bincode fixint 编码**：WAL 记录使用小端固定长度整数编码，序列化/反序列化比 varint 更快
@@ -124,6 +124,19 @@ curl -fsSL https://raw.githubusercontent.com/neko233-com/mydb/main/scripts/insta
 irm https://raw.githubusercontent.com/neko233-com/mydb/main/scripts/install.ps1 | iex
 ```
 
+默认安装到 `C:\Server\mydb\mydb-server`，创建 `MyDBServer` 自动启动服务，监听
+`0.0.0.0:3306`，配置和数据分别位于 `config\`、`data\`。安装脚本会幂等保留已有配置/数据，升级只替换二进制；远程连接需要 Windows 防火墙允许 TCP 3306。
+
+```powershell
+# 本地发布包升级（不重复发布版本）
+.\scripts\install.ps1 -PackagePath .\mydb-windows-x86_64.zip
+
+# 卸载 MySQL/MariaDB；先完成迁移和备份，再按需加 -PurgeData
+.\scripts\uninstall-mysql.ps1
+```
+
+root/root 仅为现有游戏服务兼容默认值；公网部署必须修改密码并启用 TLS/限制防火墙来源。
+
 ### 从源码编译
 
 要求：Rust 1.75+
@@ -150,7 +163,7 @@ cargo install --path crates/mydb-dump
 配置文件使用 YAML 格式，默认位置：
 - Linux: `/etc/mydb/config.yaml`
 - macOS: `/usr/local/etc/mydb/config.yaml`
-- Windows: `%APPDATA%\mydb\config.yaml`
+- Windows: `C:\Server\mydb\mydb-server\config\config.yaml`
 
 ### 生产级配置示例
 
@@ -209,6 +222,33 @@ mydb-cli -h 127.0.0.1 -P 3306 -u root -p --source schema.sql
 # 或使用标准 MySQL 客户端
 mysql -h 127.0.0.1 -P 3306 -u root -p
 ```
+
+### JDBC / JetBrains / VS Code / Go / Node.js
+
+MyDB 暴露标准 MySQL TCP 协议，不要求使用 `mydb-cli`。JetBrains DataGrip/IDEA、VS Code
+MySQL 扩展和数据库插件使用 MySQL 数据源：Host `127.0.0.1`、Port `3306`、User `root`、
+Password `root`。JDBC URL：
+
+```text
+jdbc:mysql://127.0.0.1:3306/game_db_0?useSSL=false&serverTimezone=UTC
+```
+
+Go `database/sql`（`github.com/go-sql-driver/mysql`）：
+
+```go
+db, err := sql.Open("mysql", "root:root@tcp(127.0.0.1:3306)/game_db_0?charset=utf8mb4&parseTime=true&loc=Local")
+```
+
+Node.js / VS Code JavaScript/TypeScript（`mysql2`）：
+
+```js
+const db = await mysql.createConnection({
+  host: "127.0.0.1", port: 3306, user: "root", password: "root", database: "game_db_0"
+});
+```
+
+远程客户端将 Host 改为服务器 IP；安装脚本默认监听全部网卡并创建 TCP 3306 入站规则。
+生产环境应改为强密码、TLS 或明确的来源 IP 白名单。
 
 ---
 
@@ -446,7 +486,7 @@ mysql -h 127.0.0.1 -P 3306 game < game.sql
 
 - 持久化存储引擎
 - 完整 ACID 支持
-- Actor 顺序写、Group Commit、WAL、COW Checkpoint
+- Leader/Follower 组提交、Group Commit、WAL、COW Checkpoint
 - 主键/唯一索引、外键、CHECK 约束
 - `ENGINE=InnoDB` 是外部兼容别名；未知引擎返回 MySQL 1286，实际兼容范围以 [CheckList.md](CheckList.md) 已验收项为准
 - 崩溃恢复回归覆盖 WAL 预分配零尾、torn write 与中段损坏；完整故障注入/平台验收仍是发布门槛

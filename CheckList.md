@@ -17,8 +17,8 @@
 ## 内核与存储
 
 - [x] `InnoDB` 映射到自研持久化 Neko233 引擎，`MEMORY` 保持独立非事务语义
-- [x] 单写 Actor FIFO、事务批次、group commit、CRC WAL、断尾截断、checkpoint 与恢复
-- [x] 同 Actor/主键顺序写、并发计数更新和 UPSERT 不丢写
+- [x] Leader/Follower FIFO、事务批次、group commit、CRC WAL、断尾截断、checkpoint 与恢复
+- [x] 同主键顺序写、并发计数更新和 UPSERT 不丢写
 - [x] 主键/唯一索引、AUTO_INCREMENT、NULL/空字节/BLOB 持久化
 - [x] 存储目录感知与只清理未引用 page generation；测试证明不会删除正在引用的数据
 - [x] Prometheus 暴露 prepare/WAL sync/apply/checkpoint/锁/错误等指标
@@ -64,7 +64,7 @@
 - [x] 常用 JSON_EXTRACT/JSON_UNQUOTE 和标量 IS NULL
 - [x] 游戏 profile 常用 JSON CRUD：JSON_OBJECT/ARRAY/VALID/TYPE/LENGTH/CONTAINS/SET/REMOVE，覆盖 INSERT/SELECT/WHERE/UPDATE/UPSERT 和事务回滚
 - [x] 持久化只读 VIEW：CREATE/CREATE OR REPLACE/DROP/SHOW CREATE/SHOW FULL TABLES；显式列名、普通/JOIN/聚合视图、外层过滤、DDL 隐式提交、重启恢复和禁止写视图
-- [x] CREATE TABLE [IF NOT EXISTS] ... AS SELECT：普通/JOIN/聚合/视图来源、结果列类型推导、DDL 隐式提交、建表与首批数据同一 Actor/WAL 原子组、重启恢复
+- [x] CREATE TABLE [IF NOT EXISTS] ... AS SELECT：普通/JOIN/聚合/视图来源、结果列类型推导、DDL 隐式提交、建表与首批数据同一 WAL 原子组、重启恢复
 - [x] RENAME TABLE 多项及 ALTER TABLE RENAME TO/AS：原子 schema+数据镜像，保留普通表、无主键重复行、AUTO_INCREMENT、视图定义、DDL 隐式提交和重启恢复
 - [x] 单条 ALTER TABLE 多操作：组合 ADD/DROP/MODIFY COLUMN、ADD/DROP INDEX/UNIQUE KEY，接受 ALGORITHM/LOCK 提示；整批预校验、失败零变更、同一 WAL 原子组、DDL 隐式提交和重启恢复
 - [x] ALTER TABLE 列演进：ADD/MODIFY ... FIRST|AFTER、CHANGE COLUMN、RENAME COLUMN；保持旧行字段值、列顺序、主键/自增和索引引用，使用 COW 行重写并可重启恢复
@@ -145,7 +145,7 @@
 - [x] 真实 MySQL 8.0.45 dump、循环外键 dump 和 hex BLOB 原样导入
 - [x] 独立 `crates/mydb-dump` / `mydbdump` CLI
 - [x] 一致性全量、LSN 增量、校验、恢复和 PITR HTTP/CLI 链路
-- [x] 备份使用 Actor 边界快照，不锁业务表
+- [x] 备份使用组提交边界快照，不锁业务表
 - [ ] 大数据量迁移的断点续传、限速、在线增量追平与切流回滚演练
 - [ ] 与 mysqldump/mysqlpump/mysqlbinlog 复杂对象及全部选项的兼容矩阵
 
@@ -174,16 +174,16 @@
 ## 当前可复现证据
 
 - [x] `cargo test --workspace`：204 项通过
-- [x] `cargo test -p mydb-wire`：133 项通过（含 IANA 命名时区、大小写名称、上海/纽约、DST 跳时/回拨、连接隔离、动态默认值、事务及函数比较投影，会话 time_zone 固定偏移/SYSTEM、连接隔离、SET 左到右、NOW/SYSDATE、UNIX 微秒往返、动态默认值、ON UPDATE、事务，CONVERT_TZ 固定偏移、UTC/GMT/SYSTEM、跨日、微秒、无效时区、WHERE/UPDATE/事务，NOW/CURRENT_TIMESTAMP/local/UTC/UNIX 的语句开始快照、SYSDATE 调用时刻、跨 SLEEP 与批量 UPDATE 一致性，UTC_DATE/UTC_TIME/UTC_TIMESTAMP、LOCALTIME/LOCALTIMESTAMP、CURTIME/CURRENT_TIME 的 UTC/local、fsp、DML 和事务，ADDDATE/SUBDATE/TIMESTAMP/TIMESTAMPADD 的别名、天数简写、SQL_TSI_、月末、微秒和排期 DML/事务，GET_FORMAT/STR_TO_DATE/TIME_FORMAT 的官方格式、月名/微秒差异、文本导入 DML/事务，EXTRACT 基础/复合单位、函数内 FROM 顶层解析、事件分区 DML/事务，TO_DAYS/FROM_DAYS/TO_SECONDS 与 PERIOD_ADD/PERIOD_DIFF 的 year-0 日序、紧凑数字日期、归档/赛季 DML/事务，WEEK/WEEKOFYEAR/YEARWEEK 的 0–7 模式、ISO 跨年、注册周 cohort DML/事务，ADDTIME/SUBTIME/MAKETIME 的跨日 DATETIME、负时长、微秒、游戏冷却 DML/事务，TIME/MICROSECOND/TIME_TO_SEC/SEC_TO_TIME/TIMEDIFF 的负时长、跨天、微秒、DATETIME 差值及 DML/事务，DAYOFYEAR/WEEKDAY/QUARTER/DAYNAME/MONTHNAME/LAST_DAY/MAKEDATE 的闰年、跨年、月末结算 DML/事务，CONV/BIT_COUNT 的 64 位进制、显式二进制位计数、权限掩码 DML/事务，PI/角度/三角函数的定义域、游戏向量 DML/事务，MD5/SHA/SHA1/SHA2/CRC32 的文本/二进制迁移摘要、DML/事务和 CHECK 关键字边界，UUID v1/二进制 swap/校验、IPv4/IPv6 二进制往返与 DML/事务，BIN/OCT/HEX/UNHEX/Base64/FORMAT 的迁移编码、换行/空白、locale、DML/事务回滚，字符串工具函数 UTF-8/二进制/DML/64MiB 内存边界、FIND_IN_SET/FIELD/ELT/MAKE_SET/EXPORT_SET 的 SELECT/WHERE/UPDATE/回滚、存储程序 TIME/DATETIME/TIMESTAMP FSP 舍入/截断/进位与调用者-例程 SQL_MODE 边界、Trigger/Procedure/参数 ENUM/SET 成员与数字索引/位掩码转换、PROCEDURE CREATED/LAST_ALTERED/SQL_MODE 快照与恢复、diagnostics 多 condition/max_error_count/sql_notes、连接顶层 GET DIAGNOSTICS 真实驱动与 prepared 1295、Prepared CALL OUT/INOUT 声明类型 Binary Wire、PROCEDURE/CALL 多结果集/游标/condition handler/diagnostics/ALTER characteristics、Trigger 复合控制流与常用局部变量类型转换、连接级临时表、SQL_CALC_FOUND_ROWS、会话写后状态、日期/自动更新时间、用户/系统变量、协议/SQL prepared、注册留存、DAU、收入、数学、文本、JSON CRUD、视图及 ALTER 演进重启）
-- [x] `cargo test -p mydb-storage -p mydb-wire`：173 项通过（23 个 storage 单元测试、17 个 storage 集成测试、133 个 wire 测试）
-- [x] 最新并发回归：`cargo test -p mydb-storage` 32 个单元测试、17 个集成测试通过；`cargo test -p mydb-wire` 140 项通过；并发不同表 INSERT/UPDATE/UPSERT 合并为一个 WAL fsync，物理 apply 保持 Actor 顺序；真实 Actor group 重启后双表数据完整且无重复
+- [x] `cargo test -p mydb-wire`：167 项通过（含 IANA 命名时区、大小写名称、上海/纽约、DST 跳时/回拨、连接隔离、动态默认值、事务及函数比较投影，会话 time_zone 固定偏移/SYSTEM、连接隔离、SET 左到右、NOW/SYSDATE、UNIX 微秒往返、动态默认值、ON UPDATE、事务，CONVERT_TZ 固定偏移、UTC/GMT/SYSTEM、跨日、微秒、无效时区、WHERE/UPDATE/事务，NOW/CURRENT_TIMESTAMP/local/UTC/UNIX 的语句开始快照、SYSDATE 调用时刻、跨 SLEEP 与批量 UPDATE 一致性，UTC_DATE/UTC_TIME/UTC_TIMESTAMP、LOCALTIME/LOCALTIMESTAMP、CURTIME/CURRENT_TIME 的 UTC/local、fsp、DML 和事务，ADDDATE/SUBDATE/TIMESTAMP/TIMESTAMPADD 的别名、天数简写、SQL_TSI_、月末、微秒和排期 DML/事务，GET_FORMAT/STR_TO_DATE/TIME_FORMAT 的官方格式、月名/微秒差异、文本导入 DML/事务，EXTRACT 基础/复合单位、函数内 FROM 顶层解析、事件分区 DML/事务，TO_DAYS/FROM_DAYS/TO_SECONDS 与 PERIOD_ADD/PERIOD_DIFF 的 year-0 日序、紧凑数字日期、归档/赛季 DML/事务，WEEK/WEEKOFYEAR/YEARWEEK 的 0–7 模式、ISO 跨年、注册周 cohort DML/事务，ADDTIME/SUBTIME/MAKETIME 的跨日 DATETIME、负时长、微秒、游戏冷却 DML/事务，TIME/MICROSECOND/TIME_TO_SEC/SEC_TO_TIME/TIMEDIFF 的负时长、跨天、微秒、DATETIME 差值及 DML/事务，DAYOFYEAR/WEEKDAY/QUARTER/DAYNAME/MONTHNAME/LAST_DAY/MAKEDATE 的闰年、跨年、月末结算 DML/事务，CONV/BIT_COUNT 的 64 位进制、显式二进制位计数、权限掩码 DML/事务，PI/角度/三角函数的定义域、游戏向量 DML/事务，MD5/SHA/SHA1/SHA2/CRC32 的文本/二进制迁移摘要、DML/事务和 CHECK 关键字边界，UUID v1/二进制 swap/校验、IPv4/IPv6 二进制往返与 DML/事务，BIN/OCT/HEX/UNHEX/Base64/FORMAT 的迁移编码、换行/空白、locale、DML/事务回滚，字符串工具函数 UTF-8/二进制/DML/64MiB 内存边界、FIND_IN_SET/FIELD/ELT/MAKE_SET/EXPORT_SET 的 SELECT/WHERE/UPDATE/回滚、存储程序 TIME/DATETIME/TIMESTAMP FSP 舍入/截断/进位与调用者-例程 SQL_MODE 边界、Trigger/Procedure/参数 ENUM/SET 成员与数字索引/位掩码转换、PROCEDURE CREATED/LAST_ALTERED/SQL_MODE 快照与恢复、diagnostics 多 condition/max_error_count/sql_notes、连接顶层 GET DIAGNOSTICS 真实驱动与 prepared 1295、Prepared CALL OUT/INOUT 声明类型 Binary Wire、PROCEDURE/CALL 多结果集/游标/condition handler/diagnostics/ALTER characteristics、Trigger 复合控制流与常用局部变量类型转换、连接级临时表、SQL_CALC_FOUND_ROWS、会话写后状态、日期/自动更新时间、用户/系统变量、协议/SQL prepared、注册留存、DAU、收入、数学、文本、JSON CRUD、视图及 ALTER 演进重启）
+- [x] `cargo test -p mydb-storage -p mydb-wire`：211 项通过（mydb-storage 44、mydb-wire 167）
+- [x] 最新并发回归：`cargo test -p mydb-storage` 44 项通过；`cargo test -p mydb-wire` 167 项通过；并发不同表 INSERT/UPDATE/UPSERT 合并为一个 WAL fsync，物理 apply 保持 FIFO 顺序；真实组提交重启后双表数据完整且无重复
 - [x] vendored `opensrv-mysql`：110 项通过，覆盖自定义错误码/SQLSTATE、多结果 SERVER_MORE_RESULTS_EXISTS、握手多结果能力和 Prepared CALL SERVER_PS_OUT_PARAMS 状态位
 - [x] `cargo clippy --workspace --all-targets -- -D warnings`：通过
 - [x] MySQL 8.0.45/8.0.46 差分：真实 dump、changed-row affected counts/no-op UPSERT insert id、INSERT/REPLACE SET、INSERT VALUES 默认行/表达式/DEFAULT(col)/1364、UPDATE/UPSERT/JOIN DEFAULT、MySQL 8 行/列别名 UPSERT、复杂冲突标量表达式和左到右赋值、CREATE TABLE LIKE、TRUNCATE 隐式提交/自增/FK 1701、LOAD DATA 用户变量/SET/latin1/BLOB/1261/1262/1062 warning/strict 1261/1262/1300 原子失败、FOR SHARE/NOWAIT 3572/主键队列 SKIP LOCKED/双事务死锁 1213、FK/CHECK/事务/SAVEPOINT、JOIN/NATURAL/USING、有键/无键重复行单/多目标 JOIN UPDATE/DELETE、相关/派生/CTE 子查询、set operators、多列 GROUP BY、窗口、多列/表达式 ORDER BY、常用 CASE/字符串/数值/CAST 投影/WHERE/UPDATE/DELETE
 - [x] `scripts/docker-smoke.ps1`：通过，含 changed-row affected counts/no-op WAL avoidance、INSERT/REPLACE SET、INSERT VALUES 默认行/表达式/1364、UPDATE/UPSERT/JOIN DEFAULT、MySQL 8 行/列别名 UPSERT、复杂冲突标量表达式/左到右赋值、SIGKILL committed/uncommitted 恢复、WAL 坏尾精确截断、CREATE TABLE LIKE、TRUNCATE 自增/FK、双连接 FOR SHARE/NOWAIT/SKIP LOCKED/死锁受害者回滚、真实 `LOAD DATA LOCAL INFILE` 协议、字符集/warning/strict error 诊断、语句原子性及 `secure_file_priv` 边界
 - [x] `NO_BUILD=1 bash scripts/docker-smoke.sh`：通过（当前脚本与 PowerShell 同覆盖）
 - [x] Windows Docker Desktop Ubuntu 24.04 开发基准门禁：20 秒预算、1 轮、同为 `ENGINE=InnoDB`、20 MB/s/500 IOPS、fsync-on-commit；2026-07-20 最新原始样本 `target/io-bench-desktop-header-check/` 为 MyDB 2262.9 ops/s、MySQL 8.0.46 3318.4 ops/s、0.682x，MyDB 写 P99 40.5 ms、MySQL 495.9 ms。仅证明限速工具链与回归数据，不作为正式性能结论
-- [x] 2026-07-20 8 表/4 CPU 限速单轮：`target/io-bench-current-multitable-windowed/`，MyDB 1802.7 ops/s、MySQL 3417.4 ops/s、0.527x；WAL 305 次 fsync 覆盖 821 请求（2.69 请求/组），比无窗口专用 Actor 的 2.17 请求/组提升。单轮仅作回归证据，不作为正式性能结论
+- [x] 2026-07-20 8 表/4 CPU 限速单轮：`target/io-bench-current-multitable-windowed/`，MyDB 1802.7 ops/s、MySQL 3417.4 ops/s、0.527x；WAL 305 次 fsync 覆盖 821 请求（2.69 请求/组），比无窗口专用写线程的 2.17 请求/组提升。单轮仅作回归证据，不作为正式性能结论
 - [x] 2026-07-20 8 表/4 CPU 限速 3 轮：`target/io-bench-multitable-async-audit-3r/`，MyDB 7017.2 ops/s、MySQL 7315.1 ops/s、0.959x；WAL 269 次 fsync 覆盖 1641 请求（6.10 请求/组）。异步批量审计移出 SQL 临界路径；读主导样本 `target/io-bench-read-async-audit/` 读 P50 为 210 us。开发机 Docker 回归证据，不代表物理生产硬件验收
 - [x] db233-go `go test -count=1 ./...`：通过且仓库无改动
 - [x] 默认 MyDB 容器：healthy、`unless-stopped`、0.5 CPU、512 MiB

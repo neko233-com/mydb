@@ -41,6 +41,10 @@ struct Args {
     #[arg(short, long)]
     port: Option<u16>,
 
+    /// Override listen host/address (use 0.0.0.0 for remote clients)
+    #[arg(long)]
+    host: Option<String>,
+
     /// Override data directory
     #[arg(long)]
     data_dir: Option<PathBuf>,
@@ -120,6 +124,9 @@ fn main() -> Result<()> {
     if let Some(port) = args.port {
         config.server.port = port;
     }
+    if let Some(host) = &args.host {
+        config.server.host = host.clone();
+    }
     if let Some(data_dir) = &args.data_dir {
         config.storage.data_dir = data_dir.clone();
     }
@@ -163,14 +170,13 @@ async fn run_server(args: Args, config: mydb_config::ServerConfig) -> Result<()>
     info!("Storage engine: {}", config.storage.engine);
 
     // Initialize storage engine with WAL
-    let storage = Arc::new(
-        mydb_storage::StorageEngineManager::try_new_with_group_commit_window(
-            config.storage.data_dir.clone(),
-            config.storage.page_size as usize,
-            &config.storage.buffer_pool_size,
-            std::time::Duration::from_micros(config.storage.group_commit_window_us),
-        )?,
-    );
+    let storage = Arc::new(mydb_storage::StorageEngineManager::try_new_sharded(
+        config.storage.data_dir.clone(),
+        config.storage.page_size as usize,
+        &config.storage.buffer_pool_size,
+        std::time::Duration::from_micros(config.storage.group_commit_window_us),
+        config.storage.shard_count,
+    )?);
 
     // Initialize storage (load databases, replay WAL)
     storage.init().await?;
@@ -484,7 +490,7 @@ async fn metrics(State(state): State<AdminState>) -> impl IntoResponse {
             "# TYPE mydb_storage_reads_total counter\nmydb_storage_reads_total {}\n",
             "# TYPE mydb_storage_write_batches_total counter\nmydb_storage_write_batches_total {}\n",
             "# TYPE mydb_storage_errors_total counter\nmydb_storage_errors_total {}\n",
-            "# TYPE mydb_write_actor_queue_depth gauge\nmydb_write_actor_queue_depth {}\n",
+            "# TYPE mydb_write_commit_queue_depth gauge\nmydb_write_commit_queue_depth {}\n",
             "# TYPE mydb_buffer_pool_pages gauge\nmydb_buffer_pool_pages {}\n",
             "# TYPE mydb_group_commits_total counter\nmydb_group_commits_total {}\n",
             "# TYPE mydb_grouped_requests_total counter\nmydb_grouped_requests_total {}\n",
@@ -514,7 +520,7 @@ async fn metrics(State(state): State<AdminState>) -> impl IntoResponse {
         storage.reads,
         storage.writes,
         storage.errors,
-        storage.actor_queue_depth,
+        storage.commit_queue_depth,
         storage.buffer_pool_pages,
         storage.group_commits,
         storage.grouped_requests,
@@ -661,7 +667,7 @@ async fn memory_stats(
         "max_memory": config.memory.max_memory,
         "buffer_pool_size": config.storage.buffer_pool_size,
         "buffer_pool_pages": stats.buffer_pool_pages,
-        "actor_queue_depth": stats.actor_queue_depth,
+        "commit_queue_depth": stats.commit_queue_depth,
     })))
 }
 
@@ -1213,10 +1219,18 @@ fn apply_pending_restore(config: &mydb_config::ServerConfig) -> Result<()> {
     clear_restore_destination(data_dir, backup_root, &marker)?;
     copy_directory(&backup_root.join(&full.id).join("data"), data_dir, None)?;
     let wal_dir = data_dir.join("wal");
+    // The full backup copies every shard's WAL; `max_lsn` over the sharded
+    // layout yields the global high-water mark, which must equal `full.to_lsn`.
     let mut installed_lsn = mydb_wal::WalReader::open(wal_dir.clone())?.max_lsn()?;
     if installed_lsn != full.to_lsn {
         anyhow::bail!("restored full backup ends at unexpected LSN");
     }
+    // Incremental archives are a single merged, globally-ordered stream. Under
+    // sharding each shard's WAL is replayed independently, so install the
+    // merged archive into shard 0's directory: shard 0's replay re-applies
+    // every record through the shared catalog, and each global LSN appears in
+    // exactly one shard's WAL, so nothing is applied twice.
+    let shard_zero_wal = wal_dir.join("shard_0");
     let target_lsn = pending
         .target_lsn
         .unwrap_or_else(|| chain.last().map_or(full.to_lsn, |backup| backup.to_lsn));
@@ -1238,7 +1252,7 @@ fn apply_pending_restore(config: &mydb_config::ServerConfig) -> Result<()> {
         if target_lsn < incremental.to_lsn {
             mydb_wal::install_wal_archive_prefix(
                 &archive,
-                &wal_dir,
+                &shard_zero_wal,
                 incremental.from_lsn,
                 incremental.to_lsn,
                 target_lsn,
@@ -1248,7 +1262,7 @@ fn apply_pending_restore(config: &mydb_config::ServerConfig) -> Result<()> {
         } else {
             mydb_wal::install_wal_archive(
                 &archive,
-                &wal_dir,
+                &shard_zero_wal,
                 incremental.from_lsn,
                 incremental.to_lsn,
             )?;
@@ -1470,7 +1484,7 @@ fn answer_agent_question(
         AgentIntent::Health => diagnose_advice(
             wire.query_errors,
             storage.errors,
-            storage.actor_queue_depth,
+            storage.commit_queue_depth,
             wire.lock_timeouts,
         )
         .join("; "),
@@ -1499,7 +1513,7 @@ fn answer_agent_question(
                 .unwrap_or("unknown");
             format!(
                 "{groups} write groups, queue depth {}, average prepare/WAL/apply/checkpoint = {}/{}/{}/{} us per group; dominant phase: {dominant}",
-                storage.actor_queue_depth,
+                storage.commit_queue_depth,
                 storage.prepare_validation_micros / groups,
                 storage.wal_sync_micros / groups,
                 storage.apply_micros / groups,
@@ -1543,7 +1557,7 @@ async fn agent_health(
     let healthy = audit.healthy
         && storage.errors == 0
         && storage.checkpoint_errors == 0
-        && storage.actor_queue_depth < 1024;
+        && storage.commit_queue_depth < 1024;
     Ok(Json(json!({
         "healthy": healthy,
         "connections": wire.active_connections,
@@ -1551,7 +1565,7 @@ async fn agent_health(
         "audit_healthy": audit.healthy,
         "audit_events": audit.accepted,
         "audit_rejections": audit.rejected,
-        "write_actor_queue_depth": storage.actor_queue_depth,
+        "write_commit_queue_depth": storage.commit_queue_depth,
         "storage_errors": storage.errors,
         "group_commits": storage.group_commits,
         "grouped_requests": storage.grouped_requests,
@@ -1568,7 +1582,7 @@ async fn agent_health(
         "advice": diagnose_advice(
             wire.query_errors,
             storage.errors,
-            storage.actor_queue_depth,
+            storage.commit_queue_depth,
             wire.lock_timeouts,
         ),
     })))
@@ -1638,7 +1652,7 @@ async fn agent_diagnose(
         "summary": diagnose_advice(
             wire.query_errors,
             storage.errors,
-            storage.actor_queue_depth,
+            storage.commit_queue_depth,
             wire.lock_timeouts,
         ),
         "signals": {
@@ -1646,7 +1660,7 @@ async fn agent_diagnose(
             "total_queries": wire.queries,
             "query_errors": wire.query_errors,
             "storage_errors": storage.errors,
-            "actor_queue_depth": storage.actor_queue_depth,
+            "commit_queue_depth": storage.commit_queue_depth,
             "buffer_pool_pages": storage.buffer_pool_pages,
             "group_commits": storage.group_commits,
             "grouped_requests": storage.grouped_requests,
@@ -2067,7 +2081,7 @@ mod tests {
                 reads: 0,
                 writes: 20,
                 errors: 0,
-                actor_queue_depth: 4,
+                commit_queue_depth: 4,
                 buffer_pool_pages: 2,
                 group_commits: 10,
                 grouped_requests: 20,
@@ -2093,9 +2107,12 @@ mod tests {
         let full_id = "full-test";
         let incremental_id = "incremental-test";
         let full_data = backup_root.join(full_id).join("data");
-        std::fs::create_dir_all(full_data.join("wal")).unwrap();
+        // The sharded deployment keeps each shard's WAL under `wal/shard_N/`;
+        // the full backup copies that layout, so seed it the same way.
+        let full_wal = full_data.join("wal").join("shard_0");
+        std::fs::create_dir_all(&full_wal).unwrap();
         {
-            let mut writer = mydb_wal::WalWriter::open(full_data.join("wal"), None).unwrap();
+            let mut writer = mydb_wal::WalWriter::open(full_wal, None).unwrap();
             for transaction in 1..=2 {
                 let mut record = mydb_wal::WalRecord::new(
                     0,
