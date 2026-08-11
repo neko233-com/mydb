@@ -2,6 +2,8 @@ use std::collections::HashSet;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(target_os = "windows")]
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -14,9 +16,12 @@ use clap::Parser;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::sync::Semaphore;
+use tokio::sync::{Notify, Semaphore};
 use tower_http::trace::TraceLayer;
 use tracing::info;
+
+#[cfg(target_os = "windows")]
+static WINDOWS_SHUTDOWN: OnceLock<Arc<Notify>> = OnceLock::new();
 
 #[derive(Parser, Debug)]
 #[command(
@@ -76,6 +81,11 @@ fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+
+    #[cfg(target_os = "windows")]
+    if args.service.as_deref() == Some("run") {
+        return run_windows_service();
+    }
 
     if args.healthcheck {
         let address = "127.0.0.1:3306".parse()?;
@@ -398,6 +408,14 @@ async fn shutdown_signal() {
 
     #[cfg(not(unix))]
     {
+        #[cfg(target_os = "windows")]
+        if let Some(notify) = WINDOWS_SHUTDOWN.get() {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {},
+                _ = notify.notified() => {},
+            }
+            return;
+        }
         let _ = tokio::signal::ctrl_c().await;
     }
 }
@@ -1774,6 +1792,93 @@ fn copy_directory(source: &Path, destination: &Path, skip: Option<&Path>) -> Res
         }
     }
     Ok(())
+}
+
+#[cfg(target_os = "windows")]
+windows_service::define_windows_service!(ffi_service_main, windows_service_main);
+
+#[cfg(target_os = "windows")]
+fn run_windows_service() -> Result<()> {
+    let _ = WINDOWS_SHUTDOWN.set(Arc::new(Notify::new()));
+    windows_service::service_dispatcher::start("MyDBServer", ffi_service_main)
+        .map_err(|error| anyhow::anyhow!("Windows service dispatcher failed: {error}"))
+}
+
+#[cfg(target_os = "windows")]
+fn windows_service_main(_arguments: Vec<std::ffi::OsString>) {
+    use windows_service::service::{
+        ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus,
+        ServiceType,
+    };
+    use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
+
+    let result = (|| -> Result<()> {
+        let shutdown = WINDOWS_SHUTDOWN
+            .get()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Windows service shutdown channel is missing"))?;
+        let event_handler = move |control_event| -> ServiceControlHandlerResult {
+            match control_event {
+                ServiceControl::Stop | ServiceControl::Shutdown => {
+                    shutdown.notify_waiters();
+                    ServiceControlHandlerResult::NoError
+                }
+                ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
+                _ => ServiceControlHandlerResult::NotImplemented,
+            }
+        };
+        let status_handle = service_control_handler::register("MyDBServer", event_handler)?;
+        status_handle.set_service_status(ServiceStatus {
+            service_type: ServiceType::OWN_PROCESS,
+            current_state: ServiceState::Running,
+            controls_accepted: ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
+            exit_code: ServiceExitCode::Win32(0),
+            checkpoint: 0,
+            wait_hint: std::time::Duration::default(),
+            process_id: None,
+        })?;
+
+        let args = Args::try_parse_from(std::env::args_os())?;
+        let mut config = mydb_config::ServerConfig::load(args.config.as_deref())?;
+        if let Some(port) = args.port {
+            config.server.port = port;
+        }
+        if let Some(host) = &args.host {
+            config.server.host = host.clone();
+        }
+        if let Some(data_dir) = &args.data_dir {
+            config.storage.data_dir = data_dir.clone();
+        }
+        validate_runtime_security(&config)?;
+        let worker_threads = runtime_worker_threads(config.server.thread_count);
+        let result = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(worker_threads)
+            .thread_name("mydb-worker")
+            .build()?
+            .block_on(run_server(args, config));
+        if let Err(error) = &result {
+            tracing::error!("MyDB Windows service stopped with error: {error}");
+        }
+        status_handle.set_service_status(ServiceStatus {
+            service_type: ServiceType::OWN_PROCESS,
+            current_state: ServiceState::Stopped,
+            controls_accepted: ServiceControlAccept::empty(),
+            exit_code: if result.is_ok() {
+                ServiceExitCode::Win32(0)
+            } else {
+                ServiceExitCode::Win32(1)
+            },
+            checkpoint: 0,
+            wait_hint: std::time::Duration::default(),
+            process_id: None,
+        })?;
+        result
+    })();
+
+    if let Err(error) = result {
+        tracing::error!("MyDB Windows service initialization failed: {error}");
+    }
 }
 
 fn install_service() -> Result<()> {
