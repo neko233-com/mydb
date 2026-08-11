@@ -53,13 +53,19 @@ fn export_wal_range_inner(
     if to_lsn < from_lsn {
         bail!("invalid WAL range {from_lsn}..{to_lsn}");
     }
-    let reader = WalReader::open(wal_dir.to_path_buf())?;
+    // A sharded deployment keeps each shard's WAL under `wal/shard_N/`. Merge
+    // every shard's records into one stream; because LSNs are globally unique
+    // and contiguous, the merged `(from_lsn, to_lsn]` window is itself a
+    // contiguous sequence that the archive validator accepts.
     let mut records = Vec::new();
-    reader.replay(|record| {
-        if record.lsn > from_lsn && record.lsn <= to_lsn {
-            records.push(record);
-        }
-    })?;
+    for shard_dir in wal_dirs_to_scan(wal_dir) {
+        let reader = WalReader::open(shard_dir)?;
+        reader.replay(|record| {
+            if record.lsn > from_lsn && record.lsn <= to_lsn {
+                records.push(record);
+            }
+        })?;
+    }
     records.sort_by_key(|record| record.lsn);
     validate_record_sequence(&records, from_lsn, to_lsn)?;
     if force_redo {
@@ -299,6 +305,33 @@ fn sync_parent(_path: &Path) -> Result<()> {
     #[cfg(unix)]
     File::open(_path)?.sync_all()?;
     Ok(())
+}
+
+/// Resolve the set of shard WAL directories to scan for an export. If
+/// `wal_dir` directly contains `wal_*.log` files (single stream / one shard)
+/// it is returned as-is; otherwise every `shard_*` subdirectory is returned so
+/// a sharded deployment's records are merged into one archive.
+fn wal_dirs_to_scan(wal_dir: &Path) -> Vec<PathBuf> {
+    let mut direct = Vec::new();
+    let mut shards = Vec::new();
+    if let Ok(entries) = fs::read_dir(wal_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            if path.is_dir() {
+                if name.starts_with("shard_") {
+                    shards.push(path);
+                }
+            } else if name.starts_with("wal_") && name.ends_with(".log") {
+                direct.push(wal_dir.to_path_buf());
+            }
+        }
+    }
+    if !direct.is_empty() {
+        direct
+    } else {
+        shards
+    }
 }
 
 #[cfg(test)]

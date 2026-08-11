@@ -2589,8 +2589,7 @@ impl Database {
         let namespace = self.page_namespace(table_name);
         self.buffer_pool.clear_namespace(&namespace);
         for page in &pages {
-            self.buffer_pool
-                .insert_table_page(&namespace, page.clone());
+            self.buffer_pool.insert_table_page(&namespace, page.clone());
         }
         self.replace_table_logical_indexes(table_name, &schema, &rows);
         for page in &pages {
@@ -4906,22 +4905,24 @@ fn decode_wal_batch(payload: &[u8]) -> Result<WalBatch> {
     } else if let Some(encoded) = payload.strip_prefix(WAL_BATCH_BINARY_MAGIC_V2) {
         match bincode_compat().deserialize(encoded) {
             Ok(batch) => batch,
-            Err(current_error) => match bincode_compat().deserialize::<LegacyEventV4WalBatch>(encoded) {
-                Ok(legacy) => legacy.into(),
-                Err(event_v4_error) => {
-                    let legacy: LegacyWalBatch = bincode_compat().deserialize(encoded).map_err(
+            Err(current_error) => {
+                match bincode_compat().deserialize::<LegacyEventV4WalBatch>(encoded) {
+                    Ok(legacy) => legacy.into(),
+                    Err(event_v4_error) => {
+                        let legacy: LegacyWalBatch = bincode_compat().deserialize(encoded).map_err(
                             |legacy_error| {
                                 anyhow::anyhow!(
                                     "cannot decode v2 WAL batch ({current_error}), EVENT V4 WAL batch ({event_v4_error}), or legacy WAL batch ({legacy_error})"
                                 )
                             },
                         )?;
-                    WalBatch {
-                        version: legacy.version,
-                        commands: legacy.commands.into_iter().map(Into::into).collect(),
+                        WalBatch {
+                            version: legacy.version,
+                            commands: legacy.commands.into_iter().map(Into::into).collect(),
+                        }
                     }
                 }
-            },
+            }
         }
     } else {
         serde_json::from_slice(payload)?
@@ -4976,26 +4977,28 @@ fn decode_wal_group(payload: &[u8]) -> Result<WalGroup> {
     if let Some(encoded) = payload.strip_prefix(WAL_GROUP_BINARY_MAGIC_V2) {
         let group: WalGroupV2 = match bincode_compat().deserialize(encoded) {
             Ok(group) => group,
-            Err(current_error) => match bincode_compat().deserialize::<LegacyEventV4WalGroupV2>(encoded) {
-                Ok(legacy) => legacy.into(),
-                Err(event_v4_error) => {
-                    let legacy: LegacyWalGroupV2 =
+            Err(current_error) => {
+                match bincode_compat().deserialize::<LegacyEventV4WalGroupV2>(encoded) {
+                    Ok(legacy) => legacy.into(),
+                    Err(event_v4_error) => {
+                        let legacy: LegacyWalGroupV2 =
                             bincode_compat().deserialize(encoded).map_err(|legacy_error| {
                                 anyhow::anyhow!(
                                     "cannot decode v2 WAL group ({current_error}), EVENT V4 WAL group ({event_v4_error}), or legacy WAL group ({legacy_error})"
                                 )
                             })?;
-                    WalGroupV2 {
-                        version: legacy.version,
-                        committed_unix_ms: legacy.committed_unix_ms,
-                        transactions: legacy
-                            .transactions
-                            .into_iter()
-                            .map(|commands| commands.into_iter().map(Into::into).collect())
-                            .collect(),
+                        WalGroupV2 {
+                            version: legacy.version,
+                            committed_unix_ms: legacy.committed_unix_ms,
+                            transactions: legacy
+                                .transactions
+                                .into_iter()
+                                .map(|commands| commands.into_iter().map(Into::into).collect())
+                                .collect(),
+                        }
                     }
                 }
-            },
+            }
         };
         if group.version != 2 {
             anyhow::bail!("unsupported WAL group v2 version {}", group.version);
@@ -5066,16 +5069,55 @@ struct PendingWrite {
 struct CommitState {
     queue: VecDeque<PendingWrite>,
     active: bool,
+    /// Monotonic counter bumped on every leadership claim. A `LeaderGuard`
+    /// records the generation it claimed so its `Drop` only releases
+    /// leadership when no other task has since taken over.
+    generation: u64,
+}
+
+/// Held by the task that currently owns leadership. On normal return or on
+/// cancellation (the caller's connection dropped mid-commit), `Drop` releases
+/// leadership and re-enqueues any batch the leader had taken but not yet
+/// committed, so the pipeline never wedges and no writer loses its reply.
+struct LeaderGuard<'a> {
+    state: &'a parking_lot::Mutex<CommitState>,
+    generation: u64,
+    in_flight: VecDeque<PendingWrite>,
+}
+
+impl<'a> Drop for LeaderGuard<'a> {
+    fn drop(&mut self) {
+        let mut state = self.state.lock();
+        if state.generation != self.generation {
+            // A new leader already claimed leadership after we were cancelled;
+            // it owns the queue now, so leave `active` and the queue alone.
+            return;
+        }
+        // Re-enqueue writes we took but did not finish committing so a new
+        // leader drains them and their writers receive their replies.
+        if std::env::var_os("MYDB_PROFILE").is_some() {
+            eprintln!(
+                "PROFILE LEADER_DROP generation={} reenqueued={} active_reset=true",
+                self.generation,
+                self.in_flight.len()
+            );
+            let _ = std::io::stderr().flush();
+        }
+        while let Some(write) = self.in_flight.pop_back() {
+            state.queue.push_front(write);
+        }
+        state.active = false;
+    }
 }
 
 #[derive(Default)]
-struct ActorCheckpointState {
+struct CommitCheckpointState {
     tables: HashSet<(String, String)>,
     transactions: Vec<u64>,
     committed_requests_since_checkpoint: usize,
 }
 
-impl ActorCheckpointState {
+impl CommitCheckpointState {
     fn record_successful_group(&mut self, group_id: u64, requests: usize) {
         self.transactions.push(group_id);
         self.committed_requests_since_checkpoint = self
@@ -5096,10 +5138,408 @@ impl ActorCheckpointState {
 
 const CHECKPOINT_COMMIT_INTERVAL: usize = 1024;
 
-struct ActorCoordination {
+/// Global commit coordination shared by every shard. Only the consistent
+/// snapshot barrier lives here; each shard owns its WAL, queue, and checkpoint
+/// state so commit groups fsync in parallel on distinct cores.
+struct CommitCoordination {
     snapshot_barrier: Arc<tokio::sync::RwLock<()>>,
-    checkpoint_state: parking_lot::Mutex<ActorCheckpointState>,
+}
+
+/// One independent commit shard: a Leader/Follower group driven on the caller's
+/// task (no actor/mailbox), with its own WAL file and its own `fsync`. Distinct
+/// shards issue fsync concurrently, so commit throughput scales with the
+/// hardware instead of being capped by a single writer's fsync latency.
+struct CommitShard {
+    index: usize,
+    wal_writer: Arc<parking_lot::Mutex<WalWriter>>,
+    commit_state: parking_lot::Mutex<CommitState>,
+    commit_notify: Notify,
+    checkpoint_state: parking_lot::Mutex<CommitCheckpointState>,
     group_commit_window: Duration,
+    databases: Arc<RwLock<HashMap<String, Arc<Database>>>>,
+    buffer_pool: Arc<BufferPool>,
+    data_dir: PathBuf,
+    stats: Arc<StorageStats>,
+    snapshot_barrier: Arc<tokio::sync::RwLock<()>>,
+}
+
+/// Replay one shard's WAL: redo every committed group that has not yet been
+/// folded into the data files (no `Applied` marker), then append an `Applied`
+/// marker so a subsequent checkpoint can advance. Each shard owns its durable
+/// history, so recovery is the union of every shard's replay.
+async fn replay_shard_wal(
+    wal_dir: &Path,
+    wal_writer: &Arc<parking_lot::Mutex<WalWriter>>,
+    databases: &Arc<RwLock<HashMap<String, Arc<Database>>>>,
+    buffer_pool: &Arc<BufferPool>,
+    data_dir: &Path,
+) -> Result<u64> {
+    let reader = WalReader::open(wal_dir.to_path_buf())?;
+
+    let mut records = Vec::new();
+    reader.replay(|record| records.push(record))?;
+    let committed: HashSet<u64> = records
+        .iter()
+        .filter(|record| record.record_type == WalRecordType::Commit)
+        .map(|record| record.tx_id)
+        .collect();
+    let applied: HashSet<u64> = records
+        .iter()
+        .filter(|record| record.record_type == WalRecordType::Applied)
+        .map(|record| record.tx_id)
+        .collect();
+    let mut batches = Vec::new();
+    for record in records {
+        if applied.contains(&record.tx_id) {
+            continue;
+        }
+        let commands = match record.record_type {
+            WalRecordType::Batch if committed.contains(&record.tx_id) => {
+                decode_wal_batch(&record.data)
+                    .map_err(|error| {
+                        anyhow::anyhow!("cannot decode WAL transaction {}: {error}", record.tx_id)
+                    })?
+                    .commands
+            }
+            WalRecordType::GroupCommit => decode_wal_group(&record.data)
+                .map_err(|error| {
+                    anyhow::anyhow!("cannot decode WAL group {}: {error}", record.tx_id)
+                })?
+                .transactions
+                .into_iter()
+                .flatten()
+                .collect(),
+            _ => continue,
+        };
+        batches.push((record.lsn, record.tx_id, commands));
+    }
+    batches.sort_by_key(|(lsn, _, _)| *lsn);
+
+    let mut recovered = 0u64;
+    for (_, tx_id, commands) in batches {
+        let commands = normalize_replay_commands(commands, databases)?;
+        if !commands.is_empty() {
+            let tables = commands
+                .iter()
+                .filter_map(|command| match command {
+                    WriteCommand::Insert {
+                        database, table, ..
+                    }
+                    | WriteCommand::Upsert {
+                        database, table, ..
+                    }
+                    | WriteCommand::Update {
+                        database, table, ..
+                    }
+                    | WriteCommand::ExpressionUpdate {
+                        database, table, ..
+                    }
+                    | WriteCommand::ReplaceRows {
+                        database, table, ..
+                    }
+                    | WriteCommand::Delete {
+                        database, table, ..
+                    } => Some((database.clone(), table.clone())),
+                    _ => None,
+                })
+                .collect::<HashSet<_>>();
+            apply_write_batch(
+                commands,
+                databases,
+                buffer_pool,
+                wal_writer,
+                data_dir,
+                true,
+                true,
+            )
+            .await?;
+            for (database, table) in tables {
+                if let Some(db) = databases.read().get(&database).cloned() {
+                    if db.get_table(&table).is_some() {
+                        db.checkpoint_table(&table)?;
+                    }
+                }
+            }
+        }
+        let mut wal = wal_writer.lock();
+        wal.append_raw(WalRecordType::Applied as u8, tx_id, "", &[])?;
+        drop(wal);
+        recovered += 1;
+    }
+    if recovered > 0 {
+        wal_writer.lock().sync()?;
+    }
+    Ok(recovered)
+}
+
+/// Where a write batch should be committed.
+enum Route {
+    /// A table is touched: commit on the shard that owns it so its WAL and
+    /// fsync are independent of every other shard. Database-scoped DDL (no
+    /// table) also commits on shard 0 — the catalog is a single global map
+    /// shared by every shard, so DDL mutates it exactly once; recovery reloads
+    /// the durable catalog from `schema.json` and replays shard 0's WAL.
+    Shard(usize),
+}
+
+/// Map a batch to the shard that must commit it. A table-level command routes
+/// to the shard owning `(database, table)`; a database-scoped command
+/// (CREATE/DROP DATABASE, orphan cleanup) broadcasts to all shards.
+fn route_batch(commands: &[WriteCommand], shard_count: usize) -> Route {
+    for command in commands {
+        if let Some((database, table)) = command_table(command) {
+            return Route::Shard(shard_index_for(database, table, shard_count));
+        }
+    }
+    // No table is touched: database-scoped DDL (CREATE/DROP DATABASE and
+    // standalone CREATE EVENT/FUNCTION/PROCEDURE). The catalog is a single
+    // global map shared by every shard, so DDL must mutate it exactly once.
+    // Commit on shard 0; recovery reloads the durable catalog from
+    // `schema.json` and replays shard 0's WAL with `normalize_replay_commands`
+    // idempotency, so duplicating the DDL across every shard's WAL is both
+    // redundant and incorrect (it double-applies against the shared catalog).
+    Route::Shard(0)
+}
+
+/// Deterministic shard for a table. The same table always maps to the same
+/// shard, so a table is written by exactly one Leader/Follower group.
+fn shard_index_for(database: &str, table: &str, shard_count: usize) -> usize {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    database.hash(&mut hasher);
+    table.hash(&mut hasher);
+    (hasher.finish() as usize) % shard_count
+}
+
+impl CommitShard {
+    /// Enqueue a write and drive the Leader/Follower commit loop on the caller's
+    /// task. This is the per-shard equivalent of the former single writer: the
+    /// first writer to find `commit_state.active == false` becomes the leader,
+    /// drains and commits the queue (one WAL fsync per group), and releases
+    /// leadership only when the queue is empty, so ordering stays FIFO.
+    async fn send_write_batch(
+        &self,
+        commands: Vec<WriteCommand>,
+        prepared: bool,
+    ) -> Result<WriteResult> {
+        let (reply, result) = oneshot::channel();
+        self.stats.queue_depth.fetch_add(1, Ordering::Relaxed);
+        // Enqueue and try to claim leadership under a single lock so a writer
+        // never enqueues a write the active leader will not drain.
+        let (became_leader, generation) = {
+            let mut state = self.commit_state.lock();
+            state.queue.push_back(PendingWrite {
+                commands,
+                prepared,
+                last_insert_id: 0,
+                reply,
+            });
+            if state.active {
+                (false, 0)
+            } else {
+                state.active = true;
+                state.generation += 1;
+                (true, state.generation)
+            }
+        };
+        self.commit_notify.notify_one();
+
+        if became_leader {
+            let mut guard = LeaderGuard {
+                state: &self.commit_state,
+                generation,
+                in_flight: VecDeque::new(),
+            };
+            // Box the leader future so its (large) async state machine lives on
+            // the heap instead of the caller's (1 MB on Windows) stack.
+            Box::pin(self.run_leader(&mut guard)).await;
+            return result
+                .await
+                .map_err(|_| anyhow::anyhow!("storage commit stopped"))?;
+        }
+
+        // Follower: wait for the leader to drain and reply. If the leader task
+        // is cancelled (the client disconnected mid-commit) no reply will ever
+        // arrive, so after a short timeout re-claim leadership ourselves and
+        // drain the queue, which still holds our write.
+        let mut rx = result;
+        loop {
+            tokio::select! {
+                reply = &mut rx => {
+                    return reply.map_err(|_| anyhow::anyhow!("storage commit stopped"))?;
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {
+                    let claim = {
+                        let mut state = self.commit_state.lock();
+                        if state.active {
+                            None
+                        } else {
+                            state.active = true;
+                            state.generation += 1;
+                            Some(state.generation)
+                        }
+                    };
+                    if let Some(gen) = claim {
+                        let mut guard = LeaderGuard {
+                            state: &self.commit_state,
+                            generation: gen,
+                            in_flight: VecDeque::new(),
+                        };
+                        Box::pin(self.run_leader(&mut guard)).await;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Drives the commit loop on the caller's task until the pending queue is
+    /// drained. There is no dedicated writer thread: the first writer to find
+    /// `commit_state.active == false` becomes the leader, drains and commits
+    /// every queued write (one WAL fsync per group), and only releases
+    /// leadership once the queue is empty.
+    async fn run_leader(&self, guard: &mut LeaderGuard<'_>) {
+        const MAX_GROUP_COMMIT_REQUESTS: usize = 128;
+        let mut wal_encode_buf = Vec::with_capacity(4096);
+        loop {
+            let batch = self.collect_batch(MAX_GROUP_COMMIT_REQUESTS).await;
+            if batch.is_empty() {
+                return;
+            }
+            // Stage the taken batch in the guard so a cancelled leader
+            // re-enqueues it for the next leader instead of losing it.
+            guard.in_flight = batch;
+            // Box `commit_batch` so its state machine (which embeds the large
+            // `apply_write_batch` future) is heap-allocated rather than inlined
+            // on the caller's stack, preventing stack overflow on deep write
+            // paths such as trigger-expanded batches.
+            Box::pin(commit_batch(
+                self.databases.clone(),
+                self.buffer_pool.clone(),
+                self.wal_writer.clone(),
+                self.data_dir.clone(),
+                self.stats.clone(),
+                self.snapshot_barrier.clone(),
+                &self.checkpoint_state,
+                std::mem::take(&mut guard.in_flight),
+                &mut wal_encode_buf,
+            ))
+            .await;
+            guard.in_flight.clear();
+        }
+    }
+
+    /// Takes the whole pending queue (or waits for more arrivals) and returns
+    /// it for the leader to commit. Returns an empty queue only when leadership
+    /// is released because there is no work.
+    ///
+    /// Coalescing uses **quiescence**, not a fixed wall-clock window: after the
+    /// leader takes the initial batch it keeps draining as long as new writes
+    /// keep arriving, and only fsyncs once the queue has been quiet for
+    /// `group_commit_window` (the idle timeout) or a hard safety cap elapses.
+    /// This lets a single shard exploit multi-core throughput — under a burst
+    /// from N concurrent connections the leader gathers all N writes into one
+    /// `fsync` instead of committing each connection in its own tiny batch.
+    ///
+    /// The wait is a high-resolution clock poll plus `yield_now`, never
+    /// `tokio::time::timeout`/`sleep`: the latter are bounded by the OS timer
+    /// resolution (~15.6 ms on Windows) which would inflate even a 250 µs
+    /// window to ~12 ms. `std::time::Instant` reads the raw performance counter
+    /// (sub-µs) and `yield_now` hands the worker to concurrent followers, so
+    /// the wait is accurate without depending on OS timer granularity.
+    async fn collect_batch(&self, max: usize) -> VecDeque<PendingWrite> {
+        // `group_commit_window` is the idle timeout: how long the queue may stay
+        // quiet before the leader decides the current burst has ended and fsyncs.
+        let idle_timeout = self.group_commit_window;
+        // Hard safety cap so a never-quiet burst cannot pin the leader forever.
+        const HARD_MAX_WAIT: Duration = Duration::from_millis(5);
+        // The hard cap must sit *beyond* the configured idle timeout, otherwise
+        // it silently clamps the coalescing window to 5 ms and the
+        // group-commit window (250 µs default, or any larger value requested by
+        // mydb-server) never takes effect. It only bounds a *never-quiet*
+        // burst: a stream of writes that never goes quiet for `idle_timeout` is
+        // force-flushed after `idle_timeout + HARD_MAX_WAIT` so the leader
+        // cannot be pinned forever.
+        let hard_deadline = if idle_timeout.is_zero() {
+            None
+        } else {
+            Some(Instant::now() + idle_timeout + HARD_MAX_WAIT)
+        };
+
+        loop {
+            // Decide synchronously and drop the commit_state guard before any
+            // await, so the future stays Send and we never hold a lock across a
+            // suspension point.
+            let taken = {
+                let mut state = self.commit_state.lock();
+                if !state.queue.is_empty() {
+                    Some(std::mem::take(&mut state.queue))
+                } else if idle_timeout.is_zero()
+                    || hard_deadline.is_some_and(|d| Instant::now() >= d)
+                {
+                    state.active = false;
+                    None
+                } else {
+                    None
+                }
+            };
+
+            match taken {
+                Some(mut batch) => {
+                    if batch.len() < max {
+                        let mut last_arrival = Instant::now();
+                        loop {
+                            tokio::task::yield_now().await;
+                            let now = Instant::now();
+                            let more = {
+                                let mut state = self.commit_state.lock();
+                                let mut taken = VecDeque::new();
+                                while let Some(write) = state.queue.pop_front() {
+                                    taken.push_back(write);
+                                    if batch.len() + taken.len() >= max {
+                                        break;
+                                    }
+                                }
+                                taken
+                            };
+                            if !more.is_empty() {
+                                batch.extend(more);
+                                last_arrival = now;
+                                if batch.len() >= max {
+                                    break;
+                                }
+                            }
+                            // Quiescence: stop once the queue has been quiet for
+                            // the idle timeout, or the hard safety cap is hit.
+                            if !idle_timeout.is_zero()
+                                && now.saturating_duration_since(last_arrival) >= idle_timeout
+                            {
+                                break;
+                            }
+                            if hard_deadline.is_some_and(|d| now >= d) {
+                                break;
+                            }
+                            // Low-latency mode (zero window): never spin waiting;
+                            // take what is already queued after one yield and
+                            // fsync, matching the previous zero-window behaviour.
+                            if idle_timeout.is_zero() {
+                                break;
+                            }
+                        }
+                    }
+                    return batch;
+                }
+                None => {
+                    // No work yet (or cap elapsed and leadership released).
+                    if idle_timeout.is_zero() || hard_deadline.is_some_and(|d| Instant::now() >= d)
+                    {
+                        return VecDeque::new();
+                    }
+                    // Yield so followers can enqueue, then re-check the queue.
+                    tokio::task::yield_now().await;
+                }
+            }
+        }
+    }
 }
 
 pub struct StorageStats {
@@ -5144,7 +5584,7 @@ pub struct StorageStatsSnapshot {
     pub reads: u64,
     pub writes: u64,
     pub errors: u64,
-    pub actor_queue_depth: usize,
+    pub commit_queue_depth: usize,
     pub buffer_pool_pages: usize,
     pub group_commits: u64,
     pub grouped_requests: u64,
@@ -5184,33 +5624,40 @@ pub struct StorageInventory {
 pub struct StorageEngineManager {
     databases: Arc<RwLock<HashMap<String, Arc<Database>>>>,
     buffer_pool: Arc<BufferPool>,
-    wal_writer: Arc<parking_lot::Mutex<WalWriter>>,
     data_dir: PathBuf,
-    commit_state: parking_lot::Mutex<CommitState>,
-    commit_notify: Notify,
+    shard_count: usize,
+    shards: Vec<CommitShard>,
     stats: Arc<StorageStats>,
-    actor_coordination: Arc<ActorCoordination>,
+    commit_coordination: Arc<CommitCoordination>,
+    /// Coordinator-owned, globally monotonic LSN counter. Every shard's WAL
+    /// draws from it, so the whole deployment shares one contiguous LSN space
+    /// and a single backup/PITR stream (see AGENTS.md: backup needs a single
+    /// ordered WAL, which sharding would otherwise fragment per shard).
+    global_lsn: Arc<AtomicU64>,
 }
 
 impl Drop for StorageEngineManager {
     fn drop(&mut self) {
         // Best-effort final checkpoint so committed groups are folded into the
-        // data files. Only runs when no commit leader is in flight; otherwise
-        // the in-progress leader (or a subsequent reopen via WAL replay) covers
-        // durability, since every group is fsync'd to WAL before it applies.
-        if let Some(mut state) = self.commit_state.try_lock() {
-            if state.queue.is_empty() {
-                state.active = true;
-                drop(state);
-                let checkpoint = self.actor_coordination.checkpoint_state.lock();
-                if !checkpoint.transactions.is_empty() {
-                    if let Err(error) = checkpoint_actor_state(
-                        &self.databases,
-                        &self.wal_writer,
-                        &checkpoint.tables,
-                        &checkpoint.transactions,
-                    ) {
-                        error!("final checkpoint failed; WAL remains authoritative: {error}");
+        // data files. Only runs when no commit leader is in flight on any
+        // shard; otherwise the in-progress leader (or a subsequent reopen via
+        // WAL replay) covers durability, since every group is fsync'd to WAL
+        // before it applies.
+        for shard in &self.shards {
+            if let Some(mut state) = shard.commit_state.try_lock() {
+                if state.queue.is_empty() {
+                    state.active = true;
+                    drop(state);
+                    let checkpoint = shard.checkpoint_state.lock();
+                    if !checkpoint.transactions.is_empty() {
+                        if let Err(error) = checkpoint_committed_state(
+                            &self.databases,
+                            &shard.wal_writer,
+                            &checkpoint.tables,
+                            &checkpoint.transactions,
+                        ) {
+                            error!("final checkpoint failed; WAL remains authoritative: {error}");
+                        }
                     }
                 }
             }
@@ -5225,8 +5672,8 @@ impl StorageEngineManager {
 
     pub fn try_new(data_dir: PathBuf, page_size: usize, buffer_pool_size: &str) -> Result<Self> {
         // Keep embedding callers on the historical immediate-commit path.
-        // mydb-server supplies its configured collection window explicitly.
-        Self::try_new_with_coordinator(data_dir, page_size, buffer_pool_size, Duration::ZERO)
+        // mydb-server supplies its configured window and shard count explicitly.
+        Self::try_new_sharded(data_dir, page_size, buffer_pool_size, Duration::ZERO, 0)
     }
 
     pub fn try_new_with_group_commit_window(
@@ -5235,7 +5682,44 @@ impl StorageEngineManager {
         buffer_pool_size: &str,
         group_commit_window: Duration,
     ) -> Result<Self> {
-        Self::try_new_with_coordinator(data_dir, page_size, buffer_pool_size, group_commit_window)
+        Self::try_new_sharded(
+            data_dir,
+            page_size,
+            buffer_pool_size,
+            group_commit_window,
+            0,
+        )
+    }
+
+    /// Build a manager with `shard_count` independent commit shards. A request
+    /// of `0` auto-detects the logical CPU count so multi-core commit
+    /// throughput scales with the hardware. The storage engine uses no actor or
+    /// mailbox model; each shard is driven on the caller's task.
+    pub fn try_new_sharded(
+        data_dir: PathBuf,
+        page_size: usize,
+        buffer_pool_size: &str,
+        group_commit_window: Duration,
+        shard_count: usize,
+    ) -> Result<Self> {
+        Self::try_new_with_coordinator(
+            data_dir,
+            page_size,
+            buffer_pool_size,
+            group_commit_window,
+            shard_count,
+        )
+    }
+
+    /// Resolve the effective shard count: `0` means auto (logical CPUs),
+    /// clamped to a sane range so we never run a single degenerate shard nor
+    /// thousands of WAL files.
+    fn resolve_shard_count(requested: usize) -> usize {
+        let detected = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(8);
+        let base = if requested == 0 { detected } else { requested };
+        base.clamp(1, 64)
     }
 
     fn try_new_with_coordinator(
@@ -5243,34 +5727,62 @@ impl StorageEngineManager {
         page_size: usize,
         buffer_pool_size: &str,
         group_commit_window: Duration,
+        shard_count: usize,
     ) -> Result<Self> {
-    let buffer_pool = Arc::new(BufferPool::new(page_size, buffer_pool_size));
+        let buffer_pool = Arc::new(BufferPool::new(page_size, buffer_pool_size));
+        let shard_count = Self::resolve_shard_count(shard_count);
 
-    let wal_dir = data_dir.join("wal");
-    let wal_writer = Arc::new(parking_lot::Mutex::new(WalWriter::open(wal_dir, None)?));
+        let databases = Arc::new(RwLock::new(HashMap::new()));
+        let stats = Arc::new(StorageStats::default());
+        let commit_coordination = Arc::new(CommitCoordination {
+            snapshot_barrier: Arc::new(tokio::sync::RwLock::new(())),
+        });
+        let global_lsn = Arc::new(AtomicU64::new(1));
 
-    let databases = Arc::new(RwLock::new(HashMap::new()));
-    let stats = Arc::new(StorageStats::default());
-    let actor_coordination = Arc::new(ActorCoordination {
-        snapshot_barrier: Arc::new(tokio::sync::RwLock::new(())),
-        checkpoint_state: parking_lot::Mutex::new(ActorCheckpointState::default()),
-        group_commit_window,
-    });
+        let mut shards = Vec::with_capacity(shard_count);
+        let mut shard_file_max_lsns = Vec::with_capacity(shard_count);
+        for index in 0..shard_count {
+            let wal_dir = data_dir.join("wal").join(format!("shard_{index}"));
+            let (wal_writer, file_max_lsn) =
+                WalWriter::open_shared(wal_dir, None, global_lsn.clone())?;
+            shards.push(CommitShard {
+                index,
+                wal_writer: Arc::new(parking_lot::Mutex::new(wal_writer)),
+                commit_state: parking_lot::Mutex::new(CommitState {
+                    queue: VecDeque::new(),
+                    active: false,
+                    generation: 0,
+                }),
+                commit_notify: Notify::new(),
+                checkpoint_state: parking_lot::Mutex::new(CommitCheckpointState::default()),
+                group_commit_window,
+                databases: databases.clone(),
+                buffer_pool: buffer_pool.clone(),
+                data_dir: data_dir.clone(),
+                stats: stats.clone(),
+                snapshot_barrier: commit_coordination.snapshot_barrier.clone(),
+            });
+            shard_file_max_lsns.push(file_max_lsn);
+        }
 
-    Ok(Self {
-        databases,
-        buffer_pool,
-        wal_writer,
-        data_dir,
-        commit_state: parking_lot::Mutex::new(CommitState {
-            queue: VecDeque::new(),
-            active: false,
-        }),
-        commit_notify: Notify::new(),
-        stats,
-        actor_coordination,
-    })
-}
+        // Seed the shared counter just past every LSN already durable on disk so a
+        // fresh or recovered shard never reuses an LSN another shard owns.
+        global_lsn.store(
+            shard_file_max_lsns.into_iter().max().unwrap_or(0) + 1,
+            Ordering::Relaxed,
+        );
+
+        Ok(Self {
+            databases,
+            buffer_pool,
+            data_dir,
+            shard_count,
+            shards,
+            stats,
+            commit_coordination,
+            global_lsn,
+        })
+    }
 
     pub async fn init(&self) -> Result<()> {
         // Create directories
@@ -5296,7 +5808,7 @@ impl StorageEngineManager {
                     &name,
                     self.data_dir.clone(),
                     self.buffer_pool.clone(),
-                    self.wal_writer.clone(),
+                    self.shards[0].wal_writer.clone(),
                 );
                 db.load().await?;
 
@@ -5339,105 +5851,24 @@ impl StorageEngineManager {
     }
 
     async fn wal_replay(&self) -> Result<()> {
-        let wal_dir = self.data_dir.join("wal");
-        let reader = WalReader::open(wal_dir)?;
-
-        let mut records = Vec::new();
-        reader.replay(|record| records.push(record))?;
-        let committed: HashSet<u64> = records
-            .iter()
-            .filter(|record| record.record_type == WalRecordType::Commit)
-            .map(|record| record.tx_id)
-            .collect();
-        let applied: HashSet<u64> = records
-            .iter()
-            .filter(|record| record.record_type == WalRecordType::Applied)
-            .map(|record| record.tx_id)
-            .collect();
-        let mut batches = Vec::new();
-        for record in records {
-            if applied.contains(&record.tx_id) {
-                continue;
-            }
-            let commands = match record.record_type {
-                WalRecordType::Batch if committed.contains(&record.tx_id) => {
-                    decode_wal_batch(&record.data)
-                        .map_err(|error| {
-                            anyhow::anyhow!(
-                                "cannot decode WAL transaction {}: {error}",
-                                record.tx_id
-                            )
-                        })?
-                        .commands
-                }
-                WalRecordType::GroupCommit => decode_wal_group(&record.data)
-                    .map_err(|error| {
-                        anyhow::anyhow!("cannot decode WAL group {}: {error}", record.tx_id)
-                    })?
-                    .transactions
-                    .into_iter()
-                    .flatten()
-                    .collect(),
-                _ => continue,
-            };
-            batches.push((record.lsn, record.tx_id, commands));
+        let mut total_recovered = 0u64;
+        for shard in &self.shards {
+            let wal_dir = self
+                .data_dir
+                .join("wal")
+                .join(format!("shard_{}", shard.index));
+            let recovered = replay_shard_wal(
+                &wal_dir,
+                &shard.wal_writer,
+                &self.databases,
+                &self.buffer_pool,
+                &self.data_dir,
+            )
+            .await?;
+            total_recovered += recovered;
         }
-        batches.sort_by_key(|(lsn, _, _)| *lsn);
-
-        let mut recovered = 0u64;
-        for (_, tx_id, commands) in batches {
-            let commands = normalize_replay_commands(commands, &self.databases)?;
-            if !commands.is_empty() {
-                let tables = commands
-                    .iter()
-                    .filter_map(|command| match command {
-                        WriteCommand::Insert {
-                            database, table, ..
-                        }
-                        | WriteCommand::Upsert {
-                            database, table, ..
-                        }
-                        | WriteCommand::Update {
-                            database, table, ..
-                        }
-                        | WriteCommand::ExpressionUpdate {
-                            database, table, ..
-                        }
-                        | WriteCommand::ReplaceRows {
-                            database, table, ..
-                        }
-                        | WriteCommand::Delete {
-                            database, table, ..
-                        } => Some((database.clone(), table.clone())),
-                        _ => None,
-                    })
-                    .collect::<HashSet<_>>();
-                apply_write_batch(
-                    commands,
-                    &self.databases,
-                    &self.buffer_pool,
-                    &self.wal_writer,
-                    &self.data_dir,
-                    true,
-                    true,
-                )
-                .await?;
-                for (database, table) in tables {
-                    if let Some(db) = self.databases.read().get(&database).cloned() {
-                        if db.get_table(&table).is_some() {
-                            db.checkpoint_table(&table)?;
-                        }
-                    }
-                }
-            }
-            let mut wal = self.wal_writer.lock();
-            wal.append_raw(WalRecordType::Applied as u8, tx_id, "", &[])?;
-            drop(wal);
-            recovered += 1;
-        }
-        if recovered > 0 {
-            self.wal_writer.lock().sync()?;
-            info!("WAL redid {} committed transaction(s)", recovered);
+        if total_recovered > 0 {
+            info!("WAL redid {} committed transaction(s)", total_recovered);
         }
         Ok(())
     }
@@ -5466,43 +5897,20 @@ impl StorageEngineManager {
         self.send_write_batch(commands, true).await
     }
 
+    /// Route a write batch to the owning commit shard (or broadcast database
+    /// DDL to every shard) and return the commit result.
     async fn send_write_batch(
         &self,
         commands: Vec<WriteCommand>,
         prepared: bool,
     ) -> Result<WriteResult> {
-        let (reply, result) = oneshot::channel();
-        self.stats.queue_depth.fetch_add(1, Ordering::Relaxed);
-        // Enqueue and try to claim leadership under a single lock so a writer
-        // never enqueues a write the active leader will not drain.
-        let became_leader = {
-            let mut state = self.commit_state.lock();
-            state.queue.push_back(PendingWrite {
-                commands,
-                prepared,
-                last_insert_id: 0,
-                reply,
-            });
-            if state.active {
-                false
-            } else {
-                state.active = true;
-                true
+        match route_batch(&commands, self.shard_count) {
+            Route::Shard(index) => {
+                self.shards[index]
+                    .send_write_batch(commands, prepared)
+                    .await
             }
-        };
-        self.commit_notify.notify_one();
-        if became_leader {
-            // Box the leader future so its (large) async state machine, and in
-            // turn `commit_batch`/`apply_write_batch`, live on the heap instead
-            // of the caller's stack. The actor previously ran the commit on a
-            // dedicated thread's stack; without the actor we must avoid blowing
-            // the caller task's (1 MB on Windows) stack when a deep write path
-            // such as trigger-expanded batches nests inside it.
-            Box::pin(self.run_leader()).await;
         }
-        result
-            .await
-            .map_err(|_| anyhow::anyhow!("storage commit stopped"))?
     }
 
     pub async fn prepare_transaction_batch(
@@ -5526,133 +5934,6 @@ impl StorageEngineManager {
         result
             .await
             .map_err(|_| anyhow::anyhow!("storage commit stopped"))?
-    }
-
-    /// Drives the commit loop on the caller's task until the pending queue is
-    /// drained. There is no dedicated writer thread: the first writer to find
-    /// `commit_state.active == false` becomes the leader, drains and commits
-    /// every queued write (one WAL fsync per group), and only releases
-    /// leadership once the queue is empty, so ordering stays strictly FIFO.
-    async fn run_leader(&self) {
-        const MAX_GROUP_COMMIT_REQUESTS: usize = 128;
-        let mut wal_encode_buf = Vec::with_capacity(4096);
-        loop {
-            let batch = self.collect_batch(MAX_GROUP_COMMIT_REQUESTS).await;
-            if batch.is_empty() {
-                return;
-            }
-            // Box `commit_batch` so its state machine (which embeds the large
-            // `apply_write_batch` future) is heap-allocated rather than inlined
-            // on the caller's stack, preventing stack overflow on deep write
-            // paths such as trigger-expanded batches.
-            Box::pin(commit_batch(
-                self.databases.clone(),
-                self.buffer_pool.clone(),
-                self.wal_writer.clone(),
-                self.data_dir.clone(),
-                self.stats.clone(),
-                self.actor_coordination.clone(),
-                batch,
-                &mut wal_encode_buf,
-            ))
-            .await;
-        }
-    }
-
-    /// Takes the whole pending queue (or waits up to the group-commit window
-    /// for more arrivals) and returns it for the leader to commit. Returns an
-    /// empty queue only when leadership is released because there is no work.
-    async fn collect_batch(&self, max: usize) -> VecDeque<PendingWrite> {
-        let window = self.actor_coordination.group_commit_window;
-        loop {
-            // Decide synchronously and drop the commit_state guard before any
-            // await, so the future stays Send for tokio::spawn callers and we
-            // never hold a lock across a suspension point.
-            let taken = {
-                let mut state = self.commit_state.lock();
-                if !state.queue.is_empty() {
-                    Some(std::mem::take(&mut state.queue))
-                } else if window.is_zero() {
-                    state.active = false;
-                    None
-                } else {
-                    None
-                }
-            };
-            match taken {
-                Some(mut batch) => {
-                    if !window.is_zero() && batch.len() < max {
-                        let deadline = Instant::now() + window;
-                        loop {
-                            let remaining = deadline.saturating_duration_since(Instant::now());
-                            if remaining.is_zero() {
-                                break;
-                            }
-                            let notified = self.commit_notify.notified();
-                            tokio::pin!(notified);
-                            match tokio::time::timeout(remaining, notified).await {
-                                Ok(()) => {
-                                    let mut state = self.commit_state.lock();
-                                    while let Some(write) = state.queue.pop_front() {
-                                        batch.push_back(write);
-                                        if batch.len() >= max {
-                                            break;
-                                        }
-                                    }
-                                    drop(state);
-                                    if batch.len() >= max {
-                                        break;
-                                    }
-                                }
-                                Err(_) => break,
-                            }
-                        }
-                    } else if window.is_zero() && batch.len() < max {
-                        // Replicate the actor's blocking-recv + tight-drain: the
-                        // actor grabbed the first write then immediately drained
-                        // all concurrently-arrived ones into one group. The
-                        // leader already holds its own write, so instead yield
-                        // one scheduling slot to let concurrent followers enqueue
-                        // and drain them into this same group. This keeps
-                        // concurrent writes coalescing into a single fsync even
-                        // in the low-latency (zero-window) mode. A `yield_now`
-                        // when no other task is runnable is a near-free scheduler
-                        // round-trip, so the single-writer path is unaffected.
-                        tokio::task::yield_now().await;
-                        let mut state = self.commit_state.lock();
-                        while let Some(write) = state.queue.pop_front() {
-                            batch.push_back(write);
-                            if batch.len() >= max {
-                                break;
-                            }
-                        }
-                        drop(state);
-                    }
-                    return batch;
-                }
-                None => {
-                    if window.is_zero() {
-                        return VecDeque::new();
-                    }
-                    let notified = self.commit_notify.notified();
-                    tokio::pin!(notified);
-                    match tokio::time::timeout(window, notified).await {
-                        Ok(()) => continue,
-                        Err(_) => {
-                            let mut state = self.commit_state.lock();
-                            if state.queue.is_empty() {
-                                state.active = false;
-                                drop(state);
-                                return VecDeque::new();
-                            }
-                            let batch = std::mem::take(&mut state.queue);
-                            drop(state);
-                            return batch;
-                        }
-                    }
-                }
-            }
-        }
     }
 
     pub fn get_database(&self, name: &str) -> Option<Arc<Database>> {
@@ -5775,13 +6056,16 @@ impl StorageEngineManager {
 
     /// Sync WAL to disk
     pub fn sync_wal(&self) -> Result<()> {
-        self.wal_writer.lock().sync()
+        for shard in &self.shards {
+            shard.wal_writer.lock().sync()?;
+        }
+        Ok(())
     }
 
     /// Stop the single writer at an actor-group boundary. Holding the returned
     /// guard makes a filesystem snapshot stable while reads remain available.
     pub async fn snapshot_guard(&self) -> tokio::sync::OwnedRwLockWriteGuard<()> {
-        self.actor_coordination
+        self.commit_coordination
             .snapshot_barrier
             .clone()
             .write_owned()
@@ -5789,7 +6073,7 @@ impl StorageEngineManager {
     }
 
     pub fn current_lsn(&self) -> u64 {
-        self.wal_writer.lock().next_lsn().saturating_sub(1)
+        self.global_lsn.load(Ordering::Relaxed).saturating_sub(1)
     }
 
     pub fn flush(&self) -> Result<()> {
@@ -5809,19 +6093,22 @@ impl StorageEngineManager {
     ) -> Result<tokio::sync::OwnedRwLockWriteGuard<()>> {
         let guard = self.snapshot_guard().await;
         let checkpoint_started = Instant::now();
-        let checkpointed = {
-            let mut state = self.actor_coordination.checkpoint_state.lock();
-            let checkpointed = !state.transactions.is_empty();
-            checkpoint_actor_state(
-                &self.databases,
-                &self.wal_writer,
-                &state.tables,
-                &state.transactions,
-            )?;
-            state.clear();
-            checkpointed
-        };
-        if checkpointed {
+        let mut checkpointed_any = false;
+        for shard in &self.shards {
+            if let Some(mut state) = shard.checkpoint_state.try_lock() {
+                if !state.transactions.is_empty() {
+                    checkpoint_committed_state(
+                        &self.databases,
+                        &shard.wal_writer,
+                        &state.tables,
+                        &state.transactions,
+                    )?;
+                    state.clear();
+                    checkpointed_any = true;
+                }
+            }
+        }
+        if checkpointed_any {
             self.stats.checkpoints.fetch_add(1, Ordering::Relaxed);
             self.stats.checkpoint_micros.fetch_add(
                 checkpoint_started.elapsed().as_micros() as u64,
@@ -5849,7 +6136,7 @@ impl StorageEngineManager {
             reads: self.stats.reads.load(Ordering::Relaxed),
             writes: self.stats.writes.load(Ordering::Relaxed),
             errors: self.stats.errors.load(Ordering::Relaxed),
-            actor_queue_depth: self.stats.queue_depth.load(Ordering::Relaxed),
+            commit_queue_depth: self.stats.queue_depth.load(Ordering::Relaxed),
             buffer_pool_pages: self.buffer_pool.page_count(),
             group_commits: self.stats.group_commits.load(Ordering::Relaxed),
             grouped_requests: self.stats.grouped_requests.load(Ordering::Relaxed),
@@ -5938,406 +6225,409 @@ async fn commit_batch(
     wal_writer: Arc<parking_lot::Mutex<WalWriter>>,
     data_dir: PathBuf,
     stats: Arc<StorageStats>,
-    coordination: Arc<ActorCoordination>,
+    snapshot_barrier: Arc<tokio::sync::RwLock<()>>,
+    checkpoint_state: &parking_lot::Mutex<CommitCheckpointState>,
     mut pending: VecDeque<PendingWrite>,
     wal_encode_buf: &mut Vec<u8>,
 ) {
-    let _snapshot_read_guard = coordination.snapshot_barrier.clone().read_owned().await;
+    let _snapshot_read_guard = snapshot_barrier.clone().read_owned().await;
     while !pending.is_empty() {
-            let prepare_started = Instant::now();
-            let mut staged: Vec<PreparedWrite> = Vec::new();
-            let mut cumulative = Vec::new();
-            let mut insert_group_keys = HashMap::new();
+        let prepare_started = Instant::now();
+        let mut staged: Vec<PreparedWrite> = Vec::new();
+        let mut cumulative = Vec::new();
+        let mut insert_group_keys = HashMap::new();
 
-            while let Some(mut request) = pending.pop_front() {
-                if !request.prepared {
-                    let original_last_insert_id = request.last_insert_id;
-                    match prepare_write_commands(std::mem::take(&mut request.commands), &databases)
-                    {
-                        Ok((commands, generated_id)) => {
-                            request.commands = commands;
-                            request.last_insert_id = if original_last_insert_id != 0 {
-                                original_last_insert_id
-                            } else {
-                                generated_id
-                            };
-                        }
-                        Err(error) if !staged.is_empty() => {
-                            pending.push_front(request);
-                            debug!("ending WAL group before dependent write: {}", error);
-                            break;
-                        }
-                        Err(error) => {
-                            stats.queue_depth.fetch_sub(1, Ordering::Relaxed);
-                            record_write_result(&stats, &Err(anyhow::anyhow!(error.to_string())));
-                            let _ = request.reply.send(Err(error));
-                            continue;
-                        }
+        while let Some(mut request) = pending.pop_front() {
+            if !request.prepared {
+                let original_last_insert_id = request.last_insert_id;
+                match prepare_write_commands(std::mem::take(&mut request.commands), &databases) {
+                    Ok((commands, generated_id)) => {
+                        request.commands = commands;
+                        request.last_insert_id = if original_last_insert_id != 0 {
+                            original_last_insert_id
+                        } else {
+                            generated_id
+                        };
                     }
-                }
-
-                let request_is_memory = commands_are_memory_dml(&request.commands, &databases);
-                if let Some(first_staged) = staged.first() {
-                    let staged_is_memory =
-                        commands_are_memory_dml(&first_staged.commands, &databases);
-                    if request_is_memory != staged_is_memory {
+                    Err(error) if !staged.is_empty() => {
                         pending.push_front(request);
+                        debug!("ending WAL group before dependent write: {}", error);
                         break;
                     }
+                    Err(error) => {
+                        stats.queue_depth.fetch_sub(1, Ordering::Relaxed);
+                        record_write_result(&stats, &Err(anyhow::anyhow!(error.to_string())));
+                        let _ = request.reply.send(Err(error));
+                        continue;
+                    }
                 }
+            }
 
-                let request_is_insert = request
-                    .commands
-                    .iter()
-                    .all(|command| matches!(command, WriteCommand::Insert { .. }));
-                let staged_are_inserts = staged.iter().all(|request| {
-                    request
-                        .commands
-                        .iter()
-                        .all(|command| matches!(command, WriteCommand::Insert { .. }))
-                });
-                if !staged.is_empty() && request_is_insert != staged_are_inserts {
+            let request_is_memory = commands_are_memory_dml(&request.commands, &databases);
+            if let Some(first_staged) = staged.first() {
+                let staged_is_memory = commands_are_memory_dml(&first_staged.commands, &databases);
+                if request_is_memory != staged_is_memory {
                     pending.push_front(request);
                     break;
                 }
+            }
 
-                let request_is_independent = request.commands.iter().all(|command| {
+            let request_is_insert = request
+                .commands
+                .iter()
+                .all(|command| matches!(command, WriteCommand::Insert { .. }));
+            let staged_are_inserts = staged.iter().all(|request| {
+                request
+                    .commands
+                    .iter()
+                    .all(|command| matches!(command, WriteCommand::Insert { .. }))
+            });
+            if !staged.is_empty() && request_is_insert != staged_are_inserts {
+                pending.push_front(request);
+                break;
+            }
+
+            let request_is_independent = request.commands.iter().all(|command| {
+                matches!(
+                    command,
+                    WriteCommand::Upsert { .. }
+                        | WriteCommand::Update { .. }
+                        | WriteCommand::ExpressionUpdate { .. }
+                        | WriteCommand::ReplaceRows { .. }
+                        | WriteCommand::Delete { .. }
+                )
+            });
+            let staged_are_independent = cumulative.is_empty()
+                && staged.iter().all(|request: &PreparedWrite| {
+                    request.commands.iter().all(|command| {
+                        matches!(
+                            command,
+                            WriteCommand::Upsert { .. }
+                                | WriteCommand::Update { .. }
+                                | WriteCommand::ExpressionUpdate { .. }
+                                | WriteCommand::ReplaceRows { .. }
+                                | WriteCommand::Delete { .. }
+                        )
+                    })
+                });
+            if !request_is_independent && !staged.is_empty() && staged_are_independent {
+                pending.push_front(request);
+                break;
+            }
+            let mut candidate = Vec::new();
+            let validation = if request_is_insert {
+                validate_insert_commands_incremental(
+                    &request.commands,
+                    &databases,
+                    &mut insert_group_keys,
+                )
+            } else if request_is_independent && staged_are_independent {
+                validate_write_batch(&request.commands, &databases)
+            } else {
+                candidate = cumulative.clone();
+                candidate.extend(request.commands.iter().cloned());
+                validate_write_batch(&candidate, &databases)
+            };
+            if let Err(error) = validation {
+                if staged.is_empty() {
+                    stats.queue_depth.fetch_sub(1, Ordering::Relaxed);
+                    record_write_result(&stats, &Err(anyhow::anyhow!(error.to_string())));
+                    let _ = request.reply.send(Err(error));
+                    continue;
+                }
+                pending.push_front(request);
+                break;
+            }
+            if !candidate.is_empty() {
+                cumulative = candidate;
+            }
+            staged.push(PreparedWrite {
+                tx_id: 0,
+                commands: request.commands,
+                last_insert_id: request.last_insert_id,
+                reply: request.reply,
+            });
+        }
+
+        stats.prepare_validation_micros.fetch_add(
+            prepare_started.elapsed().as_micros() as u64,
+            Ordering::Relaxed,
+        );
+
+        if staged.is_empty() {
+            continue;
+        }
+        let committed_requests = staged.len();
+
+        if commands_are_memory_dml(&staged[0].commands, &databases) {
+            // MEMORY is deliberately nontransactional and non-durable in
+            // MySQL. Preserve actor order, but skip WAL/fsync/checkpoint.
+            let apply_started = Instant::now();
+            let mut earlier_apply_failed = false;
+            for request in staged {
+                let mut result = if earlier_apply_failed {
+                    Err(anyhow::anyhow!("earlier MEMORY statement failed to apply"))
+                } else {
+                    apply_write_batch(
+                        request.commands,
+                        &databases,
+                        &buffer_pool,
+                        &wal_writer,
+                        &data_dir,
+                        false,
+                        false,
+                    )
+                    .await
+                };
+                if let Ok(value) = &mut result {
+                    if value.last_insert_id == 0 {
+                        value.last_insert_id = request.last_insert_id;
+                    }
+                }
+                if result.is_err() {
+                    earlier_apply_failed = true;
+                }
+                stats.queue_depth.fetch_sub(1, Ordering::Relaxed);
+                record_write_result(&stats, &result);
+                let _ = request.reply.send(result);
+            }
+            stats.apply_micros.fetch_add(
+                apply_started.elapsed().as_micros() as u64,
+                Ordering::Relaxed,
+            );
+            continue;
+        }
+        stats.group_commits.fetch_add(1, Ordering::Relaxed);
+        stats
+            .grouped_requests
+            .fetch_add(staged.len() as u64, Ordering::Relaxed);
+
+        // Phase 1: one checksummed WAL record and one fsync cover the whole
+        // actor group. A complete record is the commit marker, eliminating
+        // per-transaction Batch+Commit records without weakening durability.
+        let wal_started = Instant::now();
+        let transactions: Vec<&[WriteCommand]> = staged
+            .iter()
+            .map(|request| request.commands.as_slice())
+            .collect();
+        if let Err(error) = encode_wal_group_into(&mut *wal_encode_buf, &transactions) {
+            let message = error.to_string();
+            for request in staged {
+                stats.queue_depth.fetch_sub(1, Ordering::Relaxed);
+                let result = Err(anyhow::anyhow!("WAL encode failed: {message}"));
+                record_write_result(&stats, &result);
+                let _ = request.reply.send(result);
+            }
+            continue;
+        }
+        let wal_result = (|| -> Result<u64> {
+            let mut wal = wal_writer.lock();
+            let group_id = wal.next_lsn();
+            for request in &mut staged {
+                request.tx_id = group_id;
+            }
+            let lsn = wal.append_raw(
+                WalRecordType::GroupCommit as u8,
+                group_id,
+                "",
+                wal_encode_buf,
+            )?;
+            debug_assert_eq!(lsn, group_id);
+            let sync_start = Instant::now();
+            wal.sync()?;
+            if std::env::var_os("MYDB_PROFILE").is_some() {
+                eprintln!("PROFILE WALSYNC {}us", sync_start.elapsed().as_micros());
+            }
+            Ok(group_id)
+        })();
+        stats
+            .wal_sync_micros
+            .fetch_add(wal_started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        let group_id = match wal_result {
+            Ok(group_id) => group_id,
+            Err(error) => {
+                let message = error.to_string();
+                for request in staged {
+                    stats.queue_depth.fetch_sub(1, Ordering::Relaxed);
+                    let result = Err(anyhow::anyhow!("WAL group commit failed: {message}"));
+                    record_write_result(&stats, &result);
+                    let _ = request.reply.send(result);
+                }
+                continue;
+            }
+        };
+
+        // Phase 2: apply in actor order, then flush table and catalog state.
+        let apply_started = Instant::now();
+        let mut completed = Vec::with_capacity(staged.len());
+        let mut deferred_tables = HashSet::new();
+        let pure_insert_group = staged.iter().all(|request| {
+            request
+                .commands
+                .iter()
+                .all(|command| matches!(command, WriteCommand::Insert { .. }))
+        });
+        if pure_insert_group {
+            // Every transaction already has an independent durable Batch
+            // and Commit record. Apply the whole insert group together so
+            // adjacent actor transactions share packed data pages.
+            let mut commands = Vec::new();
+            let mut requests = Vec::with_capacity(staged.len());
+            for request in staged {
+                for command in &request.commands {
+                    if let WriteCommand::Insert {
+                        database, table, ..
+                    } = command
+                    {
+                        deferred_tables.insert((database.clone(), table.clone()));
+                    }
+                }
+                let affected_rows = request.commands.len() as u64;
+                commands.extend(request.commands);
+                requests.push((
+                    request.tx_id,
+                    request.reply,
+                    request.last_insert_id,
+                    affected_rows,
+                ));
+            }
+            match apply_write_batch(
+                commands,
+                &databases,
+                &buffer_pool,
+                &wal_writer,
+                &data_dir,
+                true,
+                false,
+            )
+            .await
+            {
+                Ok(_) => {
+                    for (tx_id, reply, last_insert_id, affected_rows) in requests {
+                        completed.push((
+                            tx_id,
+                            reply,
+                            Ok(WriteResult {
+                                affected_rows,
+                                last_insert_id,
+                            }),
+                        ));
+                    }
+                }
+                Err(error) => {
+                    let message = error.to_string();
+                    for (tx_id, reply, _, _) in requests {
+                        completed.push((tx_id, reply, Err(anyhow::anyhow!(message.clone()))));
+                    }
+                }
+            }
+        } else {
+            let mut earlier_apply_failed = false;
+            for request in staged {
+                let deferred = request.commands.iter().all(|command| {
                     matches!(
                         command,
-                        WriteCommand::Upsert { .. }
+                        WriteCommand::Insert { .. }
+                            | WriteCommand::Upsert { .. }
                             | WriteCommand::Update { .. }
                             | WriteCommand::ExpressionUpdate { .. }
                             | WriteCommand::ReplaceRows { .. }
                             | WriteCommand::Delete { .. }
                     )
                 });
-                let staged_are_independent = cumulative.is_empty()
-                    && staged.iter().all(|request: &PreparedWrite| {
-                        request.commands.iter().all(|command| {
-                            matches!(
-                                command,
-                                WriteCommand::Upsert { .. }
-                                    | WriteCommand::Update { .. }
-                                    | WriteCommand::ExpressionUpdate { .. }
-                                    | WriteCommand::ReplaceRows { .. }
-                                    | WriteCommand::Delete { .. }
-                            )
-                        })
-                    });
-                if !request_is_independent && !staged.is_empty() && staged_are_independent {
-                    pending.push_front(request);
-                    break;
-                }
-                let mut candidate = Vec::new();
-                let validation = if request_is_insert {
-                    validate_insert_commands_incremental(
-                        &request.commands,
-                        &databases,
-                        &mut insert_group_keys,
-                    )
-                } else if request_is_independent && staged_are_independent {
-                    validate_write_batch(&request.commands, &databases)
-                } else {
-                    candidate = cumulative.clone();
-                    candidate.extend(request.commands.iter().cloned());
-                    validate_write_batch(&candidate, &databases)
-                };
-                if let Err(error) = validation {
-                    if staged.is_empty() {
-                        stats.queue_depth.fetch_sub(1, Ordering::Relaxed);
-                        record_write_result(&stats, &Err(anyhow::anyhow!(error.to_string())));
-                        let _ = request.reply.send(Err(error));
-                        continue;
-                    }
-                    pending.push_front(request);
-                    break;
-                }
-                if !candidate.is_empty() {
-                    cumulative = candidate;
-                }
-                staged.push(PreparedWrite {
-                    tx_id: 0,
-                    commands: request.commands,
-                    last_insert_id: request.last_insert_id,
-                    reply: request.reply,
-                });
-            }
-
-            stats.prepare_validation_micros.fetch_add(
-                prepare_started.elapsed().as_micros() as u64,
-                Ordering::Relaxed,
-            );
-
-            if staged.is_empty() {
-                continue;
-            }
-            let committed_requests = staged.len();
-
-            if commands_are_memory_dml(&staged[0].commands, &databases) {
-                // MEMORY is deliberately nontransactional and non-durable in
-                // MySQL. Preserve actor order, but skip WAL/fsync/checkpoint.
-                let apply_started = Instant::now();
-                let mut earlier_apply_failed = false;
-                for request in staged {
-                    let mut result = if earlier_apply_failed {
-                        Err(anyhow::anyhow!("earlier MEMORY statement failed to apply"))
-                    } else {
-                        apply_write_batch(
-                            request.commands,
-                            &databases,
-                            &buffer_pool,
-                            &wal_writer,
-                            &data_dir,
-                            false,
-                            false,
-                        )
-                        .await
-                    };
-                    if let Ok(value) = &mut result {
-                        if value.last_insert_id == 0 {
-                            value.last_insert_id = request.last_insert_id;
-                        }
-                    }
-                    if result.is_err() {
-                        earlier_apply_failed = true;
-                    }
-                    stats.queue_depth.fetch_sub(1, Ordering::Relaxed);
-                    record_write_result(&stats, &result);
-                    let _ = request.reply.send(result);
-                }
-                stats.apply_micros.fetch_add(
-                    apply_started.elapsed().as_micros() as u64,
-                    Ordering::Relaxed,
-                );
-                continue;
-            }
-            stats.group_commits.fetch_add(1, Ordering::Relaxed);
-            stats
-                .grouped_requests
-                .fetch_add(staged.len() as u64, Ordering::Relaxed);
-
-            // Phase 1: one checksummed WAL record and one fsync cover the whole
-            // actor group. A complete record is the commit marker, eliminating
-            // per-transaction Batch+Commit records without weakening durability.
-            let wal_started = Instant::now();
-            let transactions: Vec<&[WriteCommand]> = staged
-                .iter()
-                .map(|request| request.commands.as_slice())
-                .collect();
-            if let Err(error) = encode_wal_group_into(&mut *wal_encode_buf, &transactions) {
-                let message = error.to_string();
-                for request in staged {
-                    stats.queue_depth.fetch_sub(1, Ordering::Relaxed);
-                    let result = Err(anyhow::anyhow!("WAL encode failed: {message}"));
-                    record_write_result(&stats, &result);
-                    let _ = request.reply.send(result);
-                }
-                continue;
-            }
-            let wal_result = (|| -> Result<u64> {
-                let mut wal = wal_writer.lock();
-                let group_id = wal.next_lsn();
-                for request in &mut staged {
-                    request.tx_id = group_id;
-                }
-                let lsn = wal.append_raw(
-                    WalRecordType::GroupCommit as u8,
-                    group_id,
-                    "",
-                    wal_encode_buf,
-                )?;
-                debug_assert_eq!(lsn, group_id);
-                wal.sync()?;
-                Ok(group_id)
-            })();
-            stats
-                .wal_sync_micros
-                .fetch_add(wal_started.elapsed().as_micros() as u64, Ordering::Relaxed);
-            let group_id = match wal_result {
-                Ok(group_id) => group_id,
-                Err(error) => {
-                    let message = error.to_string();
-                    for request in staged {
-                        stats.queue_depth.fetch_sub(1, Ordering::Relaxed);
-                        let result = Err(anyhow::anyhow!("WAL group commit failed: {message}"));
-                        record_write_result(&stats, &result);
-                        let _ = request.reply.send(result);
-                    }
-                    continue;
-                }
-            };
-
-            // Phase 2: apply in actor order, then flush table and catalog state.
-            let apply_started = Instant::now();
-            let mut completed = Vec::with_capacity(staged.len());
-            let mut deferred_tables = HashSet::new();
-            let pure_insert_group = staged.iter().all(|request| {
-                request
-                    .commands
-                    .iter()
-                    .all(|command| matches!(command, WriteCommand::Insert { .. }))
-            });
-            if pure_insert_group {
-                // Every transaction already has an independent durable Batch
-                // and Commit record. Apply the whole insert group together so
-                // adjacent actor transactions share packed data pages.
-                let mut commands = Vec::new();
-                let mut requests = Vec::with_capacity(staged.len());
-                for request in staged {
+                if deferred {
                     for command in &request.commands {
-                        if let WriteCommand::Insert {
-                            database, table, ..
-                        } = command
-                        {
-                            deferred_tables.insert((database.clone(), table.clone()));
-                        }
-                    }
-                    let affected_rows = request.commands.len() as u64;
-                    commands.extend(request.commands);
-                    requests.push((
-                        request.tx_id,
-                        request.reply,
-                        request.last_insert_id,
-                        affected_rows,
-                    ));
-                }
-                match apply_write_batch(
-                    commands,
-                    &databases,
-                    &buffer_pool,
-                    &wal_writer,
-                    &data_dir,
-                    true,
-                    false,
-                )
-                .await
-                {
-                    Ok(_) => {
-                        for (tx_id, reply, last_insert_id, affected_rows) in requests {
-                            completed.push((
-                                tx_id,
-                                reply,
-                                Ok(WriteResult {
-                                    affected_rows,
-                                    last_insert_id,
-                                }),
-                            ));
-                        }
-                    }
-                    Err(error) => {
-                        let message = error.to_string();
-                        for (tx_id, reply, _, _) in requests {
-                            completed.push((tx_id, reply, Err(anyhow::anyhow!(message.clone()))));
-                        }
-                    }
-                }
-            } else {
-                let mut earlier_apply_failed = false;
-                for request in staged {
-                    let deferred = request.commands.iter().all(|command| {
-                        matches!(
-                            command,
-                            WriteCommand::Insert { .. }
-                                | WriteCommand::Upsert { .. }
-                                | WriteCommand::Update { .. }
-                                | WriteCommand::ExpressionUpdate { .. }
-                                | WriteCommand::ReplaceRows { .. }
-                                | WriteCommand::Delete { .. }
-                        )
-                    });
-                    if deferred {
-                        for command in &request.commands {
-                            match command {
-                                WriteCommand::Insert {
-                                    database, table, ..
-                                }
-                                | WriteCommand::Upsert {
-                                    database, table, ..
-                                }
-                                | WriteCommand::Update {
-                                    database, table, ..
-                                }
-                                | WriteCommand::ExpressionUpdate {
-                                    database, table, ..
-                                }
-                                | WriteCommand::ReplaceRows {
-                                    database, table, ..
-                                }
-                                | WriteCommand::Delete {
-                                    database, table, ..
-                                } => {
-                                    deferred_tables.insert((database.clone(), table.clone()));
-                                }
-                                _ => {}
+                        match command {
+                            WriteCommand::Insert {
+                                database, table, ..
                             }
+                            | WriteCommand::Upsert {
+                                database, table, ..
+                            }
+                            | WriteCommand::Update {
+                                database, table, ..
+                            }
+                            | WriteCommand::ExpressionUpdate {
+                                database, table, ..
+                            }
+                            | WriteCommand::ReplaceRows {
+                                database, table, ..
+                            }
+                            | WriteCommand::Delete {
+                                database, table, ..
+                            } => {
+                                deferred_tables.insert((database.clone(), table.clone()));
+                            }
+                            _ => {}
                         }
                     }
-                    let mut result = if earlier_apply_failed {
-                        Err(anyhow::anyhow!(
-                            "earlier committed transaction failed to apply; restart recovery required"
-                        ))
-                    } else {
-                        apply_write_batch(
-                            request.commands,
-                            &databases,
-                            &buffer_pool,
-                            &wal_writer,
-                            &data_dir,
-                            deferred,
-                            false,
-                        )
-                        .await
-                    };
-                    if let Ok(value) = &mut result {
-                        if value.last_insert_id == 0 {
-                            value.last_insert_id = request.last_insert_id;
-                        }
-                    } else {
-                        earlier_apply_failed = true;
-                    }
-                    completed.push((request.tx_id, request.reply, result));
                 }
-            }
-
-            stats.apply_micros.fetch_add(
-                apply_started.elapsed().as_micros() as u64,
-                Ordering::Relaxed,
-            );
-
-            let group_succeeded = completed.iter().all(|(_, _, result)| result.is_ok());
-            for (_, reply, result) in completed {
-                stats.queue_depth.fetch_sub(1, Ordering::Relaxed);
-                record_write_result(&stats, &result);
-                let _ = reply.send(result);
-            }
-            let mut checkpoint = coordination.checkpoint_state.lock();
-            checkpoint.tables.extend(deferred_tables);
-            if group_succeeded {
-                checkpoint.record_successful_group(group_id, committed_requests);
-            }
-            if checkpoint.checkpoint_due() {
-                let checkpoint_started = Instant::now();
-                match checkpoint_actor_state(
-                    &databases,
-                    &wal_writer,
-                    &checkpoint.tables,
-                    &checkpoint.transactions,
-                ) {
-                    Ok(()) => {
-                        stats.checkpoints.fetch_add(1, Ordering::Relaxed);
-                        checkpoint.clear();
+                let mut result = if earlier_apply_failed {
+                    Err(anyhow::anyhow!(
+                        "earlier committed transaction failed to apply; restart recovery required"
+                    ))
+                } else {
+                    apply_write_batch(
+                        request.commands,
+                        &databases,
+                        &buffer_pool,
+                        &wal_writer,
+                        &data_dir,
+                        deferred,
+                        false,
+                    )
+                    .await
+                };
+                if let Ok(value) = &mut result {
+                    if value.last_insert_id == 0 {
+                        value.last_insert_id = request.last_insert_id;
                     }
-                    Err(error) => {
-                        stats.checkpoint_errors.fetch_add(1, Ordering::Relaxed);
-                        error!("actor checkpoint failed; WAL remains authoritative: {error}")
-                    }
+                } else {
+                    earlier_apply_failed = true;
                 }
-                stats.checkpoint_micros.fetch_add(
-                    checkpoint_started.elapsed().as_micros() as u64,
-                    Ordering::Relaxed,
-                );
+                completed.push((request.tx_id, request.reply, result));
             }
         }
+
+        stats.apply_micros.fetch_add(
+            apply_started.elapsed().as_micros() as u64,
+            Ordering::Relaxed,
+        );
+
+        let group_succeeded = completed.iter().all(|(_, _, result)| result.is_ok());
+        for (_, reply, result) in completed {
+            stats.queue_depth.fetch_sub(1, Ordering::Relaxed);
+            record_write_result(&stats, &result);
+            let _ = reply.send(result);
+        }
+        let mut checkpoint = checkpoint_state.lock();
+        checkpoint.tables.extend(deferred_tables);
+        if group_succeeded {
+            checkpoint.record_successful_group(group_id, committed_requests);
+        }
+        if checkpoint.checkpoint_due() {
+            let checkpoint_started = Instant::now();
+            match checkpoint_committed_state(
+                &databases,
+                &wal_writer,
+                &checkpoint.tables,
+                &checkpoint.transactions,
+            ) {
+                Ok(()) => {
+                    stats.checkpoints.fetch_add(1, Ordering::Relaxed);
+                    checkpoint.clear();
+                }
+                Err(error) => {
+                    stats.checkpoint_errors.fetch_add(1, Ordering::Relaxed);
+                    error!("actor checkpoint failed; WAL remains authoritative: {error}")
+                }
+            }
+            stats.checkpoint_micros.fetch_add(
+                checkpoint_started.elapsed().as_micros() as u64,
+                Ordering::Relaxed,
+            );
+        }
+    }
 }
 
 fn commands_are_memory_dml(
@@ -6432,7 +6722,7 @@ fn validate_insert_commands_incremental(
     Ok(())
 }
 
-fn checkpoint_actor_state(
+fn checkpoint_committed_state(
     databases: &Arc<RwLock<HashMap<String, Arc<Database>>>>,
     wal_writer: &Arc<parking_lot::Mutex<WalWriter>>,
     tables: &HashSet<(String, String)>,
@@ -9915,7 +10205,14 @@ mod tests {
 
     async fn recovery_manager() -> (tempfile::TempDir, StorageEngineManager) {
         let temp = tempfile::tempdir().unwrap();
-        let manager = StorageEngineManager::new(temp.path().to_path_buf(), 16384, "4M");
+        let manager = StorageEngineManager::try_new_sharded(
+            temp.path().to_path_buf(),
+            16384,
+            "4M",
+            Duration::ZERO,
+            1,
+        )
+        .unwrap();
         manager.init().await.unwrap();
         manager.create_database("game").await.unwrap();
         for table in ["a", "b"] {
@@ -9934,11 +10231,12 @@ mod tests {
         group_commit_window: Duration,
     ) -> (tempfile::TempDir, StorageEngineManager) {
         let temp = tempfile::tempdir().unwrap();
-        let manager = StorageEngineManager::try_new_with_group_commit_window(
+        let manager = StorageEngineManager::try_new_sharded(
             temp.path().to_path_buf(),
             16384,
             "4M",
             group_commit_window,
+            1,
         )
         .unwrap();
         manager.init().await.unwrap();
@@ -9960,7 +10258,7 @@ mod tests {
         commands: Vec<WriteCommand>,
         commit: bool,
     ) -> u64 {
-        let mut wal = manager.wal_writer.lock();
+        let mut wal = manager.shards[0].wal_writer.lock();
         let tx_id = wal.next_lsn();
         let mut batch = WalRecord::new(
             0,
@@ -9986,12 +10284,13 @@ mod tests {
         manager: &StorageEngineManager,
         transactions: Vec<Vec<WriteCommand>>,
     ) -> u64 {
-        let mut wal = manager.wal_writer.lock();
+        let mut wal = manager.shards[0].wal_writer.lock();
         let tx_id = wal.next_lsn();
         let transaction_refs = transactions.iter().map(Vec::as_slice).collect::<Vec<_>>();
         let mut buf = Vec::new();
         encode_wal_group_into(&mut buf, &transaction_refs).unwrap();
-        wal.append_raw(WalRecordType::GroupCommit as u8, tx_id, "", &buf).unwrap();
+        wal.append_raw(WalRecordType::GroupCommit as u8, tx_id, "", &buf)
+            .unwrap();
         wal.sync().unwrap();
         tx_id
     }
@@ -10054,7 +10353,7 @@ mod tests {
 
     #[test]
     fn actor_checkpoint_threshold_tracks_committed_requests() {
-        let mut state = ActorCheckpointState::default();
+        let mut state = CommitCheckpointState::default();
         state.record_successful_group(7, CHECKPOINT_COMMIT_INTERVAL - 1);
         assert!(!state.checkpoint_due());
 
@@ -10114,29 +10413,30 @@ mod tests {
 
     #[test]
     fn table_schema_reads_legacy_bincode_without_trigger_field() {
-        let encoded = bincode_compat().serialize(&LegacyWalBatch {
-            version: 2,
-            commands: vec![LegacyWriteCommand::CreateTable {
-                database: "game".into(),
-                schema: LegacyTableSchema {
-                    name: "legacy".into(),
-                    columns: vec![Column {
-                        name: "id".into(),
-                        data_type: DataType::BigInt,
-                        nullable: false,
-                        default: None,
-                        is_primary_key: true,
-                    }],
-                    primary_key: Some(vec!["id".into()]),
-                    indexes: Vec::new(),
-                    next_page_number: 0,
-                    generation: 0,
-                    create_sql: Some("CREATE TABLE legacy(id BIGINT PRIMARY KEY)".into()),
-                    engine: TableEngine::Neko233,
-                },
-            }],
-        })
-        .unwrap();
+        let encoded = bincode_compat()
+            .serialize(&LegacyWalBatch {
+                version: 2,
+                commands: vec![LegacyWriteCommand::CreateTable {
+                    database: "game".into(),
+                    schema: LegacyTableSchema {
+                        name: "legacy".into(),
+                        columns: vec![Column {
+                            name: "id".into(),
+                            data_type: DataType::BigInt,
+                            nullable: false,
+                            default: None,
+                            is_primary_key: true,
+                        }],
+                        primary_key: Some(vec!["id".into()]),
+                        indexes: Vec::new(),
+                        next_page_number: 0,
+                        generation: 0,
+                        create_sql: Some("CREATE TABLE legacy(id BIGINT PRIMARY KEY)".into()),
+                        engine: TableEngine::Neko233,
+                    },
+                }],
+            })
+            .unwrap();
         let mut payload = WAL_BATCH_BINARY_MAGIC_V2.to_vec();
         payload.extend(encoded);
         let decoded = decode_wal_batch(&payload).unwrap();
@@ -10146,24 +10446,25 @@ mod tests {
         assert_eq!(schema.name, "legacy");
         assert!(schema.triggers.is_empty());
 
-        let encoded = bincode_compat().serialize(&LegacyWalGroupV2 {
-            version: 2,
-            committed_unix_ms: 7,
-            transactions: vec![vec![LegacyWriteCommand::CreateTable {
-                database: "game".into(),
-                schema: LegacyTableSchema {
-                    name: "legacy_group".into(),
-                    columns: Vec::new(),
-                    primary_key: None,
-                    indexes: Vec::new(),
-                    next_page_number: 0,
-                    generation: 0,
-                    create_sql: None,
-                    engine: TableEngine::Neko233,
-                },
-            }]],
-        })
-        .unwrap();
+        let encoded = bincode_compat()
+            .serialize(&LegacyWalGroupV2 {
+                version: 2,
+                committed_unix_ms: 7,
+                transactions: vec![vec![LegacyWriteCommand::CreateTable {
+                    database: "game".into(),
+                    schema: LegacyTableSchema {
+                        name: "legacy_group".into(),
+                        columns: Vec::new(),
+                        primary_key: None,
+                        indexes: Vec::new(),
+                        next_page_number: 0,
+                        generation: 0,
+                        create_sql: None,
+                        engine: TableEngine::Neko233,
+                    },
+                }]],
+            })
+            .unwrap();
         let mut payload = WAL_GROUP_BINARY_MAGIC_V2.to_vec();
         payload.extend(encoded);
         let decoded = decode_wal_group(&payload).unwrap();
@@ -10182,15 +10483,16 @@ mod tests {
             last_executed: Some("2026-07-21 12:01:00".into()),
             sql_mode: "STRICT_TRANS_TABLES".into(),
         };
-        let encoded = bincode_compat().serialize(&LegacyEventV4WalBatch {
-            version: 2,
-            commands: vec![LegacyEventV4WriteCommand::CreateEventV4 {
-                database: "game".into(),
-                event: event_definition("legacy_event_batch"),
-                metadata: legacy_metadata,
-            }],
-        })
-        .unwrap();
+        let encoded = bincode_compat()
+            .serialize(&LegacyEventV4WalBatch {
+                version: 2,
+                commands: vec![LegacyEventV4WriteCommand::CreateEventV4 {
+                    database: "game".into(),
+                    event: event_definition("legacy_event_batch"),
+                    metadata: legacy_metadata,
+                }],
+            })
+            .unwrap();
         let mut payload = WAL_BATCH_BINARY_MAGIC_V2.to_vec();
         payload.extend(encoded);
 
@@ -10221,16 +10523,17 @@ mod tests {
             last_executed: None,
             sql_mode: "ANSI_QUOTES".into(),
         };
-        let encoded = bincode_compat().serialize(&LegacyEventV4WalGroupV2 {
-            version: 2,
-            committed_unix_ms: 7,
-            transactions: vec![vec![LegacyEventV4WriteCommand::AlterEventV4 {
-                database: "game".into(),
-                event: event_definition("legacy_event_group"),
-                metadata: legacy_metadata,
-            }]],
-        })
-        .unwrap();
+        let encoded = bincode_compat()
+            .serialize(&LegacyEventV4WalGroupV2 {
+                version: 2,
+                committed_unix_ms: 7,
+                transactions: vec![vec![LegacyEventV4WriteCommand::AlterEventV4 {
+                    database: "game".into(),
+                    event: event_definition("legacy_event_group"),
+                    metadata: legacy_metadata,
+                }]],
+            })
+            .unwrap();
         let mut payload = WAL_GROUP_BINARY_MAGIC_V2.to_vec();
         payload.extend(encoded);
 
@@ -10346,16 +10649,20 @@ mod tests {
         })
         .unwrap();
         assert!(current.starts_with(WAL_BATCH_BINARY_MAGIC));
-        assert_eq!(decode_wal_batch(&current).unwrap().version, WAL_BATCH_VERSION);
+        assert_eq!(
+            decode_wal_batch(&current).unwrap().version,
+            WAL_BATCH_VERSION
+        );
     }
 
     #[test]
     fn wal_group_v3_timestamp_keeps_older_versions_read_compatible() {
-        let legacy_encoded = bincode_compat().serialize(&WalGroupV1 {
-            version: 1,
-            transactions: vec![vec![insert_command("a", "1")]],
-        })
-        .unwrap();
+        let legacy_encoded = bincode_compat()
+            .serialize(&WalGroupV1 {
+                version: 1,
+                transactions: vec![vec![insert_command("a", "1")]],
+            })
+            .unwrap();
         let mut legacy = WAL_GROUP_BINARY_MAGIC_V1.to_vec();
         legacy.extend_from_slice(&legacy_encoded);
         let decoded = decode_wal_group(&legacy).unwrap();
@@ -10365,10 +10672,7 @@ mod tests {
         let mut buf = Vec::new();
         encode_wal_group_into(&mut buf, &[&[insert_command("a", "2")]]).unwrap();
         assert!(buf.starts_with(WAL_GROUP_BINARY_MAGIC_V3));
-        assert!(decode_wal_group(&buf)
-            .unwrap()
-            .committed_unix_ms
-            .is_some());
+        assert!(decode_wal_group(&buf).unwrap().committed_unix_ms.is_some());
     }
 
     #[tokio::test]
@@ -10743,7 +11047,7 @@ mod tests {
 
         manager.flush_consistent().await.unwrap();
 
-        let reader = WalReader::open(temp.path().join("wal")).unwrap();
+        let reader = WalReader::open(temp.path().join("wal").join("shard_0")).unwrap();
         let mut committed = HashSet::new();
         let mut applied = HashSet::new();
         reader
@@ -10781,7 +11085,7 @@ mod tests {
             vec![commands[0].clone()],
             &manager.databases,
             &manager.buffer_pool,
-            &manager.wal_writer,
+            &manager.shards[0].wal_writer,
             &manager.data_dir,
             false,
             true,
@@ -10806,7 +11110,7 @@ mod tests {
             commands,
             &manager.databases,
             &manager.buffer_pool,
-            &manager.wal_writer,
+            &manager.shards[0].wal_writer,
             &manager.data_dir,
             true,
             true,
@@ -10827,7 +11131,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get("id"), Some(b"1".as_slice()));
 
-        let reader = WalReader::open(temp.path().join("wal")).unwrap();
+        let reader = WalReader::open(temp.path().join("wal").join("shard_0")).unwrap();
         let mut applied = 0;
         reader
             .replay(|record| {
@@ -10851,7 +11155,7 @@ mod tests {
             vec![command],
             &manager.databases,
             &manager.buffer_pool,
-            &manager.wal_writer,
+            &manager.shards[0].wal_writer,
             &manager.data_dir,
             false,
             true,
@@ -10878,7 +11182,14 @@ mod tests {
     #[tokio::test]
     async fn auto_increment_id_is_materialized_in_batch_wal() {
         let temp = tempfile::tempdir().unwrap();
-        let manager = StorageEngineManager::new(temp.path().to_path_buf(), 16384, "4M");
+        let manager = StorageEngineManager::try_new_sharded(
+            temp.path().to_path_buf(),
+            16384,
+            "4M",
+            Duration::ZERO,
+            1,
+        )
+        .unwrap();
         manager.init().await.unwrap();
         manager.create_database("game").await.unwrap();
         let mut schema = recovery_schema("ids");
@@ -10899,7 +11210,7 @@ mod tests {
         assert_eq!(result.last_insert_id, 1);
         assert_eq!(result.affected_rows, 2);
 
-        let reader = WalReader::open(temp.path().join("wal")).unwrap();
+        let reader = WalReader::open(temp.path().join("wal").join("shard_0")).unwrap();
         let mut ids = Vec::new();
         reader
             .replay(|record| {

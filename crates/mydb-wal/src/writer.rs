@@ -2,6 +2,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use anyhow::Result;
 use crc32fast::Hasher;
@@ -48,7 +49,7 @@ pub struct WalWriter {
     current_file_size: u64,
     current_file_alloc_size: u64,
     max_file_size: u64,
-    next_lsn: AtomicU64,
+    next_lsn: Arc<AtomicU64>,
     write_buf: Vec<u8>,
 }
 
@@ -57,7 +58,27 @@ impl WalWriter {
         self.next_lsn.load(Ordering::Relaxed)
     }
 
+    /// Open a standalone WAL whose LSN counter is private to this file. New
+    /// records resume just after the highest LSN already on disk, matching the
+    /// historical single-stream behavior used by tests and the restore path.
     pub fn open(dir: PathBuf, max_file_size: Option<u64>) -> Result<Self> {
+        let next_lsn = Arc::new(AtomicU64::new(1));
+        let (writer, file_max_lsn) = Self::open_shared(dir, max_file_size, next_lsn.clone())?;
+        next_lsn.store(file_max_lsn + 1, Ordering::Relaxed);
+        Ok(writer)
+    }
+
+    /// Open a WAL that draws its LSN from a shared, coordinator-owned counter
+    /// (`next_lsn`). This is what `StorageEngineManager` uses so every shard
+    /// contributes to one globally monotonic LSN space — a prerequisite for a
+    /// single, contiguous backup/PITR stream across shards. Returns the
+    /// highest LSN physically present in the file so the caller can seed the
+    /// shared counter to `max(file_max_lsn) + 1` after all shards are opened.
+    pub fn open_shared(
+        dir: PathBuf,
+        max_file_size: Option<u64>,
+        next_lsn: Arc<AtomicU64>,
+    ) -> Result<(Self, u64)> {
         fs::create_dir_all(&dir)?;
 
         let max_file_size = max_file_size.unwrap_or(DEFAULT_MAX_FILE_SIZE);
@@ -65,20 +86,27 @@ impl WalWriter {
         let current_file_index = Self::find_latest_file_index(&dir)?;
 
         let file_path = Self::wal_file_path(&dir, current_file_index);
-        let mut file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&file_path)?;
+        let mut opts = OpenOptions::new();
+        opts.create(true).truncate(false).read(true).write(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            // FILE_FLAG_WRITE_THROUGH (0x80000000): writes go straight to the
+            // device so sync_data() / FlushFileBuffers only flushes the written
+            // range instead of the whole dirty page set. This keeps the
+            // per-group fsync near-instant on Windows. See AGENTS.md rule on the
+            // WAL fsync cost (system-performance-impact #2).
+            opts.custom_flags(0x80000000);
+        }
+        let mut file = opts.open(&file_path)?;
 
-        let (current_file_size, next_lsn) = if file.metadata()?.len() < 8 {
+        let (current_file_size, file_max_lsn) = if file.metadata()?.len() < 8 {
             file.set_len(0)?;
             file.seek(SeekFrom::Start(0))?;
             file.write_all(WAL_MAGIC)?;
             file.write_all(&0u32.to_le_bytes())?;
             file.sync_all()?;
-            (8, 1)
+            (8, 0)
         } else {
             Self::recover_valid_tail(&mut file)?
         };
@@ -86,20 +114,23 @@ impl WalWriter {
         file.seek(SeekFrom::Start(current_file_size))?;
 
         info!(
-            "WAL opened: {:?} (index={}, size={}, next_lsn={})",
-            file_path, current_file_index, current_file_size, next_lsn
+            "WAL opened: {:?} (index={}, size={}, file_max_lsn={})",
+            file_path, current_file_index, current_file_size, file_max_lsn
         );
 
-        Ok(Self {
-            dir,
-            current_file: file,
-            current_file_index,
-            current_file_size,
-            current_file_alloc_size: current_file_size,
-            max_file_size,
-            next_lsn: AtomicU64::new(next_lsn),
-            write_buf: Vec::with_capacity(SCRATCHBUF_CAPACITY),
-        })
+        Ok((
+            Self {
+                dir,
+                current_file: file,
+                current_file_index,
+                current_file_size,
+                current_file_alloc_size: current_file_size,
+                max_file_size,
+                next_lsn,
+                write_buf: Vec::with_capacity(SCRATCHBUF_CAPACITY),
+            },
+            file_max_lsn,
+        ))
     }
 
     pub fn append(&mut self, record: &mut WalRecord) -> Result<u64> {
@@ -255,12 +286,16 @@ impl WalWriter {
         self.current_file_index += 1;
         let file_path = Self::wal_file_path(&self.dir, self.current_file_index);
 
-        let mut file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .read(true)
-            .write(true)
-            .open(&file_path)?;
+        let mut opts = OpenOptions::new();
+        opts.create(true).truncate(true).read(true).write(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            // FILE_FLAG_WRITE_THROUGH (0x80000000): keep the rotated file
+            // write-through so durability stays cheap for the rest of the run.
+            opts.custom_flags(0x80000000);
+        }
+        let mut file = opts.open(&file_path)?;
 
         file.write_all(WAL_MAGIC)?;
         file.write_all(&0u32.to_le_bytes())?;
@@ -370,7 +405,7 @@ impl WalWriter {
             file.set_len(valid_len)?;
             file.sync_all()?;
         }
-        Ok((valid_len, last_lsn.saturating_add(1).max(1)))
+        Ok((valid_len, last_lsn))
     }
 }
 

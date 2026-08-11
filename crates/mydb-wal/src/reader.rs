@@ -21,7 +21,10 @@ struct WalFileInfo {
 }
 
 impl WalReader {
-    /// Open WAL directory for reading
+    /// Open WAL directory for reading. The directory may hold `wal_*.log`
+    /// files directly (single-stream or one shard), or contain `shard_*`
+    /// subdirectories each holding their own `wal_*.log` (the sharded layout).
+    /// Both are merged so backup/PITR and recovery see one unified stream.
     pub fn open(dir: PathBuf) -> Result<Self> {
         let mut files = Vec::new();
 
@@ -30,6 +33,29 @@ impl WalReader {
                 let entry = entry?;
                 let path = entry.path();
                 let name = path.file_name().unwrap_or_default().to_string_lossy();
+
+                if path.is_dir() {
+                    if name.starts_with("shard_") {
+                        if let Ok(sub) = fs::read_dir(&path) {
+                            for shard_entry in sub.flatten() {
+                                let shard_path = shard_entry.path();
+                                let shard_name =
+                                    shard_path.file_name().unwrap_or_default().to_string_lossy();
+                                if shard_name.starts_with("wal_") && shard_name.ends_with(".log") {
+                                    if let Ok(index) =
+                                        shard_name[4..shard_name.len() - 4].parse::<u32>()
+                                    {
+                                        files.push(WalFileInfo {
+                                            index,
+                                            path: shard_path,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
 
                 if name.starts_with("wal_") && name.ends_with(".log") {
                     let index_str = &name[4..name.len() - 4];
