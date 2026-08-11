@@ -9603,8 +9603,7 @@ fn validate_check_constraints(row: &Row, schema: &TableSchema) -> Result<()> {
 }
 
 fn check_constraint_name(table: &str, definition: &str, index: usize) -> Option<String> {
-    let upper = definition.to_ascii_uppercase();
-    let check = upper.find("CHECK")?;
+    let check = find_sql_keyword_token(definition, "CHECK")?;
     let prefix = definition[..check].trim();
     if prefix.to_ascii_uppercase().starts_with("CONSTRAINT ") {
         prefix
@@ -9630,8 +9629,7 @@ fn table_check_constraints(schema: &TableSchema) -> Vec<(String, String)> {
         .into_iter()
         .enumerate()
         .filter_map(|(index, definition)| {
-            let upper = definition.to_ascii_uppercase();
-            let check = upper.find("CHECK")?;
+            let check = find_sql_keyword_token(definition, "CHECK")?;
             let expression_start = definition[check + 5..].find('(')? + check + 6;
             let expression_end = definition.rfind(')')?;
             if expression_end < expression_start {
@@ -10008,6 +10006,21 @@ fn split_schema_definitions(value: &str) -> Vec<&str> {
     }
     result.push(value[start..].trim());
     result
+}
+
+fn find_sql_keyword_token(value: &str, keyword: &str) -> Option<usize> {
+    let upper = value.to_ascii_uppercase();
+    let keyword = keyword.to_ascii_uppercase();
+    upper.match_indices(&keyword).find_map(|(position, _)| {
+        let boundary = |byte: Option<&u8>| {
+            byte.is_none_or(|byte| !byte.is_ascii_alphanumeric() && *byte != b'_')
+        };
+        let before = position
+            .checked_sub(1)
+            .and_then(|position| upper.as_bytes().get(position));
+        let after = upper.as_bytes().get(position + keyword.len());
+        (boundary(before) && boundary(after)).then_some(position)
+    })
 }
 
 fn validate_column_exists(schema: &TableSchema, column: &str) -> Result<()> {

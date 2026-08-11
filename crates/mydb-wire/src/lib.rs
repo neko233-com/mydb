@@ -30431,6 +30431,8 @@ fn parse_create_table(sql: &str) -> anyhow::Result<TableSchema> {
         if upper.starts_with("KEY ")
             || upper.starts_with("INDEX ")
             || upper.starts_with("UNIQUE ")
+            || upper.starts_with("FULLTEXT ")
+            || upper.starts_with("SPATIAL ")
             || upper.starts_with("CONSTRAINT ")
         {
             if let Some(index) = parse_index(&definition) {
@@ -55179,9 +55181,7 @@ mod tests {
     #[test]
     fn strips_connector_leading_comments_before_dispatch() {
         assert_eq!(
-            strip_leading_sql_comments(
-                "/* mysql-connector-j */ SELECT 1"
-            ),
+            strip_leading_sql_comments("/* mysql-connector-j */ SELECT 1"),
             "SELECT 1"
         );
         assert_eq!(
@@ -55224,6 +55224,12 @@ mod tests {
             parse_where("DELETE FROM players WHERE id > 0").unwrap(),
             Some(RowPredicate::Greater("id".into(), b"0".to_vec()))
         );
+        let fulltext = parse_create_table(
+            "CREATE TABLE film_text (film_id SMALLINT PRIMARY KEY, title VARCHAR(255), description TEXT, FULLTEXT KEY idx_title_description (title, description))",
+        )
+        .unwrap();
+        assert_eq!(fulltext.columns.len(), 3);
+        assert_eq!(fulltext.indexes[0].name, "idx_title_description");
         assert_eq!(
             parse_group_by(
                 "SELECT actor_id, COUNT(*) FROM events GROUP BY actor_id ORDER BY actor_id"
