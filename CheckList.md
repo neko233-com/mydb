@@ -1,6 +1,6 @@
 # MyDB 落地验收清单
 
-> 规则：只有当前源码和可复现实测能证明的项目才打勾。宽泛目标不能由局部 smoke 代替。最后更新：2026-07-17。
+> 规则：只有当前源码和可复现实测能证明的项目才打勾。宽泛目标不能由局部 smoke 代替。最后更新：2026-08-11。
 
 > **范围边界（设计决定）**：MyDB 定位为**替代 SQLite 的单机高性能数据库**，以 MySQL 形式与语法暴露接口。以下**非单机能力明确不支持**，不计入本清单、不视为缺失：binlog 复制拓扑 / GTID、读写分离、Group Replication / Galera、分布式 XA 两阶段协调、跨节点一致性。单机版本地 XA（`XA START/COMMIT` 映射为会话内事务）与复制 SHOW 表面（空结果）作为兼容 no-op 保留。完整判定见 [`SYNTAX_MATRIX.md`](SYNTAX_MATRIX.md) 的“❌ 明确不支持”分类。
 
@@ -187,5 +187,9 @@
 - [x] 2026-07-20 8 表/4 CPU 限速 3 轮：`target/io-bench-multitable-async-audit-3r/`，MyDB 7017.2 ops/s、MySQL 7315.1 ops/s、0.959x；WAL 269 次 fsync 覆盖 1641 请求（6.10 请求/组）。异步批量审计移出 SQL 临界路径；读主导样本 `target/io-bench-read-async-audit/` 读 P50 为 210 us。开发机 Docker 回归证据，不代表物理生产硬件验收
 - [x] db233-go `go test -count=1 ./...`：通过且仓库无改动
 - [x] 默认 MyDB 容器：healthy、`unless-stopped`、0.5 CPU、512 MiB
-- [x] 本机 MySQL80：仍为 Running/Automatic，符合“最终验收前不得卸载”
+- [x] MySQL Connector/J 8.4.0：4/4 通过，含默认认证、mysql_native_password、UTF-8、DataGrip/IDEA 常用连接属性、DDL/DML/预查询
+- [x] Go `database/sql` `github.com/go-sql-driver/mysql` v1.10.0：真实 `server-project-sf-go/test_get_lock.go` 通过，`DATABASE()`、`GET_LOCK`、`RELEASE_LOCK` 均正确
+- [x] Node.js `mysql2`：当前 v3 客户端连接 3306，预处理查询通过；覆盖 VS Code JavaScript/TypeScript 连接路径
+- [x] Windows 当前构建：`MyDBServer` Automatic 服务停止/启动循环通过；监听 `0.0.0.0:3306`，LAN 地址连接成功，防火墙入站规则启用
+- [x] 本机全量切流：9 个业务库迁移并重启校验；`sakila.staff` 超大 BLOB 通过 16KB 页外溢存储保留；MySQL80 服务、程序、进程和数据目录已卸载清理，SQL 备份保留在 `C:\Server\mydb\mysql-backup-20260811\all-databases.sql`
 - [ ] 正式 Ubuntu 24.04 物理 linux/amd64 性能结果稳定达到目标；当前证据不足
