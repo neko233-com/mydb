@@ -525,14 +525,14 @@ bash scripts/docker-smoke.sh
 
 > 完整测试方法、运行指标和发布前验证见 [性能报告.md](性能报告.md)。以下均为同一台本机的实测中位数（每项 3 次），不是历史参考值。
 >
-> 本轮数据：`56ef073`，2026-08-11，本机 Windows；MySQL 8.0.45，`innodb_flush_log_at_trx_commit=1`、`sync_binlog=1`。
+> 本轮数据：`d325944`，2026-08-11，本机 Windows；MySQL 8.0.45，`innodb_flush_log_at_trx_commit=1`、`sync_binlog=1`。
 
 | 场景 | MyDB | MySQL 8.0.45 | MyDB / MySQL |
 |------|------|--------------|--------------|
-| 单表写（fsync-per-commit） | 85 ops/s | 125 ops/s | 0.69x |
-| 8 actor / 8表 写 P99 延迟 | 27 ms | 49.4 ms | 1.83x（低更好） |
-| 8 actor / 8表 Group Commit | 317 ops/s | 432 ops/s | 0.73x |
-| 读 P50 延迟 | 175 μs | 84 μs | - |
+| 单表写（fsync-per-commit） | 90 ops/s | 133 ops/s | 0.68x |
+| 8 actor / 8表 写 P99 延迟 | 24.2 ms | 40.5 ms | 1.67x（低更好） |
+| 8 actor / 8表 Group Commit | 552 ops/s | 520 ops/s | 1.06x |
+| 读 P50 延迟 | 164 μs | 85 μs | - |
 
 性能优化不以关闭 WAL 持久化或弱化恢复语义换取数字。默认 250μs Group Commit 窗口优先并发吞吐，checkpoint 按 1024 个已提交请求触发；不声明未经实测证明的固定倍数。
 
@@ -542,7 +542,7 @@ bash scripts/docker-smoke.sh
 
 当前开发状态、已完成项、未完成项、差分证据统一维护在 [CheckList.md](CheckList.md)。只有可复现实测证明的项目才会打勾。
 
-**本轮本地门槛（2026-07-22）：**
+**本轮本地门槛（2026-08-11）：**
 - ✅ `cargo test --workspace`
 - ✅ `cargo clippy --workspace --all-targets -- -D warnings`
 - ✅ `cargo build --release -p mydb-server -p mydb-bench`
