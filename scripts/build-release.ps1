@@ -45,7 +45,10 @@ try {
 }
 
 # 获取架构
-$arch = [System.Environment]::GetEnvironmentVariable("PROCESSOR_ARCHITECTURE")
+$arch = [System.Environment]::GetEnvironmentVariable("PROCESSOR_ARCHITEW6432")
+if ([string]::IsNullOrWhiteSpace($arch)) {
+    $arch = [System.Environment]::GetEnvironmentVariable("PROCESSOR_ARCHITECTURE")
+}
 switch ($arch) {
     "AMD64" { $arch = "x86_64" }
     "ARM64" { $arch = "aarch64" }
