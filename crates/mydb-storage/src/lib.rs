@@ -413,6 +413,32 @@ impl DiskManager {
         self.write_pages_inner(table_name, pages, true)
     }
 
+    fn read_overflow_rows(&self, table_name: &str) -> Result<Option<Vec<Row>>> {
+        let path = self.data_dir.join(table_name).join("rows.overflow");
+        if !path.exists() {
+            return Ok(None);
+        }
+        let mut file = File::open(path)?;
+        let mut encoded = Vec::new();
+        file.read_to_end(&mut encoded)?;
+        Ok(Some(decode_overflow_rows(&encoded)?))
+    }
+
+    fn write_overflow_rows(&self, table_name: &str, rows: &[Row]) -> Result<()> {
+        let table_dir = self.data_dir.join(table_name);
+        fs::create_dir_all(&table_dir)?;
+        let path = table_dir.join("rows.overflow");
+        let encoded = encode_overflow_rows(rows)?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(path)?;
+        file.write_all(&encoded)?;
+        file.sync_data()?;
+        Ok(())
+    }
+
     fn write_pages_inner(&self, table_name: &str, pages: &[Page], sync: bool) -> Result<()> {
         if pages.is_empty() {
             fs::create_dir_all(self.data_dir.join(table_name))?;
@@ -1284,11 +1310,18 @@ impl Default for Row {
 const ROW_PAGE_MAGIC: &[u8; 4] = b"RWS1";
 const ROW_PAGE_HEADER_SIZE: usize = 8;
 const DEFAULT_PAGE_SIZE: usize = 16384;
+const OVERFLOW_ROWS_MAGIC: &[u8; 4] = b"OVR1";
+const OVERFLOW_ROWS_CHECKSUM_SIZE: usize = 32;
 type ConstraintKeySets = HashMap<(String, String), HashSet<Vec<u8>>>;
 type RowPageIndex = HashMap<(String, String, Vec<u8>), HashSet<u32>>;
 type RowValueIndex = HashMap<(String, String, Vec<u8>), Vec<usize>>;
 
-fn pack_row_pages(first_page_number: u32, rows: &[Row]) -> Result<Vec<Page>> {
+struct PackedRows {
+    pages: Vec<Page>,
+    overflow: bool,
+}
+
+fn pack_row_pages(first_page_number: u32, rows: &[Row]) -> Result<PackedRows> {
     let encoded = rows.iter().map(Row::encode).collect::<Vec<_>>();
     let mut pages = Vec::new();
     let mut index = 0;
@@ -1304,7 +1337,10 @@ fn pack_row_pages(first_page_number: u32, rows: &[Row]) -> Result<Vec<Page>> {
         while index < encoded.len() {
             let row = &encoded[index];
             if row.len() + 4 > page.data.len() - ROW_PAGE_HEADER_SIZE {
-                anyhow::bail!("Row size {} exceeds page capacity", row.len());
+                return Ok(PackedRows {
+                    pages: Vec::new(),
+                    overflow: true,
+                });
             }
             if cursor + 4 + row.len() > page.data.len() {
                 break;
@@ -1320,7 +1356,47 @@ fn pack_row_pages(first_page_number: u32, rows: &[Row]) -> Result<Vec<Page>> {
         page.header.is_dirty = true;
         pages.push(page);
     }
-    Ok(pages)
+    Ok(PackedRows {
+        pages,
+        overflow: false,
+    })
+}
+
+fn encode_overflow_rows(rows: &[Row]) -> Result<Vec<u8>> {
+    let payload = bincode_fast().serialize(rows)?;
+    let mut encoded = Vec::with_capacity(
+        OVERFLOW_ROWS_MAGIC.len() + 8 + payload.len() + OVERFLOW_ROWS_CHECKSUM_SIZE,
+    );
+    encoded.extend_from_slice(OVERFLOW_ROWS_MAGIC);
+    encoded.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+    encoded.extend_from_slice(&payload);
+    encoded.extend_from_slice(&Sha256::digest(&payload));
+    Ok(encoded)
+}
+
+fn decode_overflow_rows(encoded: &[u8]) -> Result<Vec<Row>> {
+    if encoded.len() < OVERFLOW_ROWS_MAGIC.len() + 8 + OVERFLOW_ROWS_CHECKSUM_SIZE
+        || !encoded.starts_with(OVERFLOW_ROWS_MAGIC)
+    {
+        anyhow::bail!("Overflow row file has an invalid header");
+    }
+    let payload_len = u64::from_le_bytes(
+        encoded[4..12]
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("Overflow row payload length is invalid"))?,
+    ) as usize;
+    let payload_start: usize = 12;
+    let payload_end = payload_start
+        .checked_add(payload_len)
+        .ok_or_else(|| anyhow::anyhow!("Overflow row payload length overflows"))?;
+    if payload_end + OVERFLOW_ROWS_CHECKSUM_SIZE != encoded.len() {
+        anyhow::bail!("Overflow row file is truncated");
+    }
+    let payload = &encoded[payload_start..payload_end];
+    if Sha256::digest(payload).as_slice() != &encoded[payload_end..] {
+        anyhow::bail!("Overflow row file checksum mismatch");
+    }
+    Ok(bincode_fast().deserialize(payload)?)
 }
 
 fn unpack_page_rows(page: &Page) -> Vec<Row> {
@@ -1368,6 +1444,7 @@ pub struct Database {
     data_dir: PathBuf,
     constraint_keys: RwLock<ConstraintKeySets>,
     row_page_index: RwLock<RowPageIndex>,
+    overflow_tables: RwLock<HashSet<String>>,
     // Indexed values point into current rewrite overlays. Disk-resident rows
     // use page indexes; overlay rows use offsets to avoid duplicating BLOBs.
     row_value_index: RwLock<RowValueIndex>,
@@ -1446,6 +1523,7 @@ impl Database {
             data_dir,
             constraint_keys: RwLock::new(HashMap::new()),
             row_page_index: RwLock::new(HashMap::new()),
+            overflow_tables: RwLock::new(HashSet::new()),
             row_value_index: RwLock::new(HashMap::new()),
             auto_increment_next: RwLock::new(HashMap::new()),
             pending_rewrites: RwLock::new(HashMap::new()),
@@ -2080,6 +2158,9 @@ impl Database {
     }
 
     fn scan_table_from_disk_only(&self, table_name: &str) -> Result<Vec<Row>> {
+        if let Some(rows) = self.disk_manager.read_overflow_rows(table_name)? {
+            return Ok(rows);
+        }
         let next_page_number = self
             .tables
             .read()
@@ -2112,6 +2193,9 @@ impl Database {
         }
         if let Some(rows) = self.pending_rewrites.read().get(table_name) {
             return Ok(rows.clone());
+        }
+        if let Some(rows) = self.disk_manager.read_overflow_rows(table_name)? {
+            return Ok(rows);
         }
         let next_page_number = self
             .tables
@@ -2159,6 +2243,14 @@ impl Database {
     ) -> Result<Vec<Row>> {
         if limit == Some(0) {
             return Ok(Vec::new());
+        }
+        if self.overflow_tables.read().contains(table_name) {
+            return Ok(self
+                .scan_table(table_name)?
+                .into_iter()
+                .filter(|row| filter.is_none_or(|predicate| predicate.matches(row)))
+                .take(limit.unwrap_or(usize::MAX))
+                .collect());
         }
         let (column, values): (&String, Vec<&Vec<u8>>) = match filter {
             Some(RowPredicate::Eq(column, value)) => (column, vec![value]),
@@ -2549,13 +2641,15 @@ impl Database {
             self.replace_table_logical_indexes(table_name, &schema, &rows);
             return Ok(());
         }
-        let pages = pack_row_pages(0, &rows)?;
+        let packed = pack_row_pages(0, &rows)?;
+        let pages = packed.pages;
+        let overflow = packed.overflow;
         let database_dir = self.data_dir.join(&self.name);
         let safe_table = rewrite_component(table_name)?;
         let marker = TableRewriteMarker {
             table: table_name.to_string(),
             old_next_page_number: schema.next_page_number,
-            new_next_page_number: pages.len() as u32,
+            new_next_page_number: if overflow { 0 } else { pages.len() as u32 },
             old_generation: schema.generation,
             new_generation: schema.generation.saturating_add(1),
             staging_dir: format!(".rewrite-{safe_table}.staging"),
@@ -2570,6 +2664,10 @@ impl Database {
         }
         fs::create_dir_all(&staging)?;
         self.disk_manager.write_pages(&marker.staging_dir, &pages)?;
+        if overflow {
+            self.disk_manager
+                .write_overflow_rows(&marker.staging_dir, &rows)?;
+        }
         write_json_sync(&marker_path, &marker)?;
         if active.exists() {
             fs::rename(&active, &backup)?;
@@ -2582,10 +2680,15 @@ impl Database {
         }
 
         if let Some(table) = self.tables.write().get_mut(table_name) {
-            table.next_page_number = pages.len() as u32;
+            table.next_page_number = if overflow { 0 } else { pages.len() as u32 };
             table.generation = marker.new_generation;
         }
         self.pending_rewrites.write().remove(table_name);
+        if overflow {
+            self.overflow_tables.write().insert(table_name.to_string());
+        } else {
+            self.overflow_tables.write().remove(table_name);
+        }
         let namespace = self.page_namespace(table_name);
         self.buffer_pool.clear_namespace(&namespace);
         for page in &pages {
@@ -2707,11 +2810,15 @@ impl Database {
         let mut page_index: RowPageIndex = HashMap::new();
         let mut value_index: RowValueIndex = HashMap::new();
         let mut auto_increment_next = HashMap::new();
+        let mut overflow_tables = HashSet::new();
         for (table_name, schema) in schemas {
             let (rows, has_overlay) = if let Some(rows) = memory.get(&table_name) {
                 (rows.clone(), true)
             } else if let Some(rows) = pending.get(&table_name) {
                 (rows.clone(), true)
+            } else if let Some(rows) = self.disk_manager.read_overflow_rows(&table_name)? {
+                overflow_tables.insert(table_name.clone());
+                (rows, false)
             } else {
                 let mut rows = Vec::new();
                 for page_number in self.disk_manager.list_pages(&table_name)? {
@@ -2767,6 +2874,7 @@ impl Database {
         *self.row_page_index.write() = page_index;
         *self.row_value_index.write() = value_index;
         *self.auto_increment_next.write() = auto_increment_next;
+        *self.overflow_tables.write() = overflow_tables;
         Ok(())
     }
 
@@ -10422,6 +10530,27 @@ mod tests {
         assert!(decoded.is_null("score"));
         decoded.set("score", b"100".to_vec());
         assert!(!decoded.is_null("SCORE"));
+    }
+
+    #[test]
+    fn oversized_rows_roundtrip_through_checked_overflow_storage() {
+        let temp = tempfile::tempdir().expect("create overflow test directory");
+        let disk = DiskManager::new(temp.path().to_path_buf(), DEFAULT_PAGE_SIZE);
+        let mut row = Row::new();
+        row.push("id", 1u32.to_le_bytes().to_vec());
+        row.push("picture", vec![0xA5; DEFAULT_PAGE_SIZE * 2]);
+
+        let packed = pack_row_pages(0, std::slice::from_ref(&row)).expect("pack oversized row");
+        assert!(packed.overflow);
+        assert!(packed.pages.is_empty());
+
+        disk.write_overflow_rows("staff", std::slice::from_ref(&row))
+            .expect("write overflow row");
+        let loaded = disk
+            .read_overflow_rows("staff")
+            .expect("read overflow row")
+            .expect("overflow row exists");
+        assert_eq!(loaded, vec![row]);
     }
 
     #[test]
