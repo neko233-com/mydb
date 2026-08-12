@@ -116,7 +116,7 @@
 | `RENAME USER old TO new` | ✅ Verified | 本轮新增（`AuthCatalog::rename_user`） |
 | `SET PASSWORD [FOR user] = '...'` | ✅ Verified | 本轮新增，路由到 `alter_user_passwords` |
 | `SHOW GRANTS` | ✅ Verified | |
-| 表级 / 列级权限（`tables_priv`/`columns_priv`） | 🟡 Partial | 虚拟表存在且返回空行，但**不强制**表/列级校验；全局/库级权限强制 |
+| 表级 / 列级权限（`tables_priv`/`columns_priv`） | 🟡 Partial | 表级 `GRANT/REVOKE ... ON db.table` 已持久化、角色继承并强制简单 DML；列级校验仍 Deferred，虚拟 `tables_priv`/`columns_priv` 展示仍待补齐 |
 | `mysql.user` / `mysql.db` / `mysql.role_edges` 虚拟表 | ✅ Verified | 真实填充 |
 | `mysql.global_grants` / `default_roles` / `tables_priv` / `columns_priv` / `procs_priv` / `func` 虚拟表 | ✅ Verified | 动态全局权限未实现，`global_grants` 故意为空 |
 | 审计日志 | ✅ Verified | `AuditLog` 轮转 worker + metrics |
@@ -213,4 +213,4 @@
 - **已实现并经测试**：DDL 全量、DML 全量、事务与锁常用面、存储函数/事件调度、账号/角色/审计、information_schema+mysql 虚拟库、时区、错误码、协议与迁移。
 - **本轮补齐（兼容 no-op / 虚拟表 / 表面）**：performance_schema、sys、RENAME USER、SET PASSWORD、ALTER DATABASE 选项、ANALYZE/OPTIMIZE/CHECK/REPAIR/CHECKSUM TABLE、FLUSH、CACHE INDEX、复制 SHOW 表面、本地 XA 表面。
 - **明确不支持（设计决定，非临时延迟 ❌）**：binlog 复制拓扑 / GTID、读写分离、Group Replication / Galera、分布式 XA 两阶段协调、跨节点一致性。这些是**非单机能力**，与 MyDB“替代 SQLite 的单机高性能数据库”定位相悖，不会实现，也不计入“缺失”。复制 SHOW 表面（空结果）与本地 XA（会话内事务）仍作为兼容表面保留。
-- **尚未完成（单机范围内的语义 🔴 Deferred）**：完整 next-key/gap 锁与多连接成本化死锁、表/列级权限强制、排序规则真实比较语义（`*_general_ci`/`*_ai_ci`）、JOIN ON 常量/函数表达式、复杂互递归 CTE、ONLY_FULL_GROUP_BY 函数依赖、routine 局部变量 charset/collation 与进 routine 时 sql_mode 差异 warning、冷门语句清理边缘。它们仍是“完整 MySQL 8.4 对外表现”目标的未完成项。
+- **尚未完成（单机范围内的语义 🔴 Deferred）**：完整 next-key/gap 锁与多连接成本化死锁、列级权限强制与 `tables_priv`/`columns_priv` 真实展示、排序规则真实比较语义（`*_general_ci`/`*_ai_ci`）、JOIN ON 常量/函数表达式、复杂互递归 CTE、ONLY_FULL_GROUP_BY 函数依赖、routine 局部变量 charset/collation 与进 routine 时 sql_mode 差异 warning、冷门语句清理边缘。它们仍是“完整 MySQL 8.4 对外表现”目标的未完成项。

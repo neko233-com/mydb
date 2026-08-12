@@ -677,6 +677,8 @@ struct AuthUser {
     global_privileges: HashSet<String>,
     database_privileges: HashMap<String, HashSet<String>>,
     #[serde(default)]
+    table_privileges: AuthTablePrivileges,
+    #[serde(default)]
     routine_privileges: AuthRoutinePrivileges,
     roles: HashSet<String>,
 }
@@ -686,10 +688,16 @@ struct AuthRole {
     global_privileges: HashSet<String>,
     database_privileges: HashMap<String, HashSet<String>>,
     #[serde(default)]
+    table_privileges: AuthTablePrivileges,
+    #[serde(default)]
     routine_privileges: AuthRoutinePrivileges,
     #[serde(default)]
     roles: HashSet<String>,
 }
+
+/// Table grants use database/table keys so legacy auth JSON remains readable
+/// while `GRANT ... ON db.table` can be enforced without broad database grants.
+type AuthTablePrivileges = HashMap<String, HashMap<String, HashSet<String>>>;
 
 /// Routine grants use nested maps so their durable JSON representation stays
 /// readable and unambiguous even when object names contain punctuation.
@@ -854,6 +862,7 @@ impl AuthCatalog {
                     password_sha1: password_sha1_hex(bootstrap_password),
                     global_privileges: HashSet::from(["ALL".to_string()]),
                     database_privileges: HashMap::new(),
+                    table_privileges: AuthTablePrivileges::default(),
                     routine_privileges: AuthRoutinePrivileges::default(),
                     roles: HashSet::new(),
                 },
@@ -879,6 +888,7 @@ impl AuthCatalog {
                 password_sha1: password_sha1_hex(bootstrap_password),
                 global_privileges: HashSet::from(["ALL".to_string()]),
                 database_privileges: HashMap::new(),
+                table_privileges: AuthTablePrivileges::default(),
                 routine_privileges: AuthRoutinePrivileges::default(),
                 roles: HashSet::new(),
             },
@@ -943,6 +953,35 @@ impl AuthCatalog {
                 .is_some_and(|set| privilege_set_allows(set, privilege))
             || user.roles.iter().any(|role| {
                 role_has_privilege(&data, role, &database, privilege, &mut HashSet::new())
+            })
+    }
+
+    fn has_table_privilege(
+        &self,
+        user: &str,
+        database: &str,
+        table: &str,
+        privilege: &str,
+    ) -> bool {
+        let data = self.data.read();
+        let Some(user) = data.users.get(&normalize_auth_name(user)) else {
+            return false;
+        };
+        let database = database.to_ascii_lowercase();
+        let table = table.to_ascii_lowercase();
+        user.table_privileges
+            .get(&database)
+            .and_then(|tables| tables.get(&table))
+            .is_some_and(|set| privilege_set_allows(set, privilege))
+            || user.roles.iter().any(|role| {
+                role_has_table_privilege(
+                    &data,
+                    role,
+                    &database,
+                    &table,
+                    privilege,
+                    &mut HashSet::new(),
+                )
             })
     }
 
@@ -1025,6 +1064,7 @@ impl AuthCatalog {
                         password_sha1: password_sha1_hex(&password),
                         global_privileges: HashSet::new(),
                         database_privileges: HashMap::new(),
+                        table_privileges: AuthTablePrivileges::default(),
                         routine_privileges: AuthRoutinePrivileges::default(),
                         roles: HashSet::new(),
                     },
@@ -1136,6 +1176,90 @@ impl AuthCatalog {
                     })
                     .unwrap_or(&mut role.global_privileges);
                 target.extend(privileges.iter().cloned());
+            }
+            Ok(())
+        })
+    }
+
+    fn grant_table_privileges(
+        &self,
+        principals: &[String],
+        database: &str,
+        table: &str,
+        privileges: HashSet<String>,
+    ) -> anyhow::Result<()> {
+        let principals = normalize_auth_names(principals)?;
+        let database = database.to_ascii_lowercase();
+        let table = table.to_ascii_lowercase();
+        self.mutate(|data| {
+            for principal in &principals {
+                if !data.users.contains_key(principal) && !data.roles.contains_key(principal) {
+                    anyhow::bail!("Unknown user or role '{}'", principal);
+                }
+            }
+            for principal in principals {
+                if let Some(user) = data.users.get_mut(&principal) {
+                    user.table_privileges
+                        .entry(database.clone())
+                        .or_default()
+                        .entry(table.clone())
+                        .or_default()
+                        .extend(privileges.iter().cloned());
+                } else {
+                    data.roles
+                        .get_mut(&principal)
+                        .expect("principal was checked above")
+                        .table_privileges
+                        .entry(database.clone())
+                        .or_default()
+                        .entry(table.clone())
+                        .or_default()
+                        .extend(privileges.iter().cloned());
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn revoke_table_privileges(
+        &self,
+        principals: &[String],
+        database: &str,
+        table: &str,
+        privileges: &HashSet<String>,
+    ) -> anyhow::Result<()> {
+        let principals = normalize_auth_names(principals)?;
+        let database = database.to_ascii_lowercase();
+        let table = table.to_ascii_lowercase();
+        self.mutate(|data| {
+            for principal in &principals {
+                if !data.users.contains_key(principal) && !data.roles.contains_key(principal) {
+                    anyhow::bail!("Unknown user or role '{}'", principal);
+                }
+            }
+            for principal in principals {
+                let grants = if let Some(user) = data.users.get_mut(&principal) {
+                    &mut user.table_privileges
+                } else {
+                    &mut data
+                        .roles
+                        .get_mut(&principal)
+                        .expect("principal was checked above")
+                        .table_privileges
+                };
+                if let Some(tables) = grants.get_mut(&database) {
+                    if let Some(current) = tables.get_mut(&table) {
+                        for privilege in privileges {
+                            current.remove(privilege);
+                        }
+                        if current.is_empty() {
+                            tables.remove(&table);
+                        }
+                    }
+                    if tables.is_empty() {
+                        grants.remove(&database);
+                    }
+                }
             }
             Ok(())
         })
@@ -1323,11 +1447,12 @@ impl AuthCatalog {
     fn show_grants(&self, principal: &str, using_roles: &[String]) -> anyhow::Result<Vec<String>> {
         let principal = normalize_auth_name(principal);
         let data = self.data.read();
-        let (mut global, mut databases, mut routines, roles) =
+        let (mut global, mut databases, mut tables, mut routines, roles) =
             if let Some(user) = data.users.get(&principal) {
                 (
                     user.global_privileges.clone(),
                     user.database_privileges.clone(),
+                    user.table_privileges.clone(),
                     user.routine_privileges.clone(),
                     user.roles.clone(),
                 )
@@ -1335,6 +1460,7 @@ impl AuthCatalog {
                 (
                     role.global_privileges.clone(),
                     role.database_privileges.clone(),
+                    role.table_privileges.clone(),
                     role.routine_privileges.clone(),
                     role.roles.clone(),
                 )
@@ -1350,6 +1476,7 @@ impl AuthCatalog {
                 &role,
                 &mut global,
                 &mut databases,
+                &mut tables,
                 &mut routines,
                 &mut HashSet::new(),
             )?;
@@ -1374,6 +1501,23 @@ impl AuthCatalog {
                     database.replace('`', "``"),
                     subject
                 ));
+            }
+        }
+        let mut tables = tables.into_iter().collect::<Vec<_>>();
+        tables.sort_by(|left, right| left.0.cmp(&right.0));
+        for (database, database_tables) in tables {
+            let mut database_tables = database_tables.into_iter().collect::<Vec<_>>();
+            database_tables.sort_by(|left, right| left.0.cmp(&right.0));
+            for (table, privileges) in database_tables {
+                if !privileges.is_empty() {
+                    grants.push(format!(
+                        "GRANT {} ON `{}`.`{}` TO {}",
+                        render_privileges(&privileges),
+                        database.replace('`', "``"),
+                        table.replace('`', "``"),
+                        subject
+                    ));
+                }
             }
         }
         grants.extend(render_routine_grants(&routines, &subject));
@@ -1514,6 +1658,34 @@ fn role_has_privilege(
             .any(|nested| role_has_privilege(data, nested, database, privilege, visited))
 }
 
+fn role_has_table_privilege(
+    data: &AuthCatalogData,
+    role_name: &str,
+    database: &str,
+    table: &str,
+    privilege: &str,
+    visited: &mut HashSet<String>,
+) -> bool {
+    if !visited.insert(role_name.to_string()) {
+        return false;
+    }
+    let Some(role) = data.roles.get(role_name) else {
+        return false;
+    };
+    role.table_privileges
+        .get(database)
+        .and_then(|tables| tables.get(table))
+        .is_some_and(|set| privilege_set_allows(set, privilege))
+        || privilege_set_allows(&role.global_privileges, privilege)
+        || role
+            .database_privileges
+            .get(database)
+            .is_some_and(|set| privilege_set_allows(set, privilege))
+        || role.roles.iter().any(|nested| {
+            role_has_table_privilege(data, nested, database, table, privilege, visited)
+        })
+}
+
 fn role_has_routine_privilege(
     data: &AuthCatalogData,
     role_name: &str,
@@ -1547,6 +1719,7 @@ fn collect_role_privileges(
     role_name: &str,
     global_privileges: &mut HashSet<String>,
     database_privileges: &mut HashMap<String, HashSet<String>>,
+    table_privileges: &mut AuthTablePrivileges,
     routine_privileges: &mut AuthRoutinePrivileges,
     visited: &mut HashSet<String>,
 ) -> anyhow::Result<()> {
@@ -1564,6 +1737,16 @@ fn collect_role_privileges(
             .or_default()
             .extend(privileges.iter().cloned());
     }
+    for (database, tables) in &role.table_privileges {
+        for (table, privileges) in tables {
+            table_privileges
+                .entry(database.clone())
+                .or_default()
+                .entry(table.clone())
+                .or_default()
+                .extend(privileges.iter().cloned());
+        }
+    }
     routine_privileges.extend_from(&role.routine_privileges);
     for nested in &role.roles {
         collect_role_privileges(
@@ -1571,6 +1754,7 @@ fn collect_role_privileges(
             nested,
             global_privileges,
             database_privileges,
+            table_privileges,
             routine_privileges,
             visited,
         )?;
@@ -1756,6 +1940,21 @@ fn parse_routine_privilege_scope(scope: &str) -> anyhow::Result<Option<RoutinePr
         database,
         routine,
     }))
+}
+
+fn parse_table_privilege_scope(scope: &str) -> anyhow::Result<Option<(String, String)>> {
+    let scope = scope.trim();
+    if scope == "*.*" || scope.ends_with(".*") {
+        return Ok(None);
+    }
+    if scope.contains('(') || scope.contains(')') {
+        anyhow::bail!("column-level privileges are not implemented yet");
+    }
+    let (database, table) = split_table_reference(scope, "")?;
+    if database.is_empty() || table.is_empty() || table == "*" {
+        anyhow::bail!("table privilege scope requires database.table");
+    }
+    Ok(Some((database, table)))
 }
 
 fn authorization_routine_scope(sql: &str) -> anyhow::Result<Option<RoutinePrivilegeScope>> {
@@ -7328,10 +7527,21 @@ impl Backend {
         {
             return Ok(());
         }
+        let table_granted = statement_privilege_table(sql, upper, &self.database).is_some_and(
+            |(table_database, table)| {
+                self.config.auth_catalog.has_table_privilege(
+                    &user,
+                    &table_database,
+                    &table,
+                    privilege,
+                )
+            },
+        );
         if self
             .config
             .auth_catalog
             .has_privilege(&user, &database, privilege)
+            || table_granted
         {
             Ok(())
         } else {
@@ -7477,6 +7687,27 @@ impl Backend {
                         scope.kind,
                         &scope.database,
                         &scope.routine,
+                        privileges,
+                    )?;
+                }
+                return Ok(QueryOutcome::ok(0));
+            }
+            if let Some((database, table)) = parse_table_privilege_scope(scope)? {
+                if revoke {
+                    self.config.auth_catalog.revoke_table_privileges(
+                        &principals,
+                        &database,
+                        &table,
+                        &privileges,
+                    )?;
+                } else {
+                    if with_grant_option {
+                        privileges.insert("GRANT OPTION".to_string());
+                    }
+                    self.config.auth_catalog.grant_table_privileges(
+                        &principals,
+                        &database,
+                        &table,
                         privileges,
                     )?;
                 }
@@ -14030,6 +14261,14 @@ fn generate_auth_salt() -> [u8; 20] {
 }
 
 fn statement_privilege_database(sql: &str, upper: &str, default_database: &str) -> Option<String> {
+    statement_privilege_table(sql, upper, default_database).map(|(database, _)| database)
+}
+
+fn statement_privilege_table(
+    sql: &str,
+    upper: &str,
+    default_database: &str,
+) -> Option<(String, String)> {
     let reference = if upper.starts_with("INSERT ") || upper.starts_with("REPLACE ") {
         let into = upper.find("INTO ")? + "INTO ".len();
         let tail = sql[into..].trim_start();
@@ -14045,12 +14284,22 @@ fn statement_privilege_database(sql: &str, upper: &str, default_database: &str) 
         let tail = sql[from..].trim_start();
         let end = tail.find(char::is_whitespace).unwrap_or(tail.len());
         &tail[..end]
+    } else if upper.starts_with("SELECT ") {
+        let from = find_top_level_keyword(sql, " FROM ", 0)? + " FROM ".len();
+        let tail = sql[from..].trim_start();
+        if tail.starts_with('(') {
+            return None;
+        }
+        let end = tail
+            .find(|character: char| character.is_whitespace() || character == ',')
+            .unwrap_or(tail.len());
+        &tail[..end]
     } else {
         return None;
     };
     split_table_reference(reference, default_database)
         .ok()
-        .map(|(database, _)| database)
+        .filter(|(database, table)| !database.is_empty() && !table.is_empty())
 }
 
 impl Drop for Backend {
@@ -36762,6 +37011,14 @@ mod tests {
             )
             .unwrap();
         catalog
+            .grant_table_privileges(
+                &["game_writer".to_string()],
+                "game",
+                "scores",
+                HashSet::from(["SELECT".to_string()]),
+            )
+            .unwrap();
+        catalog
             .grant_roles(&["analyst".to_string()], &["game_writer".to_string()])
             .unwrap();
         drop(catalog);
@@ -36770,6 +37027,8 @@ mod tests {
         assert!(restarted.has_privilege("game_writer", "game", "INSERT"));
         assert!(restarted.has_privilege("game_writer", "game", "UPDATE"));
         assert!(!restarted.has_privilege("game_writer", "game", "DELETE"));
+        assert!(restarted.has_table_privilege("game_writer", "game", "scores", "SELECT"));
+        assert!(!restarted.has_table_privilege("game_writer", "game", "other", "SELECT"));
         assert!(restarted.data.read().users["game_writer"]
             .roles
             .contains("analyst"));
@@ -36942,6 +37201,63 @@ mod tests {
             _ => panic!("expected grants rows"),
         };
         assert!(!rendered.iter().any(|grant| grant.contains("analyst")));
+    }
+
+    #[tokio::test]
+    async fn table_grants_are_enforced_for_simple_dml() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = Arc::new(StorageEngineManager::new(
+            temp.path().to_path_buf(),
+            16384,
+            "4M",
+        ));
+        storage.init().await.unwrap();
+        storage.create_database("mydb").await.unwrap();
+        let mut backend = Backend::new(
+            storage,
+            Arc::new(ProtocolConfig::default()),
+            Arc::new(WireStats::default()),
+            1,
+        );
+        backend
+            .execute("CREATE TABLE mydb.allowed (id BIGINT PRIMARY KEY)")
+            .await
+            .unwrap();
+        backend
+            .execute("CREATE TABLE mydb.denied (id BIGINT PRIMARY KEY)")
+            .await
+            .unwrap();
+        backend
+            .execute("INSERT INTO mydb.allowed VALUES (1)")
+            .await
+            .unwrap();
+        backend
+            .execute("CREATE USER 'table_reader' IDENTIFIED BY 'table-password'")
+            .await
+            .unwrap();
+        backend
+            .execute("GRANT SELECT ON mydb.allowed TO 'table_reader'")
+            .await
+            .unwrap();
+        backend
+            .authenticated_user
+            .lock()
+            .replace("table_reader".to_string());
+        backend.database = "mydb".to_string();
+
+        assert!(matches!(
+            backend
+                .execute("SELECT id FROM mydb.allowed")
+                .await
+                .unwrap(),
+            QueryOutcome::Rows { .. }
+        ));
+        let error = backend
+            .execute("SELECT id FROM mydb.denied")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("lacks SELECT privilege"), "{error}");
     }
 
     #[tokio::test]

@@ -128,7 +128,7 @@
 - [x] 冷门 DDL/DML 兼容表面：`ANALYZE`/`OPTIMIZE`/`CHECK`/`REPAIR`/`CHECKSUM TABLE`（MySQL 形态结果集）、`FLUSH`/`CACHE INDEX`（no-op）、`ALTER DATABASE ... CHARACTER SET/COLLATE/UPGRADE DATA DIRECTORY NAME/READ ONLY/ENCRYPTION`、`RENAME USER`、`SET PASSWORD`、`CREATE/ALTER DATABASE` 选项；`LOAD DATA PARTITION`、完整冷门字符集与 `sql_mode` warning/error 组合矩阵仍 **Deferred**（SYNTAX_MATRIX §7/§6）
 - [x] 触发器、存储过程与函数、事件完整语义（创建/持久化/调用/元数据/错误传播/事务原子性）
 - [ ] 可更新视图、`WITH CHECK OPTION` 完整约束——**Deferred**：视图按 MySQL 只读语义实现，单机定位不开放可更新视图（SYNTAX_MATRIX §1.2）
-- [x] MySQL 系统库：`information_schema`（~21 表）、`mysql`（user/db/role_edges 真实，global_grants/tables_priv/columns_priv/procs_priv/func 虚拟表）、`performance_schema`（12 表）、`sys`（12 视图）全部可查询；权限/角色/审计（全局/库级强制，表/列级暂不强制——**Deferred**）；复制协议表面 `SHOW MASTER/BINARY LOG STATUS`、`SHOW BINARY LOGS`、`SHOW REPLICAS`、`SHOW REPLICA STATUS`、`XA START/BEGIN/END/PREPARE/COMMIT/ROLLBACK/RECOVER` 返回 MySQL 形态结果，真正 binlog 复制拓扑/GTID/两阶段 XA 外部协调 **Deferred**（SYNTAX_MATRIX §5/§8/§3）
+- [x] MySQL 系统库：`information_schema`（~21 表）、`mysql`（user/db/role_edges 真实，global_grants/tables_priv/columns_priv/procs_priv/func 虚拟表）、`performance_schema`（12 表）、`sys`（12 视图）全部可查询；权限/角色/审计（全局/库级及表级简单 DML 强制，列级及表级虚拟表展示 **Deferred**）；复制协议表面 `SHOW MASTER/BINARY LOG STATUS`、`SHOW BINARY LOGS`、`SHOW REPLICAS`、`SHOW REPLICA STATUS`、`XA START/BEGIN/END/PREPARE/COMMIT/ROLLBACK/RECOVER` 返回 MySQL 形态结果，真正 binlog 复制拓扑/GTID/两阶段 XA 外部协调 **Deferred**（SYNTAX_MATRIX §5/§8/§3）
 
 ## 事务、锁与连接
 
