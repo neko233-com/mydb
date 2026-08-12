@@ -74,6 +74,7 @@ impl RouterConfig {
                 anyhow::bail!("router backend weight must be non-zero");
             }
         }
+        total_backend_weight(&self.backends)?;
         Ok(())
     }
 }
@@ -95,12 +96,14 @@ impl RouterState {
     }
 
     async fn connect_backend(&self) -> Result<(TcpStream, BackendConfig)> {
-        let candidates = weighted_candidates(&self.config.backends);
-        let start = self.next_backend.fetch_add(1, Ordering::Relaxed) % candidates.len();
+        let total_weight = total_backend_weight(&self.config.backends)?;
+        let slot = self.next_backend.fetch_add(1, Ordering::Relaxed) % total_weight;
+        let start = weighted_backend_index(&self.config.backends, slot);
         let timeout = Duration::from_millis(self.config.connect_timeout_ms);
         let mut last_error = None;
-        for offset in 0..candidates.len() {
-            let backend = candidates[(start + offset) % candidates.len()].clone();
+        for offset in 0..self.config.backends.len() {
+            let backend =
+                self.config.backends[(start + offset) % self.config.backends.len()].clone();
             let address = backend_address(&backend);
             match tokio::time::timeout(timeout, TcpStream::connect(&address)).await {
                 Ok(Ok(stream)) => return Ok((stream, backend)),
@@ -125,11 +128,23 @@ fn backend_address(backend: &BackendConfig) -> String {
     }
 }
 
-fn weighted_candidates(backends: &[BackendConfig]) -> Vec<BackendConfig> {
-    backends
-        .iter()
-        .flat_map(|backend| std::iter::repeat_n(backend.clone(), backend.weight))
-        .collect()
+fn weighted_backend_index(backends: &[BackendConfig], slot: usize) -> usize {
+    let mut remaining = slot;
+    for (index, backend) in backends.iter().enumerate() {
+        if remaining < backend.weight {
+            return index;
+        }
+        remaining -= backend.weight;
+    }
+    backends.len().saturating_sub(1)
+}
+
+fn total_backend_weight(backends: &[BackendConfig]) -> Result<usize> {
+    backends.iter().try_fold(0usize, |total, backend| {
+        total
+            .checked_add(backend.weight)
+            .ok_or_else(|| anyhow::anyhow!("router backend weights overflow"))
+    })
 }
 
 async fn serve(config: RouterConfig) -> Result<()> {
@@ -491,8 +506,8 @@ mod tests {
     }
 
     #[test]
-    fn weighted_candidates_preserve_backend_weight() {
-        let candidates = weighted_candidates(&[
+    fn weighted_backend_index_preserves_backend_weight() {
+        let backends = [
             BackendConfig {
                 host: "a".to_string(),
                 port: 3306,
@@ -503,11 +518,10 @@ mod tests {
                 port: 3306,
                 weight: 1,
             },
-        ]);
-        assert_eq!(candidates.len(), 3);
-        assert_eq!(candidates[0].host, "a");
-        assert_eq!(candidates[1].host, "a");
-        assert_eq!(candidates[2].host, "b");
+        ];
+        assert_eq!(weighted_backend_index(&backends, 0), 0);
+        assert_eq!(weighted_backend_index(&backends, 1), 0);
+        assert_eq!(weighted_backend_index(&backends, 2), 1);
     }
 
     #[test]

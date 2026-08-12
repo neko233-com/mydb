@@ -14836,15 +14836,43 @@ fn composite_index_range_from_predicate(
     }
     let values = columns
         .iter()
-        .map(|column| equalities.get(column).cloned())
-        .collect::<Option<Vec<_>>>()?;
+        .take_while(|column| equalities.contains_key(*column))
+        .map(|column| equalities.get(column).cloned().expect("checked above"))
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        return None;
+    }
     let key = encode_composite_lock_key(&values);
-    Some(vec![KeyRange {
-        lower: Some(key.clone()),
+    if values.len() == columns.len() {
+        return Some(vec![KeyRange {
+            lower: Some(key.clone()),
+            lower_inclusive: true,
+            upper: Some(key),
+            upper_inclusive: true,
+        }]);
+    }
+    Some(vec![composite_prefix_range(key)])
+}
+
+fn composite_prefix_range(prefix: Vec<u8>) -> KeyRange {
+    let upper = prefix_successor(&prefix);
+    KeyRange {
+        lower: Some(prefix),
         lower_inclusive: true,
-        upper: Some(key),
-        upper_inclusive: true,
-    }])
+        upper,
+        upper_inclusive: false,
+    }
+}
+
+fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut successor = prefix.to_vec();
+    for byte in successor.iter_mut().rev() {
+        if *byte != u8::MAX {
+            *byte += 1;
+            return Some(successor);
+        }
+    }
+    None
 }
 
 fn key_ranges_from_predicate(predicate: &RowPredicate, column: &str) -> Option<Vec<KeyRange>> {
@@ -36546,6 +36574,43 @@ mod tests {
             .await
             .unwrap();
         first.execute("ROLLBACK").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn composite_index_prefix_locks_do_not_block_unrelated_prefix_inserts() {
+        let (_temp, _storage, mut first, mut second) = transaction_backends().await;
+        first
+            .execute(
+                "CREATE TABLE composite_prefix_rows (id BIGINT PRIMARY KEY, kind BIGINT, shard BIGINT, INDEX idx_kind_shard (kind,shard))",
+            )
+            .await
+            .unwrap();
+        first
+            .execute("INSERT INTO composite_prefix_rows (id,kind,shard) VALUES (1,1,1),(2,1,2)")
+            .await
+            .unwrap();
+        first.execute("BEGIN").await.unwrap();
+        first
+            .execute("SELECT id FROM composite_prefix_rows WHERE kind=1 FOR UPDATE")
+            .await
+            .unwrap();
+
+        second
+            .execute("INSERT INTO composite_prefix_rows (id,kind,shard) VALUES (3,2,1)")
+            .await
+            .unwrap();
+        let error = second
+            .execute("INSERT INTO composite_prefix_rows (id,kind,shard) VALUES (4,1,3)")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Lock wait timeout"), "{error}");
+
+        first.execute("ROLLBACK").await.unwrap();
+        second
+            .execute("INSERT INTO composite_prefix_rows (id,kind,shard) VALUES (4,1,3)")
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
