@@ -6,7 +6,7 @@
 >
 > **非单机能力明确不支持（设计决定，非临时延迟）**：binlog 复制拓扑 / GTID、读写分离、Group Replication / Galera、分布式 XA 两阶段协调、跨节点一致性。这些在 [`SYNTAX_MATRIX.md`](SYNTAX_MATRIX.md) 中统一标记为 ❌ 明确不支持，不会纳入范围，也不视为“缺失”。单机版本地 XA（`XA START/COMMIT` 映射为会话内事务）仍作为兼容表面保留。
 >
-> 最后更新：2026-08-12（补齐 `event_scheduler` 全局变量 ON/OFF/DISABLED、DataGrip 探测路径、持久 row-id、MVCC 读视图/历史版本、主键/单列二级索引 next-key/gap 区间锁、二级索引插入意向锁、RC 记录锁、复合索引全等值点锁和无主键基础隐藏行锁；MDL、复杂 JOIN 锁和完整 InnoDB 语义仍按清单逐项验收）。
+> 最后更新：2026-08-12（补齐 `event_scheduler` 全局变量 ON/OFF/DISABLED、DataGrip 探测路径、持久 row-id、MVCC 读视图/历史版本、基础 statement-duration MDL、主键/单列二级索引 next-key/gap 区间锁、二级索引插入意向锁、RC 记录锁、复合索引全等值点锁和无主键基础隐藏行锁；复杂 JOIN 锁和完整 InnoDB 语义仍按清单逐项验收）。
 
 ## 状态图例
 
@@ -101,7 +101,7 @@
 | `BEGIN` / `START TRANSACTION` / `COMMIT` / `ROLLBACK` | ✅ Verified | autocommit、DDL 隐式提交、读己写 |
 | `SAVEPOINT` / `ROLLBACK TO` / `RELEASE` | ✅ Verified | 重名覆盖、1305、自增回滚留洞 |
 | 隔离级别 RU/RC/RR/SERIALIZABLE 常用可见性 | ✅ Verified | |
-| 锁 IS/IX/S/X/insert-intention、行锁、`FOR UPDATE`/`FOR SHARE`/`LOCK IN SHARE MODE`、NOWAIT/3572、SKIP LOCKED、死锁 1213 | 🟡 Partial | 持久 row-id、主键/单列二级索引 next-key/gap、二级索引插入意向、复合索引全等值点锁、RC 实际记录锁、无主键基础隐藏行锁已落地；MDL、复杂 JOIN 逐行 SKIP LOCKED、多方环成本化受害者 🔴 Deferred |
+| 锁 IS/IX/S/X/insert-intention、基础 MDL、行锁、`FOR UPDATE`/`FOR SHARE`/`LOCK IN SHARE MODE`、NOWAIT/3572、SKIP LOCKED、死锁 1213 | 🟡 Partial | 持久 row-id、statement-duration 基础 MDL、主键/单列二级索引 next-key/gap、二级索引插入意向、复合索引全等值点锁、RC 实际记录锁、无主键基础隐藏行锁已落地；复杂 JOIN 逐行 SKIP LOCKED、多方环成本化受害者 🔴 Deferred |
 | `XA START/BEGIN` / `XA END` / `XA PREPARE` / `XA COMMIT` / `XA ROLLBACK` / `XA RECOVER` | 🔵 Compatible-noop | 本轮新增；映射为单机会话内事务（XA START→开事务，XA COMMIT/ROLLBACK→提交/回滚，XA RECOVER→空）。无两阶段外部协调（分布式 XA 协调 ❌ 明确不支持），符合单机定位 |
 
 ---
@@ -213,4 +213,4 @@
 - **已实现并经测试**：DDL 全量、DML 全量、事务与锁常用面、存储函数/事件调度、账号/角色/审计、information_schema+mysql 虚拟库、时区、错误码、协议与迁移。
 - **本轮补齐（兼容 no-op / 虚拟表 / 表面）**：performance_schema、sys、RENAME USER、SET PASSWORD、ALTER DATABASE 选项、ANALYZE/OPTIMIZE/CHECK/REPAIR/CHECKSUM TABLE、FLUSH、CACHE INDEX、复制 SHOW 表面、本地 XA 表面。
 - **明确不支持（设计决定，非临时延迟 ❌）**：binlog 复制拓扑 / GTID、读写分离、Group Replication / Galera、分布式 XA 两阶段协调、跨节点一致性。这些是**非单机能力**，与 MyDB“替代 SQLite 的单机高性能数据库”定位相悖，不会实现，也不计入“缺失”。复制 SHOW 表面（空结果）与本地 XA（会话内事务）仍作为兼容表面保留。
-- **范围外（单机定位下的边缘语义 🔴 Deferred）**：完整 next-key/gap 锁与多连接成本化死锁、表/列级权限强制、排序规则真实比较语义（`*_general_ci`/`*_ai_ci`）、JOIN ON 常量/函数表达式、复杂互递归 CTE、ONLY_FULL_GROUP_BY 函数依赖、routine 局部变量 charset/collation 与进 routine 时 sql_mode 差异 warning、冷门语句清理边缘。这些在 CheckList 标注为 Deferred，不影响“兼容 MySQL 一切的单机版”目标。
+- **尚未完成（单机范围内的语义 🔴 Deferred）**：完整 next-key/gap 锁与多连接成本化死锁、表/列级权限强制、排序规则真实比较语义（`*_general_ci`/`*_ai_ci`）、JOIN ON 常量/函数表达式、复杂互递归 CTE、ONLY_FULL_GROUP_BY 函数依赖、routine 局部变量 charset/collation 与进 routine 时 sql_mode 差异 warning、冷门语句清理边缘。它们仍是“完整 MySQL 8.4 对外表现”目标的未完成项。

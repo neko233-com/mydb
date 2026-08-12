@@ -69,7 +69,7 @@ mydb/
 - **CRC 校验**：WAL 和数据页均带 CRC，检测损坏并安全拒绝启动
 - **提交热路径**：一次 `sync_data()` 顺序 fsync = 持久性保证，锁内仅 write+fsync，无额外 syscall
 - **MVCC 基础**：持久化 row-id、事务 commit 序号、RR/SERIALIZABLE 读视图、RC 语句视图、历史版本链与旧版本清理基础已接入；事务读不再复制整库快照
-- **索引锁基础**：主键/二级索引的 record、next-key、gap、insert-intention 锁已覆盖已验收路径；复杂 JOIN 逐行锁、完整 MDL 与全部 InnoDB 边界仍按验收清单推进
+- **索引锁基础**：主键/二级索引的 record、next-key、gap、insert-intention 锁与 statement-duration 基础 MDL 已覆盖已验收路径；复杂 JOIN 逐行锁、完整 InnoDB 边界仍按验收清单推进
 - **InnoDB 名称兼容**：`ENGINE=InnoDB` 在 SQL/协议层映射至 Neko233；项目不加载或复用 MySQL InnoDB 源码，`MEMORY` 保持独立语义
 
 ---

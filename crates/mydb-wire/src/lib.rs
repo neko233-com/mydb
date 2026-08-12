@@ -1845,6 +1845,7 @@ enum LockMode {
     IntentionShared,
     IntentionExclusive,
     Shared,
+    MetadataShared,
     InsertIntention,
     Exclusive,
 }
@@ -2813,14 +2814,21 @@ fn lock_modes_compatible(held: LockMode, requested: LockMode) -> bool {
         (LockMode::IntentionShared, LockMode::IntentionShared)
             | (LockMode::IntentionShared, LockMode::IntentionExclusive)
             | (LockMode::IntentionShared, LockMode::Shared)
+            | (LockMode::IntentionShared, LockMode::MetadataShared)
             | (LockMode::IntentionShared, LockMode::InsertIntention)
             | (LockMode::IntentionExclusive, LockMode::IntentionShared)
             | (LockMode::IntentionExclusive, LockMode::IntentionExclusive)
+            | (LockMode::IntentionExclusive, LockMode::MetadataShared)
             | (LockMode::IntentionExclusive, LockMode::InsertIntention)
             | (LockMode::Shared, LockMode::IntentionShared)
             | (LockMode::Shared, LockMode::Shared)
+            | (LockMode::MetadataShared, LockMode::IntentionShared)
+            | (LockMode::MetadataShared, LockMode::IntentionExclusive)
+            | (LockMode::MetadataShared, LockMode::MetadataShared)
+            | (LockMode::MetadataShared, LockMode::InsertIntention)
             | (LockMode::InsertIntention, LockMode::IntentionShared)
             | (LockMode::InsertIntention, LockMode::IntentionExclusive)
+            | (LockMode::InsertIntention, LockMode::MetadataShared)
             | (LockMode::InsertIntention, LockMode::InsertIntention)
     )
 }
@@ -2835,6 +2843,12 @@ fn merge_lock_modes(held: LockMode, requested: LockMode) -> LockMode {
         | (LockMode::IntentionExclusive, LockMode::IntentionShared) => LockMode::IntentionExclusive,
         (LockMode::IntentionShared, LockMode::Shared)
         | (LockMode::Shared, LockMode::IntentionShared) => LockMode::Shared,
+        (LockMode::MetadataShared, LockMode::IntentionExclusive)
+        | (LockMode::IntentionExclusive, LockMode::MetadataShared) => LockMode::IntentionExclusive,
+        (LockMode::MetadataShared, LockMode::IntentionShared)
+        | (LockMode::IntentionShared, LockMode::MetadataShared) => LockMode::IntentionShared,
+        (LockMode::MetadataShared, LockMode::InsertIntention)
+        | (LockMode::InsertIntention, LockMode::MetadataShared) => LockMode::IntentionExclusive,
         (LockMode::InsertIntention, LockMode::IntentionShared)
         | (LockMode::IntentionShared, LockMode::InsertIntention) => LockMode::IntentionShared,
         (LockMode::InsertIntention, LockMode::IntentionExclusive)
@@ -5825,7 +5839,13 @@ impl Backend {
             let columns = vec!["Variable_name".to_string(), "Value".to_string()];
             let rows = vec![
                 vec![bytes("version"), bytes(SERVER_VERSION)],
+                vec![bytes("version_id"), bytes("80400")],
                 vec![bytes("version_comment"), bytes("MyDB Server")],
+                vec![bytes("version_compile_os"), bytes(std::env::consts::OS)],
+                vec![
+                    bytes("version_compile_machine"),
+                    bytes(std::env::consts::ARCH),
+                ],
                 vec![
                     bytes("autocommit"),
                     bytes(if self.autocommit { "ON" } else { "OFF" }),
@@ -11862,6 +11882,14 @@ impl Backend {
                     (format!("database:{database}"), intent),
                     (format!("table:{database}.{table}"), intent),
                     (
+                        format!("mdl:{database}.{table}"),
+                        if for_update {
+                            LockMode::IntentionExclusive
+                        } else {
+                            LockMode::MetadataShared
+                        },
+                    ),
+                    (
                         format!("row:{database}.{table}:HIDDEN:{}", lock_key),
                         record,
                     ),
@@ -11891,6 +11919,14 @@ impl Backend {
             let mut lock_map = HashMap::from([
                 (format!("database:{database}"), intent),
                 (format!("table:{database}.{table}"), intent),
+                (
+                    format!("mdl:{database}.{table}"),
+                    if for_update {
+                        LockMode::IntentionExclusive
+                    } else {
+                        LockMode::MetadataShared
+                    },
+                ),
                 (format!("row:{database}.{table}:PRIMARY:{key}"), record),
             ]);
             if primary_key.len() == 1 {
@@ -13245,6 +13281,13 @@ impl Backend {
             }
             let source = self.join_source(value)?;
             if self.plain_select_lock_scope {
+                let metadata_locks = [LockRequest {
+                    resource: format!("mdl:{}.{}", source.database, source.table),
+                    mode: LockMode::MetadataShared,
+                }];
+                self.stats
+                    .acquire_locks(&metadata_locks, self.connection_id, self.lock_wait_timeout)
+                    .await?;
                 // A top-level nonlocking SELECT holds this marker only for
                 // the statement (the dispatcher restores its prior snapshot).
                 // It is needed so another connection's LOCK TABLES ... WRITE
@@ -14233,6 +14276,11 @@ fn write_lock_requests_with_gap_locks(
                     format!("table:{database}.{table}"),
                     LockMode::IntentionExclusive,
                 );
+                add_lock_request(
+                    &mut requests,
+                    format!("mdl:{database}.{table}"),
+                    LockMode::IntentionExclusive,
+                );
                 let row = match write {
                     WriteCommand::Insert { row, .. } | WriteCommand::Upsert { row, .. } => row,
                     _ => unreachable!(),
@@ -14450,6 +14498,11 @@ fn write_lock_requests_with_gap_locks(
             format!("table:{database}.{table}"),
             LockMode::Exclusive,
         );
+        add_lock_request(
+            &mut requests,
+            format!("mdl:{database}.{table}"),
+            LockMode::Exclusive,
+        );
     }
     Ok(sorted_lock_requests(requests))
 }
@@ -14459,6 +14512,11 @@ fn add_table_ddl_locks(requests: &mut HashMap<String, LockMode>, database: &str,
         requests,
         format!("database:{database}"),
         LockMode::IntentionExclusive,
+    );
+    add_lock_request(
+        requests,
+        format!("mdl:{database}.{table}"),
+        LockMode::Exclusive,
     );
     add_lock_request(
         requests,
@@ -14481,6 +14539,14 @@ fn add_record_locks(
         format!("database:{database}"),
         match record {
             LockMode::Shared | LockMode::IntentionShared => LockMode::IntentionShared,
+            _ => LockMode::IntentionExclusive,
+        },
+    );
+    add_lock_request(
+        requests,
+        format!("mdl:{database}.{table}"),
+        match record {
+            LockMode::Shared | LockMode::IntentionShared => LockMode::MetadataShared,
             _ => LockMode::IntentionExclusive,
         },
     );
@@ -14548,6 +14614,11 @@ fn add_mutation_locks(
             );
             add_lock_request(
                 requests,
+                format!("mdl:{database}.{table}"),
+                LockMode::IntentionExclusive,
+            );
+            add_lock_request(
+                requests,
                 format!("row:{database}.{table}:PRIMARY:{key}"),
                 LockMode::Exclusive,
             );
@@ -14571,6 +14642,11 @@ fn add_mutation_locks(
             format!("table:{database}.{table}"),
             LockMode::IntentionExclusive,
         );
+        add_lock_request(
+            requests,
+            format!("mdl:{database}.{table}"),
+            LockMode::IntentionExclusive,
+        );
         for (index, ranges) in index_ranges {
             for range in ranges {
                 add_lock_request(
@@ -14590,6 +14666,11 @@ fn add_mutation_locks(
         format!("table:{database}.{table}"),
         LockMode::Exclusive,
     );
+    add_lock_request(
+        requests,
+        format!("mdl:{database}.{table}"),
+        LockMode::IntentionExclusive,
+    );
 }
 
 fn read_lock_requests(
@@ -14606,6 +14687,15 @@ fn read_lock_requests(
         (LockMode::IntentionShared, LockMode::Shared)
     };
     add_lock_request(&mut requests, format!("database:{database}"), intent);
+    add_lock_request(
+        &mut requests,
+        format!("mdl:{database}.{table}"),
+        if for_update {
+            LockMode::IntentionExclusive
+        } else {
+            LockMode::MetadataShared
+        },
+    );
     if let Some(index_ranges) = predicate_index_ranges(filter, schema) {
         add_lock_request(&mut requests, format!("table:{database}.{table}"), intent);
         for (index, ranges) in index_ranges {
@@ -36146,6 +36236,65 @@ mod tests {
             .unwrap();
         let second = Backend::new(storage.clone(), config, stats, 2);
         (temp, storage, first, second)
+    }
+
+    #[tokio::test]
+    async fn metadata_shared_locks_block_ddl_but_allow_dml_intent() {
+        let stats = Arc::new(WireStats::default());
+        let metadata = [LockRequest {
+            resource: "mdl:mydb.actors".to_string(),
+            mode: LockMode::MetadataShared,
+        }];
+        stats
+            .acquire_locks(&metadata, 1, Duration::from_millis(100))
+            .await
+            .expect("metadata shared lock");
+
+        let dml_intent = [LockRequest {
+            resource: "mdl:mydb.actors".to_string(),
+            mode: LockMode::IntentionExclusive,
+        }];
+        assert!(stats.try_acquire_locks(&dml_intent, 2));
+        stats.release_all_locks(2);
+
+        let ddl = [LockRequest {
+            resource: "mdl:mydb.actors".to_string(),
+            mode: LockMode::Exclusive,
+        }];
+        let stats_for_ddl = stats.clone();
+        let ddl_task = tokio::spawn(async move {
+            stats_for_ddl
+                .acquire_locks(&ddl, 3, Duration::from_millis(500))
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(!ddl_task.is_finished());
+        stats.release_all_locks(1);
+        ddl_task
+            .await
+            .expect("DDL lock task")
+            .expect("DDL metadata lock");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ddl_path_observes_metadata_shared_lock() {
+        let (_temp, _storage, first, mut second) = transaction_backends().await;
+        let stats = first.stats.clone();
+        let metadata = [LockRequest {
+            resource: "mdl:mydb.actors".to_string(),
+            mode: LockMode::MetadataShared,
+        }];
+        stats
+            .acquire_locks(&metadata, 1, Duration::from_millis(100))
+            .await
+            .expect("metadata shared lock");
+        second.lock_wait_timeout = Duration::from_millis(50);
+        let error = second
+            .execute("ALTER TABLE actors ADD COLUMN extra BIGINT")
+            .await
+            .expect_err("DDL must wait for the plain SELECT metadata lock");
+        assert!(error.to_string().contains("Lock wait timeout"));
+        stats.release_all_locks(1);
     }
 
     #[tokio::test]

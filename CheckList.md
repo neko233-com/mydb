@@ -6,7 +6,7 @@
 
 ## 最终发布门槛
 
-- [ ] MySQL 8 单机全部 DML、事务、错误码和可见外部行为完成兼容矩阵并逐项通过差分
+- [ ] MySQL 8.4 单机全部 DML、事务、错误码和可见外部行为完成兼容矩阵并逐项通过差分
 - [ ] 稳定性、崩溃恢复、断线重连和故障注入覆盖生产边界
 - [ ] Ubuntu 24.04、linux/amd64、双方相同 `ENGINE=InnoDB`、I/O/CPU/内存同限、总计不超过 60 秒的正式性能验收完成
 - [ ] 写吞吐和延迟稳定达到 10x；若客观无法达到，保留原始数据并明确实际结果
@@ -86,7 +86,7 @@
 - [x] information_schema 只读虚拟表：SCHEMATA/TABLES/COLUMNS/STATISTICS/TABLE_CONSTRAINTS/KEY_COLUMN_USAGE/CHECK_CONSTRAINTS，多行投影、过滤、排序、分组和跨表 JOIN
 - [x] mydbdump/mydb-migrate/ORM 风格元数据查询：表/列枚举、COALESCE 引擎、复合索引 GROUP_CONCAT、PK/UNIQUE/FK/CHECK 和临时物理名隐藏
 - [x] REFERENTIAL_CONSTRAINTS 与 VIEWS：引用唯一键、UPDATE/DELETE 规则、目标表、视图定义/安全类型/只读状态
-- [x] ROUTINES/PARAMETERS 真实存储过程元数据；EVENTS 保持结构化空表，未实现事件时 ORM 探测返回 0 行
+- [x] ROUTINES/PARAMETERS 真实存储过程元数据；EVENTS 真实持久化并由 event scheduler 调度，未实现事件时 ORM 探测返回 0 行
 - [x] SHOW TABLES/COLUMNS/INDEX/TABLE STATUS 的 FROM/IN、LIKE、复合 WHERE 条件
 - [x] BEFORE INSERT Trigger：CREATE/DROP/SHOW/SHOW CREATE/information_schema，SET NEW 多赋值、表达式、普通/多行/IGNORE/REPLACE/UPSERT/INSERT SELECT/LOAD 路径、事务/重启/WAL/表改名/删除
 - [x] AFTER INSERT Trigger：BEGIN/END 多条跨表 INSERT、NEW 二进制安全绑定、目标 Trigger 链、全写集预锁、同批事务/WAL、回滚原子性与递归环/深度保护
@@ -142,9 +142,10 @@
 - [x] READ COMMITTED 锁定读与 UPDATE/DELETE 只锁命中记录、不锁普通 gap；RR/SERIALIZABLE 保留范围锁；主键 gap 插入回归
 - [x] 二级索引插入意向锁：同一非唯一索引值的不同记录可并发插入，但仍受 next-key/gap X 锁阻塞
 - [x] 复合索引全等值记录/间隙锁；无主键表使用稳定行内容+重复序号的隐藏行锁支持基础 `SKIP LOCKED`
+- [x] 基础 MDL：普通读持有 statement-duration metadata shared，DML 持有兼容的 metadata intention，DDL 通过 metadata X 锁等待并参与超时/死锁路径
 - [x] `mydb-router` 透明 MySQL TCP 入口：连接固定后端，JDBC/Go/Node.js/JetBrains/VS Code/dbx/mysql CLI 共用协议路径
 - [x] `mydb-router` Windows `MyDBRouter` 自动服务、13306 防火墙入口、IPv6 地址格式化、建立连接时后端回退；真实 MyDB 后端链路 CLI/JDBC/Go 均通过
-- [ ] MySQL InnoDB 完整 next-key/gap/意向锁、MDL、无主键/复杂 JOIN 的逐行 SKIP LOCKED、多方环与基于回滚成本的受害者选择一致性
+- [ ] MySQL InnoDB 完整 next-key/gap/意向锁、复杂 JOIN 的逐行 SKIP LOCKED、多方环与基于回滚成本的受害者选择一致性
 - [ ] 全部隔离级别 anomaly、XA、SAVEPOINT 后锁精确释放、锁升级和大事务边界矩阵
 
 ## 迁移与备份
@@ -181,9 +182,9 @@
 
 ## 当前可复现证据
 
-- [x] `cargo test --workspace`：通过（含 storage 50 个单测、17 个集成测、wire 181 个单测、WAL 18 个单测）
-- [x] `cargo test -p mydb-storage -p mydb-wire`：通过（storage 50 个单测、wire 181 个单测）
-- [x] 最新并发回归：持久 row-id、MVCC 读视图、删除历史版本、插入意向锁与已有并发写回归通过；并发不同表写入保持 FIFO/WAL 组提交语义
+- [x] `cargo test --workspace`：通过（含 storage 50 个单测、17 个集成测、wire 183 个单测、WAL 18 个单测）
+- [x] `cargo test -p mydb-storage -p mydb-wire`：通过（storage 50 个单测、wire 183 个单测）
+- [x] 最新并发回归：持久 row-id、MVCC 读视图、删除历史版本、插入意向锁、基础 MDL 与已有并发写回归通过；并发不同表写入保持 FIFO/WAL 组提交语义
 - [x] vendored `opensrv-mysql`：110 项通过，覆盖自定义错误码/SQLSTATE、多结果 SERVER_MORE_RESULTS_EXISTS、握手多结果能力和 Prepared CALL SERVER_PS_OUT_PARAMS 状态位
 - [x] `cargo clippy --workspace --all-targets -- -D warnings`：通过
 - [x] MySQL 8.0.45/8.0.46 差分：真实 dump、changed-row affected counts/no-op UPSERT insert id、INSERT/REPLACE SET、INSERT VALUES 默认行/表达式/DEFAULT(col)/1364、UPDATE/UPSERT/JOIN DEFAULT、MySQL 8 行/列别名 UPSERT、复杂冲突标量表达式和左到右赋值、CREATE TABLE LIKE、TRUNCATE 隐式提交/自增/FK 1701、LOAD DATA 用户变量/SET/latin1/BLOB/1261/1262/1062 warning/strict 1261/1262/1300 原子失败、FOR SHARE/NOWAIT 3572/主键队列 SKIP LOCKED/双事务死锁 1213、FK/CHECK/事务/SAVEPOINT、JOIN/NATURAL/USING、有键/无键重复行单/多目标 JOIN UPDATE/DELETE、相关/派生/CTE 子查询、set operators、多列 GROUP BY、窗口、多列/表达式 ORDER BY、常用 CASE/字符串/数值/CAST 投影/WHERE/UPDATE/DELETE
