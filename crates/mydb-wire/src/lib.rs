@@ -1854,6 +1854,14 @@ struct LockRequest {
     mode: LockMode,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KeyRange {
+    lower: Option<Vec<u8>>,
+    lower_inclusive: bool,
+    upper: Option<Vec<u8>>,
+    upper_inclusive: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum TransactionIsolation {
     ReadUncommitted,
@@ -2681,17 +2689,121 @@ fn lock_request_blockers(
     mode: LockMode,
 ) -> HashSet<u32> {
     locks
-        .get(resource)
-        .map(|lock| {
-            lock.holders
-                .iter()
-                .filter_map(|(holder, held)| {
-                    (*holder != connection_id && !lock_modes_compatible(*held, mode))
-                        .then_some(*holder)
-                })
-                .collect()
+        .iter()
+        .filter(|(held_resource, _)| lock_resources_overlap(held_resource, resource))
+        .flat_map(|(_, lock)| {
+            lock.holders.iter().filter_map(|(holder, held)| {
+                (*holder != connection_id && !lock_modes_compatible(*held, mode)).then_some(*holder)
+            })
         })
-        .unwrap_or_default()
+        .collect()
+}
+
+fn lock_resources_overlap(left: &str, right: &str) -> bool {
+    if left == right {
+        return true;
+    }
+    match (
+        parse_range_lock_resource(left),
+        parse_range_lock_resource(right),
+    ) {
+        (Some(left), Some(right)) => {
+            left.database == right.database
+                && left.table == right.table
+                && left.index == right.index
+                && key_ranges_overlap(&left.range, &right.range)
+        }
+        _ => false,
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ParsedRangeLock {
+    database: String,
+    table: String,
+    index: String,
+    range: KeyRange,
+}
+
+fn parse_range_lock_resource(resource: &str) -> Option<ParsedRangeLock> {
+    let mut parts = resource.strip_prefix("range:")?.split(':');
+    let database = String::from_utf8(hex_to_bytes(parts.next()?)).ok()?;
+    let table = String::from_utf8(hex_to_bytes(parts.next()?)).ok()?;
+    let index = String::from_utf8(hex_to_bytes(parts.next()?)).ok()?;
+    let lower_marker = parts.next()?;
+    let lower_value = parts.next()?;
+    let upper_marker = parts.next()?;
+    let upper_value = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let lower_inclusive = match lower_marker {
+        "I" => true,
+        "E" | "U" => false,
+        _ => return None,
+    };
+    let upper_inclusive = match upper_marker {
+        "I" => true,
+        "E" | "U" => false,
+        _ => return None,
+    };
+    let lower = (lower_marker != "U").then(|| hex_to_bytes(lower_value));
+    let upper = (upper_marker != "U").then(|| hex_to_bytes(upper_value));
+    Some(ParsedRangeLock {
+        database,
+        table,
+        index,
+        range: KeyRange {
+            lower,
+            lower_inclusive,
+            upper,
+            upper_inclusive,
+        },
+    })
+}
+
+fn key_ranges_overlap(left: &KeyRange, right: &KeyRange) -> bool {
+    !upper_before_lower(
+        left.upper.as_deref(),
+        left.upper_inclusive,
+        right.lower.as_deref(),
+        right.lower_inclusive,
+    ) && !upper_before_lower(
+        right.upper.as_deref(),
+        right.upper_inclusive,
+        left.lower.as_deref(),
+        left.lower_inclusive,
+    )
+}
+
+fn upper_before_lower(
+    upper: Option<&[u8]>,
+    upper_inclusive: bool,
+    lower: Option<&[u8]>,
+    lower_inclusive: bool,
+) -> bool {
+    match (upper, lower) {
+        (Some(upper), Some(lower)) => match compare_lock_key_values(upper, lower) {
+            std::cmp::Ordering::Less => true,
+            std::cmp::Ordering::Equal => !(upper_inclusive && lower_inclusive),
+            std::cmp::Ordering::Greater => false,
+        },
+        _ => false,
+    }
+}
+
+fn compare_lock_key_values(left: &[u8], right: &[u8]) -> std::cmp::Ordering {
+    let numeric = std::str::from_utf8(left)
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .zip(
+            std::str::from_utf8(right)
+                .ok()
+                .and_then(|value| value.parse::<f64>().ok()),
+        );
+    numeric
+        .and_then(|(left, right)| left.partial_cmp(&right))
+        .unwrap_or_else(|| left.cmp(right))
 }
 
 fn lock_modes_compatible(held: LockMode, requested: LockMode) -> bool {
@@ -11663,11 +11775,26 @@ impl Backend {
             let Some(key) = row_lock_key(&row, &primary_key) else {
                 continue;
             };
-            let locks = sorted_lock_requests(HashMap::from([
+            let mut lock_map = HashMap::from([
                 (format!("database:{database}"), intent),
                 (format!("table:{database}.{table}"), intent),
                 (format!("row:{database}.{table}:PRIMARY:{key}"), record),
-            ]));
+            ]);
+            if primary_key.len() == 1 {
+                if let Some(value) = row.get(&primary_key[0]).map(ToOwned::to_owned) {
+                    let point = KeyRange {
+                        lower: Some(value.clone()),
+                        lower_inclusive: true,
+                        upper: Some(value),
+                        upper_inclusive: true,
+                    };
+                    lock_map.insert(
+                        range_lock_resource(database, table, "PRIMARY", &point),
+                        record,
+                    );
+                }
+            }
+            let locks = sorted_lock_requests(lock_map);
             if self.stats.try_acquire_locks(&locks, self.connection_id) {
                 locked.push(row);
                 if locked.len() >= required {
@@ -13993,6 +14120,23 @@ fn write_lock_requests(
                             LockMode::Exclusive,
                         );
                     }
+                    if key_name == "PRIMARY" && columns.len() == 1 {
+                        if let Some(value) =
+                            row.get(&columns[0]).filter(|_| !row.is_null(&columns[0]))
+                        {
+                            let point = KeyRange {
+                                lower: Some(value.to_vec()),
+                                lower_inclusive: true,
+                                upper: Some(value.to_vec()),
+                                upper_inclusive: true,
+                            };
+                            add_lock_request(
+                                &mut requests,
+                                range_lock_resource(database, table, "PRIMARY", &point),
+                                LockMode::Exclusive,
+                            );
+                        }
+                    }
                 }
             }
             WriteCommand::ReplaceRows {
@@ -14169,11 +14313,36 @@ fn add_mutation_locks(
                 format!("row:{database}.{table}:PRIMARY:{key}"),
                 LockMode::Exclusive,
             );
+            if let Some(ranges) = primary_key_ranges(filter, schema) {
+                for range in ranges {
+                    add_lock_request(
+                        requests,
+                        range_lock_resource(database, table, "PRIMARY", &range),
+                        LockMode::Exclusive,
+                    );
+                }
+            }
             return;
         }
     }
-    // Range, non-PK, whole-table, and key-changing writes use table X. This is
-    // conservative next-key/gap protection until ordered range locks land.
+    if let Some(ranges) = primary_key_ranges(filter, schema) {
+        add_lock_request(
+            requests,
+            format!("table:{database}.{table}"),
+            LockMode::IntentionExclusive,
+        );
+        for range in ranges {
+            add_lock_request(
+                requests,
+                range_lock_resource(database, table, "PRIMARY", &range),
+                LockMode::Exclusive,
+            );
+        }
+        return;
+    }
+    // Non-PK, whole-table, and key-changing writes still use table X until
+    // secondary-index range scans are represented by the same interval lock
+    // model.
     add_lock_request(
         requests,
         format!("table:{database}.{table}"),
@@ -14195,17 +14364,212 @@ fn read_lock_requests(
         (LockMode::IntentionShared, LockMode::Shared)
     };
     add_lock_request(&mut requests, format!("database:{database}"), intent);
-    if let Some(key) = predicate_primary_key(filter, schema) {
+    if let Some(ranges) = primary_key_ranges(filter, schema) {
         add_lock_request(&mut requests, format!("table:{database}.{table}"), intent);
-        add_lock_request(
-            &mut requests,
-            format!("row:{database}.{table}:PRIMARY:{key}"),
-            record,
-        );
+        for range in ranges {
+            add_lock_request(
+                &mut requests,
+                range_lock_resource(database, table, "PRIMARY", &range),
+                record,
+            );
+        }
+        if let Some(key) = predicate_primary_key(filter, schema) {
+            add_lock_request(
+                &mut requests,
+                format!("row:{database}.{table}:PRIMARY:{key}"),
+                record,
+            );
+        }
     } else {
         add_lock_request(&mut requests, format!("table:{database}.{table}"), record);
     }
     sorted_lock_requests(requests)
+}
+
+fn range_lock_resource(database: &str, table: &str, index: &str, range: &KeyRange) -> String {
+    let (lower_marker, lower_value) = match (&range.lower, range.lower_inclusive) {
+        (Some(value), true) => ("I", hex_bytes(value)),
+        (Some(value), false) => ("E", hex_bytes(value)),
+        (None, _) => ("U", String::new()),
+    };
+    let (upper_marker, upper_value) = match (&range.upper, range.upper_inclusive) {
+        (Some(value), true) => ("I", hex_bytes(value)),
+        (Some(value), false) => ("E", hex_bytes(value)),
+        (None, _) => ("U", String::new()),
+    };
+    format!(
+        "range:{}:{}:{}:{lower_marker}:{lower_value}:{upper_marker}:{upper_value}",
+        hex_bytes(database.as_bytes()),
+        hex_bytes(table.as_bytes()),
+        hex_bytes(index.as_bytes()),
+    )
+}
+
+fn primary_key_ranges(
+    filter: Option<&RowPredicate>,
+    schema: &TableSchema,
+) -> Option<Vec<KeyRange>> {
+    let primary = schema.primary_key.as_ref()?;
+    if primary.len() != 1 {
+        return None;
+    }
+    key_ranges_from_predicate(filter?, &primary[0])
+}
+
+fn key_ranges_from_predicate(predicate: &RowPredicate, column: &str) -> Option<Vec<KeyRange>> {
+    match predicate {
+        RowPredicate::Eq(name, value) if name.eq_ignore_ascii_case(column) => {
+            Some(vec![KeyRange {
+                lower: Some(value.clone()),
+                lower_inclusive: true,
+                upper: Some(value.clone()),
+                upper_inclusive: true,
+            }])
+        }
+        RowPredicate::Less(name, value) if name.eq_ignore_ascii_case(column) => {
+            Some(vec![KeyRange {
+                lower: None,
+                lower_inclusive: false,
+                upper: Some(value.clone()),
+                upper_inclusive: false,
+            }])
+        }
+        RowPredicate::LessOrEq(name, value) if name.eq_ignore_ascii_case(column) => {
+            Some(vec![KeyRange {
+                lower: None,
+                lower_inclusive: false,
+                upper: Some(value.clone()),
+                upper_inclusive: true,
+            }])
+        }
+        RowPredicate::Greater(name, value) if name.eq_ignore_ascii_case(column) => {
+            Some(vec![KeyRange {
+                lower: Some(value.clone()),
+                lower_inclusive: false,
+                upper: None,
+                upper_inclusive: false,
+            }])
+        }
+        RowPredicate::GreaterOrEq(name, value) if name.eq_ignore_ascii_case(column) => {
+            Some(vec![KeyRange {
+                lower: Some(value.clone()),
+                lower_inclusive: true,
+                upper: None,
+                upper_inclusive: false,
+            }])
+        }
+        RowPredicate::In(name, values) if name.eq_ignore_ascii_case(column) => Some(
+            values
+                .iter()
+                .map(|value| KeyRange {
+                    lower: Some(value.clone()),
+                    lower_inclusive: true,
+                    upper: Some(value.clone()),
+                    upper_inclusive: true,
+                })
+                .collect(),
+        ),
+        RowPredicate::Between(name, lower, upper) if name.eq_ignore_ascii_case(column) => {
+            Some(vec![KeyRange {
+                lower: Some(lower.clone()),
+                lower_inclusive: true,
+                upper: Some(upper.clone()),
+                upper_inclusive: true,
+            }])
+        }
+        RowPredicate::And(left, right) => {
+            let left_mentions = left
+                .columns()
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(column));
+            let right_mentions = right
+                .columns()
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(column));
+            match (
+                key_ranges_from_predicate(left, column),
+                key_ranges_from_predicate(right, column),
+            ) {
+                (Some(left), Some(right)) => intersect_key_ranges(&left, &right),
+                (Some(ranges), None) if !right_mentions => Some(ranges),
+                (None, Some(ranges)) if !left_mentions => Some(ranges),
+                _ => None,
+            }
+        }
+        RowPredicate::Never => Some(Vec::new()),
+        _ => None,
+    }
+}
+
+fn intersect_key_ranges(left: &[KeyRange], right: &[KeyRange]) -> Option<Vec<KeyRange>> {
+    let mut result = Vec::new();
+    for left in left {
+        for right in right {
+            let range = intersect_key_range(left, right);
+            if let Some(range) = range {
+                result.push(range);
+            }
+        }
+    }
+    Some(result)
+}
+
+fn intersect_key_range(left: &KeyRange, right: &KeyRange) -> Option<KeyRange> {
+    let (lower, lower_inclusive) = max_lower_bound(
+        left.lower.as_deref(),
+        left.lower_inclusive,
+        right.lower.as_deref(),
+        right.lower_inclusive,
+    );
+    let (upper, upper_inclusive) = min_upper_bound(
+        left.upper.as_deref(),
+        left.upper_inclusive,
+        right.upper.as_deref(),
+        right.upper_inclusive,
+    );
+    let range = KeyRange {
+        lower,
+        lower_inclusive,
+        upper,
+        upper_inclusive,
+    };
+    key_ranges_overlap(&range, &range).then_some(range)
+}
+
+fn max_lower_bound(
+    left: Option<&[u8]>,
+    left_inclusive: bool,
+    right: Option<&[u8]>,
+    right_inclusive: bool,
+) -> (Option<Vec<u8>>, bool) {
+    match (left, right) {
+        (None, None) => (None, false),
+        (Some(left), None) => (Some(left.to_vec()), left_inclusive),
+        (None, Some(right)) => (Some(right.to_vec()), right_inclusive),
+        (Some(left), Some(right)) => match compare_lock_key_values(left, right) {
+            std::cmp::Ordering::Greater => (Some(left.to_vec()), left_inclusive),
+            std::cmp::Ordering::Less => (Some(right.to_vec()), right_inclusive),
+            std::cmp::Ordering::Equal => (Some(left.to_vec()), left_inclusive && right_inclusive),
+        },
+    }
+}
+
+fn min_upper_bound(
+    left: Option<&[u8]>,
+    left_inclusive: bool,
+    right: Option<&[u8]>,
+    right_inclusive: bool,
+) -> (Option<Vec<u8>>, bool) {
+    match (left, right) {
+        (None, None) => (None, false),
+        (Some(left), None) => (Some(left.to_vec()), left_inclusive),
+        (None, Some(right)) => (Some(right.to_vec()), right_inclusive),
+        (Some(left), Some(right)) => match compare_lock_key_values(left, right) {
+            std::cmp::Ordering::Less => (Some(left.to_vec()), left_inclusive),
+            std::cmp::Ordering::Greater => (Some(right.to_vec()), right_inclusive),
+            std::cmp::Ordering::Equal => (Some(left.to_vec()), left_inclusive && right_inclusive),
+        },
+    }
 }
 
 fn add_lock_request(requests: &mut HashMap<String, LockMode>, resource: String, mode: LockMode) {
@@ -35450,6 +35814,37 @@ mod tests {
         );
         backend
             .execute("SET GLOBAL event_scheduler = ON")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn primary_key_next_key_range_locks_block_matching_gap_inserts() {
+        let (_temp, _storage, mut first, mut second) = transaction_backends().await;
+        first
+            .execute("INSERT INTO actors (id,value) VALUES (10,100),(20,200)")
+            .await
+            .unwrap();
+        first.execute("BEGIN").await.unwrap();
+        first
+            .execute("SELECT id FROM actors WHERE id > 10 FOR UPDATE")
+            .await
+            .unwrap();
+
+        second
+            .execute("INSERT INTO actors (id,value) VALUES (5,50)")
+            .await
+            .unwrap();
+        let error = second
+            .execute("INSERT INTO actors (id,value) VALUES (30,300)")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Lock wait timeout"), "{error}");
+
+        first.execute("ROLLBACK").await.unwrap();
+        second
+            .execute("INSERT INTO actors (id,value) VALUES (30,300)")
             .await
             .unwrap();
     }
