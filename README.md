@@ -68,6 +68,8 @@ mydb/
 - **幂等 Redo**：崩溃恢复时 WAL 重放幂等，预分配零字节尾部通过 CRC 校验安全截断
 - **CRC 校验**：WAL 和数据页均带 CRC，检测损坏并安全拒绝启动
 - **提交热路径**：一次 `sync_data()` 顺序 fsync = 持久性保证，锁内仅 write+fsync，无额外 syscall
+- **MVCC 基础**：持久化 row-id、事务 commit 序号、RR/SERIALIZABLE 读视图、RC 语句视图、历史版本链与旧版本清理基础已接入；事务读不再复制整库快照
+- **索引锁基础**：主键/二级索引的 record、next-key、gap、insert-intention 锁已覆盖已验收路径；复杂 JOIN 逐行锁、完整 MDL 与全部 InnoDB 边界仍按验收清单推进
 - **InnoDB 名称兼容**：`ENGINE=InnoDB` 在 SQL/协议层映射至 Neko233；项目不加载或复用 MySQL InnoDB 源码，`MEMORY` 保持独立语义
 
 ---
@@ -538,7 +540,7 @@ bash scripts/docker-smoke.sh
 
 ## 📊 性能
 
-> 完整测试方法、运行指标和发布前验证见 [性能报告.md](性能报告.md)。以下均为同一台本机的实测中位数（每项 3 次），不是历史参考值。
+> 完整测试方法、运行指标和发布前验证见 [性能报告.md](性能报告.md)。下表是 2026-08-11 的本机 MySQL 8.0.45 基线；本轮 MVCC/锁变更尚未重新生成正式性能报告。
 >
 > 本轮数据：`d325944`，2026-08-11，本机 Windows；MySQL 8.0.45，`innodb_flush_log_at_trx_commit=1`、`sync_binlog=1`。
 

@@ -19,6 +19,10 @@ use tracing::{debug, error, info};
 
 use mydb_wal::{WalReader, WalRecord, WalRecordType, WalWriter};
 
+mod mvcc;
+
+pub use mvcc::{IsolationLevel, MvccManager, ReadView, TransactionId};
+
 #[inline(always)]
 fn bincode_fast() -> impl Options {
     bincode::options()
@@ -1170,10 +1174,12 @@ pub struct Index {
 // Row
 // ============================================================================
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Row {
     pub values: Vec<(String, Vec<u8>)>,
     null_columns: HashSet<String>,
+    #[serde(skip)]
+    pub row_id: u64,
 }
 
 impl Row {
@@ -1181,6 +1187,7 @@ impl Row {
         Self {
             values: Vec::new(),
             null_columns: HashSet::new(),
+            row_id: 0,
         }
     }
 
@@ -1215,14 +1222,28 @@ impl Row {
     }
 
     pub fn encode(&self) -> Vec<u8> {
-        mydb_wal::record::encode_nullable_row(&self.values, &self.null_columns)
+        mydb_wal::record::encode_versioned_nullable_row(
+            self.row_id,
+            &self.values,
+            &self.null_columns,
+        )
     }
 
     pub fn decode(data: &[u8]) -> Option<Self> {
+        if let Some((row_id, (values, null_columns))) =
+            mydb_wal::record::decode_versioned_nullable_row(data)
+        {
+            return Some(Self {
+                values,
+                null_columns,
+                row_id,
+            });
+        }
         let (values, null_columns) = mydb_wal::record::decode_nullable_row(data)?;
         Some(Self {
             values,
             null_columns,
+            row_id: 0,
         })
     }
 
@@ -1300,6 +1321,14 @@ impl Row {
             .retain(|column| !column.eq_ignore_ascii_case(name));
     }
 }
+
+impl PartialEq for Row {
+    fn eq(&self, other: &Self) -> bool {
+        self.values == other.values && self.null_columns == other.null_columns
+    }
+}
+
+impl Eq for Row {}
 
 impl Default for Row {
     fn default() -> Self {
@@ -1440,6 +1469,7 @@ pub struct Database {
     pub events: RwLock<HashMap<String, EventDefinition>>,
     event_metadata: RwLock<HashMap<String, EventMetadata>>,
     pub buffer_pool: Arc<BufferPool>,
+    mvcc: Arc<MvccManager>,
     disk_manager: DiskManager,
     data_dir: PathBuf,
     constraint_keys: RwLock<ConstraintKeySets>,
@@ -1449,6 +1479,7 @@ pub struct Database {
     // use page indexes; overlay rows use offsets to avoid duplicating BLOBs.
     row_value_index: RwLock<RowValueIndex>,
     auto_increment_next: RwLock<HashMap<String, u64>>,
+    next_row_id: RwLock<HashMap<String, u64>>,
     /// Full current table images for update-heavy tables since the last
     /// checkpoint. WAL is durable; the actor folds many rewrites into one COW.
     pending_rewrites: RwLock<HashMap<String, Vec<Row>>>,
@@ -1507,6 +1538,22 @@ impl Database {
         buffer_pool: Arc<BufferPool>,
         _wal_writer: Arc<parking_lot::Mutex<WalWriter>>,
     ) -> Self {
+        Self::new_with_mvcc(
+            name,
+            data_dir,
+            buffer_pool,
+            _wal_writer,
+            Arc::new(MvccManager::new()),
+        )
+    }
+
+    pub fn new_with_mvcc(
+        name: &str,
+        data_dir: PathBuf,
+        buffer_pool: Arc<BufferPool>,
+        _wal_writer: Arc<parking_lot::Mutex<WalWriter>>,
+        mvcc: Arc<MvccManager>,
+    ) -> Self {
         let disk_manager = DiskManager::new(data_dir.join(name), 16384);
 
         Self {
@@ -1519,6 +1566,7 @@ impl Database {
             events: RwLock::new(HashMap::new()),
             event_metadata: RwLock::new(HashMap::new()),
             buffer_pool,
+            mvcc,
             disk_manager,
             data_dir,
             constraint_keys: RwLock::new(HashMap::new()),
@@ -1526,6 +1574,7 @@ impl Database {
             overflow_tables: RwLock::new(HashSet::new()),
             row_value_index: RwLock::new(HashMap::new()),
             auto_increment_next: RwLock::new(HashMap::new()),
+            next_row_id: RwLock::new(HashMap::new()),
             pending_rewrites: RwLock::new(HashMap::new()),
             memory_rows: RwLock::new(HashMap::new()),
         }
@@ -1564,6 +1613,7 @@ impl Database {
                 }
             }
             *self.tables.write() = schemas;
+            self.initialize_row_ids()?;
             self.rebuild_all_indexes()?;
         }
         let routines_file = database_dir.join("routines.json");
@@ -1607,6 +1657,84 @@ impl Database {
         Ok(())
     }
 
+    fn initialize_row_ids(&self) -> Result<()> {
+        let tables = self.tables.read().clone();
+        let mut next_ids = self.next_row_id.write();
+        let mut pending = self.pending_rewrites.write();
+        for (table_name, schema) in tables {
+            if is_memory_schema(&schema) {
+                next_ids.insert(table_name, 1);
+                continue;
+            }
+            let mut rows = self.scan_table_from_disk_only(&table_name)?;
+            let mut next = 1_u64;
+            let mut changed = false;
+            for row in &mut rows {
+                if row.row_id == 0 {
+                    row.row_id = next;
+                    changed = true;
+                }
+                next = next.max(row.row_id.saturating_add(1));
+            }
+            next_ids.insert(table_name.clone(), next);
+            self.mvcc.seed_table(&self.name, &table_name, &rows);
+            if changed {
+                pending.insert(table_name, rows);
+            }
+        }
+        Ok(())
+    }
+
+    fn assign_row_ids_for_insert(&self, table_name: &str, mut rows: Vec<Row>) -> Vec<Row> {
+        let mut next_ids = self.next_row_id.write();
+        let next = next_ids.entry(table_name.to_string()).or_insert(1);
+        for row in &mut rows {
+            if row.row_id == 0 {
+                row.row_id = *next;
+                *next = (*next).saturating_add(1);
+            } else {
+                *next = (*next).max(row.row_id.saturating_add(1));
+            }
+        }
+        rows
+    }
+
+    fn assign_row_ids_for_replacement(
+        &self,
+        table_name: &str,
+        mut rows: Vec<Row>,
+    ) -> Result<Vec<Row>> {
+        let existing = self.scan_table(table_name)?;
+        let mut used = HashSet::new();
+        let mut next_ids = self.next_row_id.write();
+        let next = next_ids.entry(table_name.to_string()).or_insert(1);
+        for (index, row) in rows.iter_mut().enumerate() {
+            if row.row_id != 0 {
+                used.insert(row.row_id);
+                *next = (*next).max(row.row_id.saturating_add(1));
+                continue;
+            }
+            let matching = existing
+                .iter()
+                .enumerate()
+                .find(|(old_index, old)| {
+                    !used.contains(&old.row_id)
+                        && old.row_id != 0
+                        && (*old == row || *old_index == index)
+                })
+                .map(|(_, old)| old.row_id);
+            if let Some(row_id) = matching {
+                row.row_id = row_id;
+                used.insert(row_id);
+            } else {
+                row.row_id = *next;
+                used.insert(*next);
+                *next = (*next).saturating_add(1);
+            }
+        }
+        Ok(rows)
+    }
+
     pub async fn save(&self) -> Result<()> {
         self.save_sync()
     }
@@ -1648,6 +1776,7 @@ impl Database {
                 .write()
                 .insert(table_name.clone(), 1);
         }
+        self.next_row_id.write().insert(table_name.clone(), 1);
         tables.insert(table_name.clone(), schema);
         drop(tables);
         if memory {
@@ -1697,6 +1826,7 @@ impl Database {
             .write()
             .retain(|(table, _, _), _| table != name);
         self.auto_increment_next.write().remove(name);
+        self.next_row_id.write().remove(name);
         self.pending_rewrites.write().remove(name);
         self.memory_rows.write().remove(name);
         Ok(())
@@ -2085,6 +2215,7 @@ impl Database {
             .into_iter()
             .map(|row| materialize_row(row, &schema_snapshot))
             .collect::<Result<Vec<_>>>()?;
+        let rows = self.assign_row_ids_for_insert(table_name, rows);
 
         if self.is_memory_table(table_name) {
             let mut memory = self.memory_rows.write();
@@ -2222,6 +2353,11 @@ impl Database {
         }
 
         Ok(rows)
+    }
+
+    pub fn scan_table_at(&self, table_name: &str, view: &ReadView) -> Result<Vec<Row>> {
+        let rows = self.scan_table(table_name)?;
+        Ok(self.mvcc.visible_table(&self.name, table_name, &rows, view))
     }
 
     /// Scan only pages that can contain indexed equality/IN values. Falls back
@@ -2709,6 +2845,7 @@ impl Database {
             .into_iter()
             .map(|row| materialize_row(row, &schema))
             .collect::<Result<Vec<_>>>()?;
+        let rows = self.assign_row_ids_for_replacement(table_name, rows)?;
         for (key_name, columns, nullable) in key_constraints(&schema) {
             let mut keys = HashSet::new();
             for key in rows
@@ -2806,10 +2943,12 @@ impl Database {
         let pending = self.pending_rewrites.read().clone();
         let memory = self.memory_rows.read().clone();
         let current_auto_increment = self.auto_increment_next.read().clone();
+        let current_next_row_id = self.next_row_id.read().clone();
         let mut rebuilt = HashMap::new();
         let mut page_index: RowPageIndex = HashMap::new();
         let mut value_index: RowValueIndex = HashMap::new();
         let mut auto_increment_next = HashMap::new();
+        let mut next_row_id = HashMap::new();
         let mut overflow_tables = HashSet::new();
         for (table_name, schema) in schemas {
             let (rows, has_overlay) = if let Some(rows) = memory.get(&table_name) {
@@ -2849,6 +2988,17 @@ impl Database {
             if has_overlay {
                 add_rows_to_value_index(&mut value_index, &table_name, &schema, 0, &rows);
             }
+            let row_next = rows
+                .iter()
+                .map(|row| row.row_id)
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1)
+                .max(1);
+            next_row_id.insert(
+                table_name.clone(),
+                row_next.max(current_next_row_id.get(&table_name).copied().unwrap_or(1)),
+            );
             if let Some(column) = auto_increment_column(&schema) {
                 let next = rows
                     .iter()
@@ -2874,6 +3024,7 @@ impl Database {
         *self.row_page_index.write() = page_index;
         *self.row_value_index.write() = value_index;
         *self.auto_increment_next.write() = auto_increment_next;
+        *self.next_row_id.write() = next_row_id;
         *self.overflow_tables.write() = overflow_tables;
         Ok(())
     }
@@ -5265,6 +5416,7 @@ struct CommitShard {
     checkpoint_state: parking_lot::Mutex<CommitCheckpointState>,
     group_commit_window: Duration,
     databases: Arc<RwLock<HashMap<String, Arc<Database>>>>,
+    mvcc: Arc<MvccManager>,
     buffer_pool: Arc<BufferPool>,
     data_dir: PathBuf,
     stats: Arc<StorageStats>,
@@ -5281,6 +5433,7 @@ async fn replay_shard_wal(
     databases: &Arc<RwLock<HashMap<String, Arc<Database>>>>,
     buffer_pool: &Arc<BufferPool>,
     data_dir: &Path,
+    mvcc: &Arc<MvccManager>,
 ) -> Result<u64> {
     let reader = WalReader::open(wal_dir.to_path_buf())?;
 
@@ -5357,6 +5510,7 @@ async fn replay_shard_wal(
                 buffer_pool,
                 wal_writer,
                 data_dir,
+                mvcc,
                 true,
                 true,
             )
@@ -5527,6 +5681,7 @@ impl CommitShard {
                 self.data_dir.clone(),
                 self.stats.clone(),
                 self.snapshot_barrier.clone(),
+                self.mvcc.clone(),
                 &self.checkpoint_state,
                 std::mem::take(&mut guard.in_flight),
                 &mut wal_encode_buf,
@@ -5731,6 +5886,7 @@ pub struct StorageInventory {
 
 pub struct StorageEngineManager {
     databases: Arc<RwLock<HashMap<String, Arc<Database>>>>,
+    mvcc: Arc<MvccManager>,
     buffer_pool: Arc<BufferPool>,
     data_dir: PathBuf,
     shard_count: usize,
@@ -5841,6 +5997,7 @@ impl StorageEngineManager {
         let shard_count = Self::resolve_shard_count(shard_count);
 
         let databases = Arc::new(RwLock::new(HashMap::new()));
+        let mvcc = Arc::new(MvccManager::new());
         let stats = Arc::new(StorageStats::default());
         let commit_coordination = Arc::new(CommitCoordination {
             snapshot_barrier: Arc::new(tokio::sync::RwLock::new(())),
@@ -5865,6 +6022,7 @@ impl StorageEngineManager {
                 checkpoint_state: parking_lot::Mutex::new(CommitCheckpointState::default()),
                 group_commit_window,
                 databases: databases.clone(),
+                mvcc: mvcc.clone(),
                 buffer_pool: buffer_pool.clone(),
                 data_dir: data_dir.clone(),
                 stats: stats.clone(),
@@ -5882,6 +6040,7 @@ impl StorageEngineManager {
 
         Ok(Self {
             databases,
+            mvcc,
             buffer_pool,
             data_dir,
             shard_count,
@@ -5912,11 +6071,12 @@ impl StorageEngineManager {
                     continue;
                 }
 
-                let mut db = Database::new(
+                let mut db = Database::new_with_mvcc(
                     &name,
                     self.data_dir.clone(),
                     self.buffer_pool.clone(),
                     self.shards[0].wal_writer.clone(),
+                    self.mvcc.clone(),
                 );
                 db.load().await?;
 
@@ -5971,6 +6131,7 @@ impl StorageEngineManager {
                 &self.databases,
                 &self.buffer_pool,
                 &self.data_dir,
+                &self.mvcc,
             )
             .await?;
             total_recovered += recovered;
@@ -6138,6 +6299,25 @@ impl StorageEngineManager {
         self.get_database(database)
             .ok_or_else(|| anyhow::anyhow!("Unknown database '{}'", database))?
             .scan_table(table)
+    }
+
+    pub fn scan_table_at(&self, database: &str, table: &str, view: &ReadView) -> Result<Vec<Row>> {
+        self.stats.reads.fetch_add(1, Ordering::Relaxed);
+        self.get_database(database)
+            .ok_or_else(|| anyhow::anyhow!("Unknown database '{}'", database))?
+            .scan_table_at(table, view)
+    }
+
+    pub fn begin_transaction(&self, isolation: IsolationLevel) -> TransactionId {
+        self.mvcc.begin(isolation)
+    }
+
+    pub fn read_view(&self, transaction_id: TransactionId) -> Result<ReadView> {
+        self.mvcc.read_view(transaction_id)
+    }
+
+    pub fn end_transaction(&self, transaction_id: TransactionId) {
+        self.mvcc.end(transaction_id);
     }
 
     pub fn scan_table_filtered(
@@ -6334,6 +6514,7 @@ async fn commit_batch(
     data_dir: PathBuf,
     stats: Arc<StorageStats>,
     snapshot_barrier: Arc<tokio::sync::RwLock<()>>,
+    mvcc: Arc<MvccManager>,
     checkpoint_state: &parking_lot::Mutex<CommitCheckpointState>,
     mut pending: VecDeque<PendingWrite>,
     wal_encode_buf: &mut Vec<u8>,
@@ -6482,6 +6663,7 @@ async fn commit_batch(
                         &buffer_pool,
                         &wal_writer,
                         &data_dir,
+                        &mvcc,
                         false,
                         false,
                     )
@@ -6605,6 +6787,7 @@ async fn commit_batch(
                 &buffer_pool,
                 &wal_writer,
                 &data_dir,
+                &mvcc,
                 true,
                 false,
             )
@@ -6681,6 +6864,7 @@ async fn commit_batch(
                         &buffer_pool,
                         &wal_writer,
                         &data_dir,
+                        &mvcc,
                         deferred,
                         false,
                     )
@@ -8236,18 +8420,42 @@ fn rows_have_constraint_conflict(left: &Row, right: &Row, schema: &TableSchema) 
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn apply_write_batch(
     commands: Vec<WriteCommand>,
     databases: &Arc<RwLock<HashMap<String, Arc<Database>>>>,
     buffer_pool: &Arc<BufferPool>,
     wal_writer: &Arc<parking_lot::Mutex<WalWriter>>,
     data_dir: &Path,
+    mvcc: &Arc<MvccManager>,
     defer_catalog_save: bool,
     validate: bool,
 ) -> Result<WriteResult> {
     if validate {
         validate_write_batch(&commands, databases)?;
     }
+    let tracked_tables = commands
+        .iter()
+        .filter_map(command_table)
+        .map(|(database, table)| (database.to_string(), table.to_string()))
+        .collect::<HashSet<_>>();
+    let before_images = tracked_tables
+        .iter()
+        .filter_map(|(database, table)| {
+            let db = databases.read().get(database).cloned()?;
+            if db.is_memory_table(table) {
+                return None;
+            }
+            let rows = if db.get_table(table).is_some() {
+                db.scan_table(table)
+            } else {
+                Ok(Vec::new())
+            };
+            Some(((database.clone(), table.clone()), rows))
+        })
+        .map(|(key, rows)| rows.map(|rows| (key, rows)))
+        .collect::<Result<HashMap<_, _>>>()?;
+    let mvcc_commit_id = (!tracked_tables.is_empty()).then(|| mvcc.allocate_commit_id());
     let mut affected_rows = 0;
     let mut last_insert_id = 0;
     let mut dirty_databases = HashSet::new();
@@ -8257,11 +8465,12 @@ async fn apply_write_batch(
             WriteCommand::CreateDatabase(name) => {
                 let path = data_dir.join(&name);
                 std::fs::create_dir_all(&path)?;
-                let db = Database::new(
+                let db = Database::new_with_mvcc(
                     &name,
                     data_dir.to_path_buf(),
                     buffer_pool.clone(),
                     wal_writer.clone(),
+                    mvcc.clone(),
                 );
                 db.save().await?;
                 databases.write().insert(name.clone(), Arc::new(db));
@@ -8665,6 +8874,18 @@ async fn apply_write_batch(
             if let Some(db) = db {
                 db.save().await?;
             }
+        }
+    }
+    if let Some(commit_id) = mvcc_commit_id {
+        for ((database, table), before) in before_images {
+            let Some(db) = databases.read().get(&database).cloned() else {
+                continue;
+            };
+            if db.is_memory_table(&table) || db.get_table(&table).is_none() {
+                continue;
+            }
+            let after = db.scan_table(&table)?;
+            mvcc.record_table_commit(&database, &table, &before, &after, commit_id);
         }
     }
     Ok(WriteResult {
@@ -10533,6 +10754,86 @@ mod tests {
     }
 
     #[test]
+    fn row_encode_decode_roundtrip_preserves_hidden_row_id() {
+        let mut row = Row::new();
+        row.row_id = 42;
+        row.push("id", b"7".to_vec());
+
+        let decoded = Row::decode(&row.encode()).expect("decode versioned row");
+        assert_eq!(decoded.row_id, 42);
+        assert_eq!(decoded, row);
+
+        let legacy = mydb_wal::record::encode_nullable_row(&row.values, &HashSet::new());
+        let legacy_decoded = Row::decode(&legacy).expect("decode legacy row");
+        assert_eq!(legacy_decoded.row_id, 0);
+        assert_eq!(legacy_decoded, row);
+    }
+
+    #[tokio::test]
+    async fn persistent_row_ids_survive_mutation_and_restart() {
+        let (temp, manager) = recovery_manager().await;
+        manager
+            .execute_write(insert_command("a", "1"))
+            .await
+            .expect("insert first row");
+        manager
+            .execute_write(insert_command("a", "2"))
+            .await
+            .expect("insert second row");
+        let database = manager.get_database("game").expect("game database");
+        let rows = database.scan_table("a").expect("scan rows");
+        assert_eq!(
+            rows.iter().map(|row| row.row_id).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+
+        manager
+            .execute_write(WriteCommand::Update {
+                database: "game".into(),
+                table: "a".into(),
+                filter: Some(RowPredicate::Eq("id".into(), b"1".to_vec())),
+                assignments: vec![("value".into(), Some(b"updated".to_vec()))],
+            })
+            .await
+            .expect("update row");
+        manager
+            .execute_write(WriteCommand::Delete {
+                database: "game".into(),
+                table: "a".into(),
+                filter: Some(RowPredicate::Eq("id".into(), b"2".to_vec())),
+            })
+            .await
+            .expect("delete row");
+        manager
+            .execute_write(insert_command("a", "3"))
+            .await
+            .expect("insert third row");
+        manager.flush().expect("flush row ids");
+        let rows = database.scan_table("a").expect("scan mutated rows");
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.get("id").unwrap().to_vec(), row.row_id))
+                .collect::<Vec<_>>(),
+            vec![(b"1".to_vec(), 1), (b"3".to_vec(), 3)]
+        );
+        drop(manager);
+
+        let restarted = StorageEngineManager::new(temp.path().to_path_buf(), 16384, "4M");
+        restarted.init().await.expect("restart storage");
+        let rows = restarted
+            .get_database("game")
+            .expect("reloaded database")
+            .scan_table("a")
+            .expect("scan reloaded rows");
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.get("id").unwrap().to_vec(), row.row_id))
+                .collect::<Vec<_>>(),
+            vec![(b"1".to_vec(), 1), (b"3".to_vec(), 3)]
+        );
+    }
+
+    #[test]
     fn oversized_rows_roundtrip_through_checked_overflow_storage() {
         let temp = tempfile::tempdir().expect("create overflow test directory");
         let disk = DiskManager::new(temp.path().to_path_buf(), DEFAULT_PAGE_SIZE);
@@ -11229,6 +11530,7 @@ mod tests {
             &manager.buffer_pool,
             &manager.shards[0].wal_writer,
             &manager.data_dir,
+            &manager.mvcc,
             false,
             true,
         )
@@ -11254,6 +11556,7 @@ mod tests {
             &manager.buffer_pool,
             &manager.shards[0].wal_writer,
             &manager.data_dir,
+            &manager.mvcc,
             true,
             true,
         )
@@ -11299,6 +11602,7 @@ mod tests {
             &manager.buffer_pool,
             &manager.shards[0].wal_writer,
             &manager.data_dir,
+            &manager.mvcc,
             false,
             true,
         )

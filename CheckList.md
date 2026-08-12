@@ -17,6 +17,8 @@
 ## 内核与存储
 
 - [x] `InnoDB` 映射到自研持久化 Neko233 引擎，`MEMORY` 保持独立非事务语义
+- [x] 持久 row-id：新写入稳定分配，旧数据启动迁移补齐，替换/重启保持行身份；row 编码保留 legacy 解码路径
+- [x] MVCC 基础：事务 ID、commit 序号、RR/SERIALIZABLE 固定读视图、RC 语句读视图、删除可见历史版本及旧版本清理基础
 - [x] Leader/Follower FIFO、事务批次、group commit、CRC WAL、断尾截断、checkpoint 与恢复
 - [x] 同主键顺序写、并发计数更新和 UPSERT 不丢写
 - [x] 主键/唯一索引、AUTO_INCREMENT、NULL/空字节/BLOB 持久化
@@ -138,9 +140,10 @@
 - [x] 事务语句级 CHECK/FK 预校验、级联立即可见、回滚不落 WAL
 - [x] 主键及单列二级索引的等值/范围锁：资源化 next-key/gap 区间、空隙 INSERT 阻塞、事务锁等待与回滚回归
 - [x] READ COMMITTED 锁定读与 UPDATE/DELETE 只锁命中记录、不锁普通 gap；RR/SERIALIZABLE 保留范围锁；主键 gap 插入回归
+- [x] 二级索引插入意向锁：同一非唯一索引值的不同记录可并发插入，但仍受 next-key/gap X 锁阻塞
 - [x] 复合索引全等值记录/间隙锁；无主键表使用稳定行内容+重复序号的隐藏行锁支持基础 `SKIP LOCKED`
 - [x] `mydb-router` 透明 MySQL TCP 入口：连接固定后端，JDBC/Go/Node.js/JetBrains/VS Code/dbx/mysql CLI 共用协议路径
-- [ ] MySQL InnoDB 完整 next-key/gap/意向锁、无主键/复杂 JOIN 的逐行 SKIP LOCKED、多方环与基于回滚成本的受害者选择一致性
+- [ ] MySQL InnoDB 完整 next-key/gap/意向锁、MDL、无主键/复杂 JOIN 的逐行 SKIP LOCKED、多方环与基于回滚成本的受害者选择一致性
 - [ ] 全部隔离级别 anomaly、XA、SAVEPOINT 后锁精确释放、锁升级和大事务边界矩阵
 
 ## 迁移与备份
@@ -177,10 +180,9 @@
 
 ## 当前可复现证据
 
-- [x] `cargo test --workspace`：204 项通过
-- [x] `cargo test -p mydb-wire`：167 项通过（含 IANA 命名时区、大小写名称、上海/纽约、DST 跳时/回拨、连接隔离、动态默认值、事务及函数比较投影，会话 time_zone 固定偏移/SYSTEM、连接隔离、SET 左到右、NOW/SYSDATE、UNIX 微秒往返、动态默认值、ON UPDATE、事务，CONVERT_TZ 固定偏移、UTC/GMT/SYSTEM、跨日、微秒、无效时区、WHERE/UPDATE/事务，NOW/CURRENT_TIMESTAMP/local/UTC/UNIX 的语句开始快照、SYSDATE 调用时刻、跨 SLEEP 与批量 UPDATE 一致性，UTC_DATE/UTC_TIME/UTC_TIMESTAMP、LOCALTIME/LOCALTIMESTAMP、CURTIME/CURRENT_TIME 的 UTC/local、fsp、DML 和事务，ADDDATE/SUBDATE/TIMESTAMP/TIMESTAMPADD 的别名、天数简写、SQL_TSI_、月末、微秒和排期 DML/事务，GET_FORMAT/STR_TO_DATE/TIME_FORMAT 的官方格式、月名/微秒差异、文本导入 DML/事务，EXTRACT 基础/复合单位、函数内 FROM 顶层解析、事件分区 DML/事务，TO_DAYS/FROM_DAYS/TO_SECONDS 与 PERIOD_ADD/PERIOD_DIFF 的 year-0 日序、紧凑数字日期、归档/赛季 DML/事务，WEEK/WEEKOFYEAR/YEARWEEK 的 0–7 模式、ISO 跨年、注册周 cohort DML/事务，ADDTIME/SUBTIME/MAKETIME 的跨日 DATETIME、负时长、微秒、游戏冷却 DML/事务，TIME/MICROSECOND/TIME_TO_SEC/SEC_TO_TIME/TIMEDIFF 的负时长、跨天、微秒、DATETIME 差值及 DML/事务，DAYOFYEAR/WEEKDAY/QUARTER/DAYNAME/MONTHNAME/LAST_DAY/MAKEDATE 的闰年、跨年、月末结算 DML/事务，CONV/BIT_COUNT 的 64 位进制、显式二进制位计数、权限掩码 DML/事务，PI/角度/三角函数的定义域、游戏向量 DML/事务，MD5/SHA/SHA1/SHA2/CRC32 的文本/二进制迁移摘要、DML/事务和 CHECK 关键字边界，UUID v1/二进制 swap/校验、IPv4/IPv6 二进制往返与 DML/事务，BIN/OCT/HEX/UNHEX/Base64/FORMAT 的迁移编码、换行/空白、locale、DML/事务回滚，字符串工具函数 UTF-8/二进制/DML/64MiB 内存边界、FIND_IN_SET/FIELD/ELT/MAKE_SET/EXPORT_SET 的 SELECT/WHERE/UPDATE/回滚、存储程序 TIME/DATETIME/TIMESTAMP FSP 舍入/截断/进位与调用者-例程 SQL_MODE 边界、Trigger/Procedure/参数 ENUM/SET 成员与数字索引/位掩码转换、PROCEDURE CREATED/LAST_ALTERED/SQL_MODE 快照与恢复、diagnostics 多 condition/max_error_count/sql_notes、连接顶层 GET DIAGNOSTICS 真实驱动与 prepared 1295、Prepared CALL OUT/INOUT 声明类型 Binary Wire、PROCEDURE/CALL 多结果集/游标/condition handler/diagnostics/ALTER characteristics、Trigger 复合控制流与常用局部变量类型转换、连接级临时表、SQL_CALC_FOUND_ROWS、会话写后状态、日期/自动更新时间、用户/系统变量、协议/SQL prepared、注册留存、DAU、收入、数学、文本、JSON CRUD、视图及 ALTER 演进重启）
-- [x] `cargo test -p mydb-storage -p mydb-wire`：211 项通过（mydb-storage 44、mydb-wire 167）
-- [x] 最新并发回归：`cargo test -p mydb-storage` 44 项通过；`cargo test -p mydb-wire` 167 项通过；并发不同表 INSERT/UPDATE/UPSERT 合并为一个 WAL fsync，物理 apply 保持 FIFO 顺序；真实组提交重启后双表数据完整且无重复
+- [x] `cargo test --workspace`：通过（含 storage 50 个单测、17 个集成测、wire 181 个单测、WAL 18 个单测）
+- [x] `cargo test -p mydb-storage -p mydb-wire`：通过（storage 50 个单测、wire 181 个单测）
+- [x] 最新并发回归：持久 row-id、MVCC 读视图、删除历史版本、插入意向锁与已有并发写回归通过；并发不同表写入保持 FIFO/WAL 组提交语义
 - [x] vendored `opensrv-mysql`：110 项通过，覆盖自定义错误码/SQLSTATE、多结果 SERVER_MORE_RESULTS_EXISTS、握手多结果能力和 Prepared CALL SERVER_PS_OUT_PARAMS 状态位
 - [x] `cargo clippy --workspace --all-targets -- -D warnings`：通过
 - [x] MySQL 8.0.45/8.0.46 差分：真实 dump、changed-row affected counts/no-op UPSERT insert id、INSERT/REPLACE SET、INSERT VALUES 默认行/表达式/DEFAULT(col)/1364、UPDATE/UPSERT/JOIN DEFAULT、MySQL 8 行/列别名 UPSERT、复杂冲突标量表达式和左到右赋值、CREATE TABLE LIKE、TRUNCATE 隐式提交/自增/FK 1701、LOAD DATA 用户变量/SET/latin1/BLOB/1261/1262/1062 warning/strict 1261/1262/1300 原子失败、FOR SHARE/NOWAIT 3572/主键队列 SKIP LOCKED/双事务死锁 1213、FK/CHECK/事务/SAVEPOINT、JOIN/NATURAL/USING、有键/无键重复行单/多目标 JOIN UPDATE/DELETE、相关/派生/CTE 子查询、set operators、多列 GROUP BY、窗口、多列/表达式 ORDER BY、常用 CASE/字符串/数值/CAST 投影/WHERE/UPDATE/DELETE
@@ -191,8 +193,8 @@
 - [x] 2026-07-20 8 表/4 CPU 限速 3 轮：`target/io-bench-multitable-async-audit-3r/`，MyDB 7017.2 ops/s、MySQL 7315.1 ops/s、0.959x；WAL 269 次 fsync 覆盖 1641 请求（6.10 请求/组）。异步批量审计移出 SQL 临界路径；读主导样本 `target/io-bench-read-async-audit/` 读 P50 为 210 us。开发机 Docker 回归证据，不代表物理生产硬件验收
 - [x] db233-go `go test -count=1 ./...`：通过且仓库无改动
 - [x] 默认 MyDB 容器：healthy、`unless-stopped`、0.5 CPU、512 MiB
-- [x] MySQL Connector/J 8.4.0：4/4 通过，含默认认证、mysql_native_password、UTF-8、DataGrip/IDEA 常用连接属性、DDL/DML/预查询
-- [x] Go `database/sql` `github.com/go-sql-driver/mysql` v1.10.0：真实 `server-project-sf-go/test_get_lock.go` 通过，`DATABASE()`、`GET_LOCK`、`RELEASE_LOCK` 均正确
+- [x] MySQL Connector/J 9.1.0：最新 release 临时实例 4/4 通过，含无默认库/`mydb` 默认库、连接握手与预查询；覆盖 DataGrip/IDEA JDBC 路径
+- [x] Go `database/sql` `github.com/go-sql-driver/mysql` v1.9.3：最新 release 临时实例集成 CRUD 3/3 通过
 - [x] Node.js `mysql2`：当前 v3 客户端连接 3306，预处理查询通过；覆盖 VS Code JavaScript/TypeScript 连接路径
 - [x] Windows 当前构建：`MyDBServer` Automatic 服务停止/启动循环通过；监听 `0.0.0.0:3306`，LAN 地址连接成功，防火墙入站规则启用
 - [x] 本机全量切流：9 个业务库迁移并重启校验；`sakila.staff` 超大 BLOB 通过 16KB 页外溢存储保留；MySQL80 服务、程序、进程和数据目录已卸载清理，SQL 备份保留在 `C:\Server\mydb\mysql-backup-20260811\all-databases.sql`

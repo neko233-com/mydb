@@ -165,6 +165,8 @@ impl WalRecord {
 pub type EncodedRow = Vec<(String, Vec<u8>)>;
 pub type NullableRow = (EncodedRow, std::collections::HashSet<String>);
 
+const VERSIONED_NULLABLE_ROW_MAGIC: &[u8; 4] = b"R2ID";
+
 pub fn encode_row(row: &[(String, Vec<u8>)]) -> Vec<u8> {
     let mut buf = Vec::new();
 
@@ -294,6 +296,27 @@ pub fn decode_nullable_row(data: &[u8]) -> Option<NullableRow> {
     Some((row, nulls))
 }
 
+pub fn encode_versioned_nullable_row(
+    row_id: u64,
+    row: &[(String, Vec<u8>)],
+    null_columns: &std::collections::HashSet<String>,
+) -> Vec<u8> {
+    let payload = encode_nullable_row(row, null_columns);
+    let mut encoded = Vec::with_capacity(VERSIONED_NULLABLE_ROW_MAGIC.len() + 8 + payload.len());
+    encoded.extend_from_slice(VERSIONED_NULLABLE_ROW_MAGIC);
+    encoded.extend_from_slice(&row_id.to_le_bytes());
+    encoded.extend_from_slice(&payload);
+    encoded
+}
+
+pub fn decode_versioned_nullable_row(data: &[u8]) -> Option<(u64, NullableRow)> {
+    if !data.starts_with(VERSIONED_NULLABLE_ROW_MAGIC) || data.len() < 12 {
+        return None;
+    }
+    let row_id = u64::from_le_bytes(data[4..12].try_into().ok()?);
+    Some((row_id, decode_nullable_row(&data[12..])?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -333,6 +356,21 @@ mod tests {
         assert_eq!(decoded, row);
         assert!(decoded_nulls.contains("null_value"));
         assert!(!decoded_nulls.contains("empty_value"));
+    }
+
+    #[test]
+    fn versioned_nullable_row_roundtrip_preserves_identity_and_legacy_decode() {
+        let row = vec![("id".to_string(), b"7".to_vec())];
+        let nulls = std::collections::HashSet::new();
+        let encoded = encode_versioned_nullable_row(42, &row, &nulls);
+        let (row_id, (decoded, decoded_nulls)) = decode_versioned_nullable_row(&encoded).unwrap();
+        assert_eq!(row_id, 42);
+        assert_eq!(decoded, row);
+        assert!(decoded_nulls.is_empty());
+
+        let legacy = encode_nullable_row(&row, &nulls);
+        assert_eq!(decode_versioned_nullable_row(&legacy), None);
+        assert_eq!(decode_nullable_row(&legacy).unwrap().0, row);
     }
 
     #[test]

@@ -36,10 +36,10 @@ use mydb_storage::{
     apply_expression_assignments, is_current_timestamp_default, is_memory_schema,
     table_engine_from_sql, AlterTableOperation, Column, ColumnPosition, DataType, EventDefinition,
     EventFinishAction, EventMetadata, EventSchedule, ExpressionAssignment, FunctionDefinition,
-    FunctionParameter, Index, NumericOperator, ProcedureDefinition, ProcedureMetadata,
-    ProcedureParameter, ProcedureParameterMode, Row, RowPredicate, StorageEngineManager,
-    TableEngine, TableSchema, TriggerDefinition, TriggerEvent, TriggerTiming,
-    UpdateValueExpression, WriteCommand,
+    FunctionParameter, Index, IsolationLevel as MvccIsolation, NumericOperator,
+    ProcedureDefinition, ProcedureMetadata, ProcedureParameter, ProcedureParameterMode, Row,
+    RowPredicate, StorageEngineManager, TableEngine, TableSchema, TransactionId, TriggerDefinition,
+    TriggerEvent, TriggerTiming, UpdateValueExpression, WriteCommand,
 };
 
 pub const SERVER_VERSION: &str = "8.0.36-mydb-0.1.0";
@@ -1845,6 +1845,7 @@ enum LockMode {
     IntentionShared,
     IntentionExclusive,
     Shared,
+    InsertIntention,
     Exclusive,
 }
 
@@ -2812,10 +2813,15 @@ fn lock_modes_compatible(held: LockMode, requested: LockMode) -> bool {
         (LockMode::IntentionShared, LockMode::IntentionShared)
             | (LockMode::IntentionShared, LockMode::IntentionExclusive)
             | (LockMode::IntentionShared, LockMode::Shared)
+            | (LockMode::IntentionShared, LockMode::InsertIntention)
             | (LockMode::IntentionExclusive, LockMode::IntentionShared)
             | (LockMode::IntentionExclusive, LockMode::IntentionExclusive)
+            | (LockMode::IntentionExclusive, LockMode::InsertIntention)
             | (LockMode::Shared, LockMode::IntentionShared)
             | (LockMode::Shared, LockMode::Shared)
+            | (LockMode::InsertIntention, LockMode::IntentionShared)
+            | (LockMode::InsertIntention, LockMode::IntentionExclusive)
+            | (LockMode::InsertIntention, LockMode::InsertIntention)
     )
 }
 
@@ -2829,6 +2835,10 @@ fn merge_lock_modes(held: LockMode, requested: LockMode) -> LockMode {
         | (LockMode::IntentionExclusive, LockMode::IntentionShared) => LockMode::IntentionExclusive,
         (LockMode::IntentionShared, LockMode::Shared)
         | (LockMode::Shared, LockMode::IntentionShared) => LockMode::Shared,
+        (LockMode::InsertIntention, LockMode::IntentionShared)
+        | (LockMode::IntentionShared, LockMode::InsertIntention) => LockMode::IntentionShared,
+        (LockMode::InsertIntention, LockMode::IntentionExclusive)
+        | (LockMode::IntentionExclusive, LockMode::InsertIntention) => LockMode::IntentionExclusive,
         (LockMode::IntentionExclusive, LockMode::Shared)
         | (LockMode::Shared, LockMode::IntentionExclusive) => LockMode::Exclusive,
         _ => requested,
@@ -2850,7 +2860,7 @@ struct Backend {
     session_transaction_defaults: TransactionDefaults,
     next_transaction_characteristics: TransactionCharacteristics,
     transaction_snapshot: HashMap<(String, String), Vec<Row>>,
-    transaction_snapshot_ready: bool,
+    mvcc_transaction_id: Option<TransactionId>,
     lock_wait_timeout: std::time::Duration,
     foreign_key_checks: bool,
     prepared: HashMap<u32, String>,
@@ -3128,7 +3138,7 @@ impl Backend {
             session_transaction_defaults: transaction_defaults,
             next_transaction_characteristics: TransactionCharacteristics::default(),
             transaction_snapshot: HashMap::new(),
-            transaction_snapshot_ready: false,
+            mvcc_transaction_id: None,
             lock_wait_timeout,
             foreign_key_checks: true,
             prepared: HashMap::new(),
@@ -3161,6 +3171,7 @@ impl Backend {
     }
 
     async fn reset_connection(&mut self) -> anyhow::Result<()> {
+        self.end_mvcc_transaction();
         self.transaction_writes.write().clear();
         self.clear_transaction_snapshot();
         self.savepoints.clear();
@@ -3318,8 +3329,10 @@ impl Backend {
                 .to_string()
                 .starts_with("Deadlock found when trying to get lock")
         }) {
+            self.end_mvcc_transaction();
             self.transaction_writes.write().clear();
             self.clear_transaction_snapshot();
+            self.end_mvcc_transaction();
             self.savepoints.clear();
             self.stats.release_all_locks(self.connection_id);
             self.in_transaction = false;
@@ -3479,6 +3492,34 @@ impl Backend {
         self.transaction_read_only = defaults.read_only;
     }
 
+    fn mvcc_isolation(&self) -> MvccIsolation {
+        match self.transaction_isolation {
+            TransactionIsolation::ReadUncommitted => MvccIsolation::ReadUncommitted,
+            TransactionIsolation::ReadCommitted => MvccIsolation::ReadCommitted,
+            TransactionIsolation::RepeatableRead => MvccIsolation::RepeatableRead,
+            TransactionIsolation::Serializable => MvccIsolation::Serializable,
+        }
+    }
+
+    fn begin_mvcc_transaction(&mut self, consistent_snapshot: bool) -> anyhow::Result<()> {
+        if self.mvcc_transaction_id.is_none() {
+            self.mvcc_transaction_id = Some(self.storage.begin_transaction(self.mvcc_isolation()));
+        }
+        if consistent_snapshot {
+            let transaction_id = self
+                .mvcc_transaction_id
+                .expect("MVCC transaction initialized");
+            self.storage.read_view(transaction_id)?;
+        }
+        Ok(())
+    }
+
+    fn end_mvcc_transaction(&mut self) {
+        if let Some(transaction_id) = self.mvcc_transaction_id.take() {
+            self.storage.end_transaction(transaction_id);
+        }
+    }
+
     fn reset_transaction_characteristics(&mut self) {
         self.transaction_isolation = self.session_transaction_defaults.isolation;
         self.transaction_read_only = false;
@@ -3586,31 +3627,6 @@ impl Backend {
 
     fn clear_transaction_snapshot(&mut self) {
         self.transaction_snapshot.clear();
-        self.transaction_snapshot_ready = false;
-    }
-
-    fn capture_transaction_snapshot(&mut self) -> anyhow::Result<()> {
-        if self.transaction_snapshot_ready {
-            return Ok(());
-        }
-        let mut snapshot = HashMap::new();
-        for database_name in self.storage.list_databases() {
-            let Some(database) = self.storage.get_database(&database_name) else {
-                continue;
-            };
-            for table_name in database.list_tables() {
-                if database.is_memory_table(&table_name) {
-                    continue;
-                }
-                snapshot.insert(
-                    (database_name.clone(), table_name.clone()),
-                    database.scan_table(&table_name)?,
-                );
-            }
-        }
-        self.transaction_snapshot = snapshot;
-        self.transaction_snapshot_ready = true;
-        Ok(())
     }
 
     fn record_warning(&mut self, warning: SqlWarning) {
@@ -3808,6 +3824,7 @@ impl Backend {
                     self.clear_transaction_snapshot();
                     self.savepoints.clear();
                     self.stats.release_all_locks(self.connection_id);
+                    self.end_mvcc_transaction();
                     self.autocommit = true;
                     self.in_transaction = false;
                     self.reset_transaction_characteristics();
@@ -3817,6 +3834,7 @@ impl Backend {
                     self.in_transaction = true;
                     self.clear_transaction_snapshot();
                     self.activate_transaction_defaults(None);
+                    self.begin_mvcc_transaction(false)?;
                 }
             }
             "foreign_key_checks" => {
@@ -4254,6 +4272,8 @@ impl Backend {
         if started_transaction {
             self.in_transaction = true;
             self.clear_transaction_snapshot();
+            self.activate_transaction_defaults(None);
+            self.begin_mvcc_transaction(false)?;
         }
         self.procedure_depth += 1;
         locals.push_scope();
@@ -4281,6 +4301,7 @@ impl Backend {
                 self.transaction_writes.write().truncate(writes_len);
                 if started_transaction {
                     self.clear_transaction_snapshot();
+                    self.end_mvcc_transaction();
                     self.stats.release_all_locks(self.connection_id);
                     self.in_transaction = false;
                 }
@@ -4293,6 +4314,7 @@ impl Backend {
             self.transaction_writes.write().truncate(writes_len);
             if started_transaction {
                 self.clear_transaction_snapshot();
+                self.end_mvcc_transaction();
                 self.stats.release_all_locks(self.connection_id);
                 self.in_transaction = false;
             }
@@ -5233,9 +5255,7 @@ impl Backend {
             self.savepoints.clear();
             self.in_transaction = true;
             self.activate_transaction_defaults(access_mode);
-            if consistent_snapshot {
-                self.capture_transaction_snapshot()?;
-            }
+            self.begin_mvcc_transaction(consistent_snapshot)?;
             if _prof {
                 eprintln!("PROFILE START {}us", _prof_t0.elapsed().as_micros());
             }
@@ -5252,6 +5272,7 @@ impl Backend {
         if upper == "ROLLBACK" {
             self.transaction_writes.write().clear();
             self.clear_transaction_snapshot();
+            self.end_mvcc_transaction();
             self.savepoints.clear();
             self.stats.release_all_locks(self.connection_id);
             self.in_transaction = false;
@@ -7083,6 +7104,7 @@ impl Backend {
             let _ = xid;
             self.transaction_writes.write().clear();
             self.clear_transaction_snapshot();
+            self.end_mvcc_transaction();
             self.savepoints.clear();
             self.stats.release_all_locks(self.connection_id);
             self.in_transaction = false;
@@ -7092,6 +7114,7 @@ impl Backend {
         if upper == "ROLLBACK" {
             self.transaction_writes.write().clear();
             self.clear_transaction_snapshot();
+            self.end_mvcc_transaction();
             self.savepoints.clear();
             self.stats.release_all_locks(self.connection_id);
             self.in_transaction = false;
@@ -7117,6 +7140,7 @@ impl Backend {
         self.savepoints.clear();
         self.in_transaction = true;
         self.activate_transaction_defaults(None);
+        self.begin_mvcc_transaction(false)?;
         Ok(())
     }
 
@@ -10595,6 +10619,7 @@ impl Backend {
     async fn submit_ddl(&mut self, writes: Vec<WriteCommand>) -> anyhow::Result<QueryOutcome> {
         self.ensure_transaction_writable()?;
         self.ensure_explicit_write_access(&writes)?;
+        self.end_mvcc_transaction();
         self.in_transaction = false;
         let locks = write_lock_requests(&self.storage, &writes)?;
         if let Err(error) = self
@@ -10616,6 +10641,7 @@ impl Backend {
     ) -> anyhow::Result<QueryOutcome> {
         self.ensure_transaction_writable()?;
         self.ensure_explicit_write_access(&writes)?;
+        self.end_mvcc_transaction();
         self.in_transaction = false;
         let locks = write_lock_requests(&self.storage, &writes[..1])?;
         if let Err(error) = self
@@ -10741,6 +10767,7 @@ impl Backend {
             writes.push(drop);
         }
         self.ensure_explicit_write_access(&writes)?;
+        self.end_mvcc_transaction();
         self.in_transaction = false;
         let locks = write_lock_requests(&self.storage, &lock_commands)?;
         if let Err(error) = self
@@ -10768,6 +10795,7 @@ impl Backend {
                 .map(|result| result.affected_rows)
         };
         self.clear_transaction_snapshot();
+        self.end_mvcc_transaction();
         self.savepoints.clear();
         self.stats.release_all_locks(self.connection_id);
         self.reset_transaction_characteristics();
@@ -13803,32 +13831,29 @@ impl Backend {
             } => command_database == database && item == table,
             _ => false,
         });
-        let snapshot_isolation = use_transaction_snapshot
+        let mvcc_rows = if use_transaction_snapshot
             && !self.storage.is_memory_table(database, table)
             && self.in_transaction
-            && matches!(
-                self.transaction_isolation,
-                TransactionIsolation::RepeatableRead | TransactionIsolation::Serializable
-            );
-        // Autocommit and READ COMMITTED reads without a local write overlay can
-        // use the storage engine's page index directly. Repeatable-read and
-        // serializable transactions still capture the complete table on first
-        // access so later predicates observe one stable snapshot.
+        {
+            self.mvcc_transaction_id
+                .map(|transaction_id| {
+                    self.storage
+                        .read_view(transaction_id)
+                        .and_then(|view| self.storage.scan_table_at(database, table, &view))
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        let snapshot_isolation = mvcc_rows.is_some();
+        // MVCC supplies the transaction read view. Autocommit and local
+        // mutation planning keep using the current indexed image.
         if !pending && !snapshot_isolation {
             return self
                 .storage
                 .scan_table_filtered_limit(database, table, filter, limit);
         }
-        let mut rows = if snapshot_isolation {
-            let key = (database.to_string(), table.to_string());
-            self.capture_transaction_snapshot()?;
-            self.transaction_snapshot
-                .get(&key)
-                .cloned()
-                .unwrap_or_default()
-        } else {
-            self.storage.scan_table(database, table)?
-        };
+        let mut rows = mvcc_rows.unwrap_or(self.storage.scan_table(database, table)?);
         if !pending {
             rows.retain(|row| filter.is_none_or(|predicate| predicate.matches(row)));
             return Ok(rows);
@@ -13975,6 +14000,7 @@ fn statement_privilege_database(sql: &str, upper: &str, default_database: &str) 
 
 impl Drop for Backend {
     fn drop(&mut self) {
+        self.end_mvcc_transaction();
         self.transaction_writes.write().clear();
         if !self.temporary_tables.is_empty() {
             let storage = self.storage.clone();
@@ -14199,6 +14225,11 @@ fn write_lock_requests_with_gap_locks(
                     WriteCommand::Insert { row, .. } | WriteCommand::Upsert { row, .. } => row,
                     _ => unreachable!(),
                 };
+                let secondary_insert_mode = if matches!(write, WriteCommand::Insert { .. }) {
+                    LockMode::InsertIntention
+                } else {
+                    LockMode::Exclusive
+                };
                 for (key_name, columns) in unique_key_columns(&schema) {
                     if let Some(key) = row_lock_key(row, &columns) {
                         let prefix = if key_name == "PRIMARY" {
@@ -14224,7 +14255,7 @@ fn write_lock_requests_with_gap_locks(
                         add_lock_request(
                             &mut requests,
                             range_lock_resource(database, table, &index, &point),
-                            LockMode::Exclusive,
+                            secondary_insert_mode,
                         );
                     }
                 }
@@ -14239,7 +14270,7 @@ fn write_lock_requests_with_gap_locks(
                         add_lock_request(
                             &mut requests,
                             range_lock_resource(database, table, &index, &point),
-                            LockMode::Exclusive,
+                            secondary_insert_mode,
                         );
                     }
                 }
@@ -36297,6 +36328,30 @@ mod tests {
             .execute("INSERT INTO indexed_actors (id,value) VALUES (4,30)")
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn secondary_index_insert_intention_locks_are_mutually_compatible() {
+        let (_temp, _storage, mut first, mut second) = transaction_backends().await;
+        first
+            .execute(
+                "CREATE TABLE insert_intention_rows (id BIGINT PRIMARY KEY, value BIGINT, INDEX idx_value (value))",
+            )
+            .await
+            .unwrap();
+        first.execute("BEGIN").await.unwrap();
+        first
+            .execute("INSERT INTO insert_intention_rows (id,value) VALUES (1,10)")
+            .await
+            .unwrap();
+        second.execute("BEGIN").await.unwrap();
+        second
+            .execute("INSERT INTO insert_intention_rows (id,value) VALUES (2,10)")
+            .await
+            .unwrap();
+
+        first.execute("COMMIT").await.unwrap();
+        second.execute("COMMIT").await.unwrap();
     }
 
     #[tokio::test]
