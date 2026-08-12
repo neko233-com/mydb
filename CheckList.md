@@ -136,6 +136,7 @@
 - [x] IS/IX/S/X、主键/唯一键行锁、SELECT FOR UPDATE/FOR SHARE、LOCK IN SHARE MODE、NOWAIT 原子获取与 MySQL 3572、主键队列 ORDER BY/LIMIT SKIP LOCKED、wait-for graph 死锁检测、1213/40001 及受害者整事务回滚、锁等待超时
 - [x] 断线自动回滚并释放锁；服务重启后客户端可重连和继续新事务
 - [x] 事务语句级 CHECK/FK 预校验、级联立即可见、回滚不落 WAL
+- [x] 主键及单列二级索引的等值/范围锁：资源化 next-key/gap 区间、空隙 INSERT 阻塞、事务锁等待与回滚回归
 - [ ] MySQL InnoDB 完整 next-key/gap/意向锁、无主键/复杂 JOIN 的逐行 SKIP LOCKED、多方环与基于回滚成本的受害者选择一致性
 - [ ] 全部隔离级别 anomaly、XA、SAVEPOINT 后锁精确释放、锁升级和大事务边界矩阵
 

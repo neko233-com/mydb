@@ -6,7 +6,7 @@
 >
 > **非单机能力明确不支持（设计决定，非临时延迟）**：binlog 复制拓扑 / GTID、读写分离、Group Replication / Galera、分布式 XA 两阶段协调、跨节点一致性。这些在 [`SYNTAX_MATRIX.md`](SYNTAX_MATRIX.md) 中统一标记为 ❌ 明确不支持，不会纳入范围，也不视为“缺失”。单机版本地 XA（`XA START/COMMIT` 映射为会话内事务）仍作为兼容表面保留。
 >
-> 最后更新：2026-07-21（本轮补齐 performance_schema / sys 虚拟库、RENAME USER / SET PASSWORD、ANALYZE/OPTIMIZE/CHECK/REPAIR/CHECKSUM TABLE、FLUSH / CACHE INDEX、复制 SHOW 表面、本地 XA 表面、ALTER DATABASE 选项；并据项目定位将非单机能力从 Deferred 重新归类为“明确不支持”）。
+> 最后更新：2026-08-12（本轮补齐 `event_scheduler` 全局变量 ON/OFF/DISABLED、DataGrip 探测路径，以及主键/单列二级索引 next-key/gap 区间锁；复合索引、无主键/复杂 JOIN 锁和完整 InnoDB 语义仍按清单逐项验收）。
 
 ## 状态图例
 
@@ -101,7 +101,7 @@
 | `BEGIN` / `START TRANSACTION` / `COMMIT` / `ROLLBACK` | ✅ Verified | autocommit、DDL 隐式提交、读己写 |
 | `SAVEPOINT` / `ROLLBACK TO` / `RELEASE` | ✅ Verified | 重名覆盖、1305、自增回滚留洞 |
 | 隔离级别 RU/RC/RR/SERIALIZABLE 常用可见性 | ✅ Verified | |
-| 锁 IS/IX/S/X、行锁、`FOR UPDATE`/`FOR SHARE`/`LOCK IN SHARE MODE`、NOWAIT/3572、SKIP LOCKED、死锁 1213 | ✅ Verified | 完整 next-key/gap、无主键 SKIP LOCKED、多方环成本化受害者 🔴 Deferred |
+| 锁 IS/IX/S/X、行锁、`FOR UPDATE`/`FOR SHARE`/`LOCK IN SHARE MODE`、NOWAIT/3572、SKIP LOCKED、死锁 1213 | ✅ Verified | 主键及单列二级索引 next-key/gap 区间已落地；无主键/复杂 JOIN 逐行 SKIP LOCKED、复合索引精确扫描、多方环成本化受害者 🔴 Deferred |
 | `XA START/BEGIN` / `XA END` / `XA PREPARE` / `XA COMMIT` / `XA ROLLBACK` / `XA RECOVER` | 🔵 Compatible-noop | 本轮新增；映射为单机会话内事务（XA START→开事务，XA COMMIT/ROLLBACK→提交/回滚，XA RECOVER→空）。无两阶段外部协调（分布式 XA 协调 ❌ 明确不支持），符合单机定位 |
 
 ---
