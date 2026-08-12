@@ -35876,6 +35876,43 @@ mod tests {
             .unwrap();
     }
 
+    #[tokio::test]
+    async fn secondary_index_range_locks_block_matching_gap_inserts() {
+        let (_temp, _storage, mut first, mut second) = transaction_backends().await;
+        first
+            .execute(
+                "CREATE TABLE indexed_actors (id BIGINT PRIMARY KEY, value BIGINT, INDEX idx_value (value))",
+            )
+            .await
+            .unwrap();
+        first
+            .execute("INSERT INTO indexed_actors (id,value) VALUES (1,10),(2,20)")
+            .await
+            .unwrap();
+        first.execute("BEGIN").await.unwrap();
+        first
+            .execute("SELECT id FROM indexed_actors WHERE value > 10 FOR UPDATE")
+            .await
+            .unwrap();
+
+        second
+            .execute("INSERT INTO indexed_actors (id,value) VALUES (3,5)")
+            .await
+            .unwrap();
+        let error = second
+            .execute("INSERT INTO indexed_actors (id,value) VALUES (4,30)")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Lock wait timeout"), "{error}");
+
+        first.execute("ROLLBACK").await.unwrap();
+        second
+            .execute("INSERT INTO indexed_actors (id,value) VALUES (4,30)")
+            .await
+            .unwrap();
+    }
+
     fn single_value(outcome: QueryOutcome) -> Vec<u8> {
         match outcome {
             QueryOutcome::Rows { rows, .. } => rows[0][0].clone().unwrap(),
