@@ -138,6 +138,7 @@
 - [x] 事务语句级 CHECK/FK 预校验、级联立即可见、回滚不落 WAL
 - [x] 主键及单列二级索引的等值/范围锁：资源化 next-key/gap 区间、空隙 INSERT 阻塞、事务锁等待与回滚回归
 - [x] READ COMMITTED 锁定读与 UPDATE/DELETE 只锁命中记录、不锁普通 gap；RR/SERIALIZABLE 保留范围锁；主键 gap 插入回归
+- [x] 复合索引全等值记录/间隙锁；无主键表使用稳定行内容+重复序号的隐藏行锁支持基础 `SKIP LOCKED`
 - [x] `mydb-router` 透明 MySQL TCP 入口：连接固定后端，JDBC/Go/Node.js/JetBrains/VS Code/dbx/mysql CLI 共用协议路径
 - [ ] MySQL InnoDB 完整 next-key/gap/意向锁、无主键/复杂 JOIN 的逐行 SKIP LOCKED、多方环与基于回滚成本的受害者选择一致性
 - [ ] 全部隔离级别 anomaly、XA、SAVEPOINT 后锁精确释放、锁升级和大事务边界矩阵

@@ -3760,10 +3760,8 @@ impl Backend {
             }
             return self.apply_transaction_characteristics(scope, characteristics);
         }
-        if variable_scope == SystemVariableScope::Global {
-            if name != "event_scheduler" {
-                anyhow::bail!("Global system variable '{}' is not supported", name);
-            }
+        if variable_scope == SystemVariableScope::Global && name != "event_scheduler" {
+            anyhow::bail!("Global system variable '{}' is not supported", name);
         }
         match name.as_str() {
             "event_scheduler" => {
