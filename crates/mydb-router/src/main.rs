@@ -418,6 +418,11 @@ fn install_service(config: Option<&std::path::Path>) -> Result<()> {
         let config = config
             .map(std::path::Path::to_path_buf)
             .unwrap_or(std::env::current_dir()?.join("router.yaml"));
+        let config = if config.is_absolute() {
+            config
+        } else {
+            std::env::current_dir()?.join(config)
+        };
         let bin_path = format!(
             "\"{}\" --service run --config \"{}\"",
             executable.display(),
