@@ -5,7 +5,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -1828,7 +1828,7 @@ pub struct WireStats {
     // connection so contending sessions observe each other's leases.
     named_locks: parking_lot::Mutex<HashMap<String, u32>>,
     global_transaction_defaults: parking_lot::Mutex<TransactionDefaults>,
-    event_scheduler_disabled: AtomicBool,
+    event_scheduler_state: AtomicU8,
     waits_for: parking_lot::Mutex<HashMap<u32, HashSet<u32>>>,
     pending_transactions:
         parking_lot::Mutex<HashMap<u32, Weak<parking_lot::RwLock<Vec<WriteCommand>>>>>,
@@ -2058,12 +2058,19 @@ pub struct WireStatsSnapshot {
 
 impl WireStats {
     fn event_scheduler_enabled(&self) -> bool {
-        !self.event_scheduler_disabled.load(Ordering::Acquire)
+        self.event_scheduler_state.load(Ordering::Acquire) == 0
     }
 
-    fn set_event_scheduler_enabled(&self, enabled: bool) {
-        self.event_scheduler_disabled
-            .store(!enabled, Ordering::Release);
+    fn event_scheduler_value(&self) -> &'static str {
+        match self.event_scheduler_state.load(Ordering::Acquire) {
+            0 => "ON",
+            1 => "OFF",
+            _ => "DISABLED",
+        }
+    }
+
+    fn set_event_scheduler_value(&self, value: u8) {
+        self.event_scheduler_state.store(value, Ordering::Release);
     }
 
     pub fn snapshot(&self) -> WireStatsSnapshot {
@@ -3478,11 +3485,7 @@ impl Backend {
     fn system_variable_value(&self, name: &str) -> anyhow::Result<Option<Vec<u8>>> {
         let (scope, name) = parse_system_variable_reference(name);
         let value = match name.as_str() {
-            "event_scheduler" => Some(if self.stats.event_scheduler_enabled() {
-                b"ON".to_vec()
-            } else {
-                b"OFF".to_vec()
-            }),
+            "event_scheduler" => Some(self.stats.event_scheduler_value().as_bytes().to_vec()),
             "transaction_isolation" | "tx_isolation" => {
                 let isolation = match scope {
                     SystemVariableScope::Session => self.session_transaction_defaults.isolation,
@@ -3621,10 +3624,13 @@ impl Backend {
                     .as_deref()
                     .ok_or_else(|| anyhow::anyhow!("event_scheduler cannot be NULL"))?;
                 let value = std::str::from_utf8(value)?.trim();
-                let enabled = match value.to_ascii_uppercase().as_str() {
-                    "ON" | "1" | "TRUE" => true,
-                    "OFF" | "0" | "FALSE" => false,
-                    _ => anyhow::bail!("Variable 'event_scheduler' must be set to ON or OFF"),
+                let state = match value.to_ascii_uppercase().as_str() {
+                    "ON" | "1" | "TRUE" => 0,
+                    "OFF" | "0" | "FALSE" => 1,
+                    "DISABLED" => 2,
+                    _ => anyhow::bail!(
+                        "Variable 'event_scheduler' must be set to ON, OFF, or DISABLED"
+                    ),
                 };
                 let user = self
                     .authenticated_user
@@ -3642,7 +3648,7 @@ impl Backend {
                         user
                     );
                 }
-                self.stats.set_event_scheduler_enabled(enabled);
+                self.stats.set_event_scheduler_value(state);
             }
             "autocommit" => {
                 let enabled = mysql_truthy(value.as_deref());
@@ -5642,11 +5648,7 @@ impl Backend {
                 vec![bytes("character_set_server"), bytes("utf8mb4")],
                 vec![
                     bytes("event_scheduler"),
-                    bytes(if self.stats.event_scheduler_enabled() {
-                        "ON"
-                    } else {
-                        "OFF"
-                    }),
+                    bytes(self.stats.event_scheduler_value()),
                 ],
                 vec![
                     bytes("max_error_count"),
@@ -35433,6 +35435,18 @@ mod tests {
         assert_eq!(
             single_value(backend.execute("SELECT @@event_scheduler").await.unwrap()),
             b"OFF"
+        );
+        backend
+            .execute("SET GLOBAL event_scheduler = ON")
+            .await
+            .unwrap();
+        backend
+            .execute("SET GLOBAL event_scheduler = 'DISABLED'")
+            .await
+            .unwrap();
+        assert_eq!(
+            single_value(backend.execute("SELECT @@event_scheduler").await.unwrap()),
+            b"DISABLED"
         );
         backend
             .execute("SET GLOBAL event_scheduler = ON")
