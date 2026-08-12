@@ -5,7 +5,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -1828,6 +1828,7 @@ pub struct WireStats {
     // connection so contending sessions observe each other's leases.
     named_locks: parking_lot::Mutex<HashMap<String, u32>>,
     global_transaction_defaults: parking_lot::Mutex<TransactionDefaults>,
+    event_scheduler_disabled: AtomicBool,
     waits_for: parking_lot::Mutex<HashMap<u32, HashSet<u32>>>,
     pending_transactions:
         parking_lot::Mutex<HashMap<u32, Weak<parking_lot::RwLock<Vec<WriteCommand>>>>>,
@@ -2056,6 +2057,15 @@ pub struct WireStatsSnapshot {
 }
 
 impl WireStats {
+    fn event_scheduler_enabled(&self) -> bool {
+        !self.event_scheduler_disabled.load(Ordering::Acquire)
+    }
+
+    fn set_event_scheduler_enabled(&self, enabled: bool) {
+        self.event_scheduler_disabled
+            .store(!enabled, Ordering::Release);
+    }
+
     pub fn snapshot(&self) -> WireStatsSnapshot {
         WireStatsSnapshot {
             active_connections: self.active_connections.load(Ordering::Relaxed),
@@ -2934,6 +2944,7 @@ impl Backend {
                 Some(b"utf8mb4_0900_ai_ci".to_vec()),
             ),
             ("character_set_server".into(), Some(b"utf8mb4".to_vec())),
+            ("event_scheduler".into(), Some(b"ON".to_vec())),
             ("sql_mode".into(), Some(Vec::new())),
             ("time_zone".into(), Some(b"SYSTEM".to_vec())),
             ("system_time_zone".into(), Some(b"UTC".to_vec())),
@@ -3467,6 +3478,11 @@ impl Backend {
     fn system_variable_value(&self, name: &str) -> anyhow::Result<Option<Vec<u8>>> {
         let (scope, name) = parse_system_variable_reference(name);
         let value = match name.as_str() {
+            "event_scheduler" => Some(if self.stats.event_scheduler_enabled() {
+                b"ON".to_vec()
+            } else {
+                b"OFF".to_vec()
+            }),
             "transaction_isolation" | "tx_isolation" => {
                 let isolation = match scope {
                     SystemVariableScope::Session => self.session_transaction_defaults.isolation,
@@ -3592,9 +3608,42 @@ impl Backend {
             return self.apply_transaction_characteristics(scope, characteristics);
         }
         if variable_scope == SystemVariableScope::Global {
-            anyhow::bail!("Global system variable '{}' is not supported", name);
+            if name != "event_scheduler" {
+                anyhow::bail!("Global system variable '{}' is not supported", name);
+            }
         }
         match name.as_str() {
+            "event_scheduler" => {
+                if variable_scope != SystemVariableScope::Global {
+                    anyhow::bail!("Variable 'event_scheduler' is a GLOBAL variable");
+                }
+                let value = value
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("event_scheduler cannot be NULL"))?;
+                let value = std::str::from_utf8(value)?.trim();
+                let enabled = match value.to_ascii_uppercase().as_str() {
+                    "ON" | "1" | "TRUE" => true,
+                    "OFF" | "0" | "FALSE" => false,
+                    _ => anyhow::bail!("Variable 'event_scheduler' must be set to ON or OFF"),
+                };
+                let user = self
+                    .authenticated_user
+                    .lock()
+                    .clone()
+                    .unwrap_or_else(|| self.config.username.clone());
+                if !self
+                    .config
+                    .auth_catalog
+                    .has_privilege(&user, "", "SYSTEM_VARIABLES_ADMIN")
+                    && !self.config.auth_catalog.has_privilege(&user, "", "SUPER")
+                {
+                    anyhow::bail!(
+                        "Access denied; user '{}' lacks SYSTEM_VARIABLES_ADMIN privilege",
+                        user
+                    );
+                }
+                self.stats.set_event_scheduler_enabled(enabled);
+            }
             "autocommit" => {
                 let enabled = mysql_truthy(value.as_deref());
                 if enabled && !self.autocommit {
@@ -5591,6 +5640,14 @@ impl Backend {
                     bytes(if self.autocommit { "ON" } else { "OFF" }),
                 ],
                 vec![bytes("character_set_server"), bytes("utf8mb4")],
+                vec![
+                    bytes("event_scheduler"),
+                    bytes(if self.stats.event_scheduler_enabled() {
+                        "ON"
+                    } else {
+                        "OFF"
+                    }),
+                ],
                 vec![
                     bytes("max_error_count"),
                     bytes(&self.max_error_count().to_string()),
@@ -26327,8 +26384,10 @@ async fn run_event_scheduler(
     loop {
         tokio::select! {
             _ = ticker.tick() => {
-                if let Err(error) = run_due_events_once_at(&storage, &config, &stats, Utc::now()).await {
-                    tracing::warn!("EVENT scheduler tick failed: {}", error);
+                if stats.event_scheduler_enabled() {
+                    if let Err(error) = run_due_events_once_at(&storage, &config, &stats, Utc::now()).await {
+                        tracing::warn!("EVENT scheduler tick failed: {}", error);
+                    }
                 }
             }
             changed = shutdown.changed() => {
@@ -35349,9 +35408,49 @@ mod tests {
         (temp, storage, first, second)
     }
 
+    #[tokio::test]
+    async fn event_scheduler_system_variable_matches_mysql_scope() {
+        let (_temp, _storage, mut backend, _second) = transaction_backends().await;
+
+        assert_eq!(
+            single_value(backend.execute("SELECT @@event_scheduler").await.unwrap()),
+            b"ON"
+        );
+        assert_eq!(
+            second_value(
+                backend
+                    .execute("SHOW GLOBAL VARIABLES LIKE 'event_scheduler'")
+                    .await
+                    .unwrap()
+            ),
+            b"ON"
+        );
+
+        backend
+            .execute("SET GLOBAL event_scheduler = OFF")
+            .await
+            .unwrap();
+        assert_eq!(
+            single_value(backend.execute("SELECT @@event_scheduler").await.unwrap()),
+            b"OFF"
+        );
+        backend
+            .execute("SET GLOBAL event_scheduler = ON")
+            .await
+            .unwrap();
+    }
+
     fn single_value(outcome: QueryOutcome) -> Vec<u8> {
         match outcome {
             QueryOutcome::Rows { rows, .. } => rows[0][0].clone().unwrap(),
+            QueryOutcome::Ok { .. } => panic!("expected row result"),
+            QueryOutcome::Multiple { .. } => panic!("expected a single row result"),
+        }
+    }
+
+    fn second_value(outcome: QueryOutcome) -> Vec<u8> {
+        match outcome {
+            QueryOutcome::Rows { rows, .. } => rows[0][1].clone().unwrap(),
             QueryOutcome::Ok { .. } => panic!("expected row result"),
             QueryOutcome::Multiple { .. } => panic!("expected a single row result"),
         }
