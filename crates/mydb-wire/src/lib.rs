@@ -14851,10 +14851,10 @@ fn composite_index_range_from_predicate(
             upper_inclusive: true,
         }]);
     }
-    Some(vec![composite_prefix_range(key)])
+    Some(vec![prefix_key_range(key)])
 }
 
-fn composite_prefix_range(prefix: Vec<u8>) -> KeyRange {
+fn prefix_key_range(prefix: Vec<u8>) -> KeyRange {
     let upper = prefix_successor(&prefix);
     KeyRange {
         lower: Some(prefix),
@@ -14928,6 +14928,9 @@ fn key_ranges_from_predicate(predicate: &RowPredicate, column: &str) -> Option<V
                 })
                 .collect(),
         ),
+        RowPredicate::Like(name, pattern) if name.eq_ignore_ascii_case(column) => {
+            like_key_range(pattern)
+        }
         RowPredicate::Between(name, lower, upper) if name.eq_ignore_ascii_case(column) => {
             Some(vec![KeyRange {
                 lower: Some(lower.clone()),
@@ -14958,6 +14961,42 @@ fn key_ranges_from_predicate(predicate: &RowPredicate, column: &str) -> Option<V
         RowPredicate::Never => Some(Vec::new()),
         _ => None,
     }
+}
+
+fn like_key_range(pattern: &[u8]) -> Option<Vec<KeyRange>> {
+    let mut prefix = Vec::new();
+    let mut wildcard = false;
+    let mut index = 0;
+    while index < pattern.len() {
+        match pattern[index] {
+            b'%' | b'_' => {
+                wildcard = true;
+                break;
+            }
+            b'\\' if index + 1 < pattern.len() => {
+                prefix.push(pattern[index + 1]);
+                index += 2;
+            }
+            byte => {
+                prefix.push(byte);
+                index += 1;
+            }
+        }
+    }
+    if prefix.is_empty() {
+        return None;
+    }
+    let range = if wildcard {
+        prefix_key_range(prefix)
+    } else {
+        KeyRange {
+            lower: Some(prefix.clone()),
+            lower_inclusive: true,
+            upper: Some(prefix),
+            upper_inclusive: true,
+        }
+    };
+    Some(vec![range])
 }
 
 fn intersect_key_ranges(left: &[KeyRange], right: &[KeyRange]) -> Option<Vec<KeyRange>> {
@@ -36515,6 +36554,43 @@ mod tests {
         first.execute("ROLLBACK").await.unwrap();
         second
             .execute("INSERT INTO indexed_actors (id,value) VALUES (4,30)")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn secondary_index_like_prefix_locks_only_matching_prefix() {
+        let (_temp, _storage, mut first, mut second) = transaction_backends().await;
+        first
+            .execute(
+                "CREATE TABLE like_index_rows (id BIGINT PRIMARY KEY, value VARCHAR(32), INDEX idx_value (value))",
+            )
+            .await
+            .unwrap();
+        first
+            .execute("INSERT INTO like_index_rows (id,value) VALUES (1,'alpha'),(2,'beta')")
+            .await
+            .unwrap();
+        first.execute("BEGIN").await.unwrap();
+        first
+            .execute("SELECT id FROM like_index_rows WHERE value LIKE 'a%' FOR UPDATE")
+            .await
+            .unwrap();
+
+        second
+            .execute("INSERT INTO like_index_rows (id,value) VALUES (3,'bravo')")
+            .await
+            .unwrap();
+        let error = second
+            .execute("INSERT INTO like_index_rows (id,value) VALUES (4,'atlas')")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Lock wait timeout"), "{error}");
+
+        first.execute("ROLLBACK").await.unwrap();
+        second
+            .execute("INSERT INTO like_index_rows (id,value) VALUES (4,'atlas')")
             .await
             .unwrap();
     }
