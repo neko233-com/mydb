@@ -11810,17 +11810,35 @@ impl Backend {
             (LockMode::IntentionShared, LockMode::Shared)
         };
         if primary_key.is_empty() {
-            let locks = sorted_lock_requests(HashMap::from([
-                (format!("database:{database}"), intent),
-                (format!("table:{database}.{table}"), record),
-            ]));
-            if !self.stats.try_acquire_locks(&locks, self.connection_id) {
-                return Vec::new();
+            let required = limit
+                .map(|(offset, count)| offset.saturating_add(count))
+                .unwrap_or(usize::MAX);
+            let mut locked = Vec::new();
+            let mut duplicate_ordinals = HashMap::<String, usize>::new();
+            for row in rows {
+                let base_key = hidden_row_lock_key(&row);
+                let ordinal = duplicate_ordinals.entry(base_key).or_insert(0);
+                let lock_key = hidden_row_lock_key_with_ordinal(&row, *ordinal);
+                *ordinal += 1;
+                let locks = sorted_lock_requests(HashMap::from([
+                    (format!("database:{database}"), intent),
+                    (format!("table:{database}.{table}"), intent),
+                    (
+                        format!("row:{database}.{table}:HIDDEN:{}", lock_key),
+                        record,
+                    ),
+                ]));
+                if self.stats.try_acquire_locks(&locks, self.connection_id) {
+                    locked.push(row);
+                    if locked.len() >= required {
+                        break;
+                    }
+                }
             }
             return if let Some((offset, count)) = limit {
-                rows.into_iter().skip(offset).take(count).collect()
+                locked.into_iter().skip(offset).take(count).collect()
             } else {
-                rows
+                locked
             };
         }
 
@@ -11999,12 +12017,16 @@ impl Backend {
             anyhow::bail!("NOWAIT and SKIP LOCKED cannot be used together");
         }
         if (for_update || share_mode) && source_rows.is_none() && !skip_locked {
-            let locks = if self.transaction_isolation == TransactionIsolation::ReadCommitted {
+            let locks = if self.transaction_isolation == TransactionIsolation::ReadCommitted
+                || table_primary_key_columns(&schema).is_empty()
+            {
+                let locking_limit =
+                    parse_limit_range(sql).map(|(offset, count)| offset.saturating_add(count));
                 let visible_rows = self.rows_with_local_transaction_overlay(
                     &database,
                     &table,
                     filter.as_ref(),
-                    None,
+                    locking_limit,
                 )?;
                 record_lock_requests(&database, &table, &schema, &visible_rows, for_update)
             } else {
@@ -14208,6 +14230,21 @@ fn write_lock_requests_with_gap_locks(
                         );
                     }
                 }
+                for (index, columns) in composite_index_definitions(&schema) {
+                    if let Some(value) = composite_index_key_from_row(row, &columns) {
+                        let point = KeyRange {
+                            lower: Some(value.clone()),
+                            lower_inclusive: true,
+                            upper: Some(value),
+                            upper_inclusive: true,
+                        };
+                        add_lock_request(
+                            &mut requests,
+                            range_lock_resource(database, table, &index, &point),
+                            LockMode::Exclusive,
+                        );
+                    }
+                }
             }
             WriteCommand::ReplaceRows {
                 database, table, ..
@@ -14407,7 +14444,26 @@ fn add_record_locks(
         },
     );
     if primary_key.is_empty() {
-        add_lock_request(requests, format!("table:{database}.{table}"), record);
+        add_lock_request(
+            requests,
+            format!("table:{database}.{table}"),
+            match record {
+                LockMode::Shared | LockMode::IntentionShared => LockMode::IntentionShared,
+                _ => LockMode::IntentionExclusive,
+            },
+        );
+        let mut duplicate_ordinals = HashMap::<String, usize>::new();
+        for row in rows {
+            let base_key = hidden_row_lock_key(row);
+            let ordinal = duplicate_ordinals.entry(base_key).or_insert(0);
+            let lock_key = hidden_row_lock_key_with_ordinal(row, *ordinal);
+            *ordinal += 1;
+            add_lock_request(
+                requests,
+                format!("row:{database}.{table}:HIDDEN:{lock_key}"),
+                record,
+            );
+        }
         return;
     }
     add_lock_request(
@@ -14574,33 +14630,90 @@ fn predicate_index_ranges(
     schema: &TableSchema,
 ) -> Option<Vec<(String, Vec<KeyRange>)>> {
     let filter = filter?;
-    let ranges = single_column_index_definitions(schema)
+    let ranges = all_index_definitions(schema)
         .into_iter()
-        .filter_map(|(index, column)| {
-            key_ranges_from_predicate(filter, &column).map(|ranges| (index, ranges))
+        .filter_map(|(index, columns)| {
+            let ranges = if columns.len() == 1 {
+                key_ranges_from_predicate(filter, &columns[0])
+            } else {
+                composite_index_range_from_predicate(filter, &columns)
+            }?;
+            Some((index, ranges))
         })
         .filter(|(_, ranges)| !ranges.is_empty())
         .collect::<Vec<_>>();
     (!ranges.is_empty()).then_some(ranges)
 }
 
-fn single_column_index_definitions(schema: &TableSchema) -> Vec<(String, String)> {
+fn all_index_definitions(schema: &TableSchema) -> Vec<(String, Vec<String>)> {
+    let primary = table_primary_key_columns(schema);
     let mut definitions = Vec::new();
-    let primary = schema.primary_key.clone().unwrap_or_else(|| {
-        schema
-            .columns
-            .iter()
-            .filter(|column| column.is_primary_key)
-            .map(|column| column.name.clone())
-            .collect()
-    });
-    if primary.len() == 1 {
-        definitions.push(("PRIMARY".to_string(), primary[0].clone()));
+    if !primary.is_empty() {
+        definitions.push(("PRIMARY".to_string(), primary));
     }
-    definitions.extend(schema.indexes.iter().filter_map(|index| {
-        (index.columns.len() == 1).then(|| (index.name.clone(), index.columns[0].clone()))
-    }));
+    definitions.extend(
+        schema
+            .indexes
+            .iter()
+            .filter(|index| index.name != "PRIMARY")
+            .map(|index| (index.name.clone(), index.columns.clone())),
+    );
     definitions
+}
+
+fn single_column_index_definitions(schema: &TableSchema) -> Vec<(String, String)> {
+    all_index_definitions(schema)
+        .into_iter()
+        .filter_map(|(index, columns)| (columns.len() == 1).then(|| (index, columns[0].clone())))
+        .collect()
+}
+
+fn composite_index_definitions(schema: &TableSchema) -> Vec<(String, Vec<String>)> {
+    all_index_definitions(schema)
+        .into_iter()
+        .filter(|(_, columns)| columns.len() > 1)
+        .collect()
+}
+
+fn composite_index_key_from_row(row: &Row, columns: &[String]) -> Option<Vec<u8>> {
+    let mut values = Vec::with_capacity(columns.len());
+    for column in columns {
+        if row.is_null(column) {
+            return None;
+        }
+        values.push(row.get(column)?.to_vec());
+    }
+    Some(encode_composite_lock_key(&values))
+}
+
+fn encode_composite_lock_key(values: &[Vec<u8>]) -> Vec<u8> {
+    let mut key = Vec::new();
+    for value in values {
+        key.extend_from_slice(&(value.len() as u32).to_be_bytes());
+        key.extend_from_slice(value);
+    }
+    key
+}
+
+fn composite_index_range_from_predicate(
+    predicate: &RowPredicate,
+    columns: &[String],
+) -> Option<Vec<KeyRange>> {
+    let mut equalities = HashMap::new();
+    if !collect_predicate_equalities(predicate, &mut equalities) {
+        return None;
+    }
+    let values = columns
+        .iter()
+        .map(|column| equalities.get(column).cloned())
+        .collect::<Option<Vec<_>>>()?;
+    let key = encode_composite_lock_key(&values);
+    Some(vec![KeyRange {
+        lower: Some(key.clone()),
+        lower_inclusive: true,
+        upper: Some(key),
+        upper_inclusive: true,
+    }])
 }
 
 fn key_ranges_from_predicate(predicate: &RowPredicate, column: &str) -> Option<Vec<KeyRange>> {
@@ -14858,6 +14971,39 @@ fn row_lock_key(row: &Row, columns: &[String]) -> Option<String> {
         hasher.update(value);
     }
     Some(hex_bytes(&hasher.finalize()))
+}
+
+fn hidden_row_lock_key(row: &Row) -> String {
+    let mut columns = row
+        .values
+        .iter()
+        .filter(|(column, _)| !column.contains('.'))
+        .map(|(column, value)| {
+            (
+                column.to_ascii_lowercase(),
+                row.is_null(column),
+                value.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    columns.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut hasher = Sha256::new();
+    for (column, is_null, value) in columns {
+        hasher.update((column.len() as u32).to_le_bytes());
+        hasher.update(column.as_bytes());
+        hasher.update([u8::from(is_null)]);
+        hasher.update((value.len() as u32).to_le_bytes());
+        hasher.update(value);
+    }
+    hex_bytes(&hasher.finalize())
+}
+
+fn hidden_row_lock_key_with_ordinal(row: &Row, ordinal: usize) -> String {
+    let base = hidden_row_lock_key(row);
+    let mut hasher = Sha256::new();
+    hasher.update(base.as_bytes());
+    hasher.update((ordinal as u64).to_le_bytes());
+    hex_bytes(&hasher.finalize())
 }
 
 fn predicate_primary_key(filter: Option<&RowPredicate>, schema: &TableSchema) -> Option<String> {
@@ -36153,6 +36299,75 @@ mod tests {
             .execute("INSERT INTO indexed_actors (id,value) VALUES (4,30)")
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn composite_index_equality_locks_block_matching_gap_inserts() {
+        let (_temp, _storage, mut first, mut second) = transaction_backends().await;
+        first
+            .execute(
+                "CREATE TABLE composite_actors (id BIGINT PRIMARY KEY, kind BIGINT, shard BIGINT, INDEX idx_kind_shard (kind,shard))",
+            )
+            .await
+            .unwrap();
+        first
+            .execute("INSERT INTO composite_actors (id,kind,shard) VALUES (1,1,1),(2,1,2)")
+            .await
+            .unwrap();
+        first.execute("BEGIN").await.unwrap();
+        first
+            .execute("SELECT id FROM composite_actors WHERE kind=1 AND shard=2 FOR UPDATE")
+            .await
+            .unwrap();
+
+        let error = second
+            .execute("INSERT INTO composite_actors (id,kind,shard) VALUES (3,1,2)")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Lock wait timeout"), "{error}");
+
+        second
+            .execute("INSERT INTO composite_actors (id,kind,shard) VALUES (4,1,3)")
+            .await
+            .unwrap();
+        first.execute("ROLLBACK").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn no_primary_key_skip_locked_uses_hidden_row_locks() {
+        let (_temp, _storage, mut first, mut second) = transaction_backends().await;
+        first
+            .execute("CREATE TABLE keyless_queue (value BIGINT, payload VARCHAR(16))")
+            .await
+            .unwrap();
+        first
+            .execute("INSERT INTO keyless_queue VALUES (1,'first'),(2,'second')")
+            .await
+            .unwrap();
+
+        first.execute("BEGIN").await.unwrap();
+        assert_eq!(
+            single_value(
+                first
+                    .execute("SELECT value FROM keyless_queue WHERE value>=1 ORDER BY value LIMIT 1 FOR UPDATE")
+                    .await
+                    .unwrap()
+            ),
+            b"1"
+        );
+        second.execute("BEGIN").await.unwrap();
+        assert_eq!(
+            single_value(
+                second
+                    .execute("SELECT value FROM keyless_queue WHERE value>=1 ORDER BY value LIMIT 1 FOR UPDATE SKIP LOCKED")
+                    .await
+                    .unwrap()
+            ),
+            b"2"
+        );
+        first.execute("ROLLBACK").await.unwrap();
+        second.execute("ROLLBACK").await.unwrap();
     }
 
     fn single_value(outcome: QueryOutcome) -> Vec<u8> {
