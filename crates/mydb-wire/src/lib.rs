@@ -14120,22 +14120,20 @@ fn write_lock_requests(
                             LockMode::Exclusive,
                         );
                     }
-                    if key_name == "PRIMARY" && columns.len() == 1 {
-                        if let Some(value) =
-                            row.get(&columns[0]).filter(|_| !row.is_null(&columns[0]))
-                        {
-                            let point = KeyRange {
-                                lower: Some(value.to_vec()),
-                                lower_inclusive: true,
-                                upper: Some(value.to_vec()),
-                                upper_inclusive: true,
-                            };
-                            add_lock_request(
-                                &mut requests,
-                                range_lock_resource(database, table, "PRIMARY", &point),
-                                LockMode::Exclusive,
-                            );
-                        }
+                }
+                for (index, column) in single_column_index_definitions(&schema) {
+                    if let Some(value) = row.get(&column).filter(|_| !row.is_null(&column)) {
+                        let point = KeyRange {
+                            lower: Some(value.to_vec()),
+                            lower_inclusive: true,
+                            upper: Some(value.to_vec()),
+                            upper_inclusive: true,
+                        };
+                        add_lock_request(
+                            &mut requests,
+                            range_lock_resource(database, table, &index, &point),
+                            LockMode::Exclusive,
+                        );
                     }
                 }
             }
@@ -14313,30 +14311,34 @@ fn add_mutation_locks(
                 format!("row:{database}.{table}:PRIMARY:{key}"),
                 LockMode::Exclusive,
             );
-            if let Some(ranges) = primary_key_ranges(filter, schema) {
-                for range in ranges {
-                    add_lock_request(
-                        requests,
-                        range_lock_resource(database, table, "PRIMARY", &range),
-                        LockMode::Exclusive,
-                    );
+            if let Some(index_ranges) = predicate_index_ranges(filter, schema) {
+                for (index, ranges) in index_ranges {
+                    for range in ranges {
+                        add_lock_request(
+                            requests,
+                            range_lock_resource(database, table, &index, &range),
+                            LockMode::Exclusive,
+                        );
+                    }
                 }
             }
             return;
         }
     }
-    if let Some(ranges) = primary_key_ranges(filter, schema) {
+    if let Some(index_ranges) = predicate_index_ranges(filter, schema) {
         add_lock_request(
             requests,
             format!("table:{database}.{table}"),
             LockMode::IntentionExclusive,
         );
-        for range in ranges {
-            add_lock_request(
-                requests,
-                range_lock_resource(database, table, "PRIMARY", &range),
-                LockMode::Exclusive,
-            );
+        for (index, ranges) in index_ranges {
+            for range in ranges {
+                add_lock_request(
+                    requests,
+                    range_lock_resource(database, table, &index, &range),
+                    LockMode::Exclusive,
+                );
+            }
         }
         return;
     }
@@ -14364,14 +14366,16 @@ fn read_lock_requests(
         (LockMode::IntentionShared, LockMode::Shared)
     };
     add_lock_request(&mut requests, format!("database:{database}"), intent);
-    if let Some(ranges) = primary_key_ranges(filter, schema) {
+    if let Some(index_ranges) = predicate_index_ranges(filter, schema) {
         add_lock_request(&mut requests, format!("table:{database}.{table}"), intent);
-        for range in ranges {
-            add_lock_request(
-                &mut requests,
-                range_lock_resource(database, table, "PRIMARY", &range),
-                record,
-            );
+        for (index, ranges) in index_ranges {
+            for range in ranges {
+                add_lock_request(
+                    &mut requests,
+                    range_lock_resource(database, table, &index, &range),
+                    record,
+                );
+            }
         }
         if let Some(key) = predicate_primary_key(filter, schema) {
             add_lock_request(
@@ -14405,15 +14409,38 @@ fn range_lock_resource(database: &str, table: &str, index: &str, range: &KeyRang
     )
 }
 
-fn primary_key_ranges(
+fn predicate_index_ranges(
     filter: Option<&RowPredicate>,
     schema: &TableSchema,
-) -> Option<Vec<KeyRange>> {
-    let primary = schema.primary_key.as_ref()?;
-    if primary.len() != 1 {
-        return None;
+) -> Option<Vec<(String, Vec<KeyRange>)>> {
+    let filter = filter?;
+    let ranges = single_column_index_definitions(schema)
+        .into_iter()
+        .filter_map(|(index, column)| {
+            key_ranges_from_predicate(filter, &column).map(|ranges| (index, ranges))
+        })
+        .filter(|(_, ranges)| !ranges.is_empty())
+        .collect::<Vec<_>>();
+    (!ranges.is_empty()).then_some(ranges)
+}
+
+fn single_column_index_definitions(schema: &TableSchema) -> Vec<(String, String)> {
+    let mut definitions = Vec::new();
+    let primary = schema.primary_key.clone().unwrap_or_else(|| {
+        schema
+            .columns
+            .iter()
+            .filter(|column| column.is_primary_key)
+            .map(|column| column.name.clone())
+            .collect()
+    });
+    if primary.len() == 1 {
+        definitions.push(("PRIMARY".to_string(), primary[0].clone()));
     }
-    key_ranges_from_predicate(filter?, &primary[0])
+    definitions.extend(schema.indexes.iter().filter_map(|index| {
+        (index.columns.len() == 1).then(|| (index.name.clone(), index.columns[0].clone()))
+    }));
+    definitions
 }
 
 fn key_ranges_from_predicate(predicate: &RowPredicate, column: &str) -> Option<Vec<KeyRange>> {
