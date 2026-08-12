@@ -2850,6 +2850,7 @@ struct Backend {
     session_transaction_defaults: TransactionDefaults,
     next_transaction_characteristics: TransactionCharacteristics,
     transaction_snapshot: HashMap<(String, String), Vec<Row>>,
+    transaction_snapshot_ready: bool,
     lock_wait_timeout: std::time::Duration,
     foreign_key_checks: bool,
     prepared: HashMap<u32, String>,
@@ -3127,6 +3128,7 @@ impl Backend {
             session_transaction_defaults: transaction_defaults,
             next_transaction_characteristics: TransactionCharacteristics::default(),
             transaction_snapshot: HashMap::new(),
+            transaction_snapshot_ready: false,
             lock_wait_timeout,
             foreign_key_checks: true,
             prepared: HashMap::new(),
@@ -3160,7 +3162,7 @@ impl Backend {
 
     async fn reset_connection(&mut self) -> anyhow::Result<()> {
         self.transaction_writes.write().clear();
-        self.transaction_snapshot.clear();
+        self.clear_transaction_snapshot();
         self.savepoints.clear();
         self.stats.release_all_locks(self.connection_id);
         self.stats.release_explicit_table_locks(self.connection_id);
@@ -3317,7 +3319,7 @@ impl Backend {
                 .starts_with("Deadlock found when trying to get lock")
         }) {
             self.transaction_writes.write().clear();
-            self.transaction_snapshot.clear();
+            self.clear_transaction_snapshot();
             self.savepoints.clear();
             self.stats.release_all_locks(self.connection_id);
             self.in_transaction = false;
@@ -3575,6 +3577,35 @@ impl Backend {
         self.session_error_count = 0;
     }
 
+    fn clear_transaction_snapshot(&mut self) {
+        self.transaction_snapshot.clear();
+        self.transaction_snapshot_ready = false;
+    }
+
+    fn capture_transaction_snapshot(&mut self) -> anyhow::Result<()> {
+        if self.transaction_snapshot_ready {
+            return Ok(());
+        }
+        let mut snapshot = HashMap::new();
+        for database_name in self.storage.list_databases() {
+            let Some(database) = self.storage.get_database(&database_name) else {
+                continue;
+            };
+            for table_name in database.list_tables() {
+                if database.is_memory_table(&table_name) {
+                    continue;
+                }
+                snapshot.insert(
+                    (database_name.clone(), table_name.clone()),
+                    database.scan_table(&table_name)?,
+                );
+            }
+        }
+        self.transaction_snapshot = snapshot;
+        self.transaction_snapshot_ready = true;
+        Ok(())
+    }
+
     fn record_warning(&mut self, warning: SqlWarning) {
         if warning.level == "Note" && !self.sql_notes_enabled() {
             return;
@@ -3769,7 +3800,7 @@ impl Backend {
                     if !writes.is_empty() {
                         self.storage.execute_prepared_batch(writes).await?;
                     }
-                    self.transaction_snapshot.clear();
+                    self.clear_transaction_snapshot();
                     self.savepoints.clear();
                     self.stats.release_all_locks(self.connection_id);
                     self.autocommit = true;
@@ -3779,7 +3810,7 @@ impl Backend {
                     self.savepoints.clear();
                     self.autocommit = false;
                     self.in_transaction = true;
-                    self.transaction_snapshot.clear();
+                    self.clear_transaction_snapshot();
                     self.activate_transaction_defaults(None);
                 }
             }
@@ -4217,7 +4248,7 @@ impl Backend {
         let writes_len = self.transaction_writes.read().len();
         if started_transaction {
             self.in_transaction = true;
-            self.transaction_snapshot.clear();
+            self.clear_transaction_snapshot();
         }
         self.procedure_depth += 1;
         locals.push_scope();
@@ -4244,7 +4275,7 @@ impl Backend {
             Err(error) => {
                 self.transaction_writes.write().truncate(writes_len);
                 if started_transaction {
-                    self.transaction_snapshot.clear();
+                    self.clear_transaction_snapshot();
                     self.stats.release_all_locks(self.connection_id);
                     self.in_transaction = false;
                 }
@@ -4256,7 +4287,7 @@ impl Backend {
         } else if let Some(control) = control {
             self.transaction_writes.write().truncate(writes_len);
             if started_transaction {
-                self.transaction_snapshot.clear();
+                self.clear_transaction_snapshot();
                 self.stats.release_all_locks(self.connection_id);
                 self.in_transaction = false;
             }
@@ -5188,14 +5219,18 @@ impl Backend {
             } else {
                 None
             };
+            let consistent_snapshot = upper.contains("WITH CONSISTENT SNAPSHOT");
             self.commit_pending().await?;
             // START TRANSACTION implicitly releases table locks acquired with
             // LOCK TABLES, while COMMIT and ROLLBACK themselves do not.
             self.clear_explicit_table_locks();
-            self.transaction_snapshot.clear();
+            self.clear_transaction_snapshot();
             self.savepoints.clear();
             self.in_transaction = true;
             self.activate_transaction_defaults(access_mode);
+            if consistent_snapshot {
+                self.capture_transaction_snapshot()?;
+            }
             if _prof {
                 eprintln!("PROFILE START {}us", _prof_t0.elapsed().as_micros());
             }
@@ -5211,7 +5246,7 @@ impl Backend {
         }
         if upper == "ROLLBACK" {
             self.transaction_writes.write().clear();
-            self.transaction_snapshot.clear();
+            self.clear_transaction_snapshot();
             self.savepoints.clear();
             self.stats.release_all_locks(self.connection_id);
             self.in_transaction = false;
@@ -7042,7 +7077,7 @@ impl Backend {
         if let Some(xid) = upper.strip_prefix("ROLLBACK ") {
             let _ = xid;
             self.transaction_writes.write().clear();
-            self.transaction_snapshot.clear();
+            self.clear_transaction_snapshot();
             self.savepoints.clear();
             self.stats.release_all_locks(self.connection_id);
             self.in_transaction = false;
@@ -7051,7 +7086,7 @@ impl Backend {
         }
         if upper == "ROLLBACK" {
             self.transaction_writes.write().clear();
-            self.transaction_snapshot.clear();
+            self.clear_transaction_snapshot();
             self.savepoints.clear();
             self.stats.release_all_locks(self.connection_id);
             self.in_transaction = false;
@@ -7073,7 +7108,7 @@ impl Backend {
         // compatibility but a single-node engine has no external coordinator.
         self.commit_pending().await?;
         self.clear_explicit_table_locks();
-        self.transaction_snapshot.clear();
+        self.clear_transaction_snapshot();
         self.savepoints.clear();
         self.in_transaction = true;
         self.activate_transaction_defaults(None);
@@ -10712,7 +10747,7 @@ impl Backend {
                 .await
                 .map(|result| result.affected_rows)
         };
-        self.transaction_snapshot.clear();
+        self.clear_transaction_snapshot();
         self.savepoints.clear();
         self.stats.release_all_locks(self.connection_id);
         self.reset_transaction_characteristics();
@@ -13734,10 +13769,7 @@ impl Backend {
         }
         let mut rows = if snapshot_isolation {
             let key = (database.to_string(), table.to_string());
-            if !self.transaction_snapshot.contains_key(&key) {
-                let rows = self.storage.scan_table(database, table)?;
-                self.transaction_snapshot.insert(key.clone(), rows);
-            }
+            self.capture_transaction_snapshot()?;
             self.transaction_snapshot
                 .get(&key)
                 .cloned()
@@ -13906,7 +13938,7 @@ impl Drop for Backend {
             }
         }
         self.stats.unregister_transaction_buffer(self.connection_id);
-        self.transaction_snapshot.clear();
+        self.clear_transaction_snapshot();
         self.stats.release_all_locks(self.connection_id);
         self.stats.release_explicit_table_locks(self.connection_id);
         self.stats.release_all_named_locks(self.connection_id);
@@ -26992,7 +27024,7 @@ async fn execute_scheduled_event(
         }
         Err(body_error) => {
             backend.transaction_writes.write().clear();
-            backend.transaction_snapshot.clear();
+            backend.clear_transaction_snapshot();
             backend.savepoints.clear();
             backend.transaction_writes.write().push(finish);
             match backend.commit_pending().await {
@@ -35874,6 +35906,38 @@ mod tests {
             .execute("INSERT INTO actors (id,value) VALUES (30,300)")
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn consistent_snapshot_is_transaction_wide_and_captures_at_start() {
+        let (_temp, _storage, mut first, mut second) = transaction_backends().await;
+        first
+            .execute("CREATE TABLE other_actors (id BIGINT PRIMARY KEY, value BIGINT)")
+            .await
+            .unwrap();
+        first
+            .execute("INSERT INTO other_actors (id,value) VALUES (1,10)")
+            .await
+            .unwrap();
+
+        first
+            .execute("START TRANSACTION WITH CONSISTENT SNAPSHOT")
+            .await
+            .unwrap();
+        second
+            .execute("UPDATE other_actors SET value=20 WHERE id=1")
+            .await
+            .unwrap();
+        assert_eq!(
+            single_value(
+                first
+                    .execute("SELECT value FROM other_actors WHERE id=1")
+                    .await
+                    .unwrap()
+            ),
+            b"10"
+        );
+        first.execute("ROLLBACK").await.unwrap();
     }
 
     #[tokio::test]
