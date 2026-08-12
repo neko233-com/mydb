@@ -141,7 +141,7 @@
 - [x] 主键及单列二级索引的等值/范围锁：资源化 next-key/gap 区间、空隙 INSERT 阻塞、事务锁等待与回滚回归
 - [x] READ COMMITTED 锁定读与 UPDATE/DELETE 只锁命中记录、不锁普通 gap；RR/SERIALIZABLE 保留范围锁；主键 gap 插入回归
 - [x] 二级索引插入意向锁：同一非唯一索引值的不同记录可并发插入，但仍受 next-key/gap X 锁阻塞
-- [x] 复合索引全等值记录/间隙锁；无主键表使用稳定行内容+重复序号的隐藏行锁支持基础 `SKIP LOCKED`
+- [x] 复合索引全等值与左前缀范围记录/间隙锁；无主键表使用稳定行内容+重复序号的隐藏行锁支持基础 `SKIP LOCKED`
 - [x] 基础 MDL：普通读持有 statement-duration metadata shared，DML 持有兼容的 metadata intention，DDL 通过 metadata X 锁等待并参与超时/死锁路径
 - [x] `mydb-router` 透明 MySQL TCP 入口：连接固定后端，JDBC/Go/Node.js/JetBrains/VS Code/dbx/mysql CLI 共用协议路径
 - [x] `mydb-router` Windows `MyDBRouter` 自动服务、13306 防火墙入口、IPv6 地址格式化、建立连接时后端回退；真实 MyDB 后端链路 CLI/JDBC/Go 均通过
