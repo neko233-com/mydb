@@ -1,6 +1,6 @@
-# MyDB MySQL 8 语法矩阵（验收基线）
+# MyDB MySQL 8.4 语法矩阵（验收基线）
 
-> 本文档是 [`CheckList.md`](CheckList.md) 的**全量语法对照基线**：逐条枚举 MySQL 8.0 对外暴露的 SQL 表面，标注 MyDB 当前实现状态。状态以**源码实测**为准（检索 `crates/mydb-wire/src/lib.rs`、`crates/mydb-storage/src/lib.rs`、`vendor/opensrv-mysql`），不是目标描述。
+> 本文档是 [`CheckList.md`](CheckList.md) 的**全量语法对照基线**：逐条枚举 MySQL 8.4 对外暴露的 SQL 表面，标注 MyDB 当前实现状态。状态以**源码实测**为准（检索 `crates/mydb-wire/src/lib.rs`、`crates/mydb-storage/src/lib.rs`、`vendor/opensrv-mysql`），不是目标描述。
 >
 > 定位：MyDB 目标是替代 MySQL 8.x 的单机部署，暴露 MySQL 的协议、形式、语法和可见行为。兼容性以源码与同机差分实测为准；InnoDB 语义不因 `ENGINE=InnoDB` 名称映射而自动视为完成。`mydb-router` 是透明 MySQL TCP 入口，连接固定后端，适用于 JDBC、Go、Node.js/TypeScript、JetBrains、VS Code、dbx 和 mysql CLI。
 >

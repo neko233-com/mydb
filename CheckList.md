@@ -143,6 +143,7 @@
 - [x] 二级索引插入意向锁：同一非唯一索引值的不同记录可并发插入，但仍受 next-key/gap X 锁阻塞
 - [x] 复合索引全等值记录/间隙锁；无主键表使用稳定行内容+重复序号的隐藏行锁支持基础 `SKIP LOCKED`
 - [x] `mydb-router` 透明 MySQL TCP 入口：连接固定后端，JDBC/Go/Node.js/JetBrains/VS Code/dbx/mysql CLI 共用协议路径
+- [x] `mydb-router` Windows `MyDBRouter` 自动服务、13306 防火墙入口、IPv6 地址格式化、建立连接时后端回退；真实 MyDB 后端链路 CLI/JDBC/Go 均通过
 - [ ] MySQL InnoDB 完整 next-key/gap/意向锁、MDL、无主键/复杂 JOIN 的逐行 SKIP LOCKED、多方环与基于回滚成本的受害者选择一致性
 - [ ] 全部隔离级别 anomaly、XA、SAVEPOINT 后锁精确释放、锁升级和大事务边界矩阵
 

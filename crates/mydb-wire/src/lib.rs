@@ -42,7 +42,7 @@ use mydb_storage::{
     TriggerEvent, TriggerTiming, UpdateValueExpression, WriteCommand,
 };
 
-pub const SERVER_VERSION: &str = "8.0.36-mydb-0.1.0";
+pub const SERVER_VERSION: &str = "8.4.0-mydb-0.1.0";
 const MAX_SCALAR_RESULT_BYTES: usize = 64 * 1024 * 1024;
 const REGEX_CACHE_CAPACITY: usize = 256;
 const READ_ONLY_TRANSACTION_ERROR: &str = "Cannot execute statement in a READ ONLY transaction.";
@@ -3087,6 +3087,15 @@ impl Backend {
                 Some(b"/var/run/mysqld/mysqld.sock".to_vec()),
             ),
             ("version_comment".into(), Some(b"MyDB".to_vec())),
+            ("version_id".into(), Some(b"80400".to_vec())),
+            (
+                "version_compile_os".into(),
+                Some(std::env::consts::OS.as_bytes().to_vec()),
+            ),
+            (
+                "version_compile_machine".into(),
+                Some(std::env::consts::ARCH.as_bytes().to_vec()),
+            ),
             ("license".into(), Some(b"GPL".to_vec())),
             ("auto_increment_increment".into(), Some(b"1".to_vec())),
             ("auto_increment_offset".into(), Some(b"1".to_vec())),
@@ -3671,7 +3680,10 @@ impl Backend {
                 Some(if read_only { b"1" } else { b"0" }.to_vec())
             }
             "version" => Some(SERVER_VERSION.as_bytes().to_vec()),
+            "version_id" => Some(b"80400".to_vec()),
             "version_comment" => Some(b"MyDB Server (Neko233 engine)".to_vec()),
+            "version_compile_os" => Some(std::env::consts::OS.as_bytes().to_vec()),
+            "version_compile_machine" => Some(std::env::consts::ARCH.as_bytes().to_vec()),
             "default_storage_engine" | "storage_engine" => Some(b"InnoDB".to_vec()),
             "port" => Some(b"3306".to_vec()),
             "autocommit" => Some(if self.autocommit { b"1" } else { b"0" }.to_vec()),

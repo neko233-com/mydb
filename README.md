@@ -6,11 +6,11 @@
 [![Rust](https://img.shields.io/badge/rust-1.75+-orange.svg)](https://www.rust-lang.org/)
 [![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)]()
 
-**单机高性能数据库 · MySQL 8.x 协议兼容 · MySQL 替代目标**
+**单机高性能数据库 · MySQL 8.4 协议兼容目标 · MySQL 替代目标**
 
 </div>
 
-MyDB 是一款用 Rust 编写的单机高性能数据库，目标是替代 MySQL 8.x 的常用单机部署。它以 MySQL 协议暴露接口，JDBC、Go、Node.js/TypeScript、JetBrains、VS Code、dbx 和标准 MySQL 客户端均走同一协议入口；内部采用自研 Neko233 Leader/Follower 组提交、Group Commit、WAL 与 Copy-on-Write 存储内核。
+MyDB 是一款用 Rust 编写的单机高性能数据库，目标是替代 MySQL 8.4 的常用单机部署。它以 MySQL 协议暴露接口，JDBC、Go、Node.js/TypeScript、JetBrains、VS Code、dbx 和标准 MySQL 客户端均走同一协议入口；内部采用自研 Neko233 Leader/Follower 组提交、Group Commit、WAL 与 Copy-on-Write 存储内核。
 
 > **设计边界**：MyDB 是**单机数据库**，复制拓扑、读写分离、分布式 XA 协调等非单机能力**设计上不支持**。
 
@@ -266,6 +266,17 @@ cargo run --release -p mydb-router -- --config configs/router.yaml
 `mydb-router` 不改写 MySQL 握手、TLS、预编译协议或 SQL，因此 JDBC、Go `database/sql`、
 `mysql2`、DataGrip、VS Code、dbx 等客户端无需专用适配器。多后端配置只适合后端本身已有
 复制/一致性策略；事务不会在多个后端之间拆分。
+
+Windows 安装包的 `-Component all` 会同时安装 `MyDBRouter` 自动服务，并开放 TCP 13306；
+单独部署 router 时可执行：
+
+```powershell
+.\mydb-router.exe --service install --config C:\Server\mydb\mydb-server\router.yaml
+sc.exe start MyDBRouter
+```
+
+router 只在建立连接时选择后端，之后整条 TCP 会话固定到该后端，保证事务、prepared
+statement、临时表和连接级变量不会被拆到不同实例。后端不可用时会在建立连接阶段按权重顺序回退。
 
 ---
 

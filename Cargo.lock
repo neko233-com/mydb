@@ -1452,6 +1452,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "windows-service",
 ]
 
 [[package]]
