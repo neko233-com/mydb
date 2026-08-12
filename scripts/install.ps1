@@ -14,10 +14,11 @@
     .\install.ps1 -Version v0.1.0
     .\install.ps1 -NoService -NoRemoteFirewall
     .\install.ps1 -Component server -InstallDir C:\Server\mydb\mydb-server
+    .\install.ps1 -Component router -NoService
 #>
 
 param(
-    [ValidateSet("server", "cli", "migrate", "dump", "all")]
+    [ValidateSet("server", "cli", "router", "migrate", "dump", "all")]
     [string]$Component = "all",
 
     [string]$Version = "latest",
@@ -227,6 +228,27 @@ function Ensure-Path {
     }
 }
 
+function Ensure-RouterConfig {
+    $routerConfig = Join-Path $InstallDir "router.yaml"
+    if (Test-Path -LiteralPath $routerConfig) {
+        Write-Info "Keeping existing router config: $routerConfig"
+        return
+    }
+    @"
+# Transparent MySQL wire router; each TCP session stays on one backend.
+listen_host: "0.0.0.0"
+listen_port: 13306
+connect_timeout_ms: 2000
+max_connections: 4096
+tcp_nodelay: true
+backends:
+  - host: "127.0.0.1"
+    port: 3306
+    weight: 1
+"@ | Set-Content -LiteralPath $routerConfig -Encoding UTF8
+    Write-Success "Router config created: $routerConfig"
+}
+
 function Ensure-Firewall {
     if ($NoRemoteFirewall) { return }
     if (-not (Get-Command New-NetFirewallRule -ErrorAction SilentlyContinue)) {
@@ -272,9 +294,10 @@ function Main {
     $binaries = switch ($Component) {
         "server" { @("mydb-server.exe") }
         "cli" { @("mydb-cli.exe") }
+        "router" { @("mydb-router.exe") }
         "migrate" { @("mydb-migrate.exe") }
         "dump" { @("mydbdump.exe") }
-        default { @("mydb-server.exe", "mydb-cli.exe", "mydb-migrate.exe", "mydbdump.exe") }
+        default { @("mydb-server.exe", "mydb-cli.exe", "mydb-router.exe", "mydb-migrate.exe", "mydbdump.exe") }
     }
 
     if ($binaries -contains "mydb-server.exe") {
@@ -282,6 +305,9 @@ function Main {
     }
     Install-Binaries -Names $binaries
     Ensure-Config
+    if ($binaries -contains "mydb-router.exe") {
+        Ensure-RouterConfig
+    }
     Ensure-Path
 
     if (($binaries -contains "mydb-server.exe") -and -not $NoService) {

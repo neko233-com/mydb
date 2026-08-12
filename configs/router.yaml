@@ -1,0 +1,13 @@
+# Transparent MySQL wire router. Every TCP client (JDBC, Go, Node.js,
+# VS Code extensions, DataGrip, dbx, mysql CLI) keeps one backend for its
+# entire session, so transactions and prepared statements remain safe.
+listen_host: "0.0.0.0"
+listen_port: 13306
+connect_timeout_ms: 2000
+max_connections: 4096
+tcp_nodelay: true
+
+backends:
+  - host: "127.0.0.1"
+    port: 3306
+    weight: 1

@@ -3571,6 +3571,13 @@ impl Backend {
             .any(|mode| mode.trim().eq_ignore_ascii_case("TIME_TRUNCATE_FRACTIONAL"))
     }
 
+    fn gap_locks_enabled(&self) -> bool {
+        matches!(
+            self.transaction_isolation,
+            TransactionIsolation::RepeatableRead | TransactionIsolation::Serializable
+        )
+    }
+
     fn clear_statement_messages(&mut self) {
         self.warnings.clear();
         self.session_warning_count = 0;
@@ -7823,7 +7830,11 @@ impl Backend {
             filter: filter.clone(),
             assignments: assignments.clone(),
         };
-        let locks = write_lock_requests(&self.storage, std::slice::from_ref(&command))?;
+        let locks = write_lock_requests_with_gap_locks(
+            &self.storage,
+            std::slice::from_ref(&command),
+            self.gap_locks_enabled(),
+        )?;
         self.stats
             .acquire_locks(&locks, self.connection_id, self.lock_wait_timeout)
             .await?;
@@ -8402,7 +8413,8 @@ impl Backend {
     ) -> anyhow::Result<QueryOutcome> {
         self.ensure_transaction_writable()?;
         self.ensure_explicit_write_access(&writes)?;
-        let locks = write_lock_requests(&self.storage, &writes)?;
+        let locks =
+            write_lock_requests_with_gap_locks(&self.storage, &writes, self.gap_locks_enabled())?;
         if let Err(error) = self
             .stats
             .acquire_locks(&locks, self.connection_id, self.lock_wait_timeout)
@@ -8419,7 +8431,8 @@ impl Backend {
             .await?;
         let (writes, trigger_last_insert_id, trigger_affected_rows) =
             self.expand_trigger_writes(writes, true)?;
-        let locks = write_lock_requests(&self.storage, &writes)?;
+        let locks =
+            write_lock_requests_with_gap_locks(&self.storage, &writes, self.gap_locks_enabled())?;
         self.stats
             .acquire_locks(&locks, self.connection_id, self.lock_wait_timeout)
             .await?;
@@ -8445,7 +8458,8 @@ impl Backend {
             .await?;
         let (writes, trigger_last_insert_id, trigger_affected_rows) =
             self.expand_trigger_writes(writes, true)?;
-        let locks = write_lock_requests(&self.storage, &writes)?;
+        let locks =
+            write_lock_requests_with_gap_locks(&self.storage, &writes, self.gap_locks_enabled())?;
         if let Err(error) = self
             .stats
             .acquire_locks(&locks, self.connection_id, self.lock_wait_timeout)
@@ -9934,7 +9948,11 @@ impl Backend {
             filter: filter.clone(),
             assignments: assignments.clone(),
         };
-        let locks = write_lock_requests(&self.storage, &[ingress])?;
+        let locks = write_lock_requests_with_gap_locks(
+            &self.storage,
+            &[ingress],
+            self.gap_locks_enabled(),
+        )?;
         if let Err(error) = self
             .stats
             .acquire_locks(&locks, self.connection_id, self.lock_wait_timeout)
@@ -10047,7 +10065,11 @@ impl Backend {
             table: table.clone(),
             filter: filter.clone(),
         };
-        let locks = write_lock_requests(&self.storage, &[ingress])?;
+        let locks = write_lock_requests_with_gap_locks(
+            &self.storage,
+            &[ingress],
+            self.gap_locks_enabled(),
+        )?;
         if let Err(error) = self
             .stats
             .acquire_locks(&locks, self.connection_id, self.lock_wait_timeout)
@@ -11977,7 +11999,17 @@ impl Backend {
             anyhow::bail!("NOWAIT and SKIP LOCKED cannot be used together");
         }
         if (for_update || share_mode) && source_rows.is_none() && !skip_locked {
-            let locks = read_lock_requests(&database, &table, &schema, filter.as_ref(), for_update);
+            let locks = if self.transaction_isolation == TransactionIsolation::ReadCommitted {
+                let visible_rows = self.rows_with_local_transaction_overlay(
+                    &database,
+                    &table,
+                    filter.as_ref(),
+                    None,
+                )?;
+                record_lock_requests(&database, &table, &schema, &visible_rows, for_update)
+            } else {
+                read_lock_requests(&database, &table, &schema, filter.as_ref(), for_update)
+            };
             if upper.contains(" NOWAIT") {
                 self.stats
                     .acquire_locks_nowait(&locks, self.connection_id)?;
@@ -14096,6 +14128,14 @@ fn write_lock_requests(
     storage: &StorageEngineManager,
     writes: &[WriteCommand],
 ) -> anyhow::Result<Vec<LockRequest>> {
+    write_lock_requests_with_gap_locks(storage, writes, true)
+}
+
+fn write_lock_requests_with_gap_locks(
+    storage: &StorageEngineManager,
+    writes: &[WriteCommand],
+    gap_locks: bool,
+) -> anyhow::Result<Vec<LockRequest>> {
     let mut requests = HashMap::<String, LockMode>::new();
     for write in writes {
         match write {
@@ -14219,7 +14259,26 @@ fn write_lock_requests(
                     ),
                     _ => unreachable!(),
                 };
-                add_mutation_locks(&mut requests, database, table, &schema, filter, changes_key);
+                if !gap_locks && !changes_key {
+                    let rows = storage.scan_table_filtered_limit(database, table, filter, None)?;
+                    add_record_locks(
+                        &mut requests,
+                        database,
+                        table,
+                        &schema,
+                        &rows,
+                        LockMode::Exclusive,
+                    );
+                } else {
+                    add_mutation_locks(
+                        &mut requests,
+                        database,
+                        table,
+                        &schema,
+                        filter,
+                        changes_key,
+                    );
+                }
             }
             WriteCommand::Delete {
                 database, table, ..
@@ -14234,7 +14293,19 @@ fn write_lock_requests(
                     WriteCommand::Delete { filter, .. } => filter.as_ref(),
                     _ => unreachable!(),
                 };
-                add_mutation_locks(&mut requests, database, table, &schema, filter, false);
+                if !gap_locks {
+                    let rows = storage.scan_table_filtered_limit(database, table, filter, None)?;
+                    add_record_locks(
+                        &mut requests,
+                        database,
+                        table,
+                        &schema,
+                        &rows,
+                        LockMode::Exclusive,
+                    );
+                } else {
+                    add_mutation_locks(&mut requests, database, table, &schema, filter, false);
+                }
             }
             WriteCommand::CleanupOrphanStorage => {
                 add_lock_request(&mut requests, "storage:*".to_string(), LockMode::Exclusive)
@@ -14316,6 +14387,46 @@ fn add_table_ddl_locks(requests: &mut HashMap<String, LockMode>, database: &str,
         format!("table:{database}.{table}"),
         LockMode::Exclusive,
     );
+}
+
+fn add_record_locks(
+    requests: &mut HashMap<String, LockMode>,
+    database: &str,
+    table: &str,
+    schema: &TableSchema,
+    rows: &[Row],
+    record: LockMode,
+) {
+    let primary_key = table_primary_key_columns(schema);
+    add_lock_request(
+        requests,
+        format!("database:{database}"),
+        match record {
+            LockMode::Shared | LockMode::IntentionShared => LockMode::IntentionShared,
+            _ => LockMode::IntentionExclusive,
+        },
+    );
+    if primary_key.is_empty() {
+        add_lock_request(requests, format!("table:{database}.{table}"), record);
+        return;
+    }
+    add_lock_request(
+        requests,
+        format!("table:{database}.{table}"),
+        match record {
+            LockMode::Shared | LockMode::IntentionShared => LockMode::IntentionShared,
+            _ => LockMode::IntentionExclusive,
+        },
+    );
+    for row in rows {
+        if let Some(key) = row_lock_key(row, &primary_key) {
+            add_lock_request(
+                requests,
+                format!("row:{database}.{table}:PRIMARY:{key}"),
+                record,
+            );
+        }
+    }
 }
 
 fn add_mutation_locks(
@@ -14419,6 +14530,23 @@ fn read_lock_requests(
     } else {
         add_lock_request(&mut requests, format!("table:{database}.{table}"), record);
     }
+    sorted_lock_requests(requests)
+}
+
+fn record_lock_requests(
+    database: &str,
+    table: &str,
+    schema: &TableSchema,
+    rows: &[Row],
+    for_update: bool,
+) -> Vec<LockRequest> {
+    let mut requests = HashMap::new();
+    let record = if for_update {
+        LockMode::Exclusive
+    } else {
+        LockMode::Shared
+    };
+    add_record_locks(&mut requests, database, table, schema, rows, record);
     sorted_lock_requests(requests)
 }
 
@@ -35906,6 +36034,56 @@ mod tests {
             .execute("INSERT INTO actors (id,value) VALUES (30,300)")
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_committed_locking_read_does_not_lock_primary_key_gaps() {
+        let (_temp, _storage, mut first, mut second) = transaction_backends().await;
+        first
+            .execute("INSERT INTO actors (id,value) VALUES (10,100),(20,200)")
+            .await
+            .unwrap();
+        first
+            .execute("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED")
+            .await
+            .unwrap();
+        first.execute("BEGIN").await.unwrap();
+        first
+            .execute("SELECT id FROM actors WHERE id > 10 FOR UPDATE")
+            .await
+            .unwrap();
+
+        second
+            .execute("INSERT INTO actors (id,value) VALUES (30,300)")
+            .await
+            .unwrap();
+
+        first.execute("ROLLBACK").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_committed_updates_lock_rows_without_locking_primary_key_gaps() {
+        let (_temp, _storage, mut first, mut second) = transaction_backends().await;
+        first
+            .execute("INSERT INTO actors (id,value) VALUES (10,100),(20,200)")
+            .await
+            .unwrap();
+        first
+            .execute("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED")
+            .await
+            .unwrap();
+        first.execute("BEGIN").await.unwrap();
+        first
+            .execute("UPDATE actors SET value=value+1 WHERE id > 10")
+            .await
+            .unwrap();
+
+        second
+            .execute("INSERT INTO actors (id,value) VALUES (30,300)")
+            .await
+            .unwrap();
+
+        first.execute("ROLLBACK").await.unwrap();
     }
 
     #[tokio::test]

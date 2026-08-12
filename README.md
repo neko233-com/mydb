@@ -6,11 +6,11 @@
 [![Rust](https://img.shields.io/badge/rust-1.75+-orange.svg)](https://www.rust-lang.org/)
 [![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)]()
 
-**单机高性能数据库 · MySQL 协议兼容 · SQLite 替代者**
+**单机高性能数据库 · MySQL 8.x 协议兼容 · MySQL 替代目标**
 
 </div>
 
-MyDB 是一款用 Rust 编写的单机高性能数据库，定位为 **SQLite 的替代者**。它以 MySQL 协议暴露接口，已验证范围内的现有 MySQL 驱动/工具可直接接入；内部采用自研 Neko233 Leader/Follower 组提交、Group Commit、WAL 与 Copy-on-Write 存储内核，专为游戏行业写多读少、低交互延迟和低资源常驻场景优化。
+MyDB 是一款用 Rust 编写的单机高性能数据库，目标是替代 MySQL 8.x 的常用单机部署。它以 MySQL 协议暴露接口，JDBC、Go、Node.js/TypeScript、JetBrains、VS Code、dbx 和标准 MySQL 客户端均走同一协议入口；内部采用自研 Neko233 Leader/Follower 组提交、Group Commit、WAL 与 Copy-on-Write 存储内核。
 
 > **设计边界**：MyDB 是**单机数据库**，复制拓扑、读写分离、分布式 XA 协调等非单机能力**设计上不支持**。
 
@@ -43,6 +43,7 @@ mydb/
 │   ├── mydb-server/       # 服务端主体
 │   ├── mydb-cli/          # 命令行客户端（兼容 mysql 命令）
 │   ├── mydb-wire/         # MySQL 协议兼容层
+│   ├── mydb-router/       # 透明 MySQL TCP 路由/故障切换入口
 │   ├── mydb-parser/       # SQL 解析器
 │   ├── mydb-storage/      # Neko233 存储引擎（InnoDB 仅为外部兼容别名）
 │   ├── mydb-transaction/  # 事务管理与锁
@@ -152,6 +153,7 @@ cargo build --release
 # 安装到系统
 cargo install --path crates/mydb-server
 cargo install --path crates/mydb-cli
+cargo install --path crates/mydb-router
 cargo install --path crates/mydb-migrate
 cargo install --path crates/mydb-dump
 ```
@@ -249,6 +251,19 @@ const db = await mysql.createConnection({
 
 远程客户端将 Host 改为服务器 IP；安装脚本默认监听全部网卡并创建 TCP 3306 入站规则。
 生产环境应改为强密码、TLS 或明确的来源 IP 白名单。
+
+### mydb-router：所有客户端的统一入口
+
+需要独立入口、后端故障切换或多套 MyDB 实例时，启动透明 TCP 路由器：
+
+```bash
+cargo run --release -p mydb-router -- --config configs/router.yaml
+# 客户端统一连接 127.0.0.1:13306；单条 TCP 连接固定到一个 MyDB 后端
+```
+
+`mydb-router` 不改写 MySQL 握手、TLS、预编译协议或 SQL，因此 JDBC、Go `database/sql`、
+`mysql2`、DataGrip、VS Code、dbx 等客户端无需专用适配器。多后端配置只适合后端本身已有
+复制/一致性策略；事务不会在多个后端之间拆分。
 
 ---
 

@@ -68,7 +68,7 @@ cargo clean --release 2>$null
 
 # 构建 release 版本
 Write-Info "Building release..."
-cargo build --release -p mydb-server -p mydb-cli -p mydb-migrate -p mydb-dump
+cargo build --release -p mydb-server -p mydb-cli -p mydb-router -p mydb-migrate -p mydb-dump
 if ($LASTEXITCODE -ne 0) { Write-Error "Build failed" }
 
 # 创建打包目录
@@ -79,11 +79,13 @@ New-Item -ItemType Directory -Path $buildDir -Force | Out-Null
 # 复制二进制文件
 Copy-Item "target/release/mydb-server.exe" "$buildDir/"
 Copy-Item "target/release/mydb-cli.exe" "$buildDir/"
+Copy-Item "target/release/mydb-router.exe" "$buildDir/"
 Copy-Item "target/release/mydb-migrate.exe" "$buildDir/"
 Copy-Item "target/release/mydbdump.exe" "$buildDir/"
 
 # 复制配置文件
 Copy-Item "configs/default.yaml" "$buildDir/config.yaml.example"
+Copy-Item "configs/router.yaml" "$buildDir/router.yaml"
 
 # 复制安装脚本
 Copy-Item "scripts/install.sh" "$buildDir/"

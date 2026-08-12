@@ -1,8 +1,8 @@
 # MyDB 落地验收清单
 
-> 规则：只有当前源码和可复现实测能证明的项目才打勾。宽泛目标不能由局部 smoke 代替。最后更新：2026-08-11。
+> 规则：只有当前源码和可复现实测能证明的项目才打勾。宽泛目标不能由局部 smoke 代替。最后更新：2026-08-12。
 
-> **范围边界（设计决定）**：MyDB 定位为**替代 SQLite 的单机高性能数据库**，以 MySQL 形式与语法暴露接口。以下**非单机能力明确不支持**，不计入本清单、不视为缺失：binlog 复制拓扑 / GTID、读写分离、Group Replication / Galera、分布式 XA 两阶段协调、跨节点一致性。单机版本地 XA（`XA START/COMMIT` 映射为会话内事务）与复制 SHOW 表面（空结果）作为兼容 no-op 保留。完整判定见 [`SYNTAX_MATRIX.md`](SYNTAX_MATRIX.md) 的“❌ 明确不支持”分类。
+> **范围边界（当前验收口径）**：MyDB 目标是替代 MySQL 8.x 的单机部署，以 MySQL 协议、SQL、事务和可见外部行为为验收面。`mydb-router` 提供透明 TCP 入口；复制拓扑、Group Replication / Galera、分布式 XA 两阶段协调仍不宣称已实现。完整 InnoDB 语义必须逐项通过本清单，不能由协议兼容或名称别名代替。
 
 ## 最终发布门槛
 
@@ -137,6 +137,8 @@
 - [x] 断线自动回滚并释放锁；服务重启后客户端可重连和继续新事务
 - [x] 事务语句级 CHECK/FK 预校验、级联立即可见、回滚不落 WAL
 - [x] 主键及单列二级索引的等值/范围锁：资源化 next-key/gap 区间、空隙 INSERT 阻塞、事务锁等待与回滚回归
+- [x] READ COMMITTED 锁定读与 UPDATE/DELETE 只锁命中记录、不锁普通 gap；RR/SERIALIZABLE 保留范围锁；主键 gap 插入回归
+- [x] `mydb-router` 透明 MySQL TCP 入口：连接固定后端，JDBC/Go/Node.js/JetBrains/VS Code/dbx/mysql CLI 共用协议路径
 - [ ] MySQL InnoDB 完整 next-key/gap/意向锁、无主键/复杂 JOIN 的逐行 SKIP LOCKED、多方环与基于回滚成本的受害者选择一致性
 - [ ] 全部隔离级别 anomaly、XA、SAVEPOINT 后锁精确释放、锁升级和大事务边界矩阵
 

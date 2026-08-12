@@ -62,7 +62,7 @@ cargo clean --release 2>/dev/null || true
 
 # 构建 release 版本
 info "Building release..."
-cargo build --release -p mydb-server -p mydb-cli -p mydb-migrate -p mydb-dump
+cargo build --release -p mydb-server -p mydb-cli -p mydb-router -p mydb-migrate -p mydb-dump
 
 # 创建打包目录
 BUILD_DIR="target/release/package"
@@ -73,17 +73,20 @@ mkdir -p "$BUILD_DIR"
 if [ "$OS" = "windows" ]; then
     cp target/release/mydb-server.exe "$BUILD_DIR/"
     cp target/release/mydb-cli.exe "$BUILD_DIR/"
+    cp target/release/mydb-router.exe "$BUILD_DIR/"
     cp target/release/mydb-migrate.exe "$BUILD_DIR/"
     cp target/release/mydbdump.exe "$BUILD_DIR/"
 else
     cp target/release/mydb-server "$BUILD_DIR/"
     cp target/release/mydb-cli "$BUILD_DIR/"
+    cp target/release/mydb-router "$BUILD_DIR/"
     cp target/release/mydb-migrate "$BUILD_DIR/"
     cp target/release/mydbdump "$BUILD_DIR/"
 fi
 
 # 复制配置文件
 cp configs/default.yaml "$BUILD_DIR/config.yaml.example"
+cp configs/router.yaml "$BUILD_DIR/router.yaml"
 
 # 复制安装脚本
 cp scripts/install.sh "$BUILD_DIR/"

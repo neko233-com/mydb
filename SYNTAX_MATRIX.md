@@ -2,11 +2,11 @@
 
 > 本文档是 [`CheckList.md`](CheckList.md) 的**全量语法对照基线**：逐条枚举 MySQL 8.0 对外暴露的 SQL 表面，标注 MyDB 当前实现状态。状态以**源码实测**为准（检索 `crates/mydb-wire/src/lib.rs`、`crates/mydb-storage/src/lib.rs`、`vendor/opensrv-mysql`），不是目标描述。
 >
-> 定位：**替代 SQLite 的单机高性能数据库，但暴露 MySQL 的形式与语法**。兼容 = 协议、客户端、DDL/DML/TCL 行为与错误码与 MySQL 一致；**不追求内核一致**（无 InnoDB 分支）。设计目标是超高性能——同资源、同持久化级别下显著高于 MySQL/SQLite。下列标注 `Compatible-noop` 的项表示语句被接受并返回 MySQL 形态结果，但内部不执行对应内核动作——这对单机使用透明且符合“兼容 MySQL 一切的单机版”目标。
+> 定位：MyDB 目标是替代 MySQL 8.x 的单机部署，暴露 MySQL 的协议、形式、语法和可见行为。兼容性以源码与同机差分实测为准；InnoDB 语义不因 `ENGINE=InnoDB` 名称映射而自动视为完成。`mydb-router` 是透明 MySQL TCP 入口，连接固定后端，适用于 JDBC、Go、Node.js/TypeScript、JetBrains、VS Code、dbx 和 mysql CLI。
 >
 > **非单机能力明确不支持（设计决定，非临时延迟）**：binlog 复制拓扑 / GTID、读写分离、Group Replication / Galera、分布式 XA 两阶段协调、跨节点一致性。这些在 [`SYNTAX_MATRIX.md`](SYNTAX_MATRIX.md) 中统一标记为 ❌ 明确不支持，不会纳入范围，也不视为“缺失”。单机版本地 XA（`XA START/COMMIT` 映射为会话内事务）仍作为兼容表面保留。
 >
-> 最后更新：2026-08-12（本轮补齐 `event_scheduler` 全局变量 ON/OFF/DISABLED、DataGrip 探测路径，以及主键/单列二级索引 next-key/gap 区间锁；复合索引、无主键/复杂 JOIN 锁和完整 InnoDB 语义仍按清单逐项验收）。
+> 最后更新：2026-08-12（补齐 `event_scheduler` 全局变量 ON/OFF/DISABLED、DataGrip 探测路径、主键/单列二级索引 next-key/gap 区间锁，以及 RC 记录锁；复合索引、无主键/复杂 JOIN 锁和完整 InnoDB 语义仍按清单逐项验收）。
 
 ## 状态图例
 
@@ -101,7 +101,7 @@
 | `BEGIN` / `START TRANSACTION` / `COMMIT` / `ROLLBACK` | ✅ Verified | autocommit、DDL 隐式提交、读己写 |
 | `SAVEPOINT` / `ROLLBACK TO` / `RELEASE` | ✅ Verified | 重名覆盖、1305、自增回滚留洞 |
 | 隔离级别 RU/RC/RR/SERIALIZABLE 常用可见性 | ✅ Verified | |
-| 锁 IS/IX/S/X、行锁、`FOR UPDATE`/`FOR SHARE`/`LOCK IN SHARE MODE`、NOWAIT/3572、SKIP LOCKED、死锁 1213 | ✅ Verified | 主键及单列二级索引 next-key/gap 区间已落地；无主键/复杂 JOIN 逐行 SKIP LOCKED、复合索引精确扫描、多方环成本化受害者 🔴 Deferred |
+| 锁 IS/IX/S/X、行锁、`FOR UPDATE`/`FOR SHARE`/`LOCK IN SHARE MODE`、NOWAIT/3572、SKIP LOCKED、死锁 1213 | 🟡 Partial | 主键及单列二级索引 next-key/gap 区间、RC 实际记录锁已落地；无主键/复杂 JOIN 逐行 SKIP LOCKED、复合索引精确扫描、多方环成本化受害者 🔴 Deferred |
 | `XA START/BEGIN` / `XA END` / `XA PREPARE` / `XA COMMIT` / `XA ROLLBACK` / `XA RECOVER` | 🔵 Compatible-noop | 本轮新增；映射为单机会话内事务（XA START→开事务，XA COMMIT/ROLLBACK→提交/回滚，XA RECOVER→空）。无两阶段外部协调（分布式 XA 协调 ❌ 明确不支持），符合单机定位 |
 
 ---
