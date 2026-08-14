@@ -63,6 +63,19 @@ function Stop-WithError {
     exit 1
 }
 
+function Get-Sha256Hex {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    $stream = [System.IO.File]::OpenRead($Path)
+    try {
+        $bytes = $sha256.ComputeHash($stream)
+    } finally {
+        $stream.Dispose()
+        $sha256.Dispose()
+    }
+    (($bytes | ForEach-Object { $_.ToString("x2") }) -join "").ToLowerInvariant()
+}
+
 function Test-IsAdministrator {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = New-Object Security.Principal.WindowsPrincipal($identity)
@@ -143,7 +156,7 @@ function Install-Binaries {
         }
         if ($null -ne $checksumFile) {
             $expectedHash = ((Get-Content -LiteralPath $checksumFile -Raw).Trim() -split '\s+')[0].ToLowerInvariant()
-            $actualHash = (Get-FileHash -LiteralPath $zipFile -Algorithm SHA256).Hash.ToLowerInvariant()
+            $actualHash = Get-Sha256Hex -Path $zipFile
             if ($expectedHash -ne $actualHash) {
                 Stop-WithError "SHA-256 verification failed for $PackagePath"
             }

@@ -166,7 +166,7 @@ cargo build --release
 
 # 正式包只包含 server/cli/mydb/migrate/dump、配置、安装脚本和文档；
 # mydb-bench、测试结果与 target/bench 不进入发布包
-.\scripts\build-release.ps1 -Version "0.1.5"
+.\scripts\build-release.ps1 -Version "0.1.6"
 # 发布包同时生成同名 `.sha256` 校验文件；发布脚本会拒绝覆盖已存在的 GitHub Release。
 
 # 安装到系统
@@ -188,7 +188,7 @@ mydb update --check
 mydb update
 
 # 指定版本
-mydb update --version v0.1.5
+mydb update --version v0.1.6
 ```
 
 Windows 服务更新会在当前 CLI 退出后由后台 helper 完成，日志写入安装目录的 `mydb-update.log`；Linux 更新会自动处理同名 systemd 服务。
@@ -614,10 +614,10 @@ bash scripts/docker-smoke.sh
 
 | 场景 | MyDB | MySQL 8.4.11 | MyDB / MySQL |
 |------|------|--------------|--------------|
-| 单表写（fsync-per-commit） | 206 ops/s | 70 ops/s | 2.92x |
-| 4 actor / 4表 写 P99 延迟 | 35.1 ms | 51.0 ms | 1.45x（低更好） |
-| 4 actor / 4表 Group Commit | 335 ops/s | 149 ops/s | 2.25x |
-| 读 P50 延迟 | 423 μs | 130 μs | - |
+| 单表写（fsync-per-commit） | 212 ops/s | 80 ops/s | 2.67x |
+| 4 actor / 4表 写 P99 延迟 | 40.1 ms | 64.9 ms | 1.62x（低更好） |
+| 4 actor / 4表 Group Commit | 317 ops/s | 126 ops/s | 2.51x |
+| 读 P50 延迟 | 422 μs | 131 μs | - |
 
 性能优化不以关闭 WAL 持久化或弱化恢复语义换取数字。默认 250μs Group Commit 窗口优先并发吞吐，checkpoint 按 1024 个已提交请求触发；不声明未经实测证明的固定倍数。
 
@@ -627,7 +627,7 @@ bash scripts/docker-smoke.sh
 
 当前开发状态、已完成项、未完成项、差分证据统一维护在 [CheckList.md](CheckList.md)。只有可复现实测证明的项目才会打勾。
 
-### v0.1.5 发布候选
+### v0.1.6 发布
 
 本版面向单机 MySQL 8.4 常用生产工作负载：3306 提供 MySQL 协议，4306 提供登录保护的 Web SQL IDE/管理 API；补齐 `GRANT OPTION` 越权委派防护、角色 `ADMIN OPTION` 授权/撤销/元数据、`GRANT ALL` 后各层部分 `REVOKE` 的实际权限降级，以及 `mydb update` 在线更新命令。发布不宣称复制/集群、完整 InnoDB 全部锁边界、全部冷门字符集或全部 MySQL 错误码已完成；逐项状态见 [CheckList.md](CheckList.md) 和 [SYNTAX_MATRIX.md](SYNTAX_MATRIX.md)。
 
