@@ -5477,6 +5477,19 @@ impl Backend {
             .any(|mode| mode.trim().eq_ignore_ascii_case("ONLY_FULL_GROUP_BY"))
     }
 
+    fn evaluate_aggregate_projection(
+        &self,
+        projection: &str,
+        row: &Row,
+        schema: &TableSchema,
+    ) -> anyhow::Result<Option<Vec<u8>>> {
+        let expression = projection_without_alias(projection).trim();
+        if expression.eq_ignore_ascii_case("DATABASE()") {
+            return Ok((!self.database.is_empty()).then(|| self.database.as_bytes().to_vec()));
+        }
+        evaluate_scalar_expression_with_schema(expression, row, schema)
+    }
+
     fn session_time_zone_name(&self) -> String {
         self.session_variables
             .get("time_zone")
@@ -15999,7 +16012,19 @@ impl Backend {
             .collect::<Vec<_>>();
         if aggregates.iter().any(Option::is_some) {
             let strict_grouping = self.only_full_group_by_enabled();
-            if strict_grouping && aggregates.iter().any(Option::is_none) {
+            if strict_grouping
+                && aggregates
+                    .iter()
+                    .zip(&projection_items)
+                    .any(|(aggregate, projection)| {
+                        aggregate.is_none()
+                            && !expression_column_references(
+                                projection_without_alias(projection),
+                                &schema,
+                            )
+                            .is_empty()
+                    })
+            {
                 anyhow::bail!("Nonaggregated column without GROUP BY");
             }
             let columns = projection_items
@@ -16013,7 +16038,7 @@ impl Backend {
                     Some(aggregate) => evaluate_aggregate(aggregate, &rows, &schema),
                     None => rows
                         .first()
-                        .map(|row| evaluate_scalar_expression_with_schema(projection, row, &schema))
+                        .map(|row| self.evaluate_aggregate_projection(projection, row, &schema))
                         .unwrap_or_else(|| Ok(None)),
                 })
                 .collect::<anyhow::Result<Vec<_>>>()?];
@@ -16481,7 +16506,19 @@ impl Backend {
             .collect::<Vec<_>>();
         if aggregates.iter().any(Option::is_some) {
             let strict_grouping = self.only_full_group_by_enabled();
-            if strict_grouping && aggregates.iter().any(Option::is_none) {
+            if strict_grouping
+                && aggregates
+                    .iter()
+                    .zip(&raw_projection)
+                    .any(|(aggregate, projection)| {
+                        aggregate.is_none()
+                            && !expression_column_references(
+                                projection_without_alias(projection),
+                                &aggregate_schema,
+                            )
+                            .is_empty()
+                    })
+            {
                 anyhow::bail!("Nonaggregated column without GROUP BY");
             }
             let columns = raw_projection
@@ -16496,11 +16533,7 @@ impl Backend {
                     None => rows
                         .first()
                         .map(|row| {
-                            evaluate_scalar_expression_with_schema(
-                                projection,
-                                row,
-                                &aggregate_schema,
-                            )
+                            self.evaluate_aggregate_projection(projection, row, &aggregate_schema)
                         })
                         .unwrap_or_else(|| Ok(None)),
                 })
@@ -17041,7 +17074,19 @@ impl Backend {
             .collect::<Vec<_>>();
         if aggregates.iter().any(Option::is_some) {
             let strict_grouping = self.only_full_group_by_enabled();
-            if strict_grouping && aggregates.iter().any(Option::is_none) {
+            if strict_grouping
+                && aggregates
+                    .iter()
+                    .zip(&raw_projection)
+                    .any(|(aggregate, projection)| {
+                        aggregate.is_none()
+                            && !expression_column_references(
+                                projection_without_alias(projection),
+                                &aggregate_schema,
+                            )
+                            .is_empty()
+                    })
+            {
                 anyhow::bail!("Nonaggregated column without GROUP BY");
             }
             let columns = raw_projection
@@ -17056,11 +17101,7 @@ impl Backend {
                     None => rows
                         .first()
                         .map(|row| {
-                            evaluate_scalar_expression_with_schema(
-                                projection,
-                                row,
-                                &aggregate_schema,
-                            )
+                            self.evaluate_aggregate_projection(projection, row, &aggregate_schema)
                         })
                         .unwrap_or_else(|| Ok(None)),
                 })
@@ -66784,6 +66825,24 @@ mod tests {
                 Some(b"3".to_vec()),
                 Some(b"7".to_vec()),
                 Some(b"4".to_vec())
+            ]]
+        );
+
+        let QueryOutcome::Rows { rows, .. } = backend
+            .execute(
+                "SELECT DATABASE() AS db,COUNT(*) AS row_count,MAX(value) AS max_value FROM mysql84_expression_edges",
+            )
+            .await
+            .expect("allow constant expressions beside aggregates")
+        else {
+            panic!("expected mixed constant aggregate row")
+        };
+        assert_eq!(
+            rows,
+            vec![vec![
+                Some(b"mydb".to_vec()),
+                Some(b"3".to_vec()),
+                Some(b"7".to_vec())
             ]]
         );
 

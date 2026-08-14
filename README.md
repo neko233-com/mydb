@@ -586,10 +586,10 @@ bash scripts/docker-smoke.sh
 
 | 场景 | MyDB | MySQL 8.4.11 | MyDB / MySQL |
 |------|------|--------------|--------------|
-| 单表写（fsync-per-commit） | 201 ops/s | 69 ops/s | 2.91x |
-| 8 actor / 8表 写 P99 延迟 | 32.5 ms | 95.9 ms | 2.95x（低更好） |
-| 8 actor / 8表 Group Commit | 739 ops/s | 275 ops/s | 2.69x |
-| 读 P50 延迟 | 399 μs | 610 μs | - |
+| 单表写（fsync-per-commit） | 196 ops/s | 67 ops/s | 2.94x |
+| 8 actor / 8表 写 P99 延迟 | 38.7 ms | 92.1 ms | 2.38x（低更好） |
+| 8 actor / 8表 Group Commit | 1222 ops/s | 705 ops/s | 1.73x |
+| 读 P50 延迟 | 391 μs | 638 μs | - |
 
 性能优化不以关闭 WAL 持久化或弱化恢复语义换取数字。默认 250μs Group Commit 窗口优先并发吞吐，checkpoint 按 1024 个已提交请求触发；不声明未经实测证明的固定倍数。
 
@@ -607,7 +607,7 @@ bash scripts/docker-smoke.sh
 - ✅ Connector/J 9.1.0、Node mysql2 3.23.3 已完成 3306 普通/预处理查询 smoke；Go `database/sql` + go-sql-driver/mysql 1.10.0 已完成当前 release 3306 服务的 Ping、中文、DATE、普通/预处理查询回归
 - ✅ MySQL `'user'@'host'` 基础账户匹配：精确主机优先于通配主机，握手按账户插件选择认证方式
 - ✅ `scripts/docker-smoke.ps1`：当前源码 Docker release 镜像通过 SIGKILL、WAL 损坏、只读/ENOSPC、事务锁、LOAD DATA、备份/PITR 与 Web/Agent smoke
-- ✅ `scripts/mysql84-diff.ps1`：当前 release 隔离 13307 与同机 Docker MySQL 8.4，100/100 差分通过；新增 JSON 路径/重叠、位聚合、角色授权、ai_ci 字符集比较、视图/例程/触发器、FK/CHECK、EXPLAIN 语义和状态接口覆盖
+- ✅ `scripts/mysql84-diff.ps1`：当前 release 隔离 13307 与同机 Docker MySQL 8.4，101/101 差分通过；新增 JSON 路径/重叠、位聚合、常量聚合投影、角色授权、ai_ci 字符集比较、视图/例程/触发器、FK/CHECK、EXPLAIN 语义和状态接口覆盖
 - ⏳ Ubuntu 24.04 物理性能、macOS 原生验收、宿主断电/恢复中断、大数据压力与生产安全运维验收：以 [CheckList.md](CheckList.md) 与 [性能报告.md](性能报告.md) 为准
 
 ---
