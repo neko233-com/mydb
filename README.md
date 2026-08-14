@@ -166,7 +166,7 @@ cargo build --release
 
 # 正式包只包含 server/cli/migrate/dump、配置、安装脚本和文档；
 # mydb-bench、测试结果与 target/bench 不进入发布包
-.\scripts\build-release.ps1 -Version "0.1.3"
+.\scripts\build-release.ps1 -Version "0.1.4"
 # 发布包同时生成同名 `.sha256` 校验文件；发布脚本会拒绝覆盖已存在的 GitHub Release。
 
 # 安装到系统
@@ -610,9 +610,9 @@ bash scripts/docker-smoke.sh
 
 当前开发状态、已完成项、未完成项、差分证据统一维护在 [CheckList.md](CheckList.md)。只有可复现实测证明的项目才会打勾。
 
-### v0.1.3 发布候选
+### v0.1.4 发布候选
 
-本版面向单机 MySQL 8.4 常用生产工作负载：3306 提供 MySQL 协议，4306 提供登录保护的 Web SQL IDE/管理 API；补齐 `GRANT OPTION` 越权委派防护与角色 `ADMIN OPTION` 授权/撤销/元数据回归。发布不宣称复制/集群、完整 InnoDB 全部锁边界、全部冷门字符集或全部 MySQL 错误码已完成；逐项状态见 [CheckList.md](CheckList.md) 和 [SYNTAX_MATRIX.md](SYNTAX_MATRIX.md)。
+本版面向单机 MySQL 8.4 常用生产工作负载：3306 提供 MySQL 协议，4306 提供登录保护的 Web SQL IDE/管理 API；补齐 `GRANT OPTION` 越权委派防护、角色 `ADMIN OPTION` 授权/撤销/元数据，以及 `GRANT ALL` 后各层部分 `REVOKE` 的实际权限降级。发布不宣称复制/集群、完整 InnoDB 全部锁边界、全部冷门字符集或全部 MySQL 错误码已完成；逐项状态见 [CheckList.md](CheckList.md) 和 [SYNTAX_MATRIX.md](SYNTAX_MATRIX.md)。
 
 **本轮本地门槛（2026-08-14）：**
 - ✅ `cargo test --workspace --locked`：Docker Linux 门禁通过；wire 268（含权限委派/角色 ADMIN OPTION），其他 workspace 测试与文档测试全部通过
