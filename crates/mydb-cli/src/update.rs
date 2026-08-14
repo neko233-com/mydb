@@ -346,14 +346,24 @@ fn extract_archive(
 
 fn validate_archive_listing(listing: &str) -> Result<()> {
     for raw_entry in listing.lines() {
-        let entry = raw_entry.trim().replace('\\', "/");
-        let normalized = entry.trim_start_matches("./");
+        let entry = raw_entry.trim();
+        let normalized = entry
+            .strip_prefix("./")
+            .or_else(|| entry.strip_prefix(".\\"))
+            .unwrap_or(entry);
         if normalized.is_empty() {
             continue;
         }
+        let starts_with_backslash = normalized.starts_with('\\');
+        let is_tar_octal_escape = normalized.as_bytes().first() == Some(&b'\\')
+            && normalized
+                .as_bytes()
+                .get(1..4)
+                .is_some_and(|bytes| bytes.iter().all(u8::is_ascii_digit));
         if normalized.starts_with('/')
+            || (starts_with_backslash && !is_tar_octal_escape)
             || normalized.contains(':')
-            || normalized.split('/').any(|part| part == "..")
+            || normalized.split(['/', '\\']).any(|part| part == "..")
         {
             bail!("refusing archive path outside the update staging directory: {entry}");
         }
@@ -561,5 +571,6 @@ mod tests {
     fn accepts_archive_root_entry() {
         assert!(validate_archive_listing("./\n").is_ok());
         assert!(validate_archive_listing(".\\\n").is_ok());
+        assert!(validate_archive_listing("./\\346\\200\\247\\350.md\n").is_ok());
     }
 }
