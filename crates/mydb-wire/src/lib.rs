@@ -45,7 +45,7 @@ use mydb_storage::{
     TriggerDefinition, TriggerEvent, TriggerTiming, UpdateValueExpression, WriteCommand,
 };
 
-pub const SERVER_VERSION: &str = "8.4.0-mydb-0.1.16";
+pub const SERVER_VERSION: &str = "8.4.0-mydb-0.1.17";
 pub const MYSQL84_DEFAULT_SQL_MODE: &str = "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION";
 /// MySQL 8.4 default `innodb_lock_wait_timeout`, in seconds.
 pub const MYSQL84_DEFAULT_INNODB_LOCK_WAIT_TIMEOUT_SECONDS: u64 = 50;
@@ -16272,6 +16272,9 @@ impl Backend {
             .trim_end_matches(';')
             .trim();
         let (source, source_rows) = self.join_source_with_rows(source_spec).await?;
+        if source.json_table.is_some() && source_rows.is_none() {
+            anyhow::bail!("JSON_TABLE document requires a preceding table source");
+        }
         let projection = if single_source_wildcard_projection(projection, &source)? {
             "*"
         } else {
@@ -16927,6 +16930,7 @@ impl Backend {
             table: alias.clone(),
             alias,
             schema,
+            json_table: None,
         };
         let mut rows = values
             .into_iter()
@@ -17110,6 +17114,9 @@ impl Backend {
         let (first_source, first_rows) = self
             .join_source_with_rows(sql[from_start..first_join.0].trim())
             .await?;
+        if first_source.json_table.is_some() && first_rows.is_none() {
+            anyhow::bail!("JSON_TABLE document requires a preceding table source");
+        }
         let mut sources = vec![first_source];
         let mut source_overrides = vec![first_rows];
         let mut steps = Vec::<JoinStep>::new();
@@ -17173,7 +17180,8 @@ impl Backend {
         }
         let source_is_derived = source_overrides
             .iter()
-            .map(Option::is_some)
+            .enumerate()
+            .map(|(index, rows)| rows.is_some() || sources[index].json_table.is_some())
             .collect::<Vec<_>>();
         let correlated_filter = correlated_row_filter_clause(sql, &sources)?;
         let mut scalar_filter = None;
@@ -17227,29 +17235,35 @@ impl Backend {
                 .as_ref()
                 .and_then(|predicate| predicate_for_source(predicate, source_index, &sources))
                 .map(unqualify_row_predicate);
-            source_rows.push(if let Some(rows) = source_overrides[source_index].take() {
-                if let Some(predicate) = source_filter.as_ref() {
-                    rows.into_iter()
-                        .filter(|row| predicate.matches_with_schema(row, Some(&source.schema)))
-                        .collect()
+            source_rows.push(
+                if sources[source_index].json_table.is_some()
+                    && source_overrides[source_index].is_none()
+                {
+                    Vec::new()
+                } else if let Some(rows) = source_overrides[source_index].take() {
+                    if let Some(predicate) = source_filter.as_ref() {
+                        rows.into_iter()
+                            .filter(|row| predicate.matches_with_schema(row, Some(&source.schema)))
+                            .collect()
+                    } else {
+                        rows
+                    }
+                } else if for_update || share_mode {
+                    self.rows_with_local_transaction_overlay(
+                        &source.database,
+                        &source.table,
+                        source_filter.as_ref(),
+                        None,
+                    )?
                 } else {
-                    rows
-                }
-            } else if for_update || share_mode {
-                self.rows_with_local_transaction_overlay(
-                    &source.database,
-                    &source.table,
-                    source_filter.as_ref(),
-                    None,
-                )?
-            } else {
-                self.rows_with_transaction_overlay(
-                    &source.database,
-                    &source.table,
-                    source_filter.as_ref(),
-                    None,
-                )?
-            });
+                    self.rows_with_transaction_overlay(
+                        &source.database,
+                        &source.table,
+                        source_filter.as_ref(),
+                        None,
+                    )?
+                },
+            );
         }
         let mut combinations = (0..source_rows[0].len())
             .map(|row| vec![Some(row)])
@@ -17257,6 +17271,13 @@ impl Backend {
         let mut natural_columns = Vec::<String>::new();
         for (step_index, step) in steps.iter().enumerate() {
             let new_source = step_index + 1;
+            let dynamic_json_table = sources[new_source]
+                .json_table
+                .clone()
+                .filter(|_| source_overrides[new_source].is_none());
+            if dynamic_json_table.is_some() && step.kind == JoinKind::Right {
+                anyhow::bail!("RIGHT JOIN does not support a correlated JSON_TABLE source");
+            }
             let predicate = if step.natural {
                 Some(natural_join_predicate(
                     &sources[..=new_source],
@@ -17281,12 +17302,16 @@ impl Backend {
                     .transpose()?
             };
             join_predicates.push(predicate.clone());
-            let indexed_equalities = predicate
-                .as_ref()
-                .map(|predicate| find_indexable_join_equalities(predicate, new_source))
-                .unwrap_or_default();
+            let indexed_equalities = if dynamic_json_table.is_some() {
+                Vec::new()
+            } else {
+                predicate
+                    .as_ref()
+                    .map(|predicate| find_indexable_join_equalities(predicate, new_source))
+                    .unwrap_or_default()
+            };
             let indexed_equality = indexed_equalities.first().cloned();
-            if step.kind != JoinKind::Right {
+            if dynamic_json_table.is_none() && step.kind != JoinKind::Right {
                 if let Some((prior, right_column)) = indexed_equality.as_ref() {
                     let allowed = source_rows[prior.0]
                         .iter()
@@ -17325,7 +17350,31 @@ impl Backend {
             let mut matched_right = HashSet::new();
             for combination in &combinations {
                 let mut matched = false;
-                let candidates = if step.kind == JoinKind::Cross && indexed_equalities.is_empty() {
+                let candidates = if let Some(spec) = dynamic_json_table.as_ref() {
+                    let prior_unqualified =
+                        unambiguous_join_columns(&sources[..new_source], &natural_columns);
+                    let outer_row = join_combination_row(
+                        &sources[..new_source],
+                        &source_rows[..new_source],
+                        combination,
+                        &prior_unqualified,
+                        &natural_columns,
+                    );
+                    let mut generated = materialize_json_table(spec, &outer_row)?;
+                    let source_filter = filter
+                        .as_ref()
+                        .and_then(|filter| predicate_for_source(filter, new_source, &sources))
+                        .map(unqualify_row_predicate);
+                    if let Some(source_filter) = source_filter.as_ref() {
+                        generated.retain(|row| {
+                            source_filter
+                                .matches_with_schema(row, Some(&sources[new_source].schema))
+                        });
+                    }
+                    let start = source_rows[new_source].len();
+                    source_rows[new_source].extend(generated);
+                    (start..source_rows[new_source].len()).collect::<Vec<_>>()
+                } else if step.kind == JoinKind::Cross && indexed_equalities.is_empty() {
                     (0..source_rows[new_source].len()).collect::<Vec<_>>()
                 } else if !indexed_equalities.is_empty() {
                     indexed_equalities
@@ -17855,6 +17904,11 @@ impl Backend {
         value: &str,
     ) -> anyhow::Result<(JoinSource, Option<Vec<Row>>)> {
         let value = value.trim();
+        let value = value
+            .strip_prefix("LATERAL ")
+            .or_else(|| value.strip_prefix("lateral "))
+            .unwrap_or(value)
+            .trim();
         if value
             .get(.."JSON_TABLE".len())
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case("JSON_TABLE"))
@@ -17872,6 +17926,7 @@ impl Backend {
                         table: reference.trim_matches('`').to_string(),
                         alias,
                         schema,
+                        json_table: None,
                     },
                     Some(rows),
                 ));
@@ -17940,6 +17995,7 @@ impl Backend {
                         table: source.table,
                         alias,
                         schema,
+                        json_table: None,
                     },
                     Some(rows),
                 ));
@@ -18007,6 +18063,7 @@ impl Backend {
                 table: alias.clone(),
                 alias,
                 schema,
+                json_table: None,
             },
             Some(rows),
         ))
@@ -18356,6 +18413,7 @@ impl Backend {
             table,
             alias,
             schema,
+            json_table: None,
         })
     }
 
@@ -22156,6 +22214,7 @@ struct JoinSource {
     table: String,
     alias: String,
     schema: TableSchema,
+    json_table: Option<JsonTableSpec>,
 }
 
 #[derive(Debug)]
@@ -26574,6 +26633,13 @@ enum JsonTableBehavior {
 }
 
 #[derive(Debug, Clone)]
+struct JsonTableSpec {
+    document: String,
+    root_path: String,
+    columns: Vec<JsonTableColumn>,
+}
+
+#[derive(Debug, Clone)]
 enum JsonTableColumn {
     Scalar {
         name: String,
@@ -26609,20 +26675,14 @@ fn json_table_source(
     if arguments.len() < 2 {
         anyhow::bail!("JSON_TABLE requires a document, path, and COLUMNS clause");
     }
-    let document = evaluate_scalar_expression(arguments[0].trim(), &Row::new())?;
-    let document = document
-        .map(|value| serde_json::from_slice::<serde_json::Value>(&value))
-        .transpose()
-        .map_err(|error| anyhow::anyhow!("Invalid JSON document for JSON_TABLE: {error}"))?
-        .unwrap_or(serde_json::Value::Null);
     let clause = arguments[1..].join(",");
     let (root_path, columns) = parse_json_table_columns_clause(&clause)?;
-    let matches = json_extract_path_matches(&document, &root_path)?;
-    let mut rows = Vec::new();
-    for (ordinal, (_, value)) in matches.iter().enumerate() {
-        rows.extend(json_table_expand(value, &columns, ordinal + 1)?);
-    }
-    let schema_columns = json_table_schema_columns(&columns)?;
+    let spec = JsonTableSpec {
+        document: arguments[0].trim().to_string(),
+        root_path,
+        columns,
+    };
+    let schema_columns = json_table_schema_columns(&spec.columns)?;
     let schema = TableSchema {
         name: alias.clone(),
         columns: schema_columns,
@@ -26634,15 +26694,41 @@ fn json_table_source(
         create_sql: None,
         engine: TableEngine::Neko233,
     };
-    Ok((
-        JoinSource {
-            database: database.to_string(),
-            table: alias.clone(),
-            alias,
-            schema,
-        },
-        Some(rows),
-    ))
+    let source = JoinSource {
+        database: database.to_string(),
+        table: alias.clone(),
+        alias,
+        schema,
+        json_table: Some(spec.clone()),
+    };
+    let rows = match materialize_json_table(&spec, &Row::new()) {
+        Ok(rows) => Some(rows),
+        Err(error) if json_table_correlation_error(&error) => None,
+        Err(error) => return Err(error),
+    };
+    Ok((source, rows))
+}
+
+fn materialize_json_table(spec: &JsonTableSpec, row: &Row) -> anyhow::Result<Vec<Row>> {
+    let document = evaluate_scalar_expression(&spec.document, row)?;
+    let document = document
+        .map(|value| serde_json::from_slice::<serde_json::Value>(&value))
+        .transpose()
+        .map_err(|error| anyhow::anyhow!("Invalid JSON document for JSON_TABLE: {error}"))?
+        .unwrap_or(serde_json::Value::Null);
+    let matches = json_extract_path_matches(&document, &spec.root_path)?;
+    let mut rows = Vec::new();
+    for (ordinal, (_, value)) in matches.iter().enumerate() {
+        rows.extend(json_table_expand(value, &spec.columns, ordinal + 1)?);
+    }
+    Ok(rows)
+}
+
+fn json_table_correlation_error(error: &anyhow::Error) -> bool {
+    let message = error.to_string();
+    message.contains("Unknown column")
+        || message.contains("Unknown or ambiguous column")
+        || message.contains("Unknown column or expression")
 }
 
 fn parse_json_table_columns_clause(value: &str) -> anyhow::Result<(String, Vec<JsonTableColumn>)> {
@@ -69614,6 +69700,63 @@ mod tests {
             )
             .await
             .is_err());
+
+        backend
+            .execute("CREATE TABLE mysql84_json_table_docs (id INT PRIMARY KEY, payload TEXT)")
+            .await
+            .expect("create correlated JSON_TABLE table");
+        backend
+            .execute("INSERT INTO mysql84_json_table_docs VALUES (1,'[10,20]'),(2,'[30]'),(3,'[]')")
+            .await
+            .expect("insert correlated JSON_TABLE rows");
+        let QueryOutcome::Rows { columns, rows } = backend
+            .execute(
+                "SELECT d.id,j.ord,j.value FROM mysql84_json_table_docs AS d JOIN JSON_TABLE(d.payload, '$[*]' COLUMNS (ord FOR ORDINALITY, value INT PATH '$')) AS j ON TRUE ORDER BY d.id,j.ord",
+            )
+            .await
+            .expect("evaluate correlated JSON_TABLE")
+        else {
+            panic!("expected correlated JSON_TABLE rows")
+        };
+        assert_eq!(columns, vec!["id", "ord", "value"]);
+        assert_eq!(
+            rows,
+            vec![
+                vec![
+                    Some(b"1".to_vec()),
+                    Some(b"1".to_vec()),
+                    Some(b"10".to_vec())
+                ],
+                vec![
+                    Some(b"1".to_vec()),
+                    Some(b"2".to_vec()),
+                    Some(b"20".to_vec())
+                ],
+                vec![
+                    Some(b"2".to_vec()),
+                    Some(b"1".to_vec()),
+                    Some(b"30".to_vec())
+                ]
+            ]
+        );
+        let QueryOutcome::Rows { rows, .. } = backend
+            .execute(
+                "SELECT d.id,j.value FROM mysql84_json_table_docs AS d LEFT JOIN JSON_TABLE(d.payload, '$[*]' COLUMNS (value INT PATH '$')) AS j ON TRUE ORDER BY d.id,j.value",
+            )
+            .await
+            .expect("evaluate left correlated JSON_TABLE")
+        else {
+            panic!("expected left correlated JSON_TABLE rows")
+        };
+        assert_eq!(
+            rows,
+            vec![
+                vec![Some(b"1".to_vec()), Some(b"10".to_vec())],
+                vec![Some(b"1".to_vec()), Some(b"20".to_vec())],
+                vec![Some(b"2".to_vec()), Some(b"30".to_vec())],
+                vec![Some(b"3".to_vec()), None]
+            ]
+        );
 
         let QueryOutcome::Rows { rows, .. } = backend
             .execute(
