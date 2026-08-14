@@ -211,5 +211,5 @@
 - [x] Windows 物理服务已切换到本轮最新 release：管理员安装脚本 exit 0；`MyDBServer` Automatic/Running，3306 与 4306 均监听，当前二进制时间 2026-08-14 12:25
 - [x] 本机全量切流：9 个业务库迁移并重启校验；`sakila.staff` 超大 BLOB 通过 16KB 页外溢存储保留；MySQL80 服务、程序、进程和数据目录已卸载清理，SQL 备份保留在 `C:\Server\mydb\mysql-backup-20260811\all-databases.sql`
 - [x] 2026-08-14 当前 release 真实 MySQL 8.4 差分：同机 Docker `mysql:8.4` 与物理 3306 对比，83/83 cases 通过；含生成列 INSERT/UPDATE/UPSERT/INSERT SELECT 显式写入错误码/消息；先前旧服务多语句 setup 的 `ERROR 2000` 已由 release 切换消除
-- [x] 2026-08-14 同机持久化基准：MyDB release 13307 vs MySQL 8.4.11 13306，3 次中位数；单表写 254/366 ops/s、P99 30.5/47.2 ms、并发吞吐 770/916 ops/s、读 P50 361/648 μs；吞吐仍 0.84x，未宣称全面领先
+- [x] 2026-08-14 同机持久化基准：MyDB release 13307 vs MySQL 8.4.11 13306，3 次中位数；单表写 191/167 ops/s、P99 36.4/41.9 ms、并发吞吐 858/1356 ops/s、读 P50 362/747 μs；吞吐 0.63x，未宣称全面领先
 - [ ] 正式 Ubuntu 24.04 物理 linux/amd64 性能结果稳定达到目标；当前证据不足
