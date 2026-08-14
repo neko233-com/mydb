@@ -6,7 +6,7 @@
 >
 > **非单机能力明确不支持（设计决定，非临时延迟）**：binlog 复制拓扑 / GTID、读写分离、Group Replication / Galera、分布式 XA 两阶段协调、跨节点一致性。这些在 [`SYNTAX_MATRIX.md`](SYNTAX_MATRIX.md) 中统一标记为 ❌ 明确不支持，不会纳入范围，也不视为“缺失”。单机本地 XA 支持跨连接 prepared 分支、锁保留、RECOVER、one-phase 与 durable WAL commit marker 故障恢复。
 >
-> 最后更新：2026-08-15（补齐 `event_scheduler` 全局变量 ON/OFF/DISABLED、DataGrip/GoLand 探测路径、无默认 schema 的 `DATABASE()`、明文 `SHOW STATUS LIKE 'ssl_version'`、SHOW 元数据 LIKE 大小写不敏感、CASE 文本投影中的嵌套 `IN`、持久 row-id、MVCC 读视图/历史版本、基础 statement-duration MDL、主键/单列二级索引 next-key/gap 区间锁、二级索引插入意向锁、RC 记录锁、复合索引全等值/左前缀范围锁、单列索引 `LIKE` 前缀范围锁、无主键基础隐藏行锁和 JOIN 基础 `SKIP LOCKED` 行过滤；新增单基表直接列投影可更新视图和 LOCAL/CASCADED CHECK OPTION、逻辑表级 RANGE/LIST/HASH/KEY 分区及常用表达式函数、`information_schema.PARTITIONS` 行级元数据、`LOAD DATA ... PARTITION` 逻辑分区校验、`PAD SPACE/NO PAD` 与字符串 `_bin` 排序规则边界；新增二级索引锁定读同步锁聚簇记录、JOIN 二级索引点锁、列对列比较范围锁、JOIN ON 常量/常用标量函数/算术表达式、HAVING 未关联标量子查询/`IN (SELECT ...)` 与存储层 UPSERT 唯一键候选镜像校验回归；新增基础空间构造器、度量、SRID 轴序和空间谓词差分，并扩展 MULTI*/GEOMETRYCOLLECTION 基础构造器、度量和访问器；新增 `REGEXP_INSTR`/`REGEXP_SUBSTR`/`REGEXP_REPLACE` 的位置、occurrence、return_option、NULL 和 Unicode 差分；新增多列/表达式 `COUNT(DISTINCT ...)` 元组 NULL 与排序规则语义，以及多表达式 `GROUP_CONCAT` 的 NULL、元组去重、排序和分隔符语义，当前 MySQL 8.4 差分 120/120；完整 InnoDB/GIS/正则 ICU 边界语义仍按清单逐项验收）。
+> 最后更新：2026-08-15（补齐 `event_scheduler` 全局变量 ON/OFF/DISABLED、DataGrip/GoLand 探测路径、无默认 schema 的 `DATABASE()`、明文 `SHOW STATUS LIKE 'ssl_version'`、SHOW 元数据 LIKE 大小写不敏感、CASE 文本投影中的嵌套 `IN`、持久 row-id、MVCC 读视图/历史版本、基础 statement-duration MDL、主键/单列二级索引 next-key/gap 区间锁、二级索引插入意向锁、RC 记录锁、复合索引全等值/左前缀范围锁、单列索引 `LIKE` 前缀范围锁、无主键基础隐藏行锁和 JOIN 基础 `SKIP LOCKED` 行过滤；新增单基表直接列投影可更新视图和 LOCAL/CASCADED CHECK OPTION、逻辑表级 RANGE/LIST/HASH/KEY 分区及常用表达式函数、`information_schema.PARTITIONS` 行级元数据、`LOAD DATA ... PARTITION` 逻辑分区校验、`PAD SPACE/NO PAD` 与字符串 `_bin` 排序规则边界；新增二级索引锁定读同步锁聚簇记录、JOIN 二级索引点锁、列对列比较范围锁、JOIN ON 常量/常用标量函数/算术表达式、HAVING 未关联标量子查询/`IN (SELECT ...)` 与存储层 UPSERT 唯一键候选镜像校验回归；新增基础空间构造器、度量、SRID 轴序和空间谓词差分，并扩展 MULTI*/GEOMETRYCOLLECTION 基础构造器、度量和访问器；新增 `REGEXP_INSTR`/`REGEXP_SUBSTR`/`REGEXP_REPLACE` 的位置、occurrence、return_option、NULL 和 Unicode 差分；新增多列/表达式 `COUNT(DISTINCT ...)` 元组 NULL 与排序规则语义，以及多表达式 `GROUP_CONCAT` 的 NULL、元组去重、排序和分隔符语义，新增 `group_concat_max_len` SESSION/GLOBAL、下限、UTF-8 截断与 1260 警告语义，当前 MySQL 8.4 差分 121/121；完整 InnoDB/GIS/正则 ICU 边界语义仍按清单逐项验收）。
 
 ## 状态图例
 
@@ -83,7 +83,7 @@
 | `UPDATE` / 单目标 & 多目标 `JOIN UPDATE` | ✅ Verified | changed-row affected、no-op 不写 WAL |
 | `DELETE` / `JOIN DELETE`（alias-list USING/FROM） | ✅ Verified | 无主键重复行物理序号区分 |
 | `LOAD DATA [LOCAL] INFILE` | ✅ Verified | 协议/安全目录、字符集转码、1261/1262/1062/1300、`PARTITION (p0,...)` 分区名与逐行归属校验 |
-| `SELECT` 谓词/聚合/`DISTINCT`/`COUNT(DISTINCT)`/`GROUP_CONCAT` | ✅ Verified | 支持多列/表达式 `COUNT(DISTINCT ...)`，按 MySQL 元组 NULL 规则和各表达式排序规则去重；多表达式 `GROUP_CONCAT` 支持 NULL、元组 DISTINCT、ORDER BY 与 SEPARATOR |
+| `SELECT` 谓词/聚合/`DISTINCT`/`COUNT(DISTINCT)`/`GROUP_CONCAT` | ✅ Verified | 支持多列/表达式 `COUNT(DISTINCT ...)`，按 MySQL 元组 NULL 规则和各表达式排序规则去重；多表达式 `GROUP_CONCAT` 支持 NULL、元组 DISTINCT、ORDER BY、SEPARATOR；`group_concat_max_len` 支持 SESSION/GLOBAL、4 字节下限、UTF-8 安全截断和 1260 警告 |
 | `JOIN` INNER/LEFT/RIGHT/CROSS/NATURAL、ON 等值/非等值/NULL-safe、常量/常用标量函数与算术表达式、USING | ✅ Verified | 复杂子查询谓词与完整优化器差异仍按子查询/执行计划条目验收 |
 | 派生表、子查询（相关/非相关 IN/NOT IN/EXISTS/标量） | ✅ Verified | |
 | `UNION/INTERSECT/EXCEPT DISTINCT/ALL` | ✅ Verified | |

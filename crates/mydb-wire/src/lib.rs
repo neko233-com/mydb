@@ -45,11 +45,17 @@ use mydb_storage::{
     TriggerDefinition, TriggerEvent, TriggerTiming, UpdateValueExpression, WriteCommand,
 };
 
-pub const SERVER_VERSION: &str = "8.4.0-mydb-0.1.25";
+pub const SERVER_VERSION: &str = "8.4.0-mydb-0.1.26";
 pub const MYSQL84_DEFAULT_SQL_MODE: &str = "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION";
 /// MySQL 8.4 default `innodb_lock_wait_timeout`, in seconds.
 pub const MYSQL84_DEFAULT_INNODB_LOCK_WAIT_TIMEOUT_SECONDS: u64 = 50;
 const MYSQL84_MAX_INNODB_LOCK_WAIT_TIMEOUT_SECONDS: u64 = 1_073_741_824;
+/// MySQL 8.4 defaults `group_concat_max_len` to 1024 bytes and clamps lower
+/// values to four bytes. The upper bound is the documented unsigned 64-bit
+/// limit exposed by MySQL 8.4.
+const MYSQL84_DEFAULT_GROUP_CONCAT_MAX_LEN: u64 = 1_024;
+const MYSQL84_MIN_GROUP_CONCAT_MAX_LEN: u64 = 4;
+const MYSQL84_MAX_GROUP_CONCAT_MAX_LEN: u64 = 18_446_744_073_709_547_520;
 const MAX_SCALAR_RESULT_BYTES: usize = 64 * 1024 * 1024;
 const REGEX_CACHE_CAPACITY: usize = 256;
 const READ_ONLY_TRANSACTION_ERROR: &str = "Cannot execute statement in a READ ONLY transaction.";
@@ -3166,6 +3172,7 @@ pub struct WireStats {
     named_locks: parking_lot::Mutex<HashMap<String, u32>>,
     global_transaction_defaults: parking_lot::Mutex<TransactionDefaults>,
     global_innodb_lock_wait_timeout_seconds: AtomicU64,
+    global_group_concat_max_len: AtomicU64,
     event_scheduler_state: AtomicU8,
     activate_all_roles_on_login: AtomicU8,
     global_cte_max_recursion_depth: AtomicU64,
@@ -3325,6 +3332,22 @@ fn parse_innodb_lock_wait_timeout(value: Option<&[u8]>) -> anyhow::Result<u64> {
         );
     }
     Ok(seconds)
+}
+
+fn parse_group_concat_max_len(value: Option<&[u8]>) -> anyhow::Result<u64> {
+    let Some(value) = value else {
+        return Ok(MYSQL84_DEFAULT_GROUP_CONCAT_MAX_LEN);
+    };
+    let value = std::str::from_utf8(value)
+        .map_err(|_| anyhow::anyhow!("group_concat_max_len must be an integer"))?
+        .trim();
+    let value = value
+        .parse::<u128>()
+        .map_err(|_| anyhow::anyhow!("group_concat_max_len must be an integer"))?;
+    Ok(value.clamp(
+        u128::from(MYSQL84_MIN_GROUP_CONCAT_MAX_LEN),
+        u128::from(MYSQL84_MAX_GROUP_CONCAT_MAX_LEN),
+    ) as u64)
 }
 
 fn parse_transaction_characteristics(value: &str) -> anyhow::Result<TransactionCharacteristics> {
@@ -3515,6 +3538,20 @@ impl WireStats {
         } else {
             value
         }
+    }
+
+    fn global_group_concat_max_len(&self) -> u64 {
+        let value = self.global_group_concat_max_len.load(Ordering::Acquire);
+        if value == 0 {
+            MYSQL84_DEFAULT_GROUP_CONCAT_MAX_LEN
+        } else {
+            value
+        }
+    }
+
+    fn set_global_group_concat_max_len(&self, value: u64) {
+        self.global_group_concat_max_len
+            .store(value, Ordering::Release);
     }
 
     fn set_global_innodb_lock_wait_timeout_seconds(&self, value: u64) {
@@ -5007,6 +5044,7 @@ struct Backend {
     client_address: String,
     xa_identifier: Option<XaIdentifier>,
     xa_branch_state: Option<XaBranchState>,
+    aggregate_context: AggregateEvaluationContext,
     // Names this connection currently holds, for RELEASE_ALL_LOCKS() counting
     // and to avoid re-registering the lease on a re-entrant GET_LOCK.
     held_named_locks: HashSet<String>,
@@ -5190,6 +5228,14 @@ impl Backend {
             ),
             ("character_set_server".into(), Some(b"utf8mb4".to_vec())),
             ("event_scheduler".into(), Some(b"ON".to_vec())),
+            (
+                "group_concat_max_len".into(),
+                Some(
+                    MYSQL84_DEFAULT_GROUP_CONCAT_MAX_LEN
+                        .to_string()
+                        .into_bytes(),
+                ),
+            ),
             ("activate_all_roles_on_login".into(), Some(b"0".to_vec())),
             ("sql_mode".into(), Some(Vec::new())),
             ("cte_max_recursion_depth".into(), Some(b"1000".to_vec())),
@@ -5290,6 +5336,10 @@ impl Backend {
                     .into_bytes(),
             ),
         );
+        session_variables.insert(
+            "group_concat_max_len".into(),
+            Some(stats.global_group_concat_max_len().to_string().into_bytes()),
+        );
         Self {
             database: config.default_database.clone(),
             storage,
@@ -5336,6 +5386,7 @@ impl Backend {
             client_address: "local".to_string(),
             xa_identifier: None,
             xa_branch_state: None,
+            aggregate_context: AggregateEvaluationContext::default(),
             held_named_locks: HashSet::new(),
         }
     }
@@ -5413,6 +5464,15 @@ impl Backend {
             Some(
                 self.stats
                     .global_cte_max_recursion_depth()
+                    .to_string()
+                    .into_bytes(),
+            ),
+        );
+        self.session_variables.insert(
+            "group_concat_max_len".into(),
+            Some(
+                self.stats
+                    .global_group_concat_max_len()
                     .to_string()
                     .into_bytes(),
             ),
@@ -5544,6 +5604,7 @@ impl Backend {
         if implicit_next_transaction && !self.in_transaction && self.autocommit {
             self.reset_transaction_characteristics();
         }
+        self.record_group_concat_warnings();
         if outcome.as_ref().err().is_some_and(|error| {
             error
                 .to_string()
@@ -5936,10 +5997,40 @@ impl Backend {
             .min(1_000_000)
     }
 
+    fn group_concat_max_len(&self) -> u64 {
+        self.session_variables
+            .get("group_concat_max_len")
+            .and_then(Option::as_deref)
+            .and_then(|value| std::str::from_utf8(value).ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(|value| {
+                value.clamp(
+                    MYSQL84_MIN_GROUP_CONCAT_MAX_LEN,
+                    MYSQL84_MAX_GROUP_CONCAT_MAX_LEN,
+                )
+            })
+            .unwrap_or(MYSQL84_DEFAULT_GROUP_CONCAT_MAX_LEN)
+    }
+
+    fn reset_aggregate_context(&mut self) {
+        self.aggregate_context = AggregateEvaluationContext::new(self.group_concat_max_len());
+    }
+
+    fn record_group_concat_warnings(&mut self) {
+        let rows = std::mem::take(&mut self.aggregate_context.truncated_rows);
+        for row in rows {
+            self.record_warning(SqlWarning::warning(
+                1260,
+                format!("Row {row} was cut by GROUP_CONCAT()"),
+            ));
+        }
+    }
+
     fn clear_statement_messages(&mut self) {
         self.warnings.clear();
         self.session_warning_count = 0;
         self.session_error_count = 0;
+        self.aggregate_context.truncated_rows.clear();
     }
 
     fn clear_transaction_snapshot(&mut self) {
@@ -6055,6 +6146,12 @@ impl Backend {
             // MySQL 8.4 exposes this policy during IDE metadata discovery.
             "authentication_policy" => Some(b"*,,".to_vec()),
             "port" => Some(b"3306".to_vec()),
+            "group_concat_max_len" if scope == SystemVariableScope::Global => Some(
+                self.stats
+                    .global_group_concat_max_len()
+                    .to_string()
+                    .into_bytes(),
+            ),
             "cte_max_recursion_depth" if scope == SystemVariableScope::Global => Some(
                 self.stats
                     .global_cte_max_recursion_depth()
@@ -6181,6 +6278,7 @@ impl Backend {
             && !matches!(
                 name.as_str(),
                 "event_scheduler"
+                    | "group_concat_max_len"
                     | "cte_max_recursion_depth"
                     | "activate_all_roles_on_login"
                     | "innodb_lock_wait_timeout"
@@ -6235,6 +6333,26 @@ impl Backend {
                     );
                 }
                 self.stats.set_event_scheduler_value(state);
+            }
+            "group_concat_max_len" => {
+                let value = parse_group_concat_max_len(value.as_deref())?;
+                if variable_scope == SystemVariableScope::Global {
+                    let user = self.authenticated_username();
+                    if !self.auth_has_privilege(&user, "", "SYSTEM_VARIABLES_ADMIN")
+                        && !self.auth_has_privilege(&user, "", "SUPER")
+                    {
+                        anyhow::bail!(
+                            "Access denied; user '{}' lacks SYSTEM_VARIABLES_ADMIN privilege",
+                            user
+                        );
+                    }
+                    self.stats.set_global_group_concat_max_len(value);
+                } else {
+                    self.session_variables.insert(
+                        "group_concat_max_len".into(),
+                        Some(value.to_string().into_bytes()),
+                    );
+                }
             }
             "autocommit" => {
                 let enabled = mysql_truthy(value.as_deref());
@@ -7629,6 +7747,7 @@ impl Backend {
 
     async fn execute_inner(&mut self, sql: &str) -> anyhow::Result<QueryOutcome> {
         self.stats.queries.fetch_add(1, Ordering::Relaxed);
+        self.reset_aggregate_context();
         let _prof = std::env::var_os("MYDB_PROFILE").is_some();
         let _prof_t0 = Instant::now();
         let sql = sql.trim().trim_end_matches(';').trim();
@@ -8400,6 +8519,17 @@ impl Backend {
                 vec![
                     bytes("event_scheduler"),
                     bytes(self.stats.event_scheduler_value()),
+                ],
+                vec![
+                    bytes("group_concat_max_len"),
+                    bytes(
+                        &if upper.starts_with("SHOW GLOBAL VARIABLES") {
+                            self.stats.global_group_concat_max_len()
+                        } else {
+                            self.group_concat_max_len()
+                        }
+                        .to_string(),
+                    ),
                 ],
                 vec![
                     bytes("cte_max_recursion_depth"),
@@ -16184,7 +16314,12 @@ impl Backend {
                 let alias = parse_alias(&item);
                 let value = if let Some(aggregate) = parse_aggregate_expression(&item) {
                     let empty_schema = virtual_table_schema("dual", &[]);
-                    evaluate_aggregate(aggregate, std::slice::from_ref(&empty_row), &empty_schema)?
+                    evaluate_aggregate(
+                        aggregate,
+                        std::slice::from_ref(&empty_row),
+                        &empty_schema,
+                        &mut self.aggregate_context,
+                    )?
                 } else if let Some(argument) =
                     last_insert_id_argument(projection_without_alias(&item))
                 {
@@ -16450,9 +16585,15 @@ impl Backend {
         if skip_locked && !skip_locked_plain {
             rows = self.lock_skip_locked_rows(rows, &database, &table, &schema, for_update, None);
         }
-        if let Some(outcome) =
-            evaluate_window_projection(sql, projection, &rows, &schema, distinct, false)?
-        {
+        if let Some(outcome) = evaluate_window_projection(
+            sql,
+            projection,
+            &rows,
+            &schema,
+            distinct,
+            false,
+            &mut self.aggregate_context,
+        )? {
             return Ok(outcome);
         }
         if let Some(group_columns) = parse_group_by(sql) {
@@ -16472,6 +16613,7 @@ impl Backend {
                 &group_columns,
                 &schema,
                 distinct,
+                &mut self.aggregate_context,
             )? {
                 return Ok(outcome);
             }
@@ -16518,14 +16660,23 @@ impl Backend {
                 .into_iter()
                 .zip(projection_items.iter())
                 .map(|(aggregate, projection)| match aggregate {
-                    Some(aggregate) => evaluate_aggregate(aggregate, &rows, &schema),
+                    Some(aggregate) => {
+                        evaluate_aggregate(aggregate, &rows, &schema, &mut self.aggregate_context)
+                    }
                     None => rows
                         .first()
                         .map(|row| self.evaluate_aggregate_projection(projection, row, &schema))
                         .unwrap_or_else(|| Ok(None)),
                 })
                 .collect::<anyhow::Result<Vec<_>>>()?];
-            filter_projected_having(sql, &columns, &mut values, &rows, &schema)?;
+            filter_projected_having(
+                sql,
+                &columns,
+                &mut values,
+                &rows,
+                &schema,
+                &mut self.aggregate_context,
+            )?;
             return Ok(QueryOutcome::byte_rows(columns, values));
         }
         let order_projections = projection_items
@@ -16972,9 +17123,15 @@ impl Backend {
 
         let raw_projection = split_csv(projection);
         let aggregate_schema = join_aggregate_schema(sources, &unqualified);
-        if let Some(outcome) =
-            evaluate_window_projection(sql, projection, &rows, &aggregate_schema, distinct, false)?
-        {
+        if let Some(outcome) = evaluate_window_projection(
+            sql,
+            projection,
+            &rows,
+            &aggregate_schema,
+            distinct,
+            false,
+            &mut self.aggregate_context,
+        )? {
             return Ok(outcome);
         }
         if let Some(group_columns) = parse_group_by(sql) {
@@ -16993,6 +17150,7 @@ impl Backend {
                 &group_columns,
                 &aggregate_schema,
                 distinct,
+                &mut self.aggregate_context,
             )? {
                 return Ok(outcome);
             }
@@ -17038,7 +17196,12 @@ impl Backend {
                 .into_iter()
                 .zip(raw_projection.iter())
                 .map(|(aggregate, projection)| match aggregate {
-                    Some(aggregate) => evaluate_aggregate(aggregate, &rows, &aggregate_schema),
+                    Some(aggregate) => evaluate_aggregate(
+                        aggregate,
+                        &rows,
+                        &aggregate_schema,
+                        &mut self.aggregate_context,
+                    ),
                     None => rows
                         .first()
                         .map(|row| {
@@ -17047,7 +17210,14 @@ impl Backend {
                         .unwrap_or_else(|| Ok(None)),
                 })
                 .collect::<anyhow::Result<Vec<_>>>()?];
-            filter_projected_having(sql, &columns, &mut values, &rows, &aggregate_schema)?;
+            filter_projected_having(
+                sql,
+                &columns,
+                &mut values,
+                &rows,
+                &aggregate_schema,
+                &mut self.aggregate_context,
+            )?;
             return Ok(QueryOutcome::byte_rows(columns, values));
         }
 
@@ -17585,9 +17755,15 @@ impl Backend {
         }
         let raw_projection = split_csv(projection);
         let aggregate_schema = join_aggregate_schema(&sources, &unqualified);
-        if let Some(outcome) =
-            evaluate_window_projection(sql, projection, &rows, &aggregate_schema, distinct, false)?
-        {
+        if let Some(outcome) = evaluate_window_projection(
+            sql,
+            projection,
+            &rows,
+            &aggregate_schema,
+            distinct,
+            false,
+            &mut self.aggregate_context,
+        )? {
             return Ok(outcome);
         }
         if let Some(group_columns) = parse_group_by(sql) {
@@ -17606,6 +17782,7 @@ impl Backend {
                 &group_columns,
                 &aggregate_schema,
                 distinct,
+                &mut self.aggregate_context,
             )? {
                 return Ok(outcome);
             }
@@ -17651,7 +17828,12 @@ impl Backend {
                 .into_iter()
                 .zip(raw_projection.iter())
                 .map(|(aggregate, projection)| match aggregate {
-                    Some(aggregate) => evaluate_aggregate(aggregate, &rows, &aggregate_schema),
+                    Some(aggregate) => evaluate_aggregate(
+                        aggregate,
+                        &rows,
+                        &aggregate_schema,
+                        &mut self.aggregate_context,
+                    ),
                     None => rows
                         .first()
                         .map(|row| {
@@ -17660,7 +17842,14 @@ impl Backend {
                         .unwrap_or_else(|| Ok(None)),
                 })
                 .collect::<anyhow::Result<Vec<_>>>()?];
-            filter_projected_having(sql, &columns, &mut values, &rows, &aggregate_schema)?;
+            filter_projected_having(
+                sql,
+                &columns,
+                &mut values,
+                &rows,
+                &aggregate_schema,
+                &mut self.aggregate_context,
+            )?;
             return Ok(QueryOutcome::byte_rows(columns, values));
         }
 
@@ -27963,6 +28152,30 @@ enum AggregateExpression {
     BitXor(String),
 }
 
+#[derive(Debug)]
+struct AggregateEvaluationContext {
+    group_concat_max_len: u64,
+    truncated_rows: Vec<usize>,
+}
+
+impl Default for AggregateEvaluationContext {
+    fn default() -> Self {
+        Self::new(MYSQL84_DEFAULT_GROUP_CONCAT_MAX_LEN)
+    }
+}
+
+impl AggregateEvaluationContext {
+    fn new(group_concat_max_len: u64) -> Self {
+        Self {
+            group_concat_max_len: group_concat_max_len.clamp(
+                MYSQL84_MIN_GROUP_CONCAT_MAX_LEN,
+                MYSQL84_MAX_GROUP_CONCAT_MAX_LEN,
+            ),
+            truncated_rows: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 enum WindowFunction {
     RowNumber,
@@ -28035,6 +28248,7 @@ fn evaluate_window_projection(
     schema: &TableSchema,
     distinct: bool,
     allow_grouped_rows: bool,
+    context: &mut AggregateEvaluationContext,
 ) -> anyhow::Result<Option<QueryOutcome>> {
     let mut projection_items = split_csv(projection);
     if projection_items.iter().any(|item| item.trim() == "*") {
@@ -28063,7 +28277,7 @@ fn evaluate_window_projection(
         .map(|window| {
             window
                 .as_ref()
-                .map(|window| evaluate_window_expression(window, rows, schema))
+                .map(|window| evaluate_window_expression(window, rows, schema, context))
                 .transpose()
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
@@ -28114,6 +28328,7 @@ fn evaluate_grouped_window_projection(
     group_columns: &[String],
     schema: &TableSchema,
     distinct: bool,
+    context: &mut AggregateEvaluationContext,
 ) -> anyhow::Result<Option<QueryOutcome>> {
     let mut aggregate_expressions = HashSet::new();
     collect_innermost_aggregate_expressions(projection, &mut aggregate_expressions);
@@ -28137,7 +28352,7 @@ fn evaluate_grouped_window_projection(
         for expression in &aggregate_expressions {
             let aggregate = parse_aggregate_expression(expression)
                 .ok_or_else(|| anyhow::anyhow!("Invalid grouped window aggregate"))?;
-            match evaluate_aggregate(aggregate, source_rows, schema)? {
+            match evaluate_aggregate(aggregate, source_rows, schema, context)? {
                 Some(value) => row.push(expression, value),
                 None => row.push_null(expression),
             }
@@ -28167,6 +28382,7 @@ fn evaluate_grouped_window_projection(
         &grouped_schema,
         distinct,
         true,
+        context,
     )
 }
 
@@ -28536,6 +28752,7 @@ fn evaluate_window_expression(
     window: &WindowExpression,
     rows: &[Row],
     schema: &TableSchema,
+    context: &mut AggregateEvaluationContext,
 ) -> anyhow::Result<Vec<Option<Vec<u8>>>> {
     let order_values = window
         .order_by
@@ -28680,7 +28897,7 @@ fn evaluate_window_expression(
                         .iter()
                         .map(|index| rows[*index].clone())
                         .collect::<Vec<_>>();
-                    evaluate_aggregate(aggregate.clone(), &frame_rows, schema)?
+                    evaluate_aggregate(aggregate.clone(), &frame_rows, schema, context)?
                 }
             };
         }
@@ -28967,13 +29184,16 @@ fn filter_projected_having(
     values: &mut Vec<Vec<Option<Vec<u8>>>>,
     source_rows: &[Row],
     schema: &TableSchema,
+    context: &mut AggregateEvaluationContext,
 ) -> anyhow::Result<()> {
     if having_expression(sql).is_none() {
         return Ok(());
     }
     let keep = values
         .first()
-        .map(|projected| evaluate_group_having(sql, columns, projected, source_rows, schema))
+        .map(|projected| {
+            evaluate_group_having(sql, columns, projected, source_rows, schema, context)
+        })
         .transpose()?
         .unwrap_or(false);
     if !keep {
@@ -36728,6 +36948,7 @@ fn evaluate_aggregate(
     aggregate: AggregateExpression,
     rows: &[Row],
     schema: &TableSchema,
+    context: &mut AggregateEvaluationContext,
 ) -> anyhow::Result<Option<Vec<u8>>> {
     let average = matches!(&aggregate, AggregateExpression::Avg(_));
     let maximum = matches!(&aggregate, AggregateExpression::Max(_));
@@ -36826,7 +37047,7 @@ fn evaluate_aggregate(
             separator,
         } => {
             let mut values = Vec::new();
-            for row in rows {
+            for (row_index, row) in rows.iter().enumerate() {
                 let mut rendered = Vec::new();
                 let mut distinct_key = Vec::new();
                 let mut has_null = false;
@@ -36842,11 +37063,16 @@ fn evaluate_aggregate(
                     rendered.extend_from_slice(&value);
                 }
                 if !has_null {
-                    values.push((row, rendered, distinct_key));
+                    let row_number = if row.row_id > 0 {
+                        row.row_id as usize
+                    } else {
+                        row_index + 1
+                    };
+                    values.push((row, rendered, distinct_key, row_number));
                 }
             }
             if !order_by.is_empty() {
-                values.sort_by(|(left, _, _), (right, _, _)| {
+                values.sort_by(|(left, _, _, _), (right, _, _, _)| {
                     for item in &order_by {
                         let left = evaluate_scalar_expression(&item.expression, left)
                             .ok()
@@ -36872,18 +37098,34 @@ fn evaluate_aggregate(
             let mut seen = HashSet::new();
             let values = values
                 .into_iter()
-                .filter(|(_, _, distinct_key)| !distinct || seen.insert(distinct_key.clone()))
-                .map(|(_, value, _)| value)
+                .filter(|(_, _, distinct_key, _)| !distinct || seen.insert(distinct_key.clone()))
+                .map(|(_, value, _, row_index)| (value, row_index))
                 .collect::<Vec<_>>();
             if values.is_empty() {
                 return Ok(None);
             }
+            let max_len = context.group_concat_max_len.min(usize::MAX as u64) as usize;
             let mut output = Vec::new();
-            for (index, value) in values.into_iter().enumerate() {
-                if index > 0 {
-                    output.extend_from_slice(&separator);
+            for (index, (value, row_index)) in values.into_iter().enumerate() {
+                let separator = if index > 0 { separator.as_slice() } else { &[] };
+                let remaining = max_len.saturating_sub(output.len());
+                if remaining == 0 {
+                    context.truncated_rows.push(row_index);
+                    break;
                 }
-                output.extend_from_slice(&value);
+                let separator_len = separator.len().min(remaining);
+                output.extend_from_slice(&separator[..separator_len]);
+                if separator_len != separator.len() {
+                    context.truncated_rows.push(row_index);
+                    break;
+                }
+                let remaining = max_len.saturating_sub(output.len());
+                let value_len = utf8_prefix_len(&value, remaining);
+                output.extend_from_slice(&value[..value_len]);
+                if value_len != value.len() {
+                    context.truncated_rows.push(row_index);
+                    break;
+                }
             }
             Ok(Some(output))
         }
@@ -36994,6 +37236,17 @@ fn evaluate_bit_aggregate(
     Ok(Some(value.to_string().into_bytes()))
 }
 
+fn utf8_prefix_len(value: &[u8], limit: usize) -> usize {
+    let limit = value.len().min(limit);
+    if limit == value.len() || std::str::from_utf8(&value[..limit]).is_ok() {
+        return limit;
+    }
+    (0..limit)
+        .rev()
+        .find(|length| std::str::from_utf8(&value[..*length]).is_ok())
+        .unwrap_or(0)
+}
+
 fn aggregate_row_value(row: &Row, expression: &str) -> anyhow::Result<Option<Vec<u8>>> {
     evaluate_scalar_expression(expression, row)
 }
@@ -37061,9 +37314,10 @@ fn evaluate_grouped_projection(
     group_expressions: &[String],
     key: &[Option<Vec<u8>>],
     allow_nondeterministic: bool,
+    context: &mut AggregateEvaluationContext,
 ) -> anyhow::Result<Option<Vec<u8>>> {
     if let Some(aggregate) = parse_aggregate_expression(item) {
-        return evaluate_aggregate(aggregate, rows, schema);
+        return evaluate_aggregate(aggregate, rows, schema, context);
     }
     if let Some(position) = grouped_projection_position(item, group_expressions) {
         return Ok(rows
@@ -37073,7 +37327,8 @@ fn evaluate_grouped_projection(
             .or_else(|| key[position].clone()));
     }
     let expression = projection_without_alias(item).trim();
-    let Some(materialized) = materialize_group_aggregates(expression, rows, schema)? else {
+    let Some(materialized) = materialize_group_aggregates(expression, rows, schema, context)?
+    else {
         if allow_nondeterministic {
             return evaluate_scalar_expression(
                 expression,
@@ -37094,6 +37349,7 @@ fn materialize_group_aggregates(
     expression: &str,
     rows: &[Row],
     schema: &TableSchema,
+    context: &mut AggregateEvaluationContext,
 ) -> anyhow::Result<Option<String>> {
     let mut aggregate_expressions = HashSet::new();
     collect_innermost_aggregate_expressions(expression, &mut aggregate_expressions);
@@ -37105,7 +37361,7 @@ fn materialize_group_aggregates(
     for aggregate_expression in aggregate_expressions {
         let aggregate = parse_aggregate_expression(&aggregate_expression)
             .ok_or_else(|| anyhow::anyhow!("Invalid aggregate expression"))?;
-        let replacement = evaluate_aggregate(aggregate.clone(), rows, schema)?
+        let replacement = evaluate_aggregate(aggregate.clone(), rows, schema, context)?
             .map(|value| {
                 let literal = match &aggregate {
                     AggregateExpression::CountAll
@@ -37369,6 +37625,7 @@ async fn evaluate_regular_grouped_projection(
                     group_expressions,
                     &key,
                     allow_nondeterministic,
+                    &mut backend.aggregate_context,
                 )
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
@@ -37417,11 +37674,12 @@ fn evaluate_group_having(
     projected: &[Option<Vec<u8>>],
     group_rows: &[Row],
     schema: &TableSchema,
+    context: &mut AggregateEvaluationContext,
 ) -> anyhow::Result<bool> {
     let Some(expression) = having_expression(sql) else {
         return Ok(true);
     };
-    let expression = materialize_group_aggregates(expression, group_rows, schema)?
+    let expression = materialize_group_aggregates(expression, group_rows, schema, context)?
         .unwrap_or_else(|| expression.to_string());
     let mut row = group_rows
         .first()
@@ -37448,8 +37706,13 @@ async fn evaluate_group_having_async(
     let Some(expression) = having_expression(sql) else {
         return Ok(true);
     };
-    let expression = materialize_group_aggregates(expression, group_rows, schema)?
-        .unwrap_or_else(|| expression.to_string());
+    let expression = materialize_group_aggregates(
+        expression,
+        group_rows,
+        schema,
+        &mut backend.aggregate_context,
+    )?
+    .unwrap_or_else(|| expression.to_string());
     let mut row = group_rows
         .first()
         .cloned()
@@ -71700,6 +71963,157 @@ mod tests {
         assert!(rows.is_empty());
     }
 
+    #[tokio::test]
+    async fn group_concat_max_len_truncation_and_warnings_match_mysql() {
+        let (_temp, _storage, mut backend, _second) = transaction_backends().await;
+        backend
+            .execute(
+                "CREATE TABLE group_concat_limits (group_id INT,sort_id INT,value VARCHAR(32))",
+            )
+            .await
+            .unwrap();
+        backend
+            .execute(
+                "INSERT INTO group_concat_limits VALUES
+                 (1,1,'ab'),(1,2,'cd'),(2,1,'ef'),(2,2,'gh')",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            single_value(
+                backend
+                    .execute("SELECT @@session.group_concat_max_len")
+                    .await
+                    .unwrap()
+            ),
+            b"1024"
+        );
+        backend
+            .execute("SET GLOBAL group_concat_max_len=8")
+            .await
+            .unwrap();
+        assert_eq!(
+            single_value(
+                backend
+                    .execute("SELECT @@global.group_concat_max_len")
+                    .await
+                    .unwrap()
+            ),
+            b"8"
+        );
+        assert_eq!(
+            single_value(
+                backend
+                    .execute("SELECT @@session.group_concat_max_len")
+                    .await
+                    .unwrap()
+            ),
+            b"1024"
+        );
+        backend
+            .execute("SET GLOBAL group_concat_max_len=DEFAULT")
+            .await
+            .unwrap();
+
+        backend
+            .execute("SET SESSION group_concat_max_len=4")
+            .await
+            .unwrap();
+        let QueryOutcome::Rows { rows, .. } = backend
+            .execute(
+                "SELECT group_id,GROUP_CONCAT(value ORDER BY sort_id SEPARATOR '|')
+                 FROM group_concat_limits GROUP BY group_id ORDER BY group_id",
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected grouped GROUP_CONCAT rows")
+        };
+        assert_eq!(
+            rows,
+            vec![
+                vec![Some(b"1".to_vec()), Some(b"ab|c".to_vec())],
+                vec![Some(b"2".to_vec()), Some(b"ef|g".to_vec())],
+            ]
+        );
+        assert_eq!(backend.session_warning_count, 2);
+        let QueryOutcome::Rows { rows, .. } = backend.execute("SHOW WARNINGS").await.unwrap()
+        else {
+            panic!("expected GROUP_CONCAT warnings")
+        };
+        assert_eq!(
+            rows,
+            vec![
+                vec![
+                    Some(b"Warning".to_vec()),
+                    Some(b"1260".to_vec()),
+                    Some(b"Row 2 was cut by GROUP_CONCAT()".to_vec()),
+                ],
+                vec![
+                    Some(b"Warning".to_vec()),
+                    Some(b"1260".to_vec()),
+                    Some(b"Row 4 was cut by GROUP_CONCAT()".to_vec()),
+                ],
+            ]
+        );
+        assert_eq!(
+            single_value(backend.execute("SELECT @@warning_count").await.unwrap()),
+            b"2"
+        );
+
+        backend
+            .execute("SET SESSION group_concat_max_len=3")
+            .await
+            .unwrap();
+        assert_eq!(
+            single_value(
+                backend
+                    .execute("SELECT @@session.group_concat_max_len")
+                    .await
+                    .unwrap()
+            ),
+            b"4"
+        );
+        backend
+            .execute("SET SESSION group_concat_max_len=DEFAULT")
+            .await
+            .unwrap();
+        assert_eq!(
+            single_value(
+                backend
+                    .execute("SELECT @@session.group_concat_max_len")
+                    .await
+                    .unwrap()
+            ),
+            b"1024"
+        );
+        backend
+            .execute("SET SESSION group_concat_max_len=4")
+            .await
+            .unwrap();
+        assert_eq!(
+            single_value(
+                backend
+                    .execute("SELECT GROUP_CONCAT('😀a','b')")
+                    .await
+                    .unwrap()
+            ),
+            b"\xF0\x9F\x98\x80"
+        );
+        let QueryOutcome::Rows { rows, .. } = backend.execute("SHOW WARNINGS").await.unwrap()
+        else {
+            panic!("expected UTF-8 GROUP_CONCAT warning")
+        };
+        assert_eq!(
+            rows,
+            vec![vec![
+                Some(b"Warning".to_vec()),
+                Some(b"1260".to_vec()),
+                Some(b"Row 1 was cut by GROUP_CONCAT()".to_vec()),
+            ]]
+        );
+    }
+
     #[test]
     fn mysql_integer_average_keeps_four_fractional_digits() {
         let schema = TableSchema {
@@ -71728,7 +72142,13 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(
-            evaluate_aggregate(AggregateExpression::Avg("score".into()), &rows, &schema).unwrap(),
+            evaluate_aggregate(
+                AggregateExpression::Avg("score".into()),
+                &rows,
+                &schema,
+                &mut AggregateEvaluationContext::default(),
+            )
+            .unwrap(),
             Some(b"30.0000".to_vec())
         );
     }
