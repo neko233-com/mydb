@@ -90,7 +90,7 @@
 | 非递归 & 常用递归 CTE | ✅ Verified | 前向引用/互递归按 MySQL 8.4 明确拒绝；`cte_max_recursion_depth` 的 SESSION/GLOBAL 默认传播、递归成员禁止聚合/窗口/GROUP BY/ORDER BY/DISTINCT 已验证；MySQL 8.4 无 `CYCLE` 语法 |
 | 窗口函数（ROW_NUMBER…NTILE/CUME_DIST、命名 WINDOW、ROWS/RANGE frame） | ✅ Verified | |
 | `GROUP BY` 表达式/别名/序号、`HAVING` | ✅ Verified | 未关联标量子查询、`IN (SELECT ...)`、按分组外层行绑定的关联标量子查询及 `AND` 组合的关联 `EXISTS` 已覆盖；更复杂关联谓词树 🔴 Deferred；显式 `ONLY_FULL_GROUP_BY` 与主键/非空唯一键函数依赖已覆盖 |
-| JSON（`JSON_EXTRACT/UNQUOTE/OBJECT/ARRAY/VALID/TYPE/LENGTH/CONTAINS/CONTAINS_PATH/OVERLAPS/SET/REMOVE/ARRAY_APPEND/ARRAY_INSERT/MERGE_PATCH/DEPTH/KEYS/PRETTY`） | 🟡 Partial | 本轮新增常用数组变更、RFC 7396 合并、深度、对象键枚举和美化输出，并纳入 MySQL 8.4 差分；JSON path 仍仅覆盖基础对象键/数组下标，通配路径、完整 JSON schema/搜索/优化器语义仍 Deferred |
+| JSON（`JSON_EXTRACT/UNQUOTE/OBJECT/ARRAY/VALID/TYPE/LENGTH/CONTAINS/CONTAINS_PATH/OVERLAPS/SET/REMOVE/ARRAY_APPEND/ARRAY_INSERT/MERGE_PATCH/DEPTH/KEYS/PRETTY/SEARCH`） | 🟡 Partial | 本轮新增 `JSON_SEARCH` 基础字符串搜索、`one/all`、`%`/`_` 通配、转义字符、路径范围及特殊 key 输出，并纳入 MySQL 8.4 差分；JSON path 仍仅覆盖基础对象键/数组下标，通配路径、完整 JSON schema/搜索优化器语义仍 Deferred |
 | 常用字符串/数值/日期/网络/摘要/进制/三角/UUID 函数 | ✅ Verified | 见 README “当前 SQL 范围” |
 
 ---

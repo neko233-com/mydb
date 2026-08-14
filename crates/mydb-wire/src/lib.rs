@@ -45,7 +45,7 @@ use mydb_storage::{
     TriggerDefinition, TriggerEvent, TriggerTiming, UpdateValueExpression, WriteCommand,
 };
 
-pub const SERVER_VERSION: &str = "8.4.0-mydb-0.1.12";
+pub const SERVER_VERSION: &str = "8.4.0-mydb-0.1.13";
 pub const MYSQL84_DEFAULT_SQL_MODE: &str = "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION";
 /// MySQL 8.4 default `innodb_lock_wait_timeout`, in seconds.
 pub const MYSQL84_DEFAULT_INNODB_LOCK_WAIT_TIMEOUT_SECONDS: u64 = 50;
@@ -18732,6 +18732,7 @@ fn mysql_expression_column(name: &str, expression: &str) -> MysqlColumn {
         || upper.starts_with("JSON_ARRAY_INSERT(")
         || upper.starts_with("JSON_MERGE_PATCH(")
         || upper.starts_with("JSON_KEYS(")
+        || upper.starts_with("JSON_SEARCH(")
         || upper.starts_with("JSON_ARRAY(")
         || upper.starts_with("JSON_OBJECT(")
     {
@@ -30937,6 +30938,70 @@ fn evaluate_scalar_expression(value: &str, row: &Row) -> anyhow::Result<Option<V
         };
         return Ok(Some(mysql_json_bytes(&value)?));
     }
+    if upper.starts_with("JSON_SEARCH(") && expression.ends_with(')') {
+        let arguments = split_csv(&expression[12..expression.len() - 1]);
+        if arguments.len() < 3 {
+            anyhow::bail!("JSON_SEARCH requires a document, a mode, and a search string");
+        }
+        let Some(document) = evaluate_scalar_expression(&arguments[0], row)? else {
+            return Ok(None);
+        };
+        let Some(mode) = evaluate_scalar_expression(&arguments[1], row)? else {
+            return Ok(None);
+        };
+        let Some(search) = evaluate_scalar_expression(&arguments[2], row)? else {
+            return Ok(None);
+        };
+        let mode = String::from_utf8(mode)?.to_ascii_lowercase();
+        if mode != "one" && mode != "all" {
+            anyhow::bail!("JSON_SEARCH mode must be 'one' or 'all'");
+        }
+        let search = String::from_utf8(search)?;
+        let escape = if let Some(argument) = arguments.get(3) {
+            let Some(escape) = evaluate_scalar_expression(argument, row)? else {
+                return Ok(None);
+            };
+            let escape = String::from_utf8(escape)?;
+            let mut characters = escape.chars();
+            let Some(character) = characters.next() else {
+                anyhow::bail!("JSON_SEARCH escape character must be one character");
+            };
+            if characters.next().is_some() {
+                anyhow::bail!("JSON_SEARCH escape character must be one character");
+            }
+            character
+        } else {
+            '\\'
+        };
+        let document: serde_json::Value = serde_json::from_slice(&document)
+            .map_err(|error| anyhow::anyhow!("Invalid JSON document: {error}"))?;
+        let mut matches = Vec::new();
+        if arguments.len() <= 4 {
+            json_search_collect(&document, "$", &search, escape, mode == "one", &mut matches);
+        } else {
+            for argument in &arguments[4..] {
+                let Some(path) = evaluate_scalar_expression(argument, row)? else {
+                    return Ok(None);
+                };
+                let path = String::from_utf8(path)?;
+                if let Some(value) = json_extract_path(&document, &path)? {
+                    json_search_collect(value, &path, &search, escape, mode == "one", &mut matches);
+                }
+                if mode == "one" && !matches.is_empty() {
+                    break;
+                }
+            }
+        }
+        if matches.is_empty() {
+            return Ok(None);
+        }
+        let value = if mode == "one" || matches.len() == 1 {
+            serde_json::Value::String(matches.remove(0))
+        } else {
+            serde_json::Value::Array(matches.into_iter().map(serde_json::Value::String).collect())
+        };
+        return Ok(Some(mysql_json_bytes(&value)?));
+    }
     if upper.starts_with("JSON_ARRAY_APPEND(") && expression.ends_with(')') {
         let arguments = split_csv(&expression[18..expression.len() - 1]);
         if arguments.len() < 3 || arguments.len().is_multiple_of(2) {
@@ -34191,6 +34256,156 @@ fn json_depth(value: &serde_json::Value) -> usize {
             .map_or(1, |depth| depth + 1),
         _ => 1,
     }
+}
+
+fn json_search_collect(
+    value: &serde_json::Value,
+    path: &str,
+    pattern: &str,
+    escape: char,
+    first_only: bool,
+    matches: &mut Vec<String>,
+) {
+    match value {
+        serde_json::Value::String(value) => {
+            if json_search_pattern_matches(value, pattern, escape)
+                && (first_only || !matches.iter().any(|candidate| candidate == path))
+            {
+                matches.push(path.to_string());
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for (index, value) in values.iter().enumerate() {
+                if first_only && !matches.is_empty() {
+                    return;
+                }
+                json_search_collect(
+                    value,
+                    &format!("{path}[{index}]"),
+                    pattern,
+                    escape,
+                    first_only,
+                    matches,
+                );
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for (key, value) in values {
+                if first_only && !matches.is_empty() {
+                    return;
+                }
+                let simple_key = !key.is_empty()
+                    && key.chars().enumerate().all(|(index, character)| {
+                        (index == 0 && (character.is_ascii_alphabetic() || character == '_'))
+                            || (index > 0
+                                && (character.is_ascii_alphanumeric() || character == '_'))
+                    });
+                let child_path = if simple_key {
+                    format!("{path}.{key}")
+                } else {
+                    format!(
+                        "{path}.{}",
+                        serde_json::to_string(key).expect("serialize JSON key")
+                    )
+                };
+                json_search_collect(value, &child_path, pattern, escape, first_only, matches);
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+    }
+}
+
+fn json_search_pattern_matches(value: &str, pattern: &str, escape: char) -> bool {
+    fn visit(
+        value: &[char],
+        pattern: &[char],
+        escape: char,
+        value_position: usize,
+        pattern_position: usize,
+        memo: &mut HashMap<(usize, usize), bool>,
+    ) -> bool {
+        if let Some(result) = memo.get(&(value_position, pattern_position)) {
+            return *result;
+        }
+        let result = if pattern_position == pattern.len() {
+            value_position == value.len()
+        } else {
+            match pattern[pattern_position] {
+                '%' => {
+                    visit(
+                        value,
+                        pattern,
+                        escape,
+                        value_position,
+                        pattern_position + 1,
+                        memo,
+                    ) || (value_position < value.len()
+                        && visit(
+                            value,
+                            pattern,
+                            escape,
+                            value_position + 1,
+                            pattern_position,
+                            memo,
+                        ))
+                }
+                '_' => {
+                    value_position < value.len()
+                        && visit(
+                            value,
+                            pattern,
+                            escape,
+                            value_position + 1,
+                            pattern_position + 1,
+                            memo,
+                        )
+                }
+                character if character == escape => {
+                    if pattern_position + 1 < pattern.len() {
+                        value_position < value.len()
+                            && value[value_position] == pattern[pattern_position + 1]
+                            && visit(
+                                value,
+                                pattern,
+                                escape,
+                                value_position + 1,
+                                pattern_position + 2,
+                                memo,
+                            )
+                    } else {
+                        value_position < value.len()
+                            && value[value_position] == escape
+                            && visit(
+                                value,
+                                pattern,
+                                escape,
+                                value_position + 1,
+                                pattern_position + 1,
+                                memo,
+                            )
+                    }
+                }
+                character => {
+                    value_position < value.len()
+                        && value[value_position] == character
+                        && visit(
+                            value,
+                            pattern,
+                            escape,
+                            value_position + 1,
+                            pattern_position + 1,
+                            memo,
+                        )
+                }
+            }
+        };
+        memo.insert((value_position, pattern_position), result);
+        result
+    }
+
+    let value = value.chars().collect::<Vec<_>>();
+    let pattern = pattern.chars().collect::<Vec<_>>();
+    visit(&value, &pattern, escape, 0, 0, &mut HashMap::new())
 }
 
 fn json_set_path(
@@ -68420,6 +68635,30 @@ mod tests {
 }"#
                     .to_vec(),
                 )
+            ]]
+        );
+
+        let QueryOutcome::Rows { rows, .. } = backend
+            .execute(
+                "SELECT JSON_SEARCH('{\"a\":\"foo\",\"b\":[\"bar\",\"foo\"]}','one','foo'),
+                        JSON_SEARCH('{\"a\":\"foo\",\"b\":[\"bar\",\"foo\"]}','all','foo'),
+                        JSON_SEARCH('{\"a\":\"foo\",\"b\":[\"bar\",\"foo\"]}','all','fo%'),
+                        JSON_SEARCH('{\"a\":\"foo\",\"b\":[\"bar\",\"foo\"]}','all','foo','x','$.b'),
+                        JSON_SEARCH('{\"a.b\":\"foo\",\"plain\":\"foo\"}','all','foo')",
+            )
+            .await
+            .expect("evaluate JSON search")
+        else {
+            panic!("expected JSON search row")
+        };
+        assert_eq!(
+            rows,
+            vec![vec![
+                Some(br#""$.a""#.to_vec()),
+                Some(br#"["$.a", "$.b[1]"]"#.to_vec()),
+                Some(br#"["$.a", "$.b[1]"]"#.to_vec()),
+                Some(br#""$.b[1]""#.to_vec()),
+                Some(br#"["$.\"a.b\"", "$.plain"]"#.to_vec())
             ]]
         );
 
