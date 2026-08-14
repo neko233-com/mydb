@@ -184,13 +184,13 @@
 - [ ] 当前最终提交在真实 macOS Docker Desktop 上完成 smoke
 - [ ] Windows 安装脚本、Linux systemd、macOS launchctl 在干净真实机器端到端通过
 - [x] Windows/Bash 发布脚本为压缩包生成并上传 SHA-256 sidecar；签名、透明密钥和升级/降级演练仍待完成
-- [ ] `mydb update` / `mydb-cli update` 跨平台在线更新：Release 资产下载、SHA-256 校验、五个二进制事务替换、Windows helper、Linux Debian CLI 更新和 Linux 安装脚本注入失败回滚已验证；真实 Windows 服务/Linux systemd 切换、签名、升级/降级仍待补齐
+- [ ] `mydb update` / `mydb-cli update` 跨平台在线更新：v0.1.12 Release 资产下载、SHA-256 校验、五个二进制事务替换、Windows helper、Linux Debian CLI 更新和 Linux 安装脚本注入失败回滚均已验证；真实 Windows 服务/Linux systemd 切换、签名、升级/降级仍待补齐
 - [ ] 发布产物签名、升级/降级和卸载流程验证
 
 ## 当前可复现证据
 
-- [x] `cargo test --workspace --locked -- --test-threads=1`：通过（wire 257 个单测、storage 61 个单测、17 个集成测、WAL 18 个单测及其余 workspace 测试）
-- [x] `cargo test -p mydb-storage -p mydb-wire --locked`：通过（wire 251 个单测、storage 61 个单测）
+- [x] `cargo test --workspace --locked -- --test-threads=1`：通过（wire 269 个单测、storage 61 个单测、17 个集成测、WAL 18 个单测及其余 workspace 测试）
+- [x] `cargo test -p mydb-storage -p mydb-wire --locked`：通过（wire 269 个单测、storage 61 个单测）
 - [x] 最新并发回归：持久 row-id、MVCC 读视图、删除历史版本、精确 DECIMAL/大整数索引范围、方向性 gap/insert-intention、基础 MDL 与已有并发写回归通过；并发不同表写入保持 FIFO/WAL 组提交语义
 - [x] vendored `opensrv-mysql`：110 项通过，覆盖自定义错误码/SQLSTATE、多结果 SERVER_MORE_RESULTS_EXISTS、握手多结果能力和 Prepared CALL SERVER_PS_OUT_PARAMS 状态位
 - [x] `cargo clippy --workspace --all-targets -- -D warnings`：通过
