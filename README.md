@@ -166,7 +166,7 @@ cargo build --release
 
 # 正式包只包含 server/cli/mydb/migrate/dump、配置、安装脚本和文档；
 # mydb-bench、测试结果与 target/bench 不进入发布包
-.\scripts\build-release.ps1 -Version "0.1.19"
+.\scripts\build-release.ps1 -Version "0.1.20"
 # 发布包同时生成同名 `.sha256` 校验文件；发布脚本会拒绝覆盖已存在的 GitHub Release。
 
 # 安装到系统
@@ -188,7 +188,7 @@ mydb update --check
 mydb update
 
 # 指定版本
-mydb update --version v0.1.19
+mydb update --version v0.1.20
 ```
 
 Windows 服务更新会在当前 CLI 退出后由后台 helper 完成，日志写入安装目录的 `mydb-update.log`；Linux 更新会自动处理同名 systemd 服务。
@@ -614,10 +614,10 @@ bash scripts/docker-smoke.sh
 
 | 场景 | MyDB | MySQL 8.4.11 | MyDB / MySQL |
 |------|------|--------------|--------------|
-| 单表写（fsync-per-commit） | 213 ops/s | 79 ops/s | 2.70x |
-| 4 actor / 4表 写 P99 延迟 | 31.0 ms | 52.7 ms | 1.70x（低更好） |
-| 4 actor / 4表 Group Commit | 259 ops/s | 154 ops/s | 1.69x |
-| 读 P50 延迟 | 306 μs | 133 μs | - |
+| 单表写（fsync-per-commit） | 217 ops/s | 80 ops/s | 2.72x |
+| 4 actor / 4表 写 P99 延迟 | 38.1 ms | 53.8 ms | 1.41x（低更好） |
+| 4 actor / 4表 Group Commit | 337 ops/s | 152 ops/s | 2.22x |
+| 读 P50 延迟 | 407 μs | 128 μs | - |
 
 性能优化不以关闭 WAL 持久化或弱化恢复语义换取数字。默认 250μs Group Commit 窗口优先并发吞吐，checkpoint 按 1024 个已提交请求触发；不声明未经实测证明的固定倍数。
 
@@ -627,21 +627,21 @@ bash scripts/docker-smoke.sh
 
 当前开发状态、已完成项、未完成项、差分证据统一维护在 [CheckList.md](CheckList.md)。只有可复现实测证明的项目才会打勾。
 
-### v0.1.19 稳定版
+### v0.1.20 稳定版
 
-本版面向单机 MySQL 8.4 常用生产工作负载：3306 提供 MySQL 协议，4306 提供登录保护的 Web SQL IDE/管理 API；补齐基础 POINT/LINESTRING/POLYGON/MULTI*/GEOMETRYCOLLECTION 空间构造器、度量、访问器、SRID 轴序和空间谓词，并保留 JSON 搜索、浅层/递归通配路径、数组范围与动态 `last` 下标、基础 `JSON_TABLE`（含按前置表行隐式关联的文档列、标量列、序号、存在性、嵌套路径、默认/错误行为）、JSON_ARRAYAGG/JSON_OBJECTAGG（含窗口聚合）、数组追加/插入、RFC 7396 合并、深度/键枚举/美化输出、全文自然语言 TF-IDF 基础相关性、布尔短语/前缀、基础查询扩展、`mydb update` 跨平台事务替换/失败回滚和非 ASCII tar 文件名校验。发布不宣称复制/集群、完整 InnoDB 全部锁边界、完整 GIS/OGC 语义、全部冷门字符集或全部 MySQL 错误码已完成；显式 `LATERAL` 前缀属于额外超集能力，不作为 MySQL 8.4 差分承诺；逐项状态见 [CheckList.md](CheckList.md) 和 [SYNTAX_MATRIX.md](SYNTAX_MATRIX.md)。
+本版面向单机 MySQL 8.4 常用生产工作负载：3306 提供 MySQL 协议，4306 提供登录保护的 Web SQL IDE/管理 API；在 v0.1.19 基础上修正 `mydb update --check`：通过 GitHub Release 页面解析最新 tag，当前已是最新版本时明确报告 up to date，不依赖受限 API 配额；保留基础 POINT/LINESTRING/POLYGON/MULTI*/GEOMETRYCOLLECTION 空间构造器、度量、访问器、SRID 轴序和空间谓词，以及 JSON、全文、迁移、跨平台更新与失败回滚能力。发布不宣称复制/集群、完整 InnoDB 全部锁边界、完整 GIS/OGC 语义、全部冷门字符集或全部 MySQL 错误码已完成；显式 `LATERAL` 前缀属于额外超集能力，不作为 MySQL 8.4 差分承诺；逐项状态见 [CheckList.md](CheckList.md) 和 [SYNTAX_MATRIX.md](SYNTAX_MATRIX.md)。
 
 **本轮本地门槛（2026-08-15）：**
 - ✅ `cargo test --workspace --locked`：Docker Linux 门禁通过；wire 269（含权限委派/角色 ADMIN OPTION/ALL 部分撤销），其他 workspace 测试与文档测试全部通过
 - ✅ `cargo clippy --workspace --all-targets -- -D warnings`
 - ✅ `cargo build --release -p mydb-server -p mydb-cli -p mydb-migrate -p mydb-dump`
-- ✅ `mydb update --check`：GitHub Release 资产下载、SHA-256 校验和包结构验证通过；更新仅替换二进制并保留配置/数据/密钥
+- ✅ `mydb update --check`：GitHub Release 页面解析最新 tag、资产下载、SHA-256 校验和包结构验证通过；当前版本明确报告 up to date；更新仅替换二进制并保留配置/数据/密钥
 - ✅ MySQL 8.4 CLI 3306 连接、`event_scheduler`/版本探测
 - ✅ Connector/J 9.1.0、Node mysql2 3.23.3 已完成 3306 普通/预处理查询 smoke；Go `database/sql` + go-sql-driver/mysql 1.10.0 已完成当前 release 3306 服务的 Ping、中文、DATE、普通/预处理查询回归
 - ✅ MySQL `'user'@'host'` 基础账户匹配：精确主机优先于通配主机，握手按账户插件选择认证方式
 - ✅ `scripts/bench.ps1`：Docker Linux Rust gate、release build 与同条件 MySQL 8.4 持久化基准通过；性能阶段无预热、60 秒硬截止（报告见 [性能报告.md](性能报告.md)）
 - ✅ `scripts/mysql84-diff.ps1`：当前源码隔离端口与同机 Docker MySQL 8.4，117/117 差分通过；新增基础 JSON_TABLE 标量/嵌套/序号/存在性/默认与错误行为、按前置表行隐式关联 JSON_TABLE、POINT/LINESTRING/POLYGON/MULTI*/GEOMETRYCOLLECTION 空间构造器/度量/访问器/SRID 轴序/谓词，以及 JSON 搜索、浅层/递归通配路径、数组范围/`last` 下标、JSON 聚合/窗口聚合、数组追加/插入、合并、深度/键/美化输出及全文相关性、布尔短语/前缀、停止词/短词边界与查询扩展覆盖
-- ✅ 本轮同条件持久化基准：单表写 MyDB/MySQL `213/79 ops/s`，4 actor P99 `31.0/52.7 ms`，并发吞吐 `259/154 ops/s`，读 P50 `306/133 μs`；1 次样本、无预热，原始数据见 [性能报告.md](性能报告.md)
+- ✅ 本轮同条件持久化基准：单表写 MyDB/MySQL `217/80 ops/s`，4 actor P99 `38.1/53.8 ms`，并发吞吐 `337/152 ops/s`，读 P50 `407/128 μs`；1 次样本、无预热，原始数据见 [性能报告.md](性能报告.md)
 - ⏳ Ubuntu 24.04 物理性能、macOS 原生验收、宿主断电/恢复中断、大数据压力与生产安全运维验收：以 [CheckList.md](CheckList.md) 与 [性能报告.md](性能报告.md) 为准
 
 ---

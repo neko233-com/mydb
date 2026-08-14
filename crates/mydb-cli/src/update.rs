@@ -10,6 +10,7 @@ use std::{
 };
 
 const REPOSITORY: &str = "neko233-com/mydb";
+const CURRENT_RELEASE_TAG: &str = concat!("v", env!("CARGO_PKG_VERSION"));
 
 #[derive(Args, Debug, Clone)]
 pub struct UpdateOptions {
@@ -45,13 +46,18 @@ struct ReleaseAsset {
 
 pub fn run(options: &UpdateOptions) -> Result<()> {
     let asset = release_asset()?;
-    let tag = normalize_tag(&options.version)?;
+    let requested_tag = normalize_tag(&options.version)?;
+    let temp = tempfile::tempdir().context("create MyDB update staging directory")?;
+    let tag = if requested_tag == "latest" {
+        resolve_latest_tag(temp.path())?
+    } else {
+        requested_tag.clone()
+    };
     let release_base = if tag == "latest" {
         format!("https://github.com/{REPOSITORY}/releases/latest/download")
     } else {
         format!("https://github.com/{REPOSITORY}/releases/download/{tag}")
     };
-    let temp = tempfile::tempdir().context("create MyDB update staging directory")?;
     let archive_path = temp.path().join(asset.archive_name);
     let checksum_path = temp.path().join(format!("{}.sha256", asset.archive_name));
     download_file(
@@ -82,12 +88,17 @@ pub fn run(options: &UpdateOptions) -> Result<()> {
     }
 
     if options.check {
-        println!(
-            "Update available: {} ({}, SHA-256 {})",
-            if tag == "latest" { "latest" } else { &tag },
-            asset.archive_name,
-            checksum
-        );
+        if tag == CURRENT_RELEASE_TAG {
+            println!(
+                "MyDB is up to date: {} ({}, SHA-256 {})",
+                tag, asset.archive_name, checksum
+            );
+        } else {
+            println!(
+                "Update available: {} (current {}, {}, SHA-256 {})",
+                tag, CURRENT_RELEASE_TAG, asset.archive_name, checksum
+            );
+        }
         return Ok(());
     }
 
@@ -118,6 +129,39 @@ pub fn run(options: &UpdateOptions) -> Result<()> {
         return Err(error);
     }
     Ok(())
+}
+
+fn resolve_latest_tag(temp_dir: &Path) -> Result<String> {
+    let metadata_path = temp_dir.join("latest-release.html");
+    download_file(
+        &format!("https://github.com/{REPOSITORY}/releases/latest"),
+        &metadata_path,
+    )?;
+    let metadata = fs::read_to_string(&metadata_path).context("read latest MyDB release page")?;
+    let tag = parse_latest_tag_from_html(&metadata)
+        .ok_or_else(|| anyhow::anyhow!("latest MyDB release page has no release tag"))?;
+    let tag = normalize_tag(tag)?;
+    if tag == "latest" {
+        bail!("latest MyDB release page contains an invalid tag")
+    }
+    Ok(tag)
+}
+
+fn parse_latest_tag_from_html(html: &str) -> Option<&str> {
+    let marker = format!("/{REPOSITORY}/releases/tag/");
+    for (position, _) in html.match_indices(&marker) {
+        let candidate = &html[position + marker.len()..];
+        let end = candidate
+            .find(|character: char| {
+                !(character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_'))
+            })
+            .unwrap_or(candidate.len());
+        let tag = &candidate[..end];
+        if !tag.is_empty() {
+            return Some(tag);
+        }
+    }
+    None
 }
 
 fn release_asset() -> Result<ReleaseAsset> {
@@ -515,6 +559,22 @@ mod tests {
         assert_eq!(normalize_tag("0.1.5").expect("version tag"), "v0.1.5");
         assert_eq!(normalize_tag("v0.1.5").expect("version tag"), "v0.1.5");
         assert!(normalize_tag("v0.1.5/../../secret").is_err());
+    }
+
+    #[test]
+    fn reports_current_release_tag_from_package_version() {
+        assert!(CURRENT_RELEASE_TAG.starts_with('v'));
+        assert_eq!(&CURRENT_RELEASE_TAG[1..], env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn extracts_latest_tag_from_github_release_page() {
+        let html = r#"
+            <meta name="route-pattern" content="/user/repo/releases/tag/*name">
+            <meta property="og:url" content="https://github.com/neko233-com/mydb/releases/tag/v0.1.19">
+        "#;
+        assert_eq!(parse_latest_tag_from_html(html), Some("v0.1.19"));
+        assert_eq!(parse_latest_tag_from_html("no release"), None);
     }
 
     #[test]
