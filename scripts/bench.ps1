@@ -136,10 +136,11 @@ function Invoke-Scenario([string]$Name, [string[]]$ScenarioArgs) {
 }
 
 if (-not $SkipBuild) {
-    Invoke-External "cargo check" "cargo.exe" @("check", "--workspace") "01_check"
-    Invoke-External "cargo clippy" "cargo.exe" @("clippy", "--workspace", "--all-targets", "--", "-D", "warnings") "02_clippy"
-    Invoke-External "cargo test" "cargo.exe" @("test", "--workspace") "03_test"
-    Invoke-External "cargo build --release" "cargo.exe" @("build", "--release", "-p", "mydb-server", "-p", "mydb-bench") "04_build"
+    Invoke-External "cargo fmt" "cargo.exe" @("fmt", "--all", "--", "--check") "00_fmt"
+    Invoke-External "cargo check" "cargo.exe" @("check", "--workspace", "--locked") "01_check"
+    Invoke-External "cargo clippy" "cargo.exe" @("clippy", "--workspace", "--all-targets", "--locked", "--", "-D", "warnings") "02_clippy"
+    Invoke-External "cargo test" "cargo.exe" @("test", "--workspace", "--locked") "03_test"
+    Invoke-External "cargo build --release" "cargo.exe" @("build", "--release", "--locked", "-p", "mydb-server", "-p", "mydb-bench") "04_build"
 }
 
 $BenchExe = Join-Path $ProjectRoot "target\release\mydb-bench.exe"

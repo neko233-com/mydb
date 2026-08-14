@@ -32,15 +32,26 @@ function Write-Success { Write-Host "[OK] $args" -ForegroundColor Green }
 function Write-Warn { Write-Host "[WARN] $args" -ForegroundColor Yellow }
 function Write-Error { Write-Host "[ERROR] $args" -ForegroundColor Red; exit 1 }
 
+function Invoke-RustGate {
+    param(
+        [string]$Name,
+        [string[]]$Arguments
+    )
+    Write-Info $Name
+    & cargo @Arguments
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "$Name failed"
+    }
+}
+
 # 检查 gh 是否可用
 if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
     Write-Error "gh (GitHub CLI) not found. Install: https://cli.github.com/"
 }
 
 # 检查 gh 是否登录
-try {
-    gh auth status 2>&1 | Out-Null
-} catch {
+gh auth status 2>&1 | Out-Null
+if ($LASTEXITCODE -ne 0) {
     Write-Error "gh not logged in. Run: gh auth login"
 }
 
@@ -61,6 +72,17 @@ $packageName = "mydb-${platform}"
 Write-Info "Building for: $platform"
 Write-Info "Version: $Version"
 Write-Info "Tag: $Tag"
+
+# 发布物不可覆盖；提前失败，避免无意义地重建本地包。
+$existingRelease = gh release view $Tag 2>&1
+if ($LASTEXITCODE -eq 0) {
+    Write-Error "Release $Tag already exists. Refusing to delete or replace it."
+}
+
+# 发布物不可覆盖；先做 Rust 质量门禁，再构建。
+Invoke-RustGate "Running format check..." @("fmt", "--all", "--", "--check")
+Invoke-RustGate "Running clippy..." @("clippy", "--workspace", "--all-targets", "--locked", "--", "-D", "warnings")
+Invoke-RustGate "Running workspace tests..." @("test", "--workspace", "--locked", "--", "--test-threads=1")
 
 # 构建 release 版本
 Write-Info "Building release..."
@@ -114,12 +136,6 @@ $checksum = (Get-FileHash -LiteralPath $packagePath -Algorithm SHA256).Hash.ToLo
 
 Write-Success "Package created: $packagePath ($([math]::Round($packageSize, 2)) MB)"
 Write-Success "Checksum created: $checksumPath"
-
-# 发布不可覆盖：同一版本只允许一次二进制发布，避免悄悄替换用户已下载的包。
-$existingRelease = gh release view $Tag 2>&1
-if ($LASTEXITCODE -eq 0) {
-    Write-Error "Release $Tag already exists. Refusing to delete or replace it."
-}
 
 # 创建 release
 Write-Info "Creating GitHub release: $Tag"

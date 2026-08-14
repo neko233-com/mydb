@@ -126,12 +126,16 @@ curl -fsSL https://raw.githubusercontent.com/neko233-com/mydb/main/scripts/insta
 irm https://raw.githubusercontent.com/neko233-com/mydb/main/scripts/install.ps1 | iex
 ```
 
-默认安装到 `C:\Server\mydb\mydb-server`，创建 `MyDBServer` 自动启动服务，监听
-`0.0.0.0:3306`，配置和数据分别位于 `config\`、`data\`。安装脚本会幂等保留已有配置/数据，升级只替换二进制；远程连接需要 Windows 防火墙允许 TCP 3306。
+Windows 默认安装到 `C:\Server\mydb\mydb-server`，创建 `MyDBServer` 自动启动服务，监听
+`0.0.0.0:3306`，配置和数据分别位于 `config\`、`data\`。首次安装会生成强随机 root/admin 密钥到
+`config\secrets\root` 与 `config\secrets\admin`，并通过 Windows 服务环境注入；升级幂等保留已有配置、数据和密钥，只替换二进制。远程连接需要 Windows 防火墙允许 TCP 3306。
+
+Linux/macOS 安装默认监听本机 `127.0.0.1:3306`，密钥位于 `~/.config/mydb/secrets/`；需要 systemd/launchd 托管时再执行 `bash scripts/install.sh service`。已有配置不会被覆盖，需管理员自行完成旧配置的密码/TLS 加固。
 
 ```powershell
 # 本地发布包升级（不重复发布版本）
 .\scripts\install.ps1 -PackagePath .\mydb-windows-x86_64.zip
+# 若同目录存在 .sha256，安装器会先校验；远程下载始终强制校验 SHA-256。
 
 # 静默安装/升级：不弹 PowerShell 窗口；首次提权仍可能显示 UAC 同意框
 cscript //nologo .\scripts\install-silent.vbs -PackagePath .\mydb-windows-x86_64.zip
@@ -140,7 +144,13 @@ cscript //nologo .\scripts\install-silent.vbs -PackagePath .\mydb-windows-x86_64
 .\scripts\uninstall-mysql.ps1
 ```
 
-root/root 仅为现有游戏服务兼容默认值；公网部署必须修改密码并启用 TLS/限制防火墙来源。
+Docker 开发配置中的 root/root 仅用于本地兼容 smoke；新安装不使用该默认值。公网部署必须使用密钥文件、启用 TLS，并限制防火墙来源。
+
+Linux/macOS 也支持离线包升级：
+```bash
+PACKAGE_PATH=./mydb-linux-x86_64.tar.gz bash scripts/install.sh all
+```
+远程包和带 `.sha256` sidecar 的本地包会先校验 SHA-256；未带 sidecar 的本地包只用于受控离线场景并会告警。
 
 ### 从源码编译
 
@@ -157,7 +167,7 @@ cargo build --release
 # 正式包只包含 server/cli/migrate/dump、配置、安装脚本和文档；
 # mydb-bench、测试结果与 target/bench 不进入发布包
 .\scripts\build-release.ps1 -Version "0.1.0"
-# 发布包同时生成同名 `.sha256` 校验文件；发布前先校验压缩包完整性。
+# 发布包同时生成同名 `.sha256` 校验文件；发布脚本会拒绝覆盖已存在的 GitHub Release。
 
 # 安装到系统
 cargo install --path crates/mydb-server
@@ -236,8 +246,8 @@ mysql -h 127.0.0.1 -P 3306 -u root -p
 ### JDBC / JetBrains / VS Code / Go / Node.js
 
 MyDB 暴露标准 MySQL TCP 协议，不要求使用 `mydb-cli`。JetBrains DataGrip/IDEA、VS Code
-MySQL 扩展和数据库插件使用 MySQL 数据源：Host `127.0.0.1`、Port `3306`、User `root`、
-Password `root`。JDBC URL：
+MySQL 扩展和数据库插件使用 MySQL 数据源：Host `127.0.0.1`、Port `3306`、User `root`。
+Docker 开发配置密码为 root；原生新安装请读取 `config/secrets/root`。JDBC URL：
 
 ```text
 jdbc:mysql://127.0.0.1:3306/game_db_0?useSSL=false&serverTimezone=UTC
@@ -257,7 +267,7 @@ const db = await mysql.createConnection({
 });
 ```
 
-远程客户端将 Host 改为服务器 IP；安装脚本默认监听全部网卡并创建 TCP 3306 入站规则。
+远程客户端将 Host 改为服务器 IP；Windows 安装脚本默认监听全部网卡并创建 TCP 3306 入站规则，Linux/macOS 默认仅监听本机。
 生产环境应改为强密码、TLS 或明确的来源 IP 白名单。
 启用 `security.enforce_strong_passwords` 后，管理密码只能用于登录换取短期 session token，不能直接作为 Bearer；Prometheus `/metrics` 也需要该 token。CLI Agent 会自动完成登录。
 
@@ -300,7 +310,7 @@ mydb-server --config /etc/mydb/production.yaml
 ### Prometheus 指标
 
 ```bash
-curl http://127.0.0.1:4306/metrics
+curl http://127.0.0.1:4306/metrics  # 弱密码/开发模式；强密码模式使用登录后的 Bearer token
 ```
 
 暴露的关键指标：
@@ -312,23 +322,28 @@ curl http://127.0.0.1:4306/metrics
 
 ### HTTP 管理 API
 
-使用管理员密码作为 Bearer Token：
+强密码模式先登录取得短期 session token；弱密码/开发模式才允许管理员密码直接作为 Bearer：
 
 ```bash
+# 强密码模式
+TOKEN=$(curl -fsS -X POST -H 'Content-Type: application/json' \
+  -d '{"username":"admin","password":"'"$(cat /run/mydb-secrets/admin)"'"}' \
+  http://127.0.0.1:4306/api/v1/auth/login | jq -r .token)
+
 # 服务状态
-curl -H "Authorization: Bearer <admin-password>" \
+curl -H "Authorization: Bearer $TOKEN" \
   http://127.0.0.1:4306/api/v1/status
 
 # 健康检查
-curl -H "Authorization: Bearer <admin-password>" \
+curl -H "Authorization: Bearer $TOKEN" \
   http://127.0.0.1:4306/api/v1/agent/health
 
 # 慢查询列表
-curl -H "Authorization: Bearer <admin-password>" \
+curl -H "Authorization: Bearer $TOKEN" \
   http://127.0.0.1:4306/api/v1/agent/slow-queries
 
 # 自然语言诊断
-curl -X POST -H "Authorization: Bearer <admin-password>" \
+curl -X POST -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"question":"为什么写入延迟高？"}' \
   http://127.0.0.1:4306/api/v1/agent/ask
@@ -336,9 +351,9 @@ curl -X POST -H "Authorization: Bearer <admin-password>" \
 
 也可以通过 CLI 访问：
 ```bash
-mydb-cli --admin-password <admin-password> agent health
-mydb-cli --admin-password <admin-password> agent slow
-mydb-cli --admin-password <admin-password> agent ask "最近有哪些慢 SQL？"
+mydb-cli --admin-password "$(cat /run/mydb-secrets/admin)" agent health
+mydb-cli --admin-password "$(cat /run/mydb-secrets/admin)" agent slow
+mydb-cli --admin-password "$(cat /run/mydb-secrets/admin)" agent ask "最近有哪些慢 SQL？"
 ```
 
 ### 内置 Web SQL IDE
@@ -405,18 +420,23 @@ mydbdump restore \
 ### HTTP 备份 API
 
 ```bash
+# 强密码模式：先登录取得短期 session token，再调用管理 API。
+TOKEN=$(curl -fsS -X POST -H 'Content-Type: application/json' \
+  -d '{"username":"admin","password":"'"$(cat /run/mydb-secrets/admin)"'"}' \
+  http://127.0.0.1:4306/api/v1/auth/login | jq -r .token)
+
 # 全量备份
-curl -X POST -H "Authorization: Bearer <admin-password>" \
+curl -X POST -H "Authorization: Bearer $TOKEN" \
   http://127.0.0.1:4306/api/v1/backup/full
 
 # LSN 增量备份
-curl -X POST -H "Authorization: Bearer <admin-password>" \
+curl -X POST -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"base_id":"full-..."}' \
   http://127.0.0.1:4306/api/v1/backup/incremental
 
 # 时间点恢复 (PITR)
-curl -X POST -H "Authorization: Bearer <admin-password>" \
+curl -X POST -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"id":"incremental-...","point_in_time":"2026-07-15T14:22:53.842Z"}' \
   http://127.0.0.1:4306/api/v1/backup/restore
@@ -562,14 +582,14 @@ bash scripts/docker-smoke.sh
 
 > 完整测试方法、运行指标和发布前验证见 [性能报告.md](性能报告.md)。下表为 2026-08-14 本机 Windows 实测；MyDB 与 MySQL 8.4.11 均使用 fsync 持久化，3 次采样取中位数。
 >
-> 本轮数据：2026-08-14，本机 Windows；MySQL 8.4.11，`innodb_flush_log_at_trx_commit=1`、`sync_binlog=1`。MySQL 基准服务为同机 Docker `127.0.0.1:13306`，MyDB 隔离 release 服务为 `127.0.0.1:13307`。
+> 本轮数据：2026-08-14，本机 Windows；MySQL 8.4.11，`innodb_flush_log_at_trx_commit=1`、`sync_binlog=1`。MySQL 基准服务为同机 Docker `127.0.0.1:3306`，MyDB 隔离 release 服务为 `127.0.0.1:13307`。
 
 | 场景 | MyDB | MySQL 8.4.11 | MyDB / MySQL |
 |------|------|--------------|--------------|
-| 单表写（fsync-per-commit） | 211 ops/s | 71 ops/s | 2.96x |
-| 8 actor / 8表 写 P99 延迟 | 30.8 ms | 69.3 ms | 2.25x（低更好） |
-| 8 actor / 8表 Group Commit | 729 ops/s | 280 ops/s | 2.60x |
-| 读 P50 延迟 | 328 μs | 594 μs | - |
+| 单表写（fsync-per-commit） | 207 ops/s | 66 ops/s | 3.15x |
+| 8 actor / 8表 写 P99 延迟 | 29.9 ms | 74.2 ms | 2.48x（低更好） |
+| 8 actor / 8表 Group Commit | 1290 ops/s | 964 ops/s | 1.34x |
+| 读 P50 延迟 | 353 μs | 631 μs | - |
 
 性能优化不以关闭 WAL 持久化或弱化恢复语义换取数字。默认 250μs Group Commit 窗口优先并发吞吐，checkpoint 按 1024 个已提交请求触发；不声明未经实测证明的固定倍数。
 

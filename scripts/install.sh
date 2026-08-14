@@ -6,8 +6,12 @@ set -euo pipefail
 
 REPO="neko233-com/mydb"
 VERSION="${VERSION:-latest}"
+PACKAGE_PATH="${PACKAGE_PATH:-}"
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.mydb}"
 CONFIG_DIR="${CONFIG_DIR:-$HOME/.config/mydb}"
+DATA_DIR="${DATA_DIR:-$HOME/.mydb/data}"
+SECRETS_DIR="${SECRETS_DIR:-$CONFIG_DIR/secrets}"
+SERVICE_NAME="${SERVICE_NAME:-mydb}"
 
 # Colors
 RED='\033[0;31m'
@@ -63,16 +67,42 @@ download_binary() {
     local tmp_dir
     tmp_dir=$(mktemp -d)
     
-    if command -v curl &> /dev/null; then
-        curl -fsSL "$url" -o "${tmp_dir}/${filename}.tar.gz"
-    elif command -v wget &> /dev/null; then
-        wget -q "$url" -O "${tmp_dir}/${filename}.tar.gz"
+    local archive_path="${tmp_dir}/${filename}.tar.gz"
+    local checksum_path="${tmp_dir}/${filename}.tar.gz.sha256"
+    if [ -n "$PACKAGE_PATH" ]; then
+        [ -f "$PACKAGE_PATH" ] || error "Local package not found: $PACKAGE_PATH"
+        cp "$PACKAGE_PATH" "$archive_path"
+        if [ -f "${PACKAGE_PATH}.sha256" ]; then
+            cp "${PACKAGE_PATH}.sha256" "$checksum_path"
+        else
+            warn "Local package has no SHA-256 sidecar: $PACKAGE_PATH"
+        fi
     else
-        error "Neither curl nor wget found"
+        if command -v curl &> /dev/null; then
+            curl -fsSL "$url" -o "$archive_path"
+            curl -fsSL "${url}.sha256" -o "$checksum_path"
+        elif command -v wget &> /dev/null; then
+            wget -q "$url" -O "$archive_path"
+            wget -q "${url}.sha256" -O "$checksum_path"
+        else
+            error "Neither curl nor wget found"
+        fi
+    fi
+
+    if [ -f "$checksum_path" ]; then
+        local expected actual
+        expected=$(awk 'NF {print $1; exit}' "$checksum_path")
+        if command -v sha256sum >/dev/null 2>&1; then
+            actual=$(sha256sum "$archive_path" | awk '{print $1}')
+        else
+            actual=$(shasum -a 256 "$archive_path" | awk '{print $1}')
+        fi
+        [ "$expected" = "$actual" ] || error "SHA-256 verification failed for ${filename}.tar.gz"
+        success "SHA-256 verified: ${filename}.tar.gz"
     fi
     
     # Extract
-    tar -xzf "${tmp_dir}/${filename}.tar.gz" -C "$tmp_dir"
+    tar -xzf "$archive_path" -C "$tmp_dir"
     
     local source_dir="$tmp_dir"
     if [ -d "${tmp_dir}/${filename}" ]; then
@@ -98,31 +128,102 @@ download_binary() {
     rm -rf "$tmp_dir"
 }
 
-# Create config
+# Create production-safe secret files. Existing secrets are never rotated by an update.
+create_secret() {
+    local name=$1
+    local path="${SECRETS_DIR}/${name}"
+    if [ -f "$path" ]; then
+        chmod 600 "$path"
+        return
+    fi
+    command -v openssl >/dev/null 2>&1 || error "openssl is required to generate MyDB secrets"
+    umask 077
+    openssl rand -base64 36 | tr -d '\r\n' > "$path"
+    chmod 600 "$path"
+}
+
+create_secrets() {
+    mkdir -p "$SECRETS_DIR"
+    chmod 700 "$SECRETS_DIR"
+    create_secret root
+    create_secret admin
+    cat > "${SECRETS_DIR}/environment" << EOF
+MYDB_ROOT_PASSWORD_FILE=${SECRETS_DIR}/root
+MYDB_ADMIN_PASSWORD_FILE=${SECRETS_DIR}/admin
+MYDB_ENFORCE_STRONG_PASSWORDS=true
+EOF
+    chmod 600 "${SECRETS_DIR}/environment"
+    success "Strong secrets stored in ${SECRETS_DIR}"
+}
+
+# Create config. Secrets are injected through the environment file and never copied into YAML.
 create_config() {
     mkdir -p "$CONFIG_DIR"
-    
     if [ ! -f "${CONFIG_DIR}/config.yaml" ]; then
-        cat > "${CONFIG_DIR}/config.yaml" << 'EOF'
+        local tls_cert_value="null"
+        local tls_key_value="null"
+        local require_tls="false"
+        if [ -n "${MYDB_TLS_CERT:-}" ] && [ -n "${MYDB_TLS_KEY:-}" ]; then
+            tls_cert_value="\"${MYDB_TLS_CERT}\""
+            tls_key_value="\"${MYDB_TLS_KEY}\""
+            require_tls="true"
+        fi
+        cat > "${CONFIG_DIR}/config.yaml" << EOF
 server:
-  host: "0.0.0.0"
+  host: "127.0.0.1"
   port: 3306
-  max_connections: 1000
+  max_connections: 512
   thread_count: 0
+  connect_timeout: 10
+  interactive_timeout: 28800
+
+http:
+  host: "127.0.0.1"
+  port: 4306
+  admin_username: "admin"
+  admin_password: "CHANGE_ME_USE_MYDB_ADMIN_PASSWORD_FILE"
+  enabled: true
 
 storage:
-  data_dir: "~/.mydb/data"
-  engine: "innodb"
-  buffer_pool_size: "128M"
+  data_dir: "${DATA_DIR}"
+  engine: "neko233"
+  buffer_pool_size: "512M"
+  log_file_size: "256M"
   page_size: 16384
+  group_commit_window_us: 250
+
+memory:
+  max_memory: "1G"
+  query_cache_size: "0"
+  sort_buffer_size: "4M"
 
 security:
+  default_username: "root"
+  default_password: "CHANGE_ME_USE_MYDB_ROOT_PASSWORD_FILE"
   authentication: "caching_sha2_password"
-  require_secure_transport: false
+  require_secure_transport: ${require_tls}
+  tls_cert: ${tls_cert_value}
+  tls_key: ${tls_key_value}
+  enforce_strong_passwords: true
+  local_infile: false
+  secure_file_priv: "${DATA_DIR}/imports"
+  max_load_data_size: 1073741824
 
 logging:
   level: "info"
   file: ""
+  max_size: "100M"
+  max_files: 14
+
+character_set:
+  server: "utf8mb4"
+  connection: "utf8mb4"
+  results: "utf8mb4"
+
+agent:
+  enabled: true
+  slow_query_threshold_ms: 100
+  max_slow_queries: 4096
 EOF
         success "Config created at ${CONFIG_DIR}/config.yaml"
     fi
@@ -130,9 +231,9 @@ EOF
 
 # Create data directory
 create_data_dir() {
-    local data_dir="$HOME/.mydb/data"
-    mkdir -p "$data_dir"
-    success "Data directory created at ${data_dir}"
+    mkdir -p "${DATA_DIR}/imports"
+    chmod 700 "$DATA_DIR" "${DATA_DIR}/imports"
+    success "Data directory created at ${DATA_DIR}"
 }
 
 # Install service (optional)
@@ -141,18 +242,33 @@ install_service() {
     
     if [ "$os" = "linux" ]; then
         info "Installing systemd service..."
+        local user_name
+        local group_name
+        user_name=$(id -un)
+        group_name=$(id -gn)
         
-        sudo tee /etc/systemd/system/mydb.service > /dev/null << EOF
+        sudo tee "/etc/systemd/system/${SERVICE_NAME}.service" > /dev/null << EOF
 [Unit]
 Description=MyDB Server
 After=network.target
 
 [Service]
 Type=simple
+User=${user_name}
+Group=${group_name}
+WorkingDirectory=${DATA_DIR}
+EnvironmentFile=${SECRETS_DIR}/environment
 ExecStart=${INSTALL_DIR}/mydb-server --config ${CONFIG_DIR}/config.yaml
-Restart=always
+Restart=on-failure
 RestartSec=5
 LimitNOFILE=65536
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=${DATA_DIR}
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 
 [Install]
 WantedBy=multi-user.target
@@ -160,11 +276,31 @@ EOF
 
         sudo systemctl daemon-reload
         success "Systemd service installed"
-        info "Enable with: sudo systemctl enable mydb"
-        info "Start with: sudo systemctl start mydb"
+        info "Enable with: sudo systemctl enable ${SERVICE_NAME}"
+        info "Start with: sudo systemctl start ${SERVICE_NAME}"
         
     elif [ "$os" = "macos" ]; then
-        info "For macOS, use launchctl or run mydb-server directly"
+        local plist_dir="$HOME/Library/LaunchAgents"
+        local plist_path="${plist_dir}/com.neko233.${SERVICE_NAME}.plist"
+        mkdir -p "$plist_dir"
+        cat > "$plist_path" << EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>com.neko233.${SERVICE_NAME}</string>
+<key>ProgramArguments</key><array><string>${INSTALL_DIR}/mydb-server</string><string>--config</string><string>${CONFIG_DIR}/config.yaml</string></array>
+<key>EnvironmentVariables</key><dict>
+<key>MYDB_ROOT_PASSWORD_FILE</key><string>${SECRETS_DIR}/root</string>
+<key>MYDB_ADMIN_PASSWORD_FILE</key><string>${SECRETS_DIR}/admin</string>
+<key>MYDB_ENFORCE_STRONG_PASSWORDS</key><string>true</string>
+</dict>
+<key>WorkingDirectory</key><string>${DATA_DIR}</string>
+<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
+</dict></plist>
+EOF
+        launchctl bootout "gui/$(id -u)/com.neko233.${SERVICE_NAME}" 2>/dev/null || true
+        launchctl bootstrap "gui/$(id -u)" "$plist_path"
+        success "launchd service installed: ${plist_path}"
     fi
 }
 
@@ -235,6 +371,7 @@ main() {
     esac
     
     if [ "$component" != "service" ]; then
+        create_secrets
         create_config
         create_data_dir
         setup_path
@@ -243,12 +380,17 @@ main() {
         echo -e "${GREEN}Installation complete!${NC}"
         echo ""
         echo "Quick start:"
-        echo "  ${INSTALL_DIR}/mydb-server --config ${CONFIG_DIR}/config.yaml"
+        echo "  MYDB_ROOT_PASSWORD_FILE=${SECRETS_DIR}/root MYDB_ADMIN_PASSWORD_FILE=${SECRETS_DIR}/admin MYDB_ENFORCE_STRONG_PASSWORDS=true ${INSTALL_DIR}/mydb-server --config ${CONFIG_DIR}/config.yaml"
         echo ""
         echo "Connect with:"
-        echo "  ${INSTALL_DIR}/mydb-cli -h 127.0.0.1 -P 3306 -u root"
+        echo "  ${INSTALL_DIR}/mydb-cli -h 127.0.0.1 -P 3306 -u root --password \$(cat ${SECRETS_DIR}/root)"
         echo "  ${INSTALL_DIR}/mydb-migrate --help"
         echo "  ${INSTALL_DIR}/mydbdump --help"
+    else
+        create_secrets
+        create_config
+        create_data_dir
+        install_service
     fi
 }
 

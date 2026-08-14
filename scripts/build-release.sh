@@ -56,6 +56,19 @@ info "Building for: $PLATFORM"
 info "Version: $VERSION"
 info "Tag: $TAG"
 
+# Fail before rebuilding if the immutable release already exists.
+if gh release view "$TAG" &> /dev/null; then
+    error "Release $TAG already exists. Refusing to delete or replace it."
+fi
+
+# A release is immutable. Run the same Rust gates required before pushing.
+info "Running format check..."
+cargo fmt --all -- --check
+info "Running clippy..."
+cargo clippy --workspace --all-targets --locked -- -D warnings
+info "Running workspace tests..."
+cargo test --workspace --locked -- --test-threads=1
+
 # 构建 release 版本
 info "Building release..."
 cargo build --release -p mydb-server -p mydb-cli -p mydb-migrate -p mydb-dump
@@ -120,12 +133,6 @@ printf '%s  %s\n' "$CHECKSUM" "$(basename "$PACKAGE_PATH")" > "$CHECKSUM_PATH"
 
 success "Package created: $PACKAGE_PATH ($PACKAGE_SIZE)"
 success "Checksum created: $CHECKSUM_PATH"
-
-# 检查 tag 是否已存在
-if gh release view "$TAG" &> /dev/null; then
-    warn "Release $TAG already exists. Deleting..."
-    gh release delete "$TAG" -y
-fi
 
 # 创建 release
 info "Creating GitHub release: $TAG"

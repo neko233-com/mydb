@@ -123,6 +123,26 @@ function Install-Binaries {
             Write-Info "Using local package: $PackagePath"
             Copy-Item -LiteralPath $PackagePath -Destination $zipFile -Force
         }
+        $checksumSource = "${PackagePath}.sha256"
+        if ([string]::IsNullOrWhiteSpace($PackagePath)) {
+            $checksumSource = Get-ReleaseUrl "$packageName.zip.sha256"
+            $checksumFile = Join-Path $tempRoot "$packageName.zip.sha256"
+            Invoke-WebRequest -Uri $checksumSource -OutFile $checksumFile -UseBasicParsing
+        } elseif (Test-Path -LiteralPath $checksumSource -PathType Leaf) {
+            $checksumFile = Join-Path $tempRoot "$packageName.zip.sha256"
+            Copy-Item -LiteralPath $checksumSource -Destination $checksumFile -Force
+        } else {
+            $checksumFile = $null
+            Write-Warn "Local package has no SHA-256 sidecar: $PackagePath"
+        }
+        if ($null -ne $checksumFile) {
+            $expectedHash = ((Get-Content -LiteralPath $checksumFile -Raw).Trim() -split '\s+')[0].ToLowerInvariant()
+            $actualHash = (Get-FileHash -LiteralPath $zipFile -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($expectedHash -ne $actualHash) {
+                Stop-WithError "SHA-256 verification failed for $PackagePath"
+            }
+            Write-Success "SHA-256 verified: $packageName.zip"
+        }
         Expand-Archive -Path $zipFile -DestinationPath $tempRoot -Force
 
         $sourceDir = Join-Path $tempRoot $packageName
@@ -180,6 +200,34 @@ function Remove-LegacyRouter {
     }
 }
 
+function New-RandomSecret {
+    $bytes = New-Object byte[] 36
+    $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
+    try {
+        $rng.GetBytes($bytes)
+    } finally {
+        $rng.Dispose()
+    }
+    return [Convert]::ToBase64String($bytes)
+}
+
+function Ensure-SecretFile {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        [IO.File]::WriteAllText($Path, (New-RandomSecret), [Text.UTF8Encoding]::new($false))
+    }
+    $acl = Get-Acl -LiteralPath $Path
+    $acl.SetAccessRuleProtection($true, $false)
+    $acl.Access | ForEach-Object { $acl.RemoveAccessRule($_) | Out-Null }
+    $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule(
+        [Security.Principal.NTAccount]::new($env:USERNAME), "FullControl", "Allow")))
+    $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule(
+        [Security.Principal.NTAccount]::new("SYSTEM"), "FullControl", "Allow")))
+    $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule(
+        [Security.Principal.NTAccount]::new("Administrators"), "FullControl", "Allow")))
+    Set-Acl -LiteralPath $Path -AclObject $acl
+}
+
 function Ensure-Config {
     New-Item -ItemType Directory -Path $ConfigDir -Force | Out-Null
     New-Item -ItemType Directory -Path $DataDir -Force | Out-Null
@@ -188,6 +236,13 @@ function Ensure-Config {
         Write-Info "Keeping existing config: $configFile"
         return
     }
+
+    $secretsDir = Join-Path $ConfigDir "secrets"
+    New-Item -ItemType Directory -Path $secretsDir -Force | Out-Null
+    $rootSecret = Join-Path $secretsDir "root"
+    $adminSecret = Join-Path $secretsDir "admin"
+    Ensure-SecretFile $rootSecret
+    Ensure-SecretFile $adminSecret
 
     $yamlDataDir = $DataDir -replace "\\", "/"
     $yaml = @"
@@ -203,8 +258,8 @@ server:
 http:
   host: "127.0.0.1"
   port: 4306
-  admin_username: "root"
-  admin_password: "root"
+  admin_username: "admin"
+  admin_password: "CHANGE_ME_USE_MYDB_ADMIN_PASSWORD_FILE"
   enabled: true
 
 storage:
@@ -223,13 +278,13 @@ memory:
 
 security:
   default_username: "root"
-  default_password: "root"
+  default_password: "CHANGE_ME_USE_MYDB_ROOT_PASSWORD_FILE"
   authentication: "caching_sha2_password"
   require_secure_transport: false
   tls_cert: null
   tls_key: null
-  enforce_strong_passwords: false
-  local_infile: true
+  enforce_strong_passwords: true
+  local_infile: false
   secure_file_priv: "$yamlDataDir/imports"
   max_load_data_size: 1073741824
 
@@ -252,6 +307,7 @@ agent:
     Set-Content -LiteralPath $configFile -Value $yaml -Encoding UTF8
     New-Item -ItemType Directory -Path (Join-Path $DataDir "imports") -Force | Out-Null
     Write-Success "Config created: $configFile"
+    Write-Info "Generated MySQL and HTTP secrets: $secretsDir\root and $secretsDir\admin"
 }
 
 function Ensure-Path {
@@ -296,6 +352,15 @@ function Ensure-Service {
         Write-Info "Windows service updated: $ServiceName"
     }
     Invoke-CheckedNative "sc.exe" @("description", $ServiceName, "MySQL-compatible Neko233 database server") "Failed to update service description"
+    $serviceEnvironment = "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName"
+    $secretsDir = Join-Path $ConfigDir "secrets"
+    if (Test-Path -LiteralPath (Join-Path $secretsDir "root") -PathType Leaf) {
+        New-ItemProperty -LiteralPath $serviceEnvironment -Name Environment -PropertyType MultiString -Value @(
+            "MYDB_ROOT_PASSWORD_FILE=$(Join-Path $secretsDir 'root')",
+            "MYDB_ADMIN_PASSWORD_FILE=$(Join-Path $secretsDir 'admin')",
+            "MYDB_ENFORCE_STRONG_PASSWORDS=true"
+        ) -Force | Out-Null
+    }
     Start-Service -Name $ServiceName
     (Get-Service -Name $ServiceName).WaitForStatus("Running", [TimeSpan]::FromSeconds(30))
     Write-Success "Windows service running and set to Automatic"
@@ -332,7 +397,7 @@ function Main {
         Write-Success "MyDB install/update complete"
         Write-Host "Config: $ConfigDir\config.yaml"
         Write-Host "Data:   $DataDir"
-        Write-Host "JDBC/Go/Node endpoint: 127.0.0.1:3306, user root, password root"
+        Write-Host "JDBC/Go/Node endpoint: 127.0.0.1:3306, user root; generated password is in $ConfigDir\secrets\root"
         Write-Host "Remote endpoint: <server-ip>:3306 (firewall rule enabled unless -NoRemoteFirewall)"
     }
 }
