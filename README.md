@@ -613,7 +613,7 @@ bash scripts/docker-smoke.sh
 - ✅ Connector/J 9.1.0、Node mysql2 3.23.3 已完成 3306 普通/预处理查询 smoke；Go `database/sql` + go-sql-driver/mysql 1.10.0 已完成当前 release 3306 服务的 Ping、中文、DATE、普通/预处理查询回归
 - ✅ MySQL `'user'@'host'` 基础账户匹配：精确主机优先于通配主机，握手按账户插件选择认证方式
 - ✅ `scripts/docker-smoke.ps1`：当前源码 Docker release 镜像通过 SIGKILL、WAL 损坏、只读/ENOSPC、事务锁、LOAD DATA、备份/PITR 与 Web/Agent smoke
-- ✅ `scripts/mysql84-diff.ps1`：当前 release 隔离 13307 与同机 Docker MySQL 8.4，101/101 差分通过；新增 JSON 路径/重叠、位聚合、常量聚合投影、角色授权、ai_ci 字符集比较、视图/例程/触发器、FK/CHECK、EXPLAIN 语义和状态接口覆盖
+- ✅ `scripts/mysql84-diff.ps1`：当前 release 隔离 13307 与同机 Docker MySQL 8.4，102/102 差分通过；新增 JSON 路径/重叠、位聚合、常量聚合投影、未知线程 KILL 错误、角色授权、ai_ci 字符集比较、视图/例程/触发器、FK/CHECK、EXPLAIN 语义和状态接口覆盖
 - ⏳ Ubuntu 24.04 物理性能、macOS 原生验收、宿主断电/恢复中断、大数据压力与生产安全运维验收：以 [CheckList.md](CheckList.md) 与 [性能报告.md](性能报告.md) 为准
 
 ---

@@ -33,7 +33,7 @@ function Invoke-MySqlClient {
     if ($Target -eq "mysql84") {
         $arguments += @("-e", $Sql)
     } else {
-        $arguments += @("-h$MyDbHost", "-P$MyDbPort", "-e", $Sql)
+        $arguments += @("--host=$MyDbHost", "--port=$MyDbPort", "-e", $Sql)
     }
 
     $output = & docker @arguments 2>&1
@@ -226,6 +226,7 @@ try {
         [pscustomobject]@{ Name = "date functions"; Sql = "SELECT DATE('2024-02-29 12:34:56') AS date_value, TIME('2024-02-29 12:34:56') AS time_value, DATEDIFF('2024-02-29','2024-02-01') AS date_diff, DATE_ADD('2024-01-31',INTERVAL 1 MONTH) AS month_end, LAST_DAY('2024-02-10') AS last_day" },
         [pscustomobject]@{ Name = "time zone session"; Sql = "SET time_zone='+00:00'; SELECT CONVERT_TZ('2024-01-01 12:00:00','+00:00','+08:00') AS converted_time, @@session.time_zone AS session_zone; SET time_zone='SYSTEM'" },
         [pscustomobject]@{ Name = "compatibility system variables"; Sql = "SELECT @@default_tmp_storage_engine AS default_tmp_storage_engine, @@authentication_policy AS authentication_policy" },
+        [pscustomobject]@{ Name = "kill unknown thread errors"; Sql = "KILL CONNECTION 999999; KILL QUERY 999999" },
         [pscustomobject]@{ Name = "datagrip connection probes"; Sql = "SELECT DATABASE() AS database_name; SELECT @@event_scheduler AS event_scheduler; SELECT @@default_storage_engine AS default_storage_engine,@@default_tmp_storage_engine AS default_tmp_storage_engine; SELECT @@authentication_policy AS policy; SELECT @@GLOBAL.lower_case_table_names AS lower_case_table_names" },
         [pscustomobject]@{ Name = "datagrip schema list"; Sql = "SELECT schema_name,default_collation_name FROM information_schema.schemata WHERE schema_name='$database'" },
         [pscustomobject]@{ Name = "datagrip tables and views"; Sql = "SELECT T.table_name AS table_name,T.table_type AS table_type,T.table_comment AS table_comment,T.engine AS engine,T.table_collation AS table_collation,T.create_options AS create_options,V.definer AS view_definer FROM information_schema.tables T LEFT JOIN information_schema.views V ON T.table_schema=V.table_schema AND T.table_name=V.table_name WHERE T.table_schema='$database' AND true ORDER BY T.table_name" },

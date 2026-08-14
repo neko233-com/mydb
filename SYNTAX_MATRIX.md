@@ -166,7 +166,7 @@
 | `SHOW PROCESSLIST` / `SHOW STATUS` / `SHOW VARIABLES` | ✅ Verified | |
 | `SHOW ENGINES` / `SHOW CHARSET` / `SHOW COLLATION` | ✅ Verified | |
 | `SHOW WARNINGS` / `SHOW ERRORS` / `SHOW COUNT(*) WARNINGS` | ✅ Verified | |
-| `KILL` / `SHOW GRANTS` | ✅ Verified | |
+| `KILL [CONNECTION\|QUERY]` / `SHOW GRANTS` | ✅ Verified | `CONNECTION` 通知连接任务退出并清理事务/锁；`QUERY` 中断活动查询的锁等待并返回 1317；权限与 1094/1095 错误已覆盖 |
 
 ---
 

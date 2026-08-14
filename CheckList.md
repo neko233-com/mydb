@@ -204,14 +204,14 @@
 - [x] 默认 MyDB 容器：healthy、`unless-stopped`、0.5 CPU、512 MiB
 - [x] MySQL Connector/J 9.1.0：当前 release 服务 3306 4/4 通过，含无默认库、认证、CRUD、UTF-8、DataGrip/IDEA 常用连接属性，以及 typed prepared metadata/DATE/BLOB binary row 回归；覆盖 JDBC 路径
 - [x] Go `database/sql` `github.com/go-sql-driver/mysql` v1.10.0：当前 release 服务 3306 回归通过 Ping、建库/建表、中文、DATE、普通查询与预处理查询
-- [x] MySQL 8.4 真实差分：`scripts/mysql84-diff.ps1` 同机 Docker MySQL 8.4（Windows `lower_case_table_names=1` 基线）与本轮最新 release 隔离 MyDB（13307）逐结果集比较，覆盖表达式、谓词、JSON（含 `JSON_CONTAINS_PATH`/`JSON_OVERLAPS`）、日期、聚合/窗口（含 BIT 聚合与常量聚合投影）、子查询/CTE、预处理、事务、大小写不敏感表名、COMMENT、全文/空间索引、`WHERE TRUE/FALSE`、无默认 schema 的 `DATABASE()`、SSL 状态探针、GoLand Database 插件真实内省 SQL、CASE 文本投影、information_schema 逗号 JOIN、BIT 数值转换、生成列及 3105 显式写入错误（INSERT/UPDATE/UPSERT/INSERT SELECT）、严格 1406、`INSERT IGNORE` 截断/1265/1062、RENAME/TRUNCATE、角色授权、视图/例程/触发器、FK/CHECK、ai_ci 字符串权重、EXPLAIN 语义和状态接口，共 101 项通过；JSON 成本与 InnoDB 物理估算字段按语义/结构校验，不硬比引擎估算值
+- [x] MySQL 8.4 真实差分：`scripts/mysql84-diff.ps1` 同机 Docker MySQL 8.4（Windows `lower_case_table_names=1` 基线）与本轮最新 release 隔离 MyDB（13307）逐结果集比较，覆盖表达式、谓词、JSON（含 `JSON_CONTAINS_PATH`/`JSON_OVERLAPS`）、日期、聚合/窗口（含 BIT 聚合与常量聚合投影）、子查询/CTE、预处理、事务、大小写不敏感表名、COMMENT、全文/空间索引、`WHERE TRUE/FALSE`、无默认 schema 的 `DATABASE()`、SSL 状态探针、GoLand Database 插件真实内省 SQL、CASE 文本投影、information_schema 逗号 JOIN、BIT 数值转换、生成列及 3105 显式写入错误（INSERT/UPDATE/UPSERT/INSERT SELECT）、严格 1406、`INSERT IGNORE` 截断/1265/1062、RENAME/TRUNCATE、角色授权、视图/例程/触发器、FK/CHECK、ai_ci 字符串权重、EXPLAIN 语义、状态接口及未知线程 `KILL` 错误，共 102 项通过；JSON 成本与 InnoDB 物理估算字段按语义/结构校验，不硬比引擎估算值
 - [x] Node.js `mysql2` v3.23.3：当前 release 服务 3306 通过普通查询与预处理查询；覆盖 VS Code JavaScript/TypeScript 连接路径
 - [x] Windows 当前构建：`MyDBServer` Automatic 服务停止/启动循环通过；监听 `0.0.0.0:3306`，LAN 地址连接成功，防火墙入站规则启用
 - [x] Windows 物理服务现状：`MyDBServer` Automatic、Running；3306 返回 `8.4.0-mydb-0.1.0` 与 `event_scheduler=ON`；本轮最新 release 已在隔离 13307 完成同等差分
-- [x] Windows 物理服务已切换到本轮最新 release：管理员安装脚本 exit 0；`MyDBServer` Automatic/Running，3306 与 4306 均监听，当前二进制时间 2026-08-14 12:25
+- [ ] Windows 物理服务已切换到本轮最新 release：当前 shell 无法重启 LocalSystem `MyDBServer`，3306/4306 仍保持稳定开发实例；本轮最新源码已在隔离 13307 完成验证，待有权限窗口切换 3306
 - [x] 本机全量切流：9 个业务库迁移并重启校验；`sakila.staff` 超大 BLOB 通过 16KB 页外溢存储保留；MySQL80 服务、程序、进程和数据目录已卸载清理，SQL 备份保留在 `C:\Server\mydb\mysql-backup-20260811\all-databases.sql`
-- [x] 2026-08-14 当前 release 真实 MySQL 8.4 差分：同机 Docker `mysql:8.4` 与隔离 13307 对比，101/101 cases 通过；含 JSON 路径/重叠、BIT 聚合、常量聚合投影、角色授权、ai_ci、EXPLAIN、状态接口、生成列 INSERT/UPDATE/UPSERT/INSERT SELECT 显式写入错误码/消息；先前旧服务多语句 setup 的 `ERROR 2000` 已由 release 切换消除
-- [x] 2026-08-14 同机持久化基准：MyDB release 13307 vs MySQL 8.4.11 13306，3 次中位数；单表写 196/67 ops/s、P99 38.7/92.1 ms、并发吞吐 1222/705 ops/s、读 P50 391/638 μs；原始结果见 `性能报告.md`，不硬编码历史比值
+- [x] 2026-08-14 当前 release 真实 MySQL 8.4 差分：同机 Docker `mysql:8.4` 与隔离 13307 对比，102/102 cases 通过；含 JSON 路径/重叠、BIT 聚合、常量聚合投影、未知线程 KILL 错误、角色授权、ai_ci、EXPLAIN、状态接口、生成列 INSERT/UPDATE/UPSERT/INSERT SELECT 显式写入错误码/消息；物理 3306 服务未强制替换
+- [x] 2026-08-14 同机持久化基准：MyDB release 13307 vs MySQL 8.4.11 13306，3 次中位数；单表写 204/69 ops/s、P99 33.1/93.8 ms、并发吞吐 705/261 ops/s、读 P50 338/626 μs；原始结果见 `性能报告.md`，不硬编码历史比值
 - [x] 2026-08-14 Windows 隔离安装回归：管理员本地发布包安装 exit 0，生成 ACL 受限 root/admin 强密钥并创建配置/数据目录；新包仅含 server/cli/migrate/dump，不含 mydb-router
 - [x] 2026-08-14 安装包完整性回归：Linux 容器本地 tar.gz 与 Windows 本地 zip 均完成 `.sha256` 校验、强密钥配置和无 router 文件检查；远程安装路径强制下载 sidecar
 - [ ] 正式 Ubuntu 24.04 物理 linux/amd64 性能结果稳定达到目标；当前证据不足

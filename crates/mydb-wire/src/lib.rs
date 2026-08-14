@@ -2978,6 +2978,47 @@ fn audit_statement_type(sql: &str) -> String {
         .to_ascii_uppercase()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KillScope {
+    Connection,
+    Query,
+}
+
+fn parse_kill_statement(sql: &str) -> Option<anyhow::Result<(KillScope, u32)>> {
+    let sql = sql.trim().trim_end_matches(';').trim();
+    let upper = sql.to_ascii_uppercase();
+    if upper != "KILL" && !upper.starts_with("KILL ") {
+        return None;
+    }
+    let mut tokens = sql["KILL".len()..].split_whitespace();
+    let first = tokens.next();
+    let (scope, id) = match first {
+        Some(value) if value.eq_ignore_ascii_case("CONNECTION") => {
+            (KillScope::Connection, tokens.next())
+        }
+        Some(value) if value.eq_ignore_ascii_case("QUERY") => (KillScope::Query, tokens.next()),
+        Some(value) => (KillScope::Connection, Some(value)),
+        None => {
+            return Some(Err(anyhow::anyhow!(
+                "You have an error in your SQL syntax; invalid KILL statement"
+            )))
+        }
+    };
+    if tokens.next().is_some() {
+        return Some(Err(anyhow::anyhow!(
+            "You have an error in your SQL syntax; invalid KILL statement"
+        )));
+    }
+    let Some(id) = id else {
+        return Some(Err(anyhow::anyhow!(
+            "You have an error in your SQL syntax; invalid KILL statement"
+        )));
+    };
+    Some(id.parse::<u32>().map(|id| (scope, id)).map_err(|_| {
+        anyhow::anyhow!("You have an error in your SQL syntax; invalid KILL thread id")
+    }))
+}
+
 #[derive(Default)]
 pub struct WireStats {
     active_connections: AtomicUsize,
@@ -3009,6 +3050,7 @@ pub struct WireStats {
     pending_transactions:
         parking_lot::Mutex<HashMap<u32, Weak<parking_lot::RwLock<Vec<WriteCommand>>>>>,
     aborted_transactions: parking_lot::Mutex<HashSet<u32>>,
+    killed_queries: parking_lot::Mutex<HashSet<u32>>,
     active_sessions: parking_lot::Mutex<HashMap<u32, ActiveSession>>,
     killed_connections: parking_lot::Mutex<HashSet<u32>>,
     kill_senders: parking_lot::Mutex<HashMap<u32, oneshot::Sender<()>>>,
@@ -3257,6 +3299,7 @@ fn event_atomic_statement_forbidden(upper: &str) -> bool {
         "PREPARE ",
         "DEALLOCATE PREPARE ",
         "DROP PREPARE ",
+        "KILL ",
     ]
     .iter()
     .any(|prefix| upper == *prefix || upper.starts_with(prefix))
@@ -3395,6 +3438,7 @@ impl WireStats {
         self.active_sessions.lock().remove(&connection_id);
         self.kill_senders.lock().remove(&connection_id);
         self.killed_connections.lock().remove(&connection_id);
+        self.killed_queries.lock().remove(&connection_id);
     }
 
     pub fn kill_connection(&self, connection_id: u32) -> bool {
@@ -3407,6 +3451,24 @@ impl WireStats {
             let _ = sender.send(());
         }
         true
+    }
+
+    fn kill_query(&self, connection_id: u32) -> bool {
+        let active_query = self
+            .active_sessions
+            .lock()
+            .get(&connection_id)
+            .is_some_and(|session| session.command.eq_ignore_ascii_case("Query"));
+        if !active_query {
+            return false;
+        }
+        self.killed_queries.lock().insert(connection_id);
+        self.lock_changed.notify_waiters();
+        true
+    }
+
+    fn take_query_kill(&self, connection_id: u32) -> bool {
+        self.killed_queries.lock().remove(&connection_id)
     }
 
     fn is_connection_killed(&self, connection_id: u32) -> bool {
@@ -3966,6 +4028,9 @@ impl WireStats {
             if self.take_transaction_abort(connection_id) {
                 anyhow::bail!("Deadlock found when trying to get lock; try restarting transaction");
             }
+            if self.take_query_kill(connection_id) {
+                anyhow::bail!("Query execution was interrupted");
+            }
             let notified = self.lock_changed.notified();
             let (already_held, blockers) = {
                 let mut locks = self.transaction_locks.lock();
@@ -4049,6 +4114,9 @@ impl WireStats {
             if self.take_transaction_abort(connection_id) {
                 anyhow::bail!("Deadlock found when trying to get lock; try restarting transaction");
             }
+            if self.take_query_kill(connection_id) {
+                anyhow::bail!("Query execution was interrupted");
+            }
             let notified = self.lock_changed.notified();
             let blockers = {
                 let mut transaction_locks = self.transaction_locks.lock();
@@ -4109,6 +4177,9 @@ impl WireStats {
         loop {
             if self.take_transaction_abort(connection_id) {
                 anyhow::bail!("Deadlock found when trying to get lock; try restarting transaction");
+            }
+            if self.take_query_kill(connection_id) {
+                anyhow::bail!("Query execution was interrupted");
             }
             let notified = self.lock_changed.notified();
             let blockers = {
@@ -5266,6 +5337,7 @@ impl Backend {
         if self.stats.is_connection_killed(self.connection_id) {
             anyhow::bail!("Query execution was interrupted");
         }
+        self.stats.take_query_kill(self.connection_id);
         let normalized = normalize_sql_whitespace(sql.trim().trim_end_matches(';').trim());
         self.stats.update_connection_query(
             self.connection_id,
@@ -5304,6 +5376,11 @@ impl Backend {
                 ),
             )
             .await;
+        let outcome = if self.stats.take_query_kill(self.connection_id) {
+            Err(anyhow::anyhow!("Query execution was interrupted"))
+        } else {
+            outcome
+        };
         if implicit_next_transaction && !self.in_transaction && self.autocommit {
             self.reset_transaction_characteristics();
         }
@@ -5670,6 +5747,7 @@ impl Backend {
             "PREPARE ",
             "DEALLOCATE PREPARE ",
             "DROP PREPARE ",
+            "KILL ",
         ]
         .iter()
         .any(|prefix| upper == *prefix || upper.starts_with(prefix))
@@ -7469,6 +7547,18 @@ impl Backend {
         self.require_statement_privilege(sql, &upper)?;
         if _prof {
             eprintln!("PROFILE PREFIX {}us", _prof_t0.elapsed().as_micros());
+        }
+
+        if let Some(kill) = parse_kill_statement(&normalized) {
+            let (scope, connection_id) = kill?;
+            let applied = match scope {
+                KillScope::Connection => self.stats.kill_connection(connection_id),
+                KillScope::Query => self.stats.kill_query(connection_id),
+            };
+            if !applied {
+                anyhow::bail!("Unknown thread id: {}", connection_id);
+            }
+            return Ok(QueryOutcome::ok(0));
         }
 
         if is_lock_tables_statement(&upper) {
@@ -9854,6 +9944,15 @@ impl Backend {
     }
 
     fn require_statement_privilege(&self, sql: &str, upper: &str) -> anyhow::Result<()> {
+        if upper == "KILL" || upper.starts_with("KILL ") {
+            let user = self.authenticated_username();
+            if self.auth_has_privilege(&user, "", "CONNECTION_ADMIN")
+                || self.auth_has_privilege(&user, "", "SUPER")
+            {
+                return Ok(());
+            }
+            anyhow::bail!("You are not owner of thread");
+        }
         // EVENT commands need schema-aware parsing (and RENAME needs two
         // schemas), so their branches authorize after extracting the object
         // name instead of falling through to the generic DML target logic.
@@ -35382,6 +35481,12 @@ fn mysql_error_kind(message: &str) -> ErrorKind {
         ErrorKind::ER_LOCK_NOWAIT
     } else if message.starts_with("Deadlock found when trying to get lock") {
         ErrorKind::ER_LOCK_DEADLOCK
+    } else if message == "Query execution was interrupted" {
+        ErrorKind::ER_QUERY_INTERRUPTED
+    } else if message.starts_with("Unknown thread id:") {
+        ErrorKind::ER_NO_SUCH_THREAD
+    } else if message.starts_with("You are not owner of thread") {
+        ErrorKind::ER_KILL_DENIED_ERROR
     } else if message == READ_ONLY_TRANSACTION_ERROR {
         ErrorKind::ER_CANT_EXECUTE_IN_READ_ONLY_TRANSACTION
     } else if message.starts_with("Cannot truncate a table referenced in a foreign key constraint")
@@ -47732,6 +47837,88 @@ mod tests {
         stats.unregister_connection(7);
         assert!(!stats.kill_connection(7));
         assert!(!stats.is_connection_killed(7));
+    }
+
+    #[test]
+    fn kill_query_only_targets_active_queries() {
+        let stats = WireStats::default();
+        let _receiver = stats.register_connection(8, "local");
+        assert!(!stats.kill_query(8));
+        stats.update_connection_query(8, "root", "mydb", "SELECT SLEEP(10)");
+        assert!(stats.kill_query(8));
+        assert!(stats.take_query_kill(8));
+        assert!(!stats.take_query_kill(8));
+    }
+
+    #[test]
+    fn parse_kill_statement_supports_mysql_scopes() {
+        assert_eq!(
+            parse_kill_statement("KILL 42").unwrap().unwrap(),
+            (KillScope::Connection, 42)
+        );
+        assert_eq!(
+            parse_kill_statement("kill connection 42;")
+                .unwrap()
+                .unwrap(),
+            (KillScope::Connection, 42)
+        );
+        assert_eq!(
+            parse_kill_statement("KILL QUERY 42").unwrap().unwrap(),
+            (KillScope::Query, 42)
+        );
+        assert!(parse_kill_statement("KILL QUERY 42 extra")
+            .unwrap()
+            .is_err());
+        assert!(parse_kill_statement("KILL nope").unwrap().is_err());
+        assert!(parse_kill_statement("SELECT 1").is_none());
+    }
+
+    #[tokio::test]
+    async fn kill_sql_uses_mysql_connection_and_query_semantics() {
+        let temp = tempfile::tempdir().expect("create KILL test directory");
+        let storage = Arc::new(StorageEngineManager::new(
+            temp.path().to_path_buf(),
+            16384,
+            "4M",
+        ));
+        storage.init().await.expect("initialize KILL test storage");
+        let stats = Arc::new(WireStats::default());
+        let config = Arc::new(ProtocolConfig::default());
+        let mut backend = Backend::new(storage, config, stats.clone(), 1);
+
+        let mut connection_receiver = stats.register_connection(7, "local");
+        assert!(matches!(
+            backend.execute("KILL CONNECTION 7").await,
+            Ok(QueryOutcome::Ok { .. })
+        ));
+        assert_eq!(connection_receiver.try_recv(), Ok(()));
+
+        let _query_receiver = stats.register_connection(8, "local");
+        stats.update_connection_query(8, "root", "", "SELECT 1");
+        assert!(matches!(
+            backend.execute("KILL QUERY 8").await,
+            Ok(QueryOutcome::Ok { .. })
+        ));
+        assert!(stats.take_query_kill(8));
+
+        let error = backend
+            .execute("KILL CONNECTION 999999")
+            .await
+            .expect_err("unknown KILL target must fail");
+        assert_eq!(
+            mysql_error_kind(&error.to_string()),
+            ErrorKind::ER_NO_SUCH_THREAD
+        );
+
+        *backend.authenticated_user.lock() = Some("non_admin".into());
+        let error = backend
+            .execute("KILL CONNECTION 8")
+            .await
+            .expect_err("non-admin KILL must fail");
+        assert_eq!(
+            mysql_error_kind(&error.to_string()),
+            ErrorKind::ER_KILL_DENIED_ERROR
+        );
     }
 
     #[test]
