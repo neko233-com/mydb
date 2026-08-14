@@ -2049,7 +2049,7 @@ const OVERFLOW_ROWS_MAGIC: &[u8; 4] = b"OVR1";
 const OVERFLOW_ROWS_CHECKSUM_SIZE: usize = 32;
 type ConstraintKeySets = HashMap<(String, String), HashSet<Vec<u8>>>;
 type RowPageIndex = HashMap<(String, String, Vec<u8>), HashSet<u32>>;
-type RowValueIndex = HashMap<(String, String, Vec<u8>), Vec<usize>>;
+type RowValueIndex = HashMap<(String, String), HashMap<Vec<u8>, Vec<usize>>>;
 
 struct PackedRows {
     pages: Vec<Page>,
@@ -2578,7 +2578,7 @@ impl Database {
             .retain(|(table, _, _), _| table != &stored_name);
         self.row_value_index
             .write()
-            .retain(|(table, _, _), _| table != &stored_name);
+            .retain(|(table, _), _| table != &stored_name);
         self.auto_increment_next.write().remove(&stored_name);
         self.next_row_id.write().remove(&stored_name);
         self.pending_rewrites.write().remove(&stored_name);
@@ -3223,38 +3223,44 @@ impl Database {
         if let Some(overlay_rows) = memory.get(table_name).or_else(|| pending.get(table_name)) {
             let value_index = self.row_value_index.read();
             let mut indexed_rows = Vec::new();
-            for ((indexed_table, indexed_column, indexed_value), positions) in value_index.iter() {
-                if indexed_table != table_name
-                    || indexed_column != column
-                    || !values.iter().any(|value| {
-                        if exact_match {
-                            indexed_value == *value
-                        } else {
+            let Some(values_index) = value_index.get(&(table_name.to_string(), column.to_string()))
+            else {
+                return Ok(indexed_rows);
+            };
+            let mut matching_positions = if exact_match {
+                values
+                    .iter()
+                    .filter_map(|value| values_index.get(*value))
+                    .flat_map(|positions| positions.iter().copied())
+                    .collect::<Vec<_>>()
+            } else {
+                values_index
+                    .iter()
+                    .filter(|(indexed_value, _)| {
+                        values.iter().any(|value| {
                             mysql_scalar_equal_for_column(
                                 indexed_value,
                                 value,
                                 Some(&schema),
                                 column,
                             )
-                        }
+                        })
                     })
+                    .flat_map(|(_, positions)| positions.iter().copied())
+                    .collect::<Vec<_>>()
+            };
+            matching_positions.sort_unstable();
+            matching_positions.dedup();
+            for position in matching_positions {
+                let Some(row) = overlay_rows.get(position) else {
+                    continue;
+                };
+                if filter
+                    .is_some_and(|predicate| !predicate.matches_with_schema(row, Some(&schema)))
                 {
                     continue;
                 }
-                for position in positions {
-                    let Some(row) = overlay_rows.get(*position) else {
-                        continue;
-                    };
-                    if filter
-                        .is_some_and(|predicate| !predicate.matches_with_schema(row, Some(&schema)))
-                    {
-                        continue;
-                    }
-                    indexed_rows.push(row.clone());
-                    if limit.is_some_and(|limit| indexed_rows.len() >= limit) {
-                        break;
-                    }
-                }
+                indexed_rows.push(row.clone());
                 if limit.is_some_and(|limit| indexed_rows.len() >= limit) {
                     break;
                 }
@@ -4038,7 +4044,7 @@ impl Database {
 
     fn replace_table_value_index(&self, table_name: &str, schema: &TableSchema, rows: &[Row]) {
         let mut index = self.row_value_index.write();
-        index.retain(|(table, _, _), _| table != table_name);
+        index.retain(|(table, _), _| table != table_name);
         add_rows_to_value_index(&mut index, table_name, schema, 0, rows);
     }
 }
@@ -12233,7 +12239,9 @@ fn add_rows_to_value_index(
             }
             if let Some(value) = row.get(&column) {
                 index
-                    .entry((table_name.to_string(), column.clone(), value.to_vec()))
+                    .entry((table_name.to_string(), column.clone()))
+                    .or_default()
+                    .entry(value.to_vec())
                     .or_default()
                     .push(first_row + offset);
             }
@@ -13411,11 +13419,33 @@ mod tests {
             database
                 .row_value_index
                 .read()
-                .get(&("a".into(), "id".into(), b"1".to_vec()))
+                .get(&("a".into(), "id".into()))
+                .and_then(|values| values.get(b"1".as_slice()))
                 .unwrap()
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn exact_index_lookup_is_column_scoped_and_limit_safe() {
+        let (_temp, manager) = recovery_manager().await;
+        manager
+            .execute_write(insert_command("a", "1"))
+            .await
+            .expect("insert first indexed row");
+        manager
+            .execute_write(insert_command("a", "2"))
+            .await
+            .expect("insert second indexed row");
+
+        let database = manager.get_database("game").expect("game database");
+        let predicate = RowPredicate::ExactEq("id".into(), b"2".to_vec());
+        let rows = database
+            .scan_table_filtered_limit("a", Some(&predicate), Some(1))
+            .expect("scan exact indexed row");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get("id"), Some(b"2".as_slice()));
     }
 
     #[test]
