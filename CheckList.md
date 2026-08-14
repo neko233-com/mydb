@@ -220,6 +220,7 @@
 - [x] 2026-08-15 v0.1.24 多列 `COUNT(DISTINCT ...)` 阶段：Rust workspace 测试、clippy、`scripts/mysql84-diff.ps1` 119/119 与完整 `scripts/docker-smoke.ps1` 均通过；Docker 使用隔离 13316/14316 端口，未触碰物理 3306/4306
 - [x] 2026-08-15 v0.1.24 同条件持久化基准：MyDB 与 MySQL 8.4.11 使用相同 Docker 资源和持久化设置；性能阶段无预热、22.1/60 秒、1 次采样，单表写 203/78 ops/s、4 actor P99 28.7/57.3 ms、并发吞吐 330/144 ops/s、读 P50 403/132 μs；原始结果见 `性能报告.md`，不硬编码历史比值
 - [x] 2026-08-15 v0.1.25 多表达式 `GROUP_CONCAT` 阶段：Rust workspace 测试、clippy、`scripts/mysql84-diff.ps1` 120/120 与完整 `scripts/docker-smoke.ps1` 均通过；覆盖多参数 NULL 行过滤、元组 DISTINCT、ORDER BY、SEPARATOR，Docker 使用隔离 13316/14316 端口，未触碰物理 3306/4306
+- [x] 2026-08-15 v0.1.25 同条件持久化基准：MyDB 与 MySQL 8.4.11 使用相同 Docker 资源和持久化设置；性能阶段无预热、21.8/60 秒、1 次采样，单表写 218/80 ops/s、4 actor P99 26.2/70.4 ms、并发吞吐 316/155 ops/s、读 P50 311/126 μs；原始结果见 `性能报告.md`，不硬编码历史比值
 - [x] 2026-08-14 Windows 隔离安装回归：管理员本地发布包安装 exit 0，生成 ACL 受限 root/admin 强密钥并创建配置/数据目录；新包仅含 server/cli/migrate/dump，不含 mydb-router
 - [x] 2026-08-14 安装包完整性回归：Linux 容器本地 tar.gz 与 Windows 本地 zip 均完成 `.sha256` 校验、强密钥配置和无 router 文件检查；远程安装路径强制下载 sidecar
 - [ ] 正式 Ubuntu 24.04 物理 linux/amd64 性能结果稳定达到目标；当前证据不足
