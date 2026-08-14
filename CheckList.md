@@ -211,7 +211,7 @@
 - [ ] Windows 物理服务已切换到本轮最新 release：当前 shell 无法重启 LocalSystem `MyDBServer`，3306/4306 仍保持稳定开发实例；本轮最新源码已在隔离 13307 完成验证，待有权限窗口切换 3306
 - [x] 本机全量切流：9 个业务库迁移并重启校验；`sakila.staff` 超大 BLOB 通过 16KB 页外溢存储保留；MySQL80 服务、程序、进程和数据目录已卸载清理，SQL 备份保留在 `C:\Server\mydb\mysql-backup-20260811\all-databases.sql`
 - [x] 2026-08-14 当前 release 真实 MySQL 8.4 差分：同机 Docker `mysql:8.4` 与隔离 13307 对比，102/102 cases 通过；含 JSON 路径/重叠、BIT 聚合、常量聚合投影、未知线程 KILL 错误、角色授权、ai_ci、EXPLAIN、状态接口、生成列 INSERT/UPDATE/UPSERT/INSERT SELECT 显式写入错误码/消息；物理 3306 服务未强制替换
-- [x] 2026-08-14 同机持久化基准：MyDB 与 MySQL 8.4.11 使用相同 Docker 资源和持久化设置；性能阶段无预热、22.5/60 秒、1 次采样，单表写 206/76 ops/s、4 actor P99 73.0/62.8 ms、并发吞吐 285/145 ops/s、读 P50 269/128 μs；原始结果见 `性能报告.md`，不硬编码历史比值
+- [x] 2026-08-14 同机持久化基准：MyDB 与 MySQL 8.4.11 使用相同 Docker 资源和持久化设置；性能阶段无预热、24.0/60 秒、1 次采样，单表写 198/76 ops/s、4 actor P99 21.5/75.2 ms、并发吞吐 194/151 ops/s、读 P50 365/140 μs；原始结果见 `性能报告.md`，不硬编码历史比值
 - [x] 2026-08-14 Windows 隔离安装回归：管理员本地发布包安装 exit 0，生成 ACL 受限 root/admin 强密钥并创建配置/数据目录；新包仅含 server/cli/migrate/dump，不含 mydb-router
 - [x] 2026-08-14 安装包完整性回归：Linux 容器本地 tar.gz 与 Windows 本地 zip 均完成 `.sha256` 校验、强密钥配置和无 router 文件检查；远程安装路径强制下载 sidecar
 - [ ] 正式 Ubuntu 24.04 物理 linux/amd64 性能结果稳定达到目标；当前证据不足
