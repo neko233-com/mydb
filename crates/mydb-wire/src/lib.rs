@@ -15858,7 +15858,7 @@ impl Backend {
                         .unwrap_or(0);
                     value
                 } else if let Some(duration) = parse_sleep_duration(&item)? {
-                    tokio::time::sleep(duration).await;
+                    self.sleep_with_query_kill(duration).await?;
                     Some(b"0".to_vec())
                 } else if item_upper.contains("@@VERSION_COMMENT") {
                     Some(b"MyDB Server (Neko233 engine)".to_vec())
@@ -16261,6 +16261,24 @@ impl Backend {
             }
         }
         Ok(QueryOutcome::byte_rows(columns, values))
+    }
+
+    async fn sleep_with_query_kill(&self, duration: Duration) -> anyhow::Result<()> {
+        let deadline = Instant::now() + duration;
+        loop {
+            if self.stats.take_query_kill(self.connection_id) {
+                anyhow::bail!("Query execution was interrupted");
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(());
+            }
+            let notified = self.stats.lock_changed.notified();
+            tokio::select! {
+                _ = tokio::time::sleep(remaining) => return Ok(()),
+                _ = notified => {}
+            }
+        }
     }
 
     async fn select_with(&mut self, sql: &str) -> anyhow::Result<QueryOutcome> {
@@ -47919,6 +47937,50 @@ mod tests {
             mysql_error_kind(&error.to_string()),
             ErrorKind::ER_KILL_DENIED_ERROR
         );
+    }
+
+    #[tokio::test]
+    async fn kill_query_interrupts_sleeping_statement() {
+        let temp = tempfile::tempdir().expect("create KILL sleep test directory");
+        let storage = Arc::new(StorageEngineManager::new(
+            temp.path().to_path_buf(),
+            16384,
+            "4M",
+        ));
+        storage
+            .init()
+            .await
+            .expect("initialize KILL sleep test storage");
+        let stats = Arc::new(WireStats::default());
+        let config = Arc::new(ProtocolConfig::default());
+        let _receiver = stats.register_connection(8, "local");
+        let mut backend = Backend::new(storage, config, stats.clone(), 8);
+        let task = tokio::spawn(async move { backend.execute("SELECT SLEEP(10)").await });
+
+        let mut active = false;
+        for _ in 0..1000 {
+            active = stats
+                .active_sessions
+                .lock()
+                .get(&8)
+                .is_some_and(|session| session.command == "Query");
+            if active {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(active, "sleep query did not become active");
+        assert!(stats.kill_query(8));
+
+        let error = task
+            .await
+            .expect("join interrupted query task")
+            .expect_err("KILL QUERY must interrupt SLEEP");
+        assert_eq!(
+            mysql_error_kind(&error.to_string()),
+            ErrorKind::ER_QUERY_INTERRUPTED
+        );
+        stats.unregister_connection(8);
     }
 
     #[test]
