@@ -45,7 +45,7 @@ use mydb_storage::{
     TriggerDefinition, TriggerEvent, TriggerTiming, UpdateValueExpression, WriteCommand,
 };
 
-pub const SERVER_VERSION: &str = "8.4.0-mydb-0.1.23";
+pub const SERVER_VERSION: &str = "8.4.0-mydb-0.1.24";
 pub const MYSQL84_DEFAULT_SQL_MODE: &str = "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION";
 /// MySQL 8.4 default `innodb_lock_wait_timeout`, in seconds.
 pub const MYSQL84_DEFAULT_INNODB_LOCK_WAIT_TIMEOUT_SECONDS: u64 = 50;
@@ -36777,21 +36777,41 @@ fn evaluate_aggregate(
             ))
         }
         AggregateExpression::CountDistinct(expression) => {
-            let values = rows
-                .iter()
-                .map(|row| aggregate_row_value(row, &expression))
-                .collect::<anyhow::Result<Vec<_>>>()?;
-            let collation = collation_for_expression(Some(schema), &expression);
-            Ok(Some(
+            let expressions = split_csv(&expression);
+            let distinct_count = if expressions.len() <= 1 {
+                let values = rows
+                    .iter()
+                    .map(|row| aggregate_row_value(row, &expression))
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+                let collation = collation_for_expression(Some(schema), &expression);
                 values
                     .into_iter()
                     .flatten()
                     .map(|value| mysql_collation_key_bytes(&value, collation.as_deref()))
                     .collect::<HashSet<_>>()
                     .len()
-                    .to_string()
-                    .into_bytes(),
-            ))
+            } else {
+                let mut distinct_values = HashSet::new();
+                for row in rows {
+                    let mut encoded = Vec::new();
+                    let mut has_null = false;
+                    for expression in &expressions {
+                        let Some(value) = aggregate_row_value(row, expression)? else {
+                            has_null = true;
+                            break;
+                        };
+                        let collation = collation_for_expression(Some(schema), expression);
+                        let value = mysql_collation_key_bytes(&value, collation.as_deref());
+                        encoded.extend_from_slice(&(value.len() as u64).to_le_bytes());
+                        encoded.extend_from_slice(&value);
+                    }
+                    if !has_null {
+                        distinct_values.insert(encoded);
+                    }
+                }
+                distinct_values.len()
+            };
+            Ok(Some(distinct_count.to_string().into_bytes()))
         }
         AggregateExpression::BitAnd(expression) => evaluate_bit_aggregate(&expression, rows, '&'),
         AggregateExpression::BitOr(expression) => evaluate_bit_aggregate(&expression, rows, '|'),
@@ -71540,6 +71560,37 @@ mod tests {
                     .unwrap()
             ),
             b"2"
+        );
+        backend
+            .execute("CREATE TABLE distinct_pairs (left_key VARCHAR(8), right_key VARCHAR(8))")
+            .await
+            .unwrap();
+        backend
+            .execute(
+                "INSERT INTO distinct_pairs VALUES
+                 ('a','x'),('a','x'),('a','y'),('b','x'),('a',NULL)",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            single_value(
+                backend
+                    .execute("SELECT COUNT(DISTINCT left_key,right_key) FROM distinct_pairs")
+                    .await
+                    .unwrap()
+            ),
+            b"3"
+        );
+        assert_eq!(
+            single_value(
+                backend
+                    .execute(
+                        "SELECT COUNT(DISTINCT left_key,UPPER(right_key)) FROM distinct_pairs",
+                    )
+                    .await
+                    .unwrap()
+            ),
+            b"3"
         );
         assert_eq!(
             single_value(
