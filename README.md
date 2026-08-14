@@ -614,10 +614,10 @@ bash scripts/docker-smoke.sh
 
 | 场景 | MyDB | MySQL 8.4.11 | MyDB / MySQL |
 |------|------|--------------|--------------|
-| 单表写（fsync-per-commit） | 220 ops/s | 80 ops/s | 2.75x |
-| 4 actor / 4表 写 P99 延迟 | 36.3 ms | 65.5 ms | 1.80x（低更好） |
-| 4 actor / 4表 Group Commit | 290 ops/s | 153 ops/s | 1.89x |
-| 读 P50 延迟 | 285 μs | 129 μs | - |
+| 单表写（fsync-per-commit） | 221 ops/s | 79 ops/s | 2.82x |
+| 4 actor / 4表 写 P99 延迟 | 35.6 ms | 68.9 ms | 1.93x（低更好） |
+| 4 actor / 4表 Group Commit | 336 ops/s | 151 ops/s | 2.22x |
+| 读 P50 延迟 | 279 μs | 128 μs | - |
 
 性能优化不以关闭 WAL 持久化或弱化恢复语义换取数字。默认 250μs Group Commit 窗口优先并发吞吐，checkpoint 按 1024 个已提交请求触发；不声明未经实测证明的固定倍数。
 
@@ -641,7 +641,7 @@ bash scripts/docker-smoke.sh
 - ✅ MySQL `'user'@'host'` 基础账户匹配：精确主机优先于通配主机，握手按账户插件选择认证方式
 - ✅ `scripts/bench.ps1`：Docker Linux Rust gate、release build 与同条件 MySQL 8.4 持久化基准通过；性能阶段无预热、60 秒硬截止（报告见 [性能报告.md](性能报告.md)）
 - ✅ `scripts/mysql84-diff.ps1`：当前源码隔离端口与同机 Docker MySQL 8.4，121/121 差分通过；新增 `group_concat_max_len` 的 SESSION/GLOBAL、下限、截断和 1260 警告覆盖，并保留多表达式 `GROUP_CONCAT` 的 NULL、元组 DISTINCT、ORDER BY、SEPARATOR 以及多列/表达式 `COUNT(DISTINCT ...)`、正则、JSON_TABLE、空间、JSON 搜索/路径/聚合、全文相关性/布尔短语/前缀/停止词/查询扩展覆盖
-- ✅ 本轮同条件持久化基准（v0.1.26、`group_concat_max_len` 修复后）：单表写 MyDB/MySQL `220/80 ops/s`，4 actor P99 `36.3/65.5 ms`，并发吞吐 `290/153 ops/s`，读 P50 `285/129 μs`；1 次样本、无预热、性能阶段 22.1 秒，原始数据见 [性能报告.md](性能报告.md)
+- ✅ 本轮同条件持久化基准（v0.1.26、`group_concat_max_len` 修复后）：单表写 MyDB/MySQL `221/79 ops/s`，4 actor P99 `35.6/68.9 ms`，并发吞吐 `336/151 ops/s`，读 P50 `279/128 μs`；1 次样本、无预热、性能阶段 21.7 秒，原始数据见 [性能报告.md](性能报告.md)
 - ⏳ Ubuntu 24.04 物理性能、macOS 原生验收、宿主断电/恢复中断、大数据压力与生产安全运维验收：以 [CheckList.md](CheckList.md) 与 [性能报告.md](性能报告.md) 为准
 
 ---
