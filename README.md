@@ -166,7 +166,7 @@ cargo build --release
 
 # 正式包只包含 server/cli/mydb/migrate/dump、配置、安装脚本和文档；
 # mydb-bench、测试结果与 target/bench 不进入发布包
-.\scripts\build-release.ps1 -Version "0.1.15"
+.\scripts\build-release.ps1 -Version "0.1.16"
 # 发布包同时生成同名 `.sha256` 校验文件；发布脚本会拒绝覆盖已存在的 GitHub Release。
 
 # 安装到系统
@@ -188,7 +188,7 @@ mydb update --check
 mydb update
 
 # 指定版本
-mydb update --version v0.1.15
+mydb update --version v0.1.16
 ```
 
 Windows 服务更新会在当前 CLI 退出后由后台 helper 完成，日志写入安装目录的 `mydb-update.log`；Linux 更新会自动处理同名 systemd 服务。
@@ -627,9 +627,9 @@ bash scripts/docker-smoke.sh
 
 当前开发状态、已完成项、未完成项、差分证据统一维护在 [CheckList.md](CheckList.md)。只有可复现实测证明的项目才会打勾。
 
-### v0.1.15 发布候选
+### v0.1.16 发布候选
 
-本版面向单机 MySQL 8.4 常用生产工作负载：3306 提供 MySQL 协议，4306 提供登录保护的 Web SQL IDE/管理 API；补齐 JSON 搜索、浅层/递归通配路径、数组范围与动态 `last` 下标、JSON_ARRAYAGG/JSON_OBJECTAGG（含窗口聚合）、数组追加/插入、RFC 7396 合并、深度/键枚举/美化输出，并保留全文自然语言 TF-IDF 基础相关性、布尔短语/前缀、基础查询扩展、`mydb update` 跨平台事务替换/失败回滚和非 ASCII tar 文件名校验。发布不宣称复制/集群、完整 InnoDB 全部锁边界、全部冷门字符集或全部 MySQL 错误码已完成；逐项状态见 [CheckList.md](CheckList.md) 和 [SYNTAX_MATRIX.md](SYNTAX_MATRIX.md)。
+本版面向单机 MySQL 8.4 常用生产工作负载：3306 提供 MySQL 协议，4306 提供登录保护的 Web SQL IDE/管理 API；补齐 JSON 搜索、浅层/递归通配路径、数组范围与动态 `last` 下标、基础 `JSON_TABLE`（标量列、序号、存在性、嵌套路径、默认/错误行为）、JSON_ARRAYAGG/JSON_OBJECTAGG（含窗口聚合）、数组追加/插入、RFC 7396 合并、深度/键枚举/美化输出，并保留全文自然语言 TF-IDF 基础相关性、布尔短语/前缀、基础查询扩展、`mydb update` 跨平台事务替换/失败回滚和非 ASCII tar 文件名校验。发布不宣称复制/集群、完整 InnoDB 全部锁边界、关联 JSON_TABLE/LATERAL、全部冷门字符集或全部 MySQL 错误码已完成；逐项状态见 [CheckList.md](CheckList.md) 和 [SYNTAX_MATRIX.md](SYNTAX_MATRIX.md)。
 
 **本轮本地门槛（2026-08-14）：**
 - ✅ `cargo test --workspace --locked`：Docker Linux 门禁通过；wire 269（含权限委派/角色 ADMIN OPTION/ALL 部分撤销），其他 workspace 测试与文档测试全部通过
@@ -640,7 +640,8 @@ bash scripts/docker-smoke.sh
 - ✅ Connector/J 9.1.0、Node mysql2 3.23.3 已完成 3306 普通/预处理查询 smoke；Go `database/sql` + go-sql-driver/mysql 1.10.0 已完成当前 release 3306 服务的 Ping、中文、DATE、普通/预处理查询回归
 - ✅ MySQL `'user'@'host'` 基础账户匹配：精确主机优先于通配主机，握手按账户插件选择认证方式
 - ✅ `scripts/bench.ps1`：Docker Linux Rust gate、release build 与同条件 MySQL 8.4 持久化基准通过；性能阶段无预热、60 秒硬截止（报告见 [性能报告.md](性能报告.md)）
-- ✅ `scripts/mysql84-diff.ps1`：当前源码隔离端口与同机 Docker MySQL 8.4，110/110 差分通过；新增 JSON 搜索、浅层/递归通配路径、数组范围/`last` 下标、JSON 聚合/窗口聚合、数组追加/插入、合并、深度/键/美化输出及全文相关性、布尔短语/前缀、停止词/短词边界与查询扩展覆盖
+- ✅ `scripts/mysql84-diff.ps1`：当前源码隔离端口与同机 Docker MySQL 8.4，112/112 差分通过；新增基础 JSON_TABLE 标量/嵌套/序号/存在性/默认与错误行为，以及 JSON 搜索、浅层/递归通配路径、数组范围/`last` 下标、JSON 聚合/窗口聚合、数组追加/插入、合并、深度/键/美化输出及全文相关性、布尔短语/前缀、停止词/短词边界与查询扩展覆盖
+- ✅ 本轮同条件持久化基准：单表写 MyDB/MySQL `209/79 ops/s`，4 actor P99 `34.4/72.6 ms`，并发吞吐 `337/148 ops/s`，读 P50 `379/125 μs`；1 次样本、无预热，原始数据见 [性能报告.md](性能报告.md)
 - ⏳ Ubuntu 24.04 物理性能、macOS 原生验收、宿主断电/恢复中断、大数据压力与生产安全运维验收：以 [CheckList.md](CheckList.md) 与 [性能报告.md](性能报告.md) 为准
 
 ---

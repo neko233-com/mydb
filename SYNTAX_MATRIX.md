@@ -90,7 +90,7 @@
 | 非递归 & 常用递归 CTE | ✅ Verified | 前向引用/互递归按 MySQL 8.4 明确拒绝；`cte_max_recursion_depth` 的 SESSION/GLOBAL 默认传播、递归成员禁止聚合/窗口/GROUP BY/ORDER BY/DISTINCT 已验证；MySQL 8.4 无 `CYCLE` 语法 |
 | 窗口函数（ROW_NUMBER…NTILE/CUME_DIST、命名 WINDOW、ROWS/RANGE frame） | ✅ Verified | |
 | `GROUP BY` 表达式/别名/序号、`HAVING` | ✅ Verified | 未关联标量子查询、`IN (SELECT ...)`、按分组外层行绑定的关联标量子查询及 `AND` 组合的关联 `EXISTS` 已覆盖；更复杂关联谓词树 🔴 Deferred；显式 `ONLY_FULL_GROUP_BY` 与主键/非空唯一键函数依赖已覆盖 |
-| JSON（`JSON_EXTRACT/UNQUOTE/OBJECT/ARRAY/VALID/TYPE/LENGTH/CONTAINS/CONTAINS_PATH/OVERLAPS/SET/REMOVE/ARRAY_APPEND/ARRAY_INSERT/MERGE_PATCH/DEPTH/KEYS/PRETTY/SEARCH/ARRAYAGG/OBJECTAGG`） | 🟡 Partial | `JSON_ARRAYAGG`/`JSON_OBJECTAGG` 的 SQL NULL、JSON 值、空集合、重复 key 覆盖和窗口累计聚合，以及 JSON path `.*`/`[*]`/`**`、数组范围与 `last` 动态下标已纳入 110 项 MySQL 8.4 差分；JSON_KEYS/JSON_SET/JSON_REMOVE 等修改类路径继续拒绝通配/范围，完整 JSON schema、`JSON_TABLE`、路径优化器语义仍 Deferred |
+| JSON（`JSON_EXTRACT/UNQUOTE/OBJECT/ARRAY/VALID/TYPE/LENGTH/CONTAINS/CONTAINS_PATH/OVERLAPS/SET/REMOVE/ARRAY_APPEND/ARRAY_INSERT/MERGE_PATCH/DEPTH/KEYS/PRETTY/SEARCH/ARRAYAGG/OBJECTAGG`） | 🟡 Partial | `JSON_ARRAYAGG`/`JSON_OBJECTAGG` 的 SQL NULL、JSON 值、空集合、重复 key 覆盖和窗口累计聚合，JSON path `.*`/`[*]`/`**`、数组范围与 `last` 动态下标，以及 `JSON_TABLE` 字面量文档的标量列、`FOR ORDINALITY`、`EXISTS`、`NESTED PATH`、`DEFAULT/NULL/ERROR ON EMPTY/ERROR` 已纳入 112 项 MySQL 8.4 差分；关联文档列、`LATERAL`、完整 JSON schema 与路径优化器语义仍 Deferred |
 | 常用字符串/数值/日期/网络/摘要/进制/三角/UUID 函数 | ✅ Verified | 见 README “当前 SQL 范围” |
 
 ---

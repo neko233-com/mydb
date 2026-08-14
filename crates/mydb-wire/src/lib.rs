@@ -45,7 +45,7 @@ use mydb_storage::{
     TriggerDefinition, TriggerEvent, TriggerTiming, UpdateValueExpression, WriteCommand,
 };
 
-pub const SERVER_VERSION: &str = "8.4.0-mydb-0.1.15";
+pub const SERVER_VERSION: &str = "8.4.0-mydb-0.1.16";
 pub const MYSQL84_DEFAULT_SQL_MODE: &str = "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION";
 /// MySQL 8.4 default `innodb_lock_wait_timeout`, in seconds.
 pub const MYSQL84_DEFAULT_INNODB_LOCK_WAIT_TIMEOUT_SECONDS: u64 = 50;
@@ -17855,6 +17855,12 @@ impl Backend {
         value: &str,
     ) -> anyhow::Result<(JoinSource, Option<Vec<Row>>)> {
         let value = value.trim();
+        if value
+            .get(.."JSON_TABLE".len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("JSON_TABLE"))
+        {
+            return json_table_source(value, &self.database);
+        }
         if !value.starts_with('(') {
             let (reference, alias) = parse_join_source(value)?;
             if let Some(table) = self.cte_table(&reference).cloned() {
@@ -26558,6 +26564,484 @@ fn parse_join_source(value: &str) -> anyhow::Result<(String, String)> {
         _ => anyhow::bail!("Invalid JOIN table alias"),
     };
     Ok((reference, alias))
+}
+
+#[derive(Debug, Clone)]
+enum JsonTableBehavior {
+    Null,
+    Error,
+    Default(String),
+}
+
+#[derive(Debug, Clone)]
+enum JsonTableColumn {
+    Scalar {
+        name: String,
+        data_type: String,
+        path: String,
+        on_empty: JsonTableBehavior,
+        on_error: JsonTableBehavior,
+    },
+    Ordinality {
+        name: String,
+    },
+    Exists {
+        name: String,
+        path: String,
+    },
+    Nested {
+        path: String,
+        columns: Vec<JsonTableColumn>,
+    },
+}
+
+fn json_table_source(
+    value: &str,
+    database: &str,
+) -> anyhow::Result<(JoinSource, Option<Vec<Row>>)> {
+    let open = value
+        .find('(')
+        .ok_or_else(|| anyhow::anyhow!("JSON_TABLE requires arguments"))?;
+    let close = matching_parenthesis(value, open)
+        .ok_or_else(|| anyhow::anyhow!("Unclosed JSON_TABLE expression"))?;
+    let alias = parse_derived_table_alias(&value[close + 1..])?;
+    let arguments = split_csv(&value[open + 1..close]);
+    if arguments.len() < 2 {
+        anyhow::bail!("JSON_TABLE requires a document, path, and COLUMNS clause");
+    }
+    let document = evaluate_scalar_expression(arguments[0].trim(), &Row::new())?;
+    let document = document
+        .map(|value| serde_json::from_slice::<serde_json::Value>(&value))
+        .transpose()
+        .map_err(|error| anyhow::anyhow!("Invalid JSON document for JSON_TABLE: {error}"))?
+        .unwrap_or(serde_json::Value::Null);
+    let clause = arguments[1..].join(",");
+    let (root_path, columns) = parse_json_table_columns_clause(&clause)?;
+    let matches = json_extract_path_matches(&document, &root_path)?;
+    let mut rows = Vec::new();
+    for (ordinal, (_, value)) in matches.iter().enumerate() {
+        rows.extend(json_table_expand(value, &columns, ordinal + 1)?);
+    }
+    let schema_columns = json_table_schema_columns(&columns)?;
+    let schema = TableSchema {
+        name: alias.clone(),
+        columns: schema_columns,
+        primary_key: None,
+        indexes: Vec::new(),
+        triggers: Vec::new(),
+        next_page_number: 0,
+        generation: 0,
+        create_sql: None,
+        engine: TableEngine::Neko233,
+    };
+    Ok((
+        JoinSource {
+            database: database.to_string(),
+            table: alias.clone(),
+            alias,
+            schema,
+        },
+        Some(rows),
+    ))
+}
+
+fn parse_json_table_columns_clause(value: &str) -> anyhow::Result<(String, Vec<JsonTableColumn>)> {
+    let columns_position = find_top_level_sql_keyword(value, "COLUMNS", 0)
+        .ok_or_else(|| anyhow::anyhow!("JSON_TABLE requires COLUMNS"))?;
+    let root_path = value[..columns_position].trim();
+    if root_path.is_empty() {
+        anyhow::bail!("JSON_TABLE requires a row path");
+    }
+    let tail = value[columns_position + "COLUMNS".len()..].trim();
+    let open = tail
+        .find('(')
+        .ok_or_else(|| anyhow::anyhow!("JSON_TABLE COLUMNS requires parentheses"))?;
+    let close = matching_parenthesis(tail, open)
+        .ok_or_else(|| anyhow::anyhow!("Unclosed JSON_TABLE COLUMNS clause"))?;
+    if !tail[close + 1..].trim().is_empty() {
+        anyhow::bail!("Unexpected tokens after JSON_TABLE COLUMNS");
+    }
+    let columns = split_csv(&tail[open + 1..close])
+        .into_iter()
+        .map(|column| parse_json_table_column(&column))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    if columns.is_empty() {
+        anyhow::bail!("JSON_TABLE COLUMNS cannot be empty");
+    }
+    Ok((json_table_static_string(root_path, "row path")?, columns))
+}
+
+fn parse_json_table_column(value: &str) -> anyhow::Result<JsonTableColumn> {
+    let value = value.trim();
+    let upper = value.to_ascii_uppercase();
+    if upper.starts_with("NESTED") {
+        let rest = value["NESTED".len()..].trim_start();
+        let columns_position = find_top_level_sql_keyword(rest, "COLUMNS", 0)
+            .ok_or_else(|| anyhow::anyhow!("JSON_TABLE NESTED requires COLUMNS"))?;
+        let path_part = rest[..columns_position].trim();
+        let path_part = path_part
+            .strip_prefix("PATH")
+            .or_else(|| path_part.strip_prefix("path"))
+            .map(str::trim)
+            .unwrap_or(path_part);
+        let (path_token, remainder) = take_json_table_token(path_part)
+            .ok_or_else(|| anyhow::anyhow!("JSON_TABLE NESTED requires a path"))?;
+        if !remainder.trim().is_empty() {
+            anyhow::bail!("Invalid JSON_TABLE NESTED path");
+        }
+        let tail = rest[columns_position + "COLUMNS".len()..].trim();
+        let open = tail
+            .find('(')
+            .ok_or_else(|| anyhow::anyhow!("JSON_TABLE NESTED COLUMNS requires parentheses"))?;
+        let close = matching_parenthesis(tail, open)
+            .ok_or_else(|| anyhow::anyhow!("Unclosed JSON_TABLE NESTED COLUMNS"))?;
+        if !tail[close + 1..].trim().is_empty() {
+            anyhow::bail!("Unexpected tokens after JSON_TABLE NESTED COLUMNS");
+        }
+        let columns = split_csv(&tail[open + 1..close])
+            .into_iter()
+            .map(|column| parse_json_table_column(&column))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        return Ok(JsonTableColumn::Nested {
+            path: json_table_static_string(path_token, "nested path")?,
+            columns,
+        });
+    }
+
+    if let Some((name, declaration_tail)) = take_json_table_token(value) {
+        if declaration_tail
+            .trim()
+            .eq_ignore_ascii_case("FOR ORDINALITY")
+        {
+            return Ok(JsonTableColumn::Ordinality {
+                name: name.trim_matches('`').to_string(),
+            });
+        }
+    }
+
+    let path_position = find_top_level_sql_keyword(value, "PATH", 0)
+        .ok_or_else(|| anyhow::anyhow!("JSON_TABLE column requires PATH"))?;
+    let declaration = value[..path_position].trim();
+    let path_tail = value[path_position + "PATH".len()..].trim_start();
+    let (path_token, options) = take_json_table_token(path_tail)
+        .ok_or_else(|| anyhow::anyhow!("JSON_TABLE column requires a path"))?;
+    let (name, declaration_tail) = take_json_table_token(declaration)
+        .ok_or_else(|| anyhow::anyhow!("JSON_TABLE column requires a name"))?;
+    let declaration_tail = declaration_tail.trim();
+    if declaration_tail.to_ascii_uppercase().ends_with(" EXISTS") {
+        let data_type = declaration_tail[..declaration_tail.len() - " EXISTS".len()].trim();
+        if data_type.is_empty() {
+            anyhow::bail!("JSON_TABLE EXISTS column requires a type");
+        }
+        return Ok(JsonTableColumn::Exists {
+            name: name.trim_matches('`').to_string(),
+            path: json_table_static_string(path_token, "EXISTS path")?,
+        });
+    }
+    if declaration_tail.is_empty() {
+        anyhow::bail!("JSON_TABLE column requires a data type");
+    }
+    let (on_empty, on_error) = parse_json_table_behaviors(options)?;
+    Ok(JsonTableColumn::Scalar {
+        name: name.trim_matches('`').to_string(),
+        data_type: declaration_tail.to_string(),
+        path: json_table_static_string(path_token, "column path")?,
+        on_empty,
+        on_error,
+    })
+}
+
+fn parse_json_table_behaviors(
+    value: &str,
+) -> anyhow::Result<(JsonTableBehavior, JsonTableBehavior)> {
+    let empty_position = find_top_level_sql_keyword(value, "ON EMPTY", 0);
+    let error_position = find_top_level_sql_keyword(value, "ON ERROR", 0);
+    let on_empty = empty_position
+        .map(|position| parse_json_table_behavior(value[..position].trim()))
+        .transpose()?
+        .unwrap_or(JsonTableBehavior::Null);
+    let on_error = error_position
+        .map(|position| {
+            let start = empty_position
+                .filter(|empty| *empty < position)
+                .map(|empty| empty + "ON EMPTY".len())
+                .unwrap_or(0);
+            parse_json_table_behavior(value[start..position].trim())
+        })
+        .transpose()?
+        .unwrap_or(JsonTableBehavior::Null);
+    Ok((on_empty, on_error))
+}
+
+fn parse_json_table_behavior(value: &str) -> anyhow::Result<JsonTableBehavior> {
+    if value.is_empty() || value.eq_ignore_ascii_case("NULL") {
+        return Ok(JsonTableBehavior::Null);
+    }
+    if value.eq_ignore_ascii_case("ERROR") {
+        return Ok(JsonTableBehavior::Error);
+    }
+    let Some(default) = value
+        .strip_prefix("DEFAULT")
+        .or_else(|| value.strip_prefix("default"))
+    else {
+        anyhow::bail!("Invalid JSON_TABLE ON EMPTY/ON ERROR behavior '{value}'");
+    };
+    let default = default.trim();
+    if default.is_empty() {
+        anyhow::bail!("JSON_TABLE DEFAULT requires a value");
+    }
+    Ok(JsonTableBehavior::Default(default.to_string()))
+}
+
+fn json_table_static_string(value: &str, label: &str) -> anyhow::Result<String> {
+    let value = evaluate_scalar_expression(value.trim(), &Row::new())?
+        .ok_or_else(|| anyhow::anyhow!("JSON_TABLE {label} cannot be NULL"))?;
+    String::from_utf8(value).map_err(|_| anyhow::anyhow!("JSON_TABLE {label} must be UTF-8"))
+}
+
+fn take_json_table_token(value: &str) -> Option<(&str, &str)> {
+    let value = value.trim_start();
+    let mut quote = None;
+    let mut escaped = false;
+    let mut depth = 0usize;
+    for (index, character) in value.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if let Some(active) = quote {
+            if character == '\\' {
+                escaped = true;
+            } else if character == active {
+                quote = None;
+            }
+            continue;
+        }
+        match character {
+            '\'' | '"' => quote = Some(character),
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            character if character.is_ascii_whitespace() && depth == 0 => {
+                return Some((&value[..index], &value[index..]));
+            }
+            _ => {}
+        }
+    }
+    (!value.is_empty()).then_some((value, ""))
+}
+
+fn json_table_schema_columns(columns: &[JsonTableColumn]) -> anyhow::Result<Vec<Column>> {
+    let mut output = Vec::new();
+    let mut names = HashSet::new();
+    json_table_schema_columns_into(columns, &mut output, &mut names)?;
+    Ok(output)
+}
+
+fn json_table_schema_columns_into(
+    columns: &[JsonTableColumn],
+    output: &mut Vec<Column>,
+    names: &mut HashSet<String>,
+) -> anyhow::Result<()> {
+    for column in columns {
+        let (name, data_type) = match column {
+            JsonTableColumn::Scalar {
+                name, data_type, ..
+            } => (name, parse_data_type(data_type)),
+            JsonTableColumn::Ordinality { name } => (name, DataType::BigInt),
+            JsonTableColumn::Exists { name, .. } => (name, DataType::Int),
+            JsonTableColumn::Nested { columns, .. } => {
+                json_table_schema_columns_into(columns, output, names)?;
+                continue;
+            }
+        };
+        if !names.insert(name.to_ascii_lowercase()) {
+            anyhow::bail!("Duplicate JSON_TABLE column name '{name}'");
+        }
+        output.push(Column {
+            name: name.clone(),
+            data_type,
+            nullable: true,
+            default: None,
+            is_primary_key: false,
+        });
+    }
+    Ok(())
+}
+
+fn json_table_expand(
+    value: &serde_json::Value,
+    columns: &[JsonTableColumn],
+    ordinal: usize,
+) -> anyhow::Result<Vec<Row>> {
+    json_table_expand_with_base(value, columns, ordinal, Row::new())
+}
+
+fn json_table_expand_with_base(
+    value: &serde_json::Value,
+    columns: &[JsonTableColumn],
+    ordinal: usize,
+    mut base: Row,
+) -> anyhow::Result<Vec<Row>> {
+    let mut nested = Vec::new();
+    for column in columns {
+        match column {
+            JsonTableColumn::Scalar {
+                name,
+                data_type,
+                path,
+                on_empty,
+                on_error,
+            } => {
+                let result = json_table_scalar(value, path, data_type);
+                let result = match result {
+                    Ok(Some(value)) => Some(value),
+                    Ok(None) => json_table_behavior_value(on_empty, data_type)?,
+                    Err(_) => json_table_behavior_value(on_error, data_type)?,
+                };
+                if let Some(value) = result {
+                    base.push(name, value);
+                } else {
+                    base.push_null(name);
+                }
+            }
+            JsonTableColumn::Ordinality { name } => {
+                base.push(name, ordinal.to_string().into_bytes());
+            }
+            JsonTableColumn::Exists { name, path } => {
+                let exists = !json_extract_path_matches(value, path)?.is_empty();
+                base.push(name, if exists { b"1" } else { b"0" }.to_vec());
+            }
+            JsonTableColumn::Nested { .. } => nested.push(column),
+        }
+    }
+    if nested.is_empty() {
+        return Ok(vec![base]);
+    }
+    let mut rows = Vec::new();
+    for (selected, nested_column) in nested.iter().enumerate() {
+        let JsonTableColumn::Nested { path, columns } = nested_column else {
+            unreachable!("JSON_TABLE nested list contains a non-nested column");
+        };
+        let matches = json_extract_path_matches(value, path)?;
+        let mut parent = base.clone();
+        for (index, other) in nested.iter().enumerate() {
+            if index != selected {
+                if let JsonTableColumn::Nested { columns, .. } = other {
+                    json_table_append_nulls(&mut parent, columns);
+                }
+            }
+        }
+        if matches.is_empty() {
+            json_table_append_nulls(&mut parent, columns);
+            rows.push(parent);
+        } else {
+            for (ordinal, (_, child)) in matches.iter().enumerate() {
+                rows.extend(json_table_expand_with_base(
+                    child,
+                    columns,
+                    ordinal + 1,
+                    parent.clone(),
+                )?);
+            }
+        }
+    }
+    Ok(rows)
+}
+
+fn json_table_append_nulls(row: &mut Row, columns: &[JsonTableColumn]) {
+    for column in columns {
+        match column {
+            JsonTableColumn::Scalar { name, .. }
+            | JsonTableColumn::Ordinality { name }
+            | JsonTableColumn::Exists { name, .. } => row.push_null(name),
+            JsonTableColumn::Nested { columns, .. } => json_table_append_nulls(row, columns),
+        }
+    }
+}
+
+fn json_table_scalar(
+    value: &serde_json::Value,
+    path: &str,
+    data_type: &str,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    let Some((_, value)) = json_extract_path_matches(value, path)?.into_iter().next() else {
+        return Ok(None);
+    };
+    json_table_value(value, data_type)
+}
+
+fn json_table_value(value: &serde_json::Value, data_type: &str) -> anyhow::Result<Option<Vec<u8>>> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    let upper = data_type.trim().to_ascii_uppercase();
+    if upper.starts_with("JSON") {
+        return Ok(Some(mysql_json_bytes(value)?));
+    }
+    let raw = match value {
+        serde_json::Value::String(value) => value.clone(),
+        serde_json::Value::Bool(value) => if *value { "1" } else { "0" }.to_string(),
+        serde_json::Value::Number(value) => value.to_string(),
+        serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+            anyhow::bail!("JSON_TABLE value is not scalar for type '{data_type}'")
+        }
+        serde_json::Value::Null => return Ok(None),
+    };
+    if upper.starts_with("CHAR")
+        || upper.starts_with("VARCHAR")
+        || upper.starts_with("TEXT")
+        || upper.starts_with("BLOB")
+        || upper.starts_with("DATE")
+        || upper.starts_with("TIME")
+        || upper.starts_with("YEAR")
+    {
+        return Ok(Some(raw.into_bytes()));
+    }
+    if upper.starts_with("FLOAT") || upper.starts_with("DOUBLE") {
+        return Ok(Some(
+            format_mysql_number(parse_scalar_number(raw.as_bytes())?).into_bytes(),
+        ));
+    }
+    if upper.starts_with("DECIMAL") || upper.starts_with("NUMERIC") {
+        return Ok(Some(raw.into_bytes()));
+    }
+    if upper.starts_with("BOOL") || upper.starts_with("TINYINT") {
+        return Ok(Some(if parse_scalar_number(raw.as_bytes())? == 0.0 {
+            b"0".to_vec()
+        } else {
+            b"1".to_vec()
+        }));
+    }
+    if upper.starts_with("SIGNED")
+        || upper.starts_with("UNSIGNED")
+        || upper.starts_with("INT")
+        || upper.starts_with("INTEGER")
+        || upper.starts_with("BIGINT")
+        || upper.starts_with("SMALLINT")
+        || upper.starts_with("MEDIUMINT")
+    {
+        return Ok(Some(
+            format!("{:.0}", parse_scalar_number(raw.as_bytes())?.round()).into_bytes(),
+        ));
+    }
+    Ok(Some(raw.into_bytes()))
+}
+
+fn json_table_behavior_value(
+    behavior: &JsonTableBehavior,
+    data_type: &str,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    match behavior {
+        JsonTableBehavior::Null => Ok(None),
+        JsonTableBehavior::Error => anyhow::bail!("JSON_TABLE column evaluation failed"),
+        JsonTableBehavior::Default(expression) => {
+            let Some(value) = evaluate_scalar_expression(expression, &Row::new())? else {
+                return Ok(None);
+            };
+            let value = sql_scalar_to_json(&value);
+            json_table_value(&value, data_type)
+        }
+    }
 }
 
 fn parse_derived_table_alias(value: &str) -> anyhow::Result<String> {
@@ -69030,6 +69514,104 @@ mod tests {
             .is_err());
         assert!(backend
             .execute("SELECT JSON_SET('{\"a\":1}','$.*',2)")
+            .await
+            .is_err());
+
+        let QueryOutcome::Rows { columns, rows } = backend
+            .execute(
+                "SELECT * FROM JSON_TABLE('[{\"id\":1,\"name\":\"a\"},{\"id\":2}]', '$[*]' COLUMNS (id INT PATH '$.id', name VARCHAR(10) PATH '$.name')) AS jt",
+            )
+            .await
+            .expect("evaluate JSON_TABLE scalar columns")
+        else {
+            panic!("expected JSON_TABLE rows")
+        };
+        assert_eq!(columns, vec!["id", "name"]);
+        assert_eq!(
+            rows,
+            vec![
+                vec![Some(b"1".to_vec()), Some(b"a".to_vec())],
+                vec![Some(b"2".to_vec()), None]
+            ]
+        );
+
+        let QueryOutcome::Rows { rows, .. } = backend
+            .execute(
+                "SELECT * FROM JSON_TABLE('{\"items\":[{\"id\":1,\"tags\":[\"a\",\"b\"]},{\"id\":2}]}', '$.items[*]' COLUMNS (id INT PATH '$.id', NESTED PATH '$.tags[*]' COLUMNS (tag VARCHAR(10) PATH '$'))) AS jt",
+            )
+            .await
+            .expect("evaluate JSON_TABLE nested path")
+        else {
+            panic!("expected nested JSON_TABLE rows")
+        };
+        assert_eq!(
+            rows,
+            vec![
+                vec![Some(b"1".to_vec()), Some(b"a".to_vec())],
+                vec![Some(b"1".to_vec()), Some(b"b".to_vec())],
+                vec![Some(b"2".to_vec()), None]
+            ]
+        );
+
+        let QueryOutcome::Rows { rows, .. } = backend
+            .execute(
+                "SELECT * FROM JSON_TABLE('[{\"id\":1},{\"id\":2}]', '$[*]' COLUMNS (id INT PATH '$.id', ord FOR ORDINALITY, present INT EXISTS PATH '$.id', raw JSON PATH '$')) AS jt",
+            )
+            .await
+            .expect("evaluate JSON_TABLE ordinality and exists")
+        else {
+            panic!("expected JSON_TABLE metadata rows")
+        };
+        assert_eq!(
+            rows,
+            vec![
+                vec![
+                    Some(b"1".to_vec()),
+                    Some(b"1".to_vec()),
+                    Some(b"1".to_vec()),
+                    Some(br#"{"id": 1}"#.to_vec())
+                ],
+                vec![
+                    Some(b"2".to_vec()),
+                    Some(b"2".to_vec()),
+                    Some(b"1".to_vec()),
+                    Some(br#"{"id": 2}"#.to_vec())
+                ]
+            ]
+        );
+
+        let QueryOutcome::Rows { rows, .. } = backend
+            .execute(
+                "SELECT * FROM JSON_TABLE('[{\"id\":1}]', '$[*]' COLUMNS (id INT PATH '$.id', a INT PATH '$.missing' DEFAULT '7' ON EMPTY, b INT PATH '$.missing' DEFAULT '\"7\"' ON EMPTY, c VARCHAR(5) PATH '$.missing' DEFAULT '\"x\"' ON EMPTY)) AS jt",
+            )
+            .await
+            .expect("evaluate JSON_TABLE default on empty")
+        else {
+            panic!("expected JSON_TABLE default row")
+        };
+        assert_eq!(
+            rows,
+            vec![vec![
+                Some(b"1".to_vec()),
+                Some(b"7".to_vec()),
+                Some(b"7".to_vec()),
+                Some(b"x".to_vec())
+            ]]
+        );
+        let QueryOutcome::Rows { rows, .. } = backend
+            .execute(
+                "SELECT * FROM JSON_TABLE('[{\"id\":\"bad\"}]', '$[*]' COLUMNS (a INT PATH '$.id' NULL ON ERROR, b INT PATH '$.id' DEFAULT '9' ON ERROR)) AS jt",
+            )
+            .await
+            .expect("evaluate JSON_TABLE default on error")
+        else {
+            panic!("expected JSON_TABLE error behavior row")
+        };
+        assert_eq!(rows, vec![vec![None, Some(b"9".to_vec())]]);
+        assert!(backend
+            .execute(
+                "SELECT * FROM JSON_TABLE('[{\"id\":1}]', '$[*]' COLUMNS (missing INT PATH '$.missing' ERROR ON EMPTY)) AS jt"
+            )
             .await
             .is_err());
 
