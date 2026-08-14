@@ -45,8 +45,11 @@ use mydb_storage::{
     TriggerDefinition, TriggerEvent, TriggerTiming, UpdateValueExpression, WriteCommand,
 };
 
-pub const SERVER_VERSION: &str = "8.4.0-mydb-0.1.0";
+pub const SERVER_VERSION: &str = "8.4.0-mydb-0.1.2";
 pub const MYSQL84_DEFAULT_SQL_MODE: &str = "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION";
+/// MySQL 8.4 default `innodb_lock_wait_timeout`, in seconds.
+pub const MYSQL84_DEFAULT_INNODB_LOCK_WAIT_TIMEOUT_SECONDS: u64 = 50;
+const MYSQL84_MAX_INNODB_LOCK_WAIT_TIMEOUT_SECONDS: u64 = 1_073_741_824;
 const MAX_SCALAR_RESULT_BYTES: usize = 64 * 1024 * 1024;
 const REGEX_CACHE_CAPACITY: usize = 256;
 const READ_ONLY_TRANSACTION_ERROR: &str = "Cannot execute statement in a READ ONLY transaction.";
@@ -426,7 +429,7 @@ impl Default for ProtocolConfig {
             default_database: "mydb".to_string(),
             slow_query_threshold_ms: 100,
             max_slow_queries: 1024,
-            lock_wait_timeout_ms: 5_000,
+            lock_wait_timeout_ms: MYSQL84_DEFAULT_INNODB_LOCK_WAIT_TIMEOUT_SECONDS * 1_000,
             local_infile: true,
             secure_file_priv: PathBuf::from("imports"),
             max_load_data_size: 1024 * 1024 * 1024,
@@ -507,7 +510,10 @@ impl AuditLog {
         }
     }
 
-    fn record(
+    /// Record a management or SQL audit event without including SQL text or
+    /// credentials. Management handlers use the same bounded queue as normal
+    /// statements so the audit stream has one ordering domain.
+    pub fn record(
         &self,
         event: &str,
         user: &str,
@@ -3043,6 +3049,7 @@ pub struct WireStats {
     // connection so contending sessions observe each other's leases.
     named_locks: parking_lot::Mutex<HashMap<String, u32>>,
     global_transaction_defaults: parking_lot::Mutex<TransactionDefaults>,
+    global_innodb_lock_wait_timeout_seconds: AtomicU64,
     event_scheduler_state: AtomicU8,
     activate_all_roles_on_login: AtomicU8,
     global_cte_max_recursion_depth: AtomicU64,
@@ -3186,6 +3193,22 @@ fn parse_transaction_isolation(value: &str) -> anyhow::Result<TransactionIsolati
         "SERIALIZABLE" => Ok(TransactionIsolation::Serializable),
         _ => anyhow::bail!("Unknown transaction isolation level '{}'", value),
     }
+}
+
+fn parse_innodb_lock_wait_timeout(value: Option<&[u8]>) -> anyhow::Result<u64> {
+    let value = value.ok_or_else(|| anyhow::anyhow!("innodb_lock_wait_timeout cannot be NULL"))?;
+    let seconds = std::str::from_utf8(value)
+        .map_err(|_| anyhow::anyhow!("innodb_lock_wait_timeout must be an integer"))?
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| anyhow::anyhow!("innodb_lock_wait_timeout must be an integer"))?;
+    if !(1..=MYSQL84_MAX_INNODB_LOCK_WAIT_TIMEOUT_SECONDS).contains(&seconds) {
+        anyhow::bail!(
+            "Variable 'innodb_lock_wait_timeout' must be between 1 and {}",
+            MYSQL84_MAX_INNODB_LOCK_WAIT_TIMEOUT_SECONDS
+        );
+    }
+    Ok(seconds)
 }
 
 fn parse_transaction_characteristics(value: &str) -> anyhow::Result<TransactionCharacteristics> {
@@ -3365,6 +3388,22 @@ impl WireStats {
         } else {
             value.saturating_sub(1) as usize
         }
+    }
+
+    fn global_innodb_lock_wait_timeout_seconds(&self, fallback_seconds: u64) -> u64 {
+        let value = self
+            .global_innodb_lock_wait_timeout_seconds
+            .load(Ordering::Acquire);
+        if value == 0 {
+            fallback_seconds
+        } else {
+            value
+        }
+    }
+
+    fn set_global_innodb_lock_wait_timeout_seconds(&self, value: u64) {
+        self.global_innodb_lock_wait_timeout_seconds
+            .store(value, Ordering::Release);
     }
 
     fn set_global_cte_max_recursion_depth(&self, value: u32) {
@@ -4897,11 +4936,8 @@ fn parse_named_lock_select(sql: &str) -> Option<Vec<(NamedLockCall, String)>> {
     let mut calls = Vec::with_capacity(segments.len());
     for segment in segments {
         let segment = segment.trim();
-        if let Some(call) = parse_single_lock_call(segment) {
-            calls.push((call, segment.to_string()));
-        } else {
-            return None;
-        }
+        let call = parse_single_lock_call(segment)?;
+        calls.push((call, segment.to_string()));
     }
     Some(calls)
 }
@@ -5104,7 +5140,10 @@ impl Backend {
         connection_id: u32,
     ) -> Self {
         let salt = generate_auth_salt();
-        let lock_wait_timeout = std::time::Duration::from_millis(config.lock_wait_timeout_ms);
+        let fallback_lock_wait_timeout_seconds = config.lock_wait_timeout_ms.div_ceil(1_000).max(1);
+        let lock_wait_timeout = std::time::Duration::from_secs(
+            stats.global_innodb_lock_wait_timeout_seconds(fallback_lock_wait_timeout_seconds),
+        );
         let transaction_writes = Arc::new(parking_lot::RwLock::new(Vec::new()));
         stats.register_transaction_buffer(connection_id, &transaction_writes);
         let transaction_defaults = *stats.global_transaction_defaults.lock();
@@ -5221,7 +5260,12 @@ impl Backend {
         self.next_transaction_characteristics = TransactionCharacteristics::default();
         self.transaction_isolation = self.session_transaction_defaults.isolation;
         self.transaction_read_only = false;
-        self.lock_wait_timeout = std::time::Duration::from_millis(self.config.lock_wait_timeout_ms);
+        let fallback_lock_wait_timeout_seconds =
+            self.config.lock_wait_timeout_ms.div_ceil(1_000).max(1);
+        self.lock_wait_timeout = std::time::Duration::from_secs(
+            self.stats
+                .global_innodb_lock_wait_timeout_seconds(fallback_lock_wait_timeout_seconds),
+        );
         self.foreign_key_checks = true;
         self.prepared.clear();
         self.cte_scopes.clear();
@@ -5911,13 +5955,16 @@ impl Backend {
             "innodb_autoinc_lock_mode" => Some(b"2".to_vec()),
             "innodb_status_output" => Some(b"OFF".to_vec()),
             "autocommit" => Some(if self.autocommit { b"1" } else { b"0" }.to_vec()),
-            "innodb_lock_wait_timeout" => Some(
-                self.lock_wait_timeout
-                    .as_secs()
-                    .max(1)
-                    .to_string()
-                    .into_bytes(),
-            ),
+            "innodb_lock_wait_timeout" => {
+                let fallback_seconds = self.config.lock_wait_timeout_ms.div_ceil(1_000).max(1);
+                let seconds = match scope {
+                    SystemVariableScope::Session => self.lock_wait_timeout.as_secs().max(1),
+                    SystemVariableScope::Global => self
+                        .stats
+                        .global_innodb_lock_wait_timeout_seconds(fallback_seconds),
+                };
+                Some(seconds.to_string().into_bytes())
+            }
             "foreign_key_checks" => {
                 Some(if self.foreign_key_checks { b"1" } else { b"0" }.to_vec())
             }
@@ -6017,7 +6064,10 @@ impl Backend {
         if variable_scope == SystemVariableScope::Global
             && !matches!(
                 name.as_str(),
-                "event_scheduler" | "cte_max_recursion_depth" | "activate_all_roles_on_login"
+                "event_scheduler"
+                    | "cte_max_recursion_depth"
+                    | "activate_all_roles_on_login"
+                    | "innodb_lock_wait_timeout"
             )
         {
             anyhow::bail!("Global system variable '{}' is not supported", name);
@@ -6122,15 +6172,22 @@ impl Backend {
                     .insert(name, Some(parsed.to_string().into_bytes()));
             }
             "innodb_lock_wait_timeout" => {
-                let seconds = value
-                    .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("innodb_lock_wait_timeout cannot be NULL"))
-                    .and_then(|value| {
-                        std::str::from_utf8(value)
-                            .map_err(Into::into)
-                            .and_then(|value| value.parse::<u64>().map_err(Into::into))
-                    })?;
-                self.lock_wait_timeout = std::time::Duration::from_secs(seconds.max(1));
+                let seconds = parse_innodb_lock_wait_timeout(value.as_deref())?;
+                if variable_scope == SystemVariableScope::Global {
+                    let user = self.authenticated_username();
+                    if !self.auth_has_privilege(&user, "", "SYSTEM_VARIABLES_ADMIN")
+                        && !self.auth_has_privilege(&user, "", "SUPER")
+                    {
+                        anyhow::bail!(
+                            "Access denied; user '{}' lacks SYSTEM_VARIABLES_ADMIN privilege",
+                            user
+                        );
+                    }
+                    self.stats
+                        .set_global_innodb_lock_wait_timeout_seconds(seconds);
+                } else {
+                    self.lock_wait_timeout = std::time::Duration::from_secs(seconds);
+                }
             }
             "max_error_count" => {
                 let count = match value.as_deref() {
@@ -12577,12 +12634,17 @@ impl Backend {
         &self,
         database: &str,
         table: &str,
-        row: Row,
+        mut row: Row,
     ) -> anyhow::Result<(Row, u64)> {
         let database = self
             .storage
             .get_database(database)
             .ok_or_else(|| anyhow::anyhow!("Unknown database '{}'", database))?;
+        let schema = database
+            .get_table(table)
+            .ok_or_else(|| anyhow::anyhow!("Table '{}.{}' does not exist", database.name, table))?
+            .clone();
+        materialize_session_timestamp_defaults(&mut row, &schema);
         let (increment, offset) = self.auto_increment_settings();
         let (mut rows, generated_id) = database.materialize_insert_rows_with_auto_increment(
             table,
@@ -12593,9 +12655,7 @@ impl Backend {
         let row = rows
             .first_mut()
             .ok_or_else(|| anyhow::anyhow!("Trigger INSERT materialization returned no row"))?;
-        if let Some(schema) = database.get_table(table) {
-            materialize_generated_columns(row, &schema)?;
-        }
+        materialize_generated_columns(row, &schema)?;
         Ok((
             rows.pop()
                 .ok_or_else(|| anyhow::anyhow!("Trigger INSERT materialization returned no row"))?,
@@ -28155,6 +28215,28 @@ fn automatic_update_timestamp_values<'a>(
         .filter(|(column, _)| !explicit.contains(&column.to_ascii_lowercase()))
         .map(|(column, fsp)| (column, format_mysql_naive_datetime(now, fsp).into_bytes()))
         .collect()
+}
+
+fn materialize_session_timestamp_defaults(row: &mut Row, schema: &TableSchema) {
+    let now = current_statement_session_datetime();
+    for column in &schema.columns {
+        if row.contains(&column.name) {
+            continue;
+        }
+        let Some(default) = column.default.as_deref() else {
+            continue;
+        };
+        if !is_current_timestamp_default(default) {
+            continue;
+        }
+        let fsp = temporal_function_precision(default, "CURRENT_TIMESTAMP", true)
+            .or_else(|| temporal_function_precision(default, "NOW", false))
+            .unwrap_or(0);
+        row.set(
+            &column.name,
+            format_mysql_naive_datetime(now, fsp).into_bytes(),
+        );
+    }
 }
 
 fn on_update_current_timestamp_columns(schema: &TableSchema) -> Vec<(String, usize)> {
@@ -48246,6 +48328,96 @@ mod tests {
             .execute("SET GLOBAL event_scheduler = ON")
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn innodb_lock_wait_timeout_matches_mysql_session_and_global_semantics() {
+        let temp = tempfile::tempdir().expect("create lock timeout test directory");
+        let storage = Arc::new(StorageEngineManager::new(
+            temp.path().to_path_buf(),
+            16384,
+            "4M",
+        ));
+        storage
+            .init()
+            .await
+            .expect("initialize lock timeout test storage");
+        storage
+            .create_database("mydb")
+            .await
+            .expect("create lock timeout test database");
+        let stats = Arc::new(WireStats::default());
+        let config = Arc::new(ProtocolConfig::default());
+        let mut first = Backend::new(storage.clone(), config.clone(), stats.clone(), 1);
+
+        assert_eq!(
+            single_value(
+                first
+                    .execute("SELECT @@SESSION.innodb_lock_wait_timeout")
+                    .await
+                    .expect("read default session lock timeout")
+            ),
+            b"50"
+        );
+        assert_eq!(
+            single_value(
+                first
+                    .execute("SELECT @@GLOBAL.innodb_lock_wait_timeout")
+                    .await
+                    .expect("read default global lock timeout")
+            ),
+            b"50"
+        );
+
+        first
+            .execute("SET SESSION innodb_lock_wait_timeout = 3")
+            .await
+            .expect("set session lock timeout");
+        first
+            .execute("SET GLOBAL innodb_lock_wait_timeout = 7")
+            .await
+            .expect("set global lock timeout");
+        assert_eq!(
+            single_value(
+                first
+                    .execute("SELECT @@SESSION.innodb_lock_wait_timeout")
+                    .await
+                    .expect("read changed session lock timeout")
+            ),
+            b"3"
+        );
+        assert_eq!(
+            single_value(
+                first
+                    .execute("SELECT @@GLOBAL.innodb_lock_wait_timeout")
+                    .await
+                    .expect("read changed global lock timeout")
+            ),
+            b"7"
+        );
+
+        let mut second = Backend::new(storage, config, stats, 2);
+        assert_eq!(
+            single_value(
+                second
+                    .execute("SELECT @@SESSION.innodb_lock_wait_timeout")
+                    .await
+                    .expect("new sessions use changed global lock timeout")
+            ),
+            b"7"
+        );
+        assert!(second
+            .execute("SET SESSION innodb_lock_wait_timeout = 0")
+            .await
+            .expect_err("zero lock timeout must be rejected")
+            .to_string()
+            .contains("between 1 and"));
+        assert!(second
+            .execute("SET SESSION innodb_lock_wait_timeout = 1073741825")
+            .await
+            .expect_err("oversized lock timeout must be rejected")
+            .to_string()
+            .contains("between 1 and"));
     }
 
     #[tokio::test]
@@ -72888,5 +73060,101 @@ mod tests {
                 Some(b"22".to_vec())
             ]]
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mysql_client_roundtrip_survives_storage_restart() -> anyhow::Result<()> {
+        use mysql::prelude::Queryable;
+
+        let temp = tempfile::tempdir()?;
+        let storage = Arc::new(StorageEngineManager::try_new(
+            temp.path().to_path_buf(),
+            16384,
+            "4M",
+        )?);
+        storage.init().await?;
+        storage.create_database("mydb").await?;
+
+        let config = Arc::new(ProtocolConfig::default());
+        let stats = Arc::new(WireStats::default());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+        let server_storage = storage.clone();
+        let server_config = config.clone();
+        let server_stats = stats.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept first MySQL client");
+            handle_connection(stream, server_storage, server_config, server_stats)
+                .await
+                .expect("serve first MySQL client");
+        });
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let options = mysql::OptsBuilder::default()
+                .ip_or_hostname(Some("127.0.0.1"))
+                .tcp_port(port)
+                .user(Some("root"))
+                .pass(Some("root"))
+                .db_name(Some("mydb"))
+                .prefer_socket(false);
+            let mut connection = mysql::Conn::new(options)?;
+            connection.query_drop(
+                "CREATE TABLE restart_rows (id BIGINT PRIMARY KEY, payload VARBINARY(32))",
+            )?;
+            connection.query_drop("INSERT INTO restart_rows VALUES (1, X'00FF')")?;
+            let row: Option<(u64, Vec<u8>)> =
+                connection.query_first("SELECT id,payload FROM restart_rows")?;
+            let row = row.expect("restart row must be returned before shutdown");
+            assert_eq!(row, (1, vec![0, 255]));
+            Ok(())
+        })
+        .await??;
+        tokio::time::timeout(Duration::from_secs(5), server).await??;
+        storage.flush_consistent().await?;
+        drop(storage);
+
+        let restarted = Arc::new(StorageEngineManager::try_new(
+            temp.path().to_path_buf(),
+            16384,
+            "4M",
+        )?);
+        restarted.init().await?;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+        let server_storage = restarted.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener
+                .accept()
+                .await
+                .expect("accept restarted MySQL client");
+            handle_connection(
+                stream,
+                server_storage,
+                Arc::new(ProtocolConfig::default()),
+                Arc::new(WireStats::default()),
+            )
+            .await
+            .expect("serve restarted MySQL client");
+        });
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let options = mysql::OptsBuilder::default()
+                .ip_or_hostname(Some("127.0.0.1"))
+                .tcp_port(port)
+                .user(Some("root"))
+                .pass(Some("root"))
+                .db_name(Some("mydb"))
+                .prefer_socket(false);
+            let mut connection = mysql::Conn::new(options)?;
+            let row: Option<(u64, Vec<u8>)> =
+                connection.query_first("SELECT id,payload FROM restart_rows")?;
+            assert_eq!(row, Some((1, vec![0, 255])));
+            connection.query_drop("INSERT INTO restart_rows VALUES (2, X'AB')")?;
+            Ok(())
+        })
+        .await??;
+        tokio::time::timeout(Duration::from_secs(5), server).await??;
+        restarted.flush_consistent().await?;
+        Ok(())
     }
 }

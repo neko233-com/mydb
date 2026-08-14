@@ -456,7 +456,7 @@ mysql --local-infile=1 --protocol=TCP --host=mydb --port=3306 --user=root --pass
     if ($LASTEXITCODE -ne 0 -or $deadlockStateText -notin @("1`t11`n2`t12", "1`t101`n2`t102")) {
         throw "deadlock victim transaction was not fully rolled back"
     }
-    $deadlockMetrics = Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:14316/metrics"
+    $deadlockMetrics = Invoke-WebRequest -UseBasicParsing -Headers @{ Authorization = "Bearer root" } -Uri "http://127.0.0.1:14316/metrics"
     if ($deadlockMetrics.Content -notmatch "mydb_deadlocks_total [1-9]") {
         throw "deadlock metric was not incremented"
     }
@@ -639,7 +639,7 @@ printf "%s\t%s\t%s\t%s\n" "$wal" "$logical_end" "$physical_before" "$physical_af
         throw "ordered/limited UPDATE DELETE check failed"
     }
 
-    $metrics = Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:14316/metrics"
+    $metrics = Invoke-WebRequest -UseBasicParsing -Headers @{ Authorization = "Bearer root" } -Uri "http://127.0.0.1:14316/metrics"
     if ($metrics.Content -notmatch "mydb_up 1" -or
         $metrics.Content -notmatch "mydb_row_lock_acquires_total [1-9]" -or
         $metrics.Content -notmatch "mydb_wal_sync_microseconds_total [1-9]" -or
@@ -675,7 +675,7 @@ printf "%s\t%s\t%s\t%s\n" "$wal" "$logical_end" "$physical_before" "$physical_af
     $incrementalBody = @{ base_id = $fullBackup.id } | ConvertTo-Json -Compress
     $incrementalBackup = Invoke-RestMethod -Method Post -Headers $headers -ContentType "application/json" `
         -Body $incrementalBody -Uri "http://127.0.0.1:14316/api/v1/backup/incremental"
-    $restoreBody = @{ id = $incrementalBackup.id; point_in_time = $pointInTime } | ConvertTo-Json -Compress
+    $restoreBody = @{ id = $incrementalBackup.id; point_in_time = $pointInTime; confirmation = "RESTORE_BACKUP:$($incrementalBackup.id)" } | ConvertTo-Json -Compress
     $restore = Invoke-RestMethod -Method Post -Headers $headers -ContentType "application/json" `
         -Body $restoreBody -Uri "http://127.0.0.1:14316/api/v1/backup/restore"
     if (-not $restore.restart_required) { throw "backup restore was not staged safely" }

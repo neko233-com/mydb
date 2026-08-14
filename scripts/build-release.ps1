@@ -32,18 +32,6 @@ function Write-Success { Write-Host "[OK] $args" -ForegroundColor Green }
 function Write-Warn { Write-Host "[WARN] $args" -ForegroundColor Yellow }
 function Write-Error { Write-Host "[ERROR] $args" -ForegroundColor Red; exit 1 }
 
-function Invoke-RustGate {
-    param(
-        [string]$Name,
-        [string[]]$Arguments
-    )
-    Write-Info $Name
-    & cargo @Arguments
-    if ($LASTEXITCODE -ne 0) {
-        Write-Error "$Name failed"
-    }
-}
-
 # 检查 gh 是否可用
 if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
     Write-Error "gh (GitHub CLI) not found. Install: https://cli.github.com/"
@@ -80,9 +68,9 @@ if ($LASTEXITCODE -eq 0) {
 }
 
 # 发布物不可覆盖；先做 Rust 质量门禁，再构建。
-Invoke-RustGate "Running format check..." @("fmt", "--all", "--", "--check")
-Invoke-RustGate "Running clippy..." @("clippy", "--workspace", "--all-targets", "--locked", "--", "-D", "warnings")
-Invoke-RustGate "Running workspace tests..." @("test", "--workspace", "--locked", "--", "--test-threads=1")
+Write-Info "Running Docker Rust quality gate (2 GiB limit)..."
+& (Join-Path $PSScriptRoot "test-docker.ps1") -MemoryLimit "2g" -CpuLimit 2 -BuildJobs 2
+if ($LASTEXITCODE -ne 0) { Write-Error "Docker Rust quality gate failed" }
 
 # 构建 release 版本
 Write-Info "Building release..."

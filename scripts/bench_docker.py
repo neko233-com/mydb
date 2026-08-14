@@ -6,11 +6,12 @@ Docker CPU/memory limits) and writes a reproducible Markdown report with
 per-scenario medians and ratios.
 
 Usage:
-    python3 scripts/bench_docker.py [--samples N] [--compose FILE] [--project DIR]
+    python3 scripts/bench_docker.py [--samples N] [--memory 2g] [--cpus 2]
 """
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import os
 import statistics
@@ -51,8 +52,13 @@ def docker_compose(*args):
     return run(cmd)
 
 
-def ensure_up():
-    print("==> starting mydb + mysql (no rebuild)", flush=True)
+def ensure_up(skip_build):
+    if not skip_build:
+        print("==> building Docker benchmark images", flush=True)
+        r = docker_compose("build", "mydb", "bench")
+        if r.returncode != 0:
+            sys.exit(f"docker compose build failed:\n{r.stderr}")
+    print("==> starting mydb + mysql", flush=True)
     r = docker_compose("up", "-d", "mydb", "mysql")
     if r.returncode != 0:
         sys.exit(f"docker compose up failed:\n{r.stderr}")
@@ -122,8 +128,21 @@ def median(values, key):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--samples", type=int, default=3)
+    ap.add_argument("--memory", default=os.environ.get("MYDB_MEM", "2g"))
+    ap.add_argument("--cpus", default=os.environ.get("MYDB_CPUS", "2"))
+    ap.add_argument("--skip-build", action="store_true")
+    ap.add_argument("--keep", action="store_true")
     args = ap.parse_args()
-    ensure_up()
+    if args.samples < 1:
+        ap.error("--samples must be positive")
+    os.environ["MYDB_MEM"] = args.memory
+    os.environ["MYSQL_MEM"] = args.memory
+    os.environ["MYDB_CPUS"] = str(args.cpus)
+    os.environ["MYSQL_CPUS"] = str(args.cpus)
+    docker_compose("down", "-v", "--remove-orphans")
+    if not args.keep:
+        atexit.register(lambda: docker_compose("down", "-v", "--remove-orphans"))
+    ensure_up(args.skip_build)
 
     print("==> warmup (discarded)", flush=True)
     for _name, _label, sc in SCENARIOS:
@@ -164,7 +183,7 @@ def main():
     lines.append("# MyDB 性能报告\n")
     lines.append(
         "> 本报告的对比在 **Docker 容器** 中进行，MyDB 与 MySQL 运行在**完全相同的 "
-        "CPU 与内存限制**下（各 2 vCPU、1 GiB 内存），保证公平可复现。双方持久化级别"
+        "CPU 与内存限制**下（各 2 vCPU、2 GiB 内存），保证公平可复现。双方持久化级别"
         "一致：MyDB 每组一次 WAL `sync_data()`；MySQL `innodb_flush_log_at_trx_commit=1` "
         "+ `sync_binlog=1`。每项取 %d 次采样中位数。\n" % args.samples)
     lines.append("> 基准工具为 `mydb-bench`，双方执行完全相同的 `ENGINE=InnoDB` 业务 "
@@ -179,7 +198,7 @@ def main():
     lines.append("## 当前实测（Docker 受控）\n")
     lines.append(f"### Git Revision: `{commit}`")
     lines.append(f"### 测试日期: {date}")
-    lines.append("### 环境: Docker Desktop，linux/amd64；MyDB 容器 2 vCPU / 1 GiB，MySQL 容器 2 vCPU / 1 GiB")
+    lines.append(f"### 环境: Docker Desktop，linux/amd64；MyDB 容器 {args.cpus} vCPU / {args.memory}，MySQL 容器 {args.cpus} vCPU / {args.memory}")
     lines.append(f"### MySQL: {mysql_build} — `innodb_flush_log_at_trx_commit=1`, `sync_binlog=1`, `transaction_isolation=REPEATABLE-READ`")
     lines.append("### MyDB: `group_commit_window_us=250`，shard_count 自动 = 分配 CPU 数（2），checkpoint 每 1024 个已提交请求\n")
     lines.append(f"| 场景 | MyDB | MySQL {mysql_build.split(' — ', 1)[0]} | MyDB / MySQL |")

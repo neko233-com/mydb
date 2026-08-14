@@ -18,6 +18,8 @@ services:
       timeout: 3s
       start_period: 10s
       retries: 20
+    mem_limit: 2g
+    memswap_limit: 2g
     networks:
       - jdbc-test-net
 
@@ -44,6 +46,8 @@ services:
                  sleep 5;
              done;
              echo "All attempts failed"; exit 1'
+    mem_limit: 2g
+    memswap_limit: 2g
 
 networks:
   jdbc-test-net:

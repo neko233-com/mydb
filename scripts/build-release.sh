@@ -62,12 +62,9 @@ if gh release view "$TAG" &> /dev/null; then
 fi
 
 # A release is immutable. Run the same Rust gates required before pushing.
-info "Running format check..."
-cargo fmt --all -- --check
-info "Running clippy..."
-cargo clippy --workspace --all-targets --locked -- -D warnings
-info "Running workspace tests..."
-cargo test --workspace --locked -- --test-threads=1
+info "Running Docker Rust quality gate (2 GiB limit)..."
+MYDB_TEST_MEMORY=2g MYDB_TEST_CPUS=2 MYDB_TEST_JOBS=2 \
+    "$PWD/scripts/test-docker.sh"
 
 # 构建 release 版本
 info "Building release..."

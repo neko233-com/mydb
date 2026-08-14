@@ -74,12 +74,80 @@ struct AdminState {
     config_path: Option<PathBuf>,
     started: Instant,
     sessions: Arc<parking_lot::Mutex<HashMap<String, AdminSession>>>,
+    login_rate_limiter: Arc<parking_lot::Mutex<LoginRateLimiter>>,
 }
 
 #[derive(Debug, Clone)]
 struct AdminSession {
     expires_at: Instant,
     sql_user: String,
+}
+
+const LOGIN_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+const LOGIN_USER_FAILURE_LIMIT: u32 = 5;
+const LOGIN_GLOBAL_FAILURE_LIMIT: u32 = 100;
+
+#[derive(Debug)]
+struct LoginAttempt {
+    window_started: Instant,
+    failures: u32,
+}
+
+#[derive(Debug, Default)]
+struct LoginRateLimiter {
+    users: HashMap<String, LoginAttempt>,
+    global: Option<LoginAttempt>,
+}
+
+impl LoginRateLimiter {
+    fn refresh(&mut self, now: Instant) {
+        self.users
+            .retain(|_, attempt| now.duration_since(attempt.window_started) < LOGIN_WINDOW);
+        if self
+            .global
+            .as_ref()
+            .is_some_and(|attempt| now.duration_since(attempt.window_started) >= LOGIN_WINDOW)
+        {
+            self.global = None;
+        }
+    }
+
+    fn allow(&mut self, username: &str) -> bool {
+        let now = Instant::now();
+        self.refresh(now);
+        let user_allowed = self
+            .users
+            .get(username)
+            .is_none_or(|attempt| attempt.failures < LOGIN_USER_FAILURE_LIMIT);
+        let global_allowed = self
+            .global
+            .as_ref()
+            .is_none_or(|attempt| attempt.failures < LOGIN_GLOBAL_FAILURE_LIMIT);
+        user_allowed && global_allowed
+    }
+
+    fn failed(&mut self, username: &str) {
+        let now = Instant::now();
+        self.refresh(now);
+        let attempt = self
+            .users
+            .entry(username.to_string())
+            .or_insert(LoginAttempt {
+                window_started: now,
+                failures: 0,
+            });
+        attempt.failures = attempt.failures.saturating_add(1);
+        let global = self.global.get_or_insert(LoginAttempt {
+            window_started: now,
+            failures: 0,
+        });
+        global.failures = global.failures.saturating_add(1);
+    }
+
+    fn succeeded(&mut self, username: &str) {
+        self.refresh(Instant::now());
+        self.users.remove(username);
+    }
 }
 
 fn main() -> Result<()> {
@@ -234,6 +302,7 @@ async fn run_server(args: Args, config: mydb_config::ServerConfig) -> Result<()>
     wire_stats.initialize_xa_catalog(config.storage.data_dir.join("xa"), storage.as_ref())?;
     let protocol_config = Arc::new(RwLock::new(protocol_config_for(&config)?));
     let sessions = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    let login_rate_limiter = Arc::new(parking_lot::Mutex::new(LoginRateLimiter::default()));
 
     let http_listener = bind_http_listener(&config).await?;
 
@@ -246,6 +315,7 @@ async fn run_server(args: Args, config: mydb_config::ServerConfig) -> Result<()>
             config_path: args.config.clone(),
             started: Instant::now(),
             sessions: sessions.clone(),
+            login_rate_limiter,
         };
         tokio::spawn(async move {
             if let Err(error) = run_admin_server(listener, state).await {
@@ -404,7 +474,7 @@ fn protocol_config_for(config: &mydb_config::ServerConfig) -> Result<mydb_wire::
         default_database: String::new(),
         slow_query_threshold_ms: config.agent.slow_query_threshold_ms,
         max_slow_queries: config.agent.max_slow_queries,
-        lock_wait_timeout_ms: 5_000,
+        lock_wait_timeout_ms: mydb_wire::MYSQL84_DEFAULT_INNODB_LOCK_WAIT_TIMEOUT_SECONDS * 1_000,
         local_infile: config.security.local_infile,
         secure_file_priv,
         max_load_data_size: config.security.max_load_data_size,
@@ -534,6 +604,12 @@ async fn auth_login(
     State(state): State<AdminState>,
     Json(request): Json<LoginRequest>,
 ) -> Result<Json<Value>, StatusCode> {
+    if request.username.len() > 512 || request.password.len() > 4096 {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    if !state.login_rate_limiter.lock().allow(&request.username) {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
     let config = state.config.read().clone();
     let valid_user = constant_time_eq(
         request.username.as_bytes(),
@@ -549,8 +625,10 @@ async fn auth_login(
         .auth_catalog
         .verify_password(&request.username, &request.password);
     if (!valid_user || !valid_password) && database_user.is_none() {
+        state.login_rate_limiter.lock().failed(&request.username);
         return Err(StatusCode::UNAUTHORIZED);
     }
+    state.login_rate_limiter.lock().succeeded(&request.username);
     let sql_user = database_user.unwrap_or(config.security.default_username.clone());
     let token = uuid::Uuid::new_v4().to_string();
     let expires_at = Instant::now() + std::time::Duration::from_secs(12 * 60 * 60);
@@ -674,8 +752,7 @@ fn authorize_agent(headers: &HeaderMap, state: &AdminState) -> Result<(), Status
 }
 
 async fn metrics(State(state): State<AdminState>, headers: HeaderMap) -> Response {
-    if state.config.read().security.enforce_strong_passwords && authorize(&headers, &state).is_err()
-    {
+    if authorize(&headers, &state).is_err() {
         return StatusCode::UNAUTHORIZED.into_response();
     }
     let wire = state.wire_stats.snapshot();
@@ -848,6 +925,7 @@ fn apply_runtime_config(
     let protocol = protocol_config_for(&candidate)?;
     *state.protocol_config.write() = protocol;
     *state.config.write() = candidate;
+    state.sessions.lock().clear();
     Ok(())
 }
 
@@ -1019,6 +1097,27 @@ struct RestoreRequest {
     id: String,
     #[serde(default)]
     point_in_time: Option<String>,
+    #[serde(default)]
+    confirmation: String,
+}
+
+const DELETE_BACKUP_CONFIRMATION_PREFIX: &str = "DELETE_BACKUP:";
+const RESTORE_BACKUP_CONFIRMATION_PREFIX: &str = "RESTORE_BACKUP:";
+
+fn confirmation_matches(value: Option<&str>, prefix: &str, id: &str) -> bool {
+    value.is_some_and(|value| value == format!("{prefix}{id}"))
+}
+
+fn record_admin_event(state: &AdminState, user: &str, event: &str, outcome: &str) {
+    if let Err(error) =
+        state
+            .protocol_config
+            .read()
+            .audit_log
+            .record(event, user, "ADMIN_API", outcome)
+    {
+        tracing::warn!(event, error = %error, "management audit event rejected");
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1214,8 +1313,17 @@ async fn backup_delete(
     headers: HeaderMap,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<Value>, StatusCode> {
-    authorize(&headers, &state)?;
+    let user = authorized_identity(&headers, &state)?;
     validate_backup_id(&id)?;
+    if !confirmation_matches(
+        headers
+            .get("x-mydb-confirm")
+            .and_then(|value| value.to_str().ok()),
+        DELETE_BACKUP_CONFIRMATION_PREFIX,
+        &id,
+    ) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
     let backup_root = state.config.read().backup.backup_dir.clone();
     let path = backup_root.join(&id);
     if !path.exists() {
@@ -1239,6 +1347,7 @@ async fn backup_delete(
     tokio::fs::remove_dir_all(path)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    record_admin_event(&state, &user, "backup.delete", "success");
     Ok(Json(json!({"deleted": id})))
 }
 
@@ -1247,8 +1356,15 @@ async fn backup_restore(
     headers: HeaderMap,
     Json(request): Json<RestoreRequest>,
 ) -> Result<Json<Value>, StatusCode> {
-    authorize(&headers, &state)?;
+    let user = authorized_identity(&headers, &state)?;
     validate_backup_id(&request.id)?;
+    if !confirmation_matches(
+        Some(request.confirmation.as_str()),
+        RESTORE_BACKUP_CONFIRMATION_PREFIX,
+        &request.id,
+    ) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
     let backup_root = state.config.read().backup.backup_dir.clone();
     let chain = build_backup_chain(&backup_root, &request.id).map_err(|_| StatusCode::CONFLICT)?;
     let target_lsn =
@@ -1265,6 +1381,7 @@ async fn backup_restore(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    record_admin_event(&state, &user, "backup.restore", "staged");
     Ok(Json(json!({
         "staged": request.id,
         "chain": chain.iter().map(|backup| backup.id.as_str()).collect::<Vec<_>>(),
@@ -2348,6 +2465,43 @@ mod tests {
         config.security.default_password = "mysql-root-secret-for-production".to_string();
         config.http.admin_password = "http-admin-secret-for-production".to_string();
         assert!(validate_runtime_security(&config).is_ok());
+    }
+
+    #[test]
+    fn destructive_backup_operations_require_id_bound_confirmation() {
+        assert!(confirmation_matches(
+            Some("DELETE_BACKUP:full-1"),
+            DELETE_BACKUP_CONFIRMATION_PREFIX,
+            "full-1"
+        ));
+        assert!(!confirmation_matches(
+            Some("DELETE_BACKUP:full-2"),
+            DELETE_BACKUP_CONFIRMATION_PREFIX,
+            "full-1"
+        ));
+        assert!(confirmation_matches(
+            Some("RESTORE_BACKUP:inc-1"),
+            RESTORE_BACKUP_CONFIRMATION_PREFIX,
+            "inc-1"
+        ));
+        assert!(!confirmation_matches(
+            None,
+            RESTORE_BACKUP_CONFIRMATION_PREFIX,
+            "inc-1"
+        ));
+    }
+
+    #[test]
+    fn admin_login_rate_limit_is_bounded_and_success_resets_user_bucket() {
+        let mut limiter = LoginRateLimiter::default();
+        assert!(limiter.allow("root"));
+        for _ in 0..LOGIN_USER_FAILURE_LIMIT {
+            limiter.failed("root");
+        }
+        assert!(!limiter.allow("root"));
+        assert!(limiter.allow("other-user"));
+        limiter.succeeded("root");
+        assert!(limiter.allow("root"));
     }
 
     #[test]

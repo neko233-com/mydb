@@ -28,7 +28,8 @@ services:
       MYDB_ADMIN_PASSWORD: "${MYDB_ADMIN_PASSWORD:?MYDB_ADMIN_PASSWORD must be set}"
       MYDB_ENFORCE_STRONG_PASSWORDS: "${MYDB_ENFORCE_STRONG_PASSWORDS:-true}"
     cpus: 0.50
-    mem_limit: 512m
+    mem_limit: 2g
+    memswap_limit: 2g
     mem_reservation: 128m
     stop_grace_period: 30s
 

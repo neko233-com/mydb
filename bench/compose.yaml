@@ -6,8 +6,8 @@
 #   MySQL : innodb_flush_log_at_trx_commit=1 + sync_binlog=1
 #
 # Symmetric limits (override on the command line if you want to change them):
-#   MYDB_CPUS / MYDB_MEM   - MyDB container limits
-#   MYSQL_CPUS / MYSQL_MEM - MySQL container limits
+#   MYDB_CPUS / MYDB_MEM   - MyDB container limits (default 2 GiB)
+#   MYSQL_CPUS / MYSQL_MEM - MySQL container limits (default 2 GiB)
 services:
   mydb:
     build:
@@ -28,7 +28,8 @@ services:
     volumes:
       - mydb-data:/var/lib/mydb
     cpus: "${MYDB_CPUS:-2.0}"
-    mem_limit: "${MYDB_MEM:-1g}"
+    mem_limit: "${MYDB_MEM:-2g}"
+    memswap_limit: "${MYDB_MEM:-2g}"
     mem_reservation: "${MYDB_MEM_RESERVE:-512m}"
     stop_grace_period: 30s
     healthcheck:
@@ -55,7 +56,8 @@ services:
     volumes:
       - mysql-data:/var/lib/mysql
     cpus: "${MYSQL_CPUS:-2.0}"
-    mem_limit: "${MYSQL_MEM:-1g}"
+    mem_limit: "${MYSQL_MEM:-2g}"
+    memswap_limit: "${MYSQL_MEM:-2g}"
     mem_reservation: "${MYSQL_MEM_RESERVE:-512m}"
     stop_grace_period: 30s
     healthcheck:

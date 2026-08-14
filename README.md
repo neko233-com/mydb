@@ -166,7 +166,7 @@ cargo build --release
 
 # 正式包只包含 server/cli/migrate/dump、配置、安装脚本和文档；
 # mydb-bench、测试结果与 target/bench 不进入发布包
-.\scripts\build-release.ps1 -Version "0.1.0"
+.\scripts\build-release.ps1 -Version "0.1.2"
 # 发布包同时生成同名 `.sha256` 校验文件；发布脚本会拒绝覆盖已存在的 GitHub Release。
 
 # 安装到系统
@@ -441,11 +441,16 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
   -d '{"base_id":"full-..."}' \
   http://127.0.0.1:4306/api/v1/backup/incremental
 
-# 时间点恢复 (PITR)
+# 时间点恢复 (PITR；必须显式确认，避免误恢复)
 curl -X POST -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"id":"incremental-...","point_in_time":"2026-07-15T14:22:53.842Z"}' \
+  -d '{"id":"incremental-...","point_in_time":"2026-07-15T14:22:53.842Z","confirmation":"RESTORE_BACKUP:incremental-..."}' \
   http://127.0.0.1:4306/api/v1/backup/restore
+
+# 删除备份也必须按备份 ID 显式确认
+curl -X DELETE -H "Authorization: Bearer $TOKEN" \
+  -H "X-MyDB-Confirm: DELETE_BACKUP:full-..." \
+  http://127.0.0.1:4306/api/v1/backup/full-...
 ```
 
 ---
@@ -586,16 +591,16 @@ bash scripts/docker-smoke.sh
 
 ## 📊 性能
 
-> 完整测试方法、运行指标和发布前验证见 [性能报告.md](性能报告.md)。下表为 2026-08-14 本机 Windows 实测；MyDB 与 MySQL 8.4.11 均使用 fsync 持久化，3 次采样取中位数。
+> 完整测试方法、运行指标和发布前验证见 [性能报告.md](性能报告.md)。下表为 2026-08-14 Docker `linux/amd64` 受控实测；MyDB 与 MySQL 8.4.11 使用相同 CPU/内存限制和持久化设置，3 次采样取中位数。
 >
-> 本轮数据：2026-08-14，本机 Windows；MySQL 8.4.11，`innodb_flush_log_at_trx_commit=1`、`sync_binlog=1`。MySQL 基准服务为同机 Docker `127.0.0.1:13306`，MyDB 隔离 release 服务为 `127.0.0.1:13307`；本机开发 MyDB 继续保留在 3306。
+> 本轮数据：MyDB/MySQL 均为 2 vCPU、2 GiB；MySQL 8.4.11 使用 `innodb_flush_log_at_trx_commit=1`、`sync_binlog=1`，MyDB 使用默认 250μs Group Commit 与每 1024 个已提交请求 checkpoint。
 
 | 场景 | MyDB | MySQL 8.4.11 | MyDB / MySQL |
 |------|------|--------------|--------------|
-| 单表写（fsync-per-commit） | 196 ops/s | 67 ops/s | 2.94x |
-| 8 actor / 8表 写 P99 延迟 | 38.7 ms | 92.1 ms | 2.38x（低更好） |
-| 8 actor / 8表 Group Commit | 1222 ops/s | 705 ops/s | 1.73x |
-| 读 P50 延迟 | 391 μs | 638 μs | - |
+| 单表写（fsync-per-commit） | 181 ops/s | 77 ops/s | 2.36x |
+| 8 actor / 8表 写 P99 延迟 | 51.4 ms | 67.4 ms | 1.31x（低更好） |
+| 8 actor / 8表 Group Commit | 384 ops/s | 269 ops/s | 1.43x |
+| 读 P50 延迟 | 962 μs | 136 μs | - |
 
 性能优化不以关闭 WAL 持久化或弱化恢复语义换取数字。默认 250μs Group Commit 窗口优先并发吞吐，checkpoint 按 1024 个已提交请求触发；不声明未经实测证明的固定倍数。
 
@@ -605,14 +610,18 @@ bash scripts/docker-smoke.sh
 
 当前开发状态、已完成项、未完成项、差分证据统一维护在 [CheckList.md](CheckList.md)。只有可复现实测证明的项目才会打勾。
 
+### v0.1.2 发布候选
+
+本版面向单机 MySQL 8.4 常用生产工作负载：3306 提供 MySQL 协议，4306 提供登录保护的 Web SQL IDE/管理 API；新增管理登录失败限流、管理操作审计、备份删除/恢复的 ID 绑定二次确认，以及真实 MySQL 客户端重启恢复回归。发布不宣称复制/集群、完整 InnoDB 全部锁边界、全部冷门字符集或全部 MySQL 错误码已完成；逐项状态见 [CheckList.md](CheckList.md) 和 [SYNTAX_MATRIX.md](SYNTAX_MATRIX.md)。
+
 **本轮本地门槛（2026-08-14）：**
-- ✅ `cargo test --workspace`（386 个测试通过，含 parser 4、server 11、wire 258、storage 61 + 17 集成、transaction 3、WAL 18）
+- ✅ `cargo test --workspace --locked`：Docker Linux 门禁通过；server 14、storage 61+17、transaction 3、WAL 18、wire 266，其他 workspace 测试与文档测试全部通过
 - ✅ `cargo clippy --workspace --all-targets -- -D warnings`
 - ✅ `cargo build --release -p mydb-server -p mydb-cli -p mydb-migrate -p mydb-dump`
 - ✅ MySQL 8.4 CLI 3306 连接、`event_scheduler`/版本探测
 - ✅ Connector/J 9.1.0、Node mysql2 3.23.3 已完成 3306 普通/预处理查询 smoke；Go `database/sql` + go-sql-driver/mysql 1.10.0 已完成当前 release 3306 服务的 Ping、中文、DATE、普通/预处理查询回归
 - ✅ MySQL `'user'@'host'` 基础账户匹配：精确主机优先于通配主机，握手按账户插件选择认证方式
-- ✅ `scripts/docker-smoke.ps1`：当前源码 Docker release 镜像通过 SIGKILL、WAL 损坏、只读/ENOSPC、事务锁、LOAD DATA、备份/PITR 与 Web/Agent smoke
+- ✅ `scripts/bench.ps1`：Docker Linux Rust gate、release build 与同条件 MySQL 8.4 持久化基准通过（报告见 [性能报告.md](性能报告.md)）
 - ✅ `scripts/mysql84-diff.ps1`：当前 release 隔离 13307 与同机 Docker MySQL 8.4，102/102 差分通过；新增 JSON 路径/重叠、位聚合、常量聚合投影、未知线程 KILL 错误、角色授权、ai_ci 字符集比较、视图/例程/触发器、FK/CHECK、EXPLAIN 语义和状态接口覆盖
 - ⏳ Ubuntu 24.04 物理性能、macOS 原生验收、宿主断电/恢复中断、大数据压力与生产安全运维验收：以 [CheckList.md](CheckList.md) 与 [性能报告.md](性能报告.md) 为准
 
