@@ -348,8 +348,10 @@ fn validate_archive_listing(listing: &str) -> Result<()> {
     for raw_entry in listing.lines() {
         let entry = raw_entry.trim().replace('\\', "/");
         let normalized = entry.trim_start_matches("./");
-        if normalized.is_empty()
-            || normalized.starts_with('/')
+        if normalized.is_empty() {
+            continue;
+        }
+        if normalized.starts_with('/')
             || normalized.contains(':')
             || normalized.split('/').any(|part| part == "..")
         {
@@ -550,8 +552,14 @@ mod tests {
 
     #[test]
     fn rejects_archive_path_traversal() {
-        assert!(validate_archive_listing("./mydb-server\n../outside\n").is_err());
+        assert!(validate_archive_listing("./\nmydb-server\n../outside\n").is_err());
         assert!(validate_archive_listing("/absolute/path\n").is_err());
         assert!(validate_archive_listing("mydb-server\nmydb-cli\n").is_ok());
+    }
+
+    #[test]
+    fn accepts_archive_root_entry() {
+        assert!(validate_archive_listing("./\n").is_ok());
+        assert!(validate_archive_listing(".\\\n").is_ok());
     }
 }
