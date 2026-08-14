@@ -45,7 +45,7 @@ use mydb_storage::{
     TriggerDefinition, TriggerEvent, TriggerTiming, UpdateValueExpression, WriteCommand,
 };
 
-pub const SERVER_VERSION: &str = "8.4.0-mydb-0.1.18";
+pub const SERVER_VERSION: &str = "8.4.0-mydb-0.1.19";
 pub const MYSQL84_DEFAULT_SQL_MODE: &str = "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION";
 /// MySQL 8.4 default `innodb_lock_wait_timeout`, in seconds.
 pub const MYSQL84_DEFAULT_INNODB_LOCK_WAIT_TIMEOUT_SECONDS: u64 = 50;
@@ -33982,6 +33982,10 @@ enum SpatialGeometry {
     Point(SpatialPoint),
     LineString(Vec<SpatialPoint>),
     Polygon(Vec<Vec<SpatialPoint>>),
+    MultiPoint(Vec<SpatialPoint>),
+    MultiLineString(Vec<Vec<SpatialPoint>>),
+    MultiPolygon(Vec<Vec<Vec<SpatialPoint>>>),
+    GeometryCollection(Vec<SpatialGeometry>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -34035,6 +34039,14 @@ fn spatial_function_call(expression: &str) -> Option<(String, Vec<String>)> {
         "POLYFROMTEXT",
         "ST_POLYGONFROMTEXT",
         "POLYGONFROMTEXT",
+        "ST_MPOINTFROMTEXT",
+        "MPOINTFROMTEXT",
+        "ST_MLINEFROMTEXT",
+        "MLINEFROMTEXT",
+        "ST_MPOLYFROMTEXT",
+        "MPOLYFROMTEXT",
+        "ST_GEOMCOLLFROMTEXT",
+        "GEOMCOLLFROMTEXT",
         "ST_ASTEXT",
         "ASTEXT",
         "ST_X",
@@ -34044,6 +34056,8 @@ fn spatial_function_call(expression: &str) -> Option<(String, Vec<String>)> {
         "ST_GEOMETRYTYPE",
         "ST_DIMENSION",
         "ST_NUMPOINTS",
+        "ST_NUMGEOMETRIES",
+        "ST_GEOMETRYN",
         "ST_NUMINTERIORRING",
         "ST_NUMINTERIORRINGS",
         "ST_EXTERIORRING",
@@ -34082,6 +34096,10 @@ enum SpatialConstructorKind {
     Point,
     LineString,
     Polygon,
+    MultiPoint,
+    MultiLineString,
+    MultiPolygon,
+    GeometryCollection,
 }
 
 fn spatial_constructor_kind(function: &str) -> Option<SpatialConstructorKind> {
@@ -34094,6 +34112,12 @@ fn spatial_constructor_kind(function: &str) -> Option<SpatialConstructorKind> {
         "ST_POLYFROMTEXT" | "POLYFROMTEXT" | "ST_POLYGONFROMTEXT" | "POLYGONFROMTEXT" => {
             Some(SpatialConstructorKind::Polygon)
         }
+        "ST_MPOINTFROMTEXT" | "MPOINTFROMTEXT" => Some(SpatialConstructorKind::MultiPoint),
+        "ST_MLINEFROMTEXT" | "MLINEFROMTEXT" => Some(SpatialConstructorKind::MultiLineString),
+        "ST_MPOLYFROMTEXT" | "MPOLYFROMTEXT" => Some(SpatialConstructorKind::MultiPolygon),
+        "ST_GEOMCOLLFROMTEXT" | "GEOMCOLLFROMTEXT" => {
+            Some(SpatialConstructorKind::GeometryCollection)
+        }
         _ => None,
     }
 }
@@ -34104,6 +34128,16 @@ fn spatial_constructor_accepts(kind: SpatialConstructorKind, geometry: &SpatialG
         SpatialConstructorKind::Point => matches!(geometry, SpatialGeometry::Point(_)),
         SpatialConstructorKind::LineString => matches!(geometry, SpatialGeometry::LineString(_)),
         SpatialConstructorKind::Polygon => matches!(geometry, SpatialGeometry::Polygon(_)),
+        SpatialConstructorKind::MultiPoint => matches!(geometry, SpatialGeometry::MultiPoint(_)),
+        SpatialConstructorKind::MultiLineString => {
+            matches!(geometry, SpatialGeometry::MultiLineString(_))
+        }
+        SpatialConstructorKind::MultiPolygon => {
+            matches!(geometry, SpatialGeometry::MultiPolygon(_))
+        }
+        SpatialConstructorKind::GeometryCollection => {
+            matches!(geometry, SpatialGeometry::GeometryCollection(_))
+        }
     }
 }
 
@@ -34179,6 +34213,38 @@ fn evaluate_spatial_operation(
                 return Ok(Some(None));
             };
             Ok(Some(Some(points.len().to_string().into_bytes())))
+        }
+        "ST_NUMGEOMETRIES" => {
+            let Some(value) = evaluate_spatial_unary_argument(function, arguments, row)? else {
+                return Ok(Some(None));
+            };
+            let Some(count) = spatial_geometry_count(&value.geometry) else {
+                return Ok(Some(None));
+            };
+            Ok(Some(Some(count.to_string().into_bytes())))
+        }
+        "ST_GEOMETRYN" => {
+            if arguments.len() != 2 {
+                anyhow::bail!("ST_GeometryN requires two arguments");
+            }
+            let Some(value) = evaluate_spatial_argument(&arguments[0], row)? else {
+                return Ok(Some(None));
+            };
+            let Some(index) = evaluate_scalar_expression(&arguments[1], row)? else {
+                return Ok(Some(None));
+            };
+            let index = parse_scalar_number(&index)? as isize;
+            let Some(geometry) = index
+                .checked_sub(1)
+                .and_then(|index| usize::try_from(index).ok())
+                .and_then(|index| spatial_geometry_n(&value.geometry, index))
+            else {
+                return Ok(Some(None));
+            };
+            Ok(Some(Some(serialize_spatial_value(&SpatialValue {
+                srid: value.srid,
+                geometry,
+            }))))
         }
         "ST_NUMINTERIORRING" | "ST_NUMINTERIORRINGS" => {
             let Some(value) = evaluate_spatial_unary_argument(function, arguments, row)? else {
@@ -34269,11 +34335,24 @@ fn evaluate_spatial_operation(
             let result = if function == "ST_LENGTH" {
                 match value.geometry {
                     SpatialGeometry::LineString(points) => spatial_line_length(&points),
+                    SpatialGeometry::MultiLineString(lines) => {
+                        lines.iter().map(|line| spatial_line_length(line)).sum()
+                    }
+                    SpatialGeometry::GeometryCollection(geometries) => {
+                        geometries.iter().map(spatial_geometry_length).sum()
+                    }
                     _ => 0.0,
                 }
             } else {
                 match value.geometry {
                     SpatialGeometry::Polygon(rings) => spatial_polygon_area(&rings),
+                    SpatialGeometry::MultiPolygon(polygons) => polygons
+                        .iter()
+                        .map(|polygon| spatial_polygon_area(polygon))
+                        .sum(),
+                    SpatialGeometry::GeometryCollection(geometries) => {
+                        geometries.iter().map(spatial_geometry_area).sum()
+                    }
                     _ => 0.0,
                 }
             };
@@ -34386,6 +34465,11 @@ fn parse_spatial_value(value: &[u8]) -> anyhow::Result<SpatialValue> {
     } else {
         (0, text)
     };
+    let geometry = parse_spatial_geometry_wkt(wkt)?;
+    Ok(SpatialValue { srid, geometry })
+}
+
+fn parse_spatial_geometry_wkt(wkt: &str) -> anyhow::Result<SpatialGeometry> {
     let open = wkt
         .find('(')
         .ok_or_else(|| anyhow::anyhow!("Invalid geometry text"))?;
@@ -34394,18 +34478,50 @@ fn parse_spatial_value(value: &[u8]) -> anyhow::Result<SpatialValue> {
     }
     let kind = wkt[..open].trim().to_ascii_uppercase();
     let body = &wkt[open + 1..wkt.len() - 1];
-    let geometry = match kind.as_str() {
-        "POINT" => SpatialGeometry::Point(parse_spatial_point(body)?),
-        "LINESTRING" => SpatialGeometry::LineString(parse_spatial_point_list(body)?),
-        "POLYGON" => SpatialGeometry::Polygon(
+    match kind.as_str() {
+        "POINT" => Ok(SpatialGeometry::Point(parse_spatial_point(body)?)),
+        "LINESTRING" => Ok(SpatialGeometry::LineString(parse_spatial_point_list(body)?)),
+        "POLYGON" => Ok(SpatialGeometry::Polygon(parse_spatial_polygon_body(body)?)),
+        "MULTIPOINT" => Ok(SpatialGeometry::MultiPoint(
             split_spatial_parts(body)
                 .into_iter()
-                .map(|ring| parse_spatial_point_list(strip_spatial_parentheses(&ring)?))
+                .map(|point| {
+                    let point = if point.trim_start().starts_with('(') {
+                        strip_spatial_parentheses(&point)?
+                    } else {
+                        point.as_str()
+                    };
+                    parse_spatial_point(point)
+                })
                 .collect::<anyhow::Result<Vec<_>>>()?,
-        ),
+        )),
+        "MULTILINESTRING" => Ok(SpatialGeometry::MultiLineString(
+            split_spatial_parts(body)
+                .into_iter()
+                .map(|line| parse_spatial_point_list(strip_spatial_parentheses(&line)?))
+                .collect::<anyhow::Result<Vec<_>>>()?,
+        )),
+        "MULTIPOLYGON" => Ok(SpatialGeometry::MultiPolygon(
+            split_spatial_parts(body)
+                .into_iter()
+                .map(|polygon| parse_spatial_polygon_body(strip_spatial_parentheses(&polygon)?))
+                .collect::<anyhow::Result<Vec<_>>>()?,
+        )),
+        "GEOMETRYCOLLECTION" => Ok(SpatialGeometry::GeometryCollection(
+            split_spatial_parts(body)
+                .into_iter()
+                .map(|geometry| parse_spatial_geometry_wkt(&geometry))
+                .collect::<anyhow::Result<Vec<_>>>()?,
+        )),
         _ => anyhow::bail!("Unsupported geometry type '{kind}'"),
-    };
-    Ok(SpatialValue { srid, geometry })
+    }
+}
+
+fn parse_spatial_polygon_body(body: &str) -> anyhow::Result<Vec<Vec<SpatialPoint>>> {
+    split_spatial_parts(body)
+        .into_iter()
+        .map(|ring| parse_spatial_point_list(strip_spatial_parentheses(&ring)?))
+        .collect::<anyhow::Result<Vec<_>>>()
 }
 
 fn serialize_spatial_value(value: &SpatialValue) -> Vec<u8> {
@@ -34419,42 +34535,70 @@ fn serialize_spatial_value(value: &SpatialValue) -> Vec<u8> {
 
 fn spatial_geometry_wkt(geometry: &SpatialGeometry) -> String {
     match geometry {
-        SpatialGeometry::Point(point) => format!(
-            "POINT({} {})",
-            format_mysql_number(point.x),
-            format_mysql_number(point.y)
-        ),
-        SpatialGeometry::LineString(points) => format!(
-            "LINESTRING({})",
+        SpatialGeometry::Point(point) => format!("POINT({})", spatial_point_wkt(point)),
+        SpatialGeometry::LineString(points) => {
+            format!("LINESTRING({})", spatial_points_wkt(points))
+        }
+        SpatialGeometry::Polygon(rings) => {
+            format!("POLYGON({})", spatial_polygon_rings_wkt(rings))
+        }
+        SpatialGeometry::MultiPoint(points) => format!(
+            "MULTIPOINT({})",
             points
                 .iter()
-                .map(|point| format!(
-                    "{} {}",
-                    format_mysql_number(point.x),
-                    format_mysql_number(point.y)
-                ))
+                .map(|point| format!("({})", spatial_point_wkt(point)))
                 .collect::<Vec<_>>()
                 .join(",")
         ),
-        SpatialGeometry::Polygon(rings) => format!(
-            "POLYGON({})",
-            rings
+        SpatialGeometry::MultiLineString(lines) => format!(
+            "MULTILINESTRING({})",
+            lines
                 .iter()
-                .map(|ring| format!(
-                    "({})",
-                    ring.iter()
-                        .map(|point| format!(
-                            "{} {}",
-                            format_mysql_number(point.x),
-                            format_mysql_number(point.y)
-                        ))
-                        .collect::<Vec<_>>()
-                        .join(",")
-                ))
+                .map(|line| format!("({})", spatial_points_wkt(line)))
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        SpatialGeometry::MultiPolygon(polygons) => format!(
+            "MULTIPOLYGON({})",
+            polygons
+                .iter()
+                .map(|polygon| format!("({})", spatial_polygon_rings_wkt(polygon)))
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        SpatialGeometry::GeometryCollection(geometries) => format!(
+            "GEOMETRYCOLLECTION({})",
+            geometries
+                .iter()
+                .map(spatial_geometry_wkt)
                 .collect::<Vec<_>>()
                 .join(",")
         ),
     }
+}
+
+fn spatial_point_wkt(point: &SpatialPoint) -> String {
+    format!(
+        "{} {}",
+        format_mysql_number(point.x),
+        format_mysql_number(point.y)
+    )
+}
+
+fn spatial_points_wkt(points: &[SpatialPoint]) -> String {
+    points
+        .iter()
+        .map(spatial_point_wkt)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn spatial_polygon_rings_wkt(rings: &[Vec<SpatialPoint>]) -> String {
+    rings
+        .iter()
+        .map(|ring| format!("({})", spatial_points_wkt(ring)))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn spatial_srid_uses_latitude_longitude(srid: u32) -> bool {
@@ -34477,6 +34621,29 @@ fn spatial_swap_axes(geometry: SpatialGeometry) -> SpatialGeometry {
                 .map(|ring| ring.into_iter().map(swap).collect())
                 .collect(),
         ),
+        SpatialGeometry::MultiPoint(points) => {
+            SpatialGeometry::MultiPoint(points.into_iter().map(swap).collect())
+        }
+        SpatialGeometry::MultiLineString(lines) => SpatialGeometry::MultiLineString(
+            lines
+                .into_iter()
+                .map(|line| line.into_iter().map(swap).collect())
+                .collect(),
+        ),
+        SpatialGeometry::MultiPolygon(polygons) => SpatialGeometry::MultiPolygon(
+            polygons
+                .into_iter()
+                .map(|polygon| {
+                    polygon
+                        .into_iter()
+                        .map(|ring| ring.into_iter().map(swap).collect())
+                        .collect()
+                })
+                .collect(),
+        ),
+        SpatialGeometry::GeometryCollection(geometries) => SpatialGeometry::GeometryCollection(
+            geometries.into_iter().map(spatial_swap_axes).collect(),
+        ),
     }
 }
 
@@ -34485,6 +34652,10 @@ fn spatial_geometry_type(geometry: &SpatialGeometry) -> &'static str {
         SpatialGeometry::Point(_) => "POINT",
         SpatialGeometry::LineString(_) => "LINESTRING",
         SpatialGeometry::Polygon(_) => "POLYGON",
+        SpatialGeometry::MultiPoint(_) => "MULTIPOINT",
+        SpatialGeometry::MultiLineString(_) => "MULTILINESTRING",
+        SpatialGeometry::MultiPolygon(_) => "MULTIPOLYGON",
+        SpatialGeometry::GeometryCollection(_) => "GEOMETRYCOLLECTION",
     }
 }
 
@@ -34493,6 +34664,14 @@ fn spatial_geometry_dimension(geometry: &SpatialGeometry) -> u8 {
         SpatialGeometry::Point(_) => 0,
         SpatialGeometry::LineString(_) => 1,
         SpatialGeometry::Polygon(_) => 2,
+        SpatialGeometry::MultiPoint(_) => 0,
+        SpatialGeometry::MultiLineString(_) => 1,
+        SpatialGeometry::MultiPolygon(_) => 2,
+        SpatialGeometry::GeometryCollection(geometries) => geometries
+            .iter()
+            .map(spatial_geometry_dimension)
+            .max()
+            .unwrap_or(0),
     }
 }
 
@@ -34513,6 +34692,71 @@ fn spatial_geometry_is_valid(geometry: &SpatialGeometry) -> bool {
                         && spatial_ring_area(ring).abs() > f64::EPSILON
                 })
         }
+        SpatialGeometry::MultiPoint(points) => points
+            .iter()
+            .all(|point| point.x.is_finite() && point.y.is_finite()),
+        SpatialGeometry::MultiLineString(lines) => lines
+            .iter()
+            .all(|points| spatial_geometry_is_valid(&SpatialGeometry::LineString(points.clone()))),
+        SpatialGeometry::MultiPolygon(polygons) => polygons
+            .iter()
+            .all(|rings| spatial_geometry_is_valid(&SpatialGeometry::Polygon(rings.clone()))),
+        SpatialGeometry::GeometryCollection(geometries) => {
+            geometries.iter().all(spatial_geometry_is_valid)
+        }
+    }
+}
+
+fn spatial_geometry_count(geometry: &SpatialGeometry) -> Option<usize> {
+    match geometry {
+        SpatialGeometry::MultiPoint(points) => Some(points.len()),
+        SpatialGeometry::MultiLineString(lines) => Some(lines.len()),
+        SpatialGeometry::MultiPolygon(polygons) => Some(polygons.len()),
+        SpatialGeometry::GeometryCollection(geometries) => Some(geometries.len()),
+        _ => None,
+    }
+}
+
+fn spatial_geometry_n(geometry: &SpatialGeometry, index: usize) -> Option<SpatialGeometry> {
+    match geometry {
+        SpatialGeometry::MultiPoint(points) => {
+            points.get(index).copied().map(SpatialGeometry::Point)
+        }
+        SpatialGeometry::MultiLineString(lines) => {
+            lines.get(index).cloned().map(SpatialGeometry::LineString)
+        }
+        SpatialGeometry::MultiPolygon(polygons) => {
+            polygons.get(index).cloned().map(SpatialGeometry::Polygon)
+        }
+        SpatialGeometry::GeometryCollection(geometries) => geometries.get(index).cloned(),
+        _ => None,
+    }
+}
+
+fn spatial_geometry_length(geometry: &SpatialGeometry) -> f64 {
+    match geometry {
+        SpatialGeometry::LineString(points) => spatial_line_length(points),
+        SpatialGeometry::MultiLineString(lines) => {
+            lines.iter().map(|line| spatial_line_length(line)).sum()
+        }
+        SpatialGeometry::GeometryCollection(geometries) => {
+            geometries.iter().map(spatial_geometry_length).sum()
+        }
+        _ => 0.0,
+    }
+}
+
+fn spatial_geometry_area(geometry: &SpatialGeometry) -> f64 {
+    match geometry {
+        SpatialGeometry::Polygon(rings) => spatial_polygon_area(rings),
+        SpatialGeometry::MultiPolygon(polygons) => polygons
+            .iter()
+            .map(|polygon| spatial_polygon_area(polygon))
+            .sum(),
+        SpatialGeometry::GeometryCollection(geometries) => {
+            geometries.iter().map(spatial_geometry_area).sum()
+        }
+        _ => 0.0,
     }
 }
 
@@ -34694,7 +34938,37 @@ fn spatial_geometry_equals(left: &SpatialGeometry, right: &SpatialGeometry) -> b
     left == right
 }
 
+fn spatial_geometry_parts(geometry: &SpatialGeometry) -> Option<Vec<SpatialGeometry>> {
+    match geometry {
+        SpatialGeometry::MultiPoint(points) => {
+            Some(points.iter().copied().map(SpatialGeometry::Point).collect())
+        }
+        SpatialGeometry::MultiLineString(lines) => Some(
+            lines
+                .iter()
+                .cloned()
+                .map(SpatialGeometry::LineString)
+                .collect(),
+        ),
+        SpatialGeometry::MultiPolygon(polygons) => Some(
+            polygons
+                .iter()
+                .cloned()
+                .map(SpatialGeometry::Polygon)
+                .collect(),
+        ),
+        SpatialGeometry::GeometryCollection(geometries) => Some(geometries.clone()),
+        _ => None,
+    }
+}
+
 fn spatial_contains(left: &SpatialGeometry, right: &SpatialGeometry) -> bool {
+    if let Some(parts) = spatial_geometry_parts(right) {
+        return parts.iter().all(|part| spatial_contains(left, part));
+    }
+    if let Some(parts) = spatial_geometry_parts(left) {
+        return parts.iter().any(|part| spatial_contains(part, right));
+    }
     match (left, right) {
         (SpatialGeometry::Polygon(rings), SpatialGeometry::Point(point)) => {
             spatial_point_in_polygon(*point, rings).0
@@ -34714,6 +34988,12 @@ fn spatial_contains(left: &SpatialGeometry, right: &SpatialGeometry) -> bool {
 }
 
 fn spatial_intersects(left: &SpatialGeometry, right: &SpatialGeometry) -> bool {
+    if let Some(parts) = spatial_geometry_parts(left) {
+        return parts.iter().any(|part| spatial_intersects(part, right));
+    }
+    if let Some(parts) = spatial_geometry_parts(right) {
+        return parts.iter().any(|part| spatial_intersects(left, part));
+    }
     match (left, right) {
         (SpatialGeometry::Point(left), SpatialGeometry::Point(right)) => left == right,
         (SpatialGeometry::Point(point), SpatialGeometry::LineString(line))
@@ -34759,6 +35039,7 @@ fn spatial_intersects(left: &SpatialGeometry, right: &SpatialGeometry) -> bool {
                     .and_then(|ring| ring.first())
                     .is_some_and(|point| spatial_point_in_polygon(*point, left).0)
         }
+        _ => false,
     }
 }
 
@@ -64569,6 +64850,55 @@ mod tests {
                     "0".to_string(),
                     "LINESTRING(0 0,4 0,4 3,0 0)".to_string(),
                     "5".to_string(),
+                ))
+            );
+            let spatial_multi_point: Option<(String, String, String, String, String)> = connection
+                .query_first(
+                    "SELECT ST_AsText(ST_MPointFromText('MULTIPOINT((1 2),(3 4))')),
+                            ST_GeometryType(ST_MPointFromText('MULTIPOINT((1 2),(3 4))')),
+                            ST_Dimension(ST_MPointFromText('MULTIPOINT((1 2),(3 4))')),
+                            ST_NumGeometries(ST_MPointFromText('MULTIPOINT((1 2),(3 4))')),
+                            ST_AsText(ST_GeometryN(ST_MPointFromText('MULTIPOINT((1 2),(3 4))'),2))",
+                )
+                .unwrap();
+            assert_eq!(
+                spatial_multi_point,
+                Some((
+                    "MULTIPOINT((1 2),(3 4))".to_string(),
+                    "MULTIPOINT".to_string(),
+                    "0".to_string(),
+                    "2".to_string(),
+                    "POINT(3 4)".to_string(),
+                ))
+            );
+            let spatial_multi_metrics: Option<(String, String, String)> = connection
+                .query_first(
+                    "SELECT ST_AsText(ST_MLineFromText('MULTILINESTRING((0 0,3 4),(0 0,0 5))')),
+                            ST_Length(ST_MLineFromText('MULTILINESTRING((0 0,3 4),(0 0,0 5))')),
+                            ST_Area(ST_MPolyFromText('MULTIPOLYGON(((0 0,4 0,4 3,0 0)),((0 0,2 0,2 2,0 0)))'))",
+                )
+                .unwrap();
+            assert_eq!(
+                spatial_multi_metrics,
+                Some((
+                    "MULTILINESTRING((0 0,3 4),(0 0,0 5))".to_string(),
+                    "10".to_string(),
+                    "8".to_string(),
+                ))
+            );
+            let spatial_collection: Option<(String, String, String)> = connection
+                .query_first(
+                    "SELECT ST_AsText(ST_GeomCollFromText('GEOMETRYCOLLECTION(POINT(1 2),LINESTRING(0 0,3 4))')),
+                            ST_NumGeometries(ST_GeomCollFromText('GEOMETRYCOLLECTION(POINT(1 2),LINESTRING(0 0,3 4))')),
+                            ST_AsText(ST_GeometryN(ST_GeomCollFromText('GEOMETRYCOLLECTION(POINT(1 2),LINESTRING(0 0,3 4))'),2))",
+                )
+                .unwrap();
+            assert_eq!(
+                spatial_collection,
+                Some((
+                    "GEOMETRYCOLLECTION(POINT(1 2),LINESTRING(0 0,3 4))".to_string(),
+                    "2".to_string(),
+                    "LINESTRING(0 0,3 4)".to_string(),
                 ))
             );
             let spatial_srid: Option<(String, u32, String)> = connection

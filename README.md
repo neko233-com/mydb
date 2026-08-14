@@ -166,7 +166,7 @@ cargo build --release
 
 # 正式包只包含 server/cli/mydb/migrate/dump、配置、安装脚本和文档；
 # mydb-bench、测试结果与 target/bench 不进入发布包
-.\scripts\build-release.ps1 -Version "0.1.18"
+.\scripts\build-release.ps1 -Version "0.1.19"
 # 发布包同时生成同名 `.sha256` 校验文件；发布脚本会拒绝覆盖已存在的 GitHub Release。
 
 # 安装到系统
@@ -188,7 +188,7 @@ mydb update --check
 mydb update
 
 # 指定版本
-mydb update --version v0.1.18
+mydb update --version v0.1.19
 ```
 
 Windows 服务更新会在当前 CLI 退出后由后台 helper 完成，日志写入安装目录的 `mydb-update.log`；Linux 更新会自动处理同名 systemd 服务。
@@ -508,7 +508,7 @@ mysql -h 127.0.0.1 -P 3306 game < game.sql
 
 - `CREATE DATABASE`/`DROP DATABASE`
 - `CREATE TABLE`（含列定义、主键、索引、外键、CHECK 约束）
-- `FULLTEXT`/`SPATIAL` 索引：类型持久化、CREATE/ALTER、SHOW INDEX、`information_schema.STATISTICS`，以及全文 TF-IDF 基础相关性、布尔必选/排除/短语/前缀、基础查询扩展检索和 POINT/LINESTRING/POLYGON 基础空间构造、度量、访问器、SRID 轴序与谓词；完整倒排索引/可配置停止词、CJK ngram、多数 GIS 类型、鲁棒拓扑和空间优化仍按兼容矩阵推进
+- `FULLTEXT`/`SPATIAL` 索引：类型持久化、CREATE/ALTER、SHOW INDEX、`information_schema.STATISTICS`，以及全文 TF-IDF 基础相关性、布尔必选/排除/短语/前缀、基础查询扩展检索和 POINT/LINESTRING/POLYGON/MULTI*/GEOMETRYCOLLECTION 基础空间构造、度量、访问器、SRID 轴序与谓词；完整倒排索引/可配置停止词、CJK ngram、多数 GIS 类型、鲁棒拓扑和空间优化仍按兼容矩阵推进
 - `CREATE TABLE ... LIKE ...`（跨 schema 复制结构）
 - `CREATE TABLE ... AS SELECT ...`（快照建表）
 - `ALTER TABLE`（ADD/DROP/MODIFY/CHANGE COLUMN、ADD/DROP INDEX/PRIMARY KEY/FOREIGN KEY/CHECK）
@@ -614,10 +614,10 @@ bash scripts/docker-smoke.sh
 
 | 场景 | MyDB | MySQL 8.4.11 | MyDB / MySQL |
 |------|------|--------------|--------------|
-| 单表写（fsync-per-commit） | 209 ops/s | 75 ops/s | 2.78x |
-| 4 actor / 4表 写 P99 延迟 | 43.4 ms | 53.3 ms | 1.23x（低更好） |
-| 4 actor / 4表 Group Commit | 287 ops/s | 148 ops/s | 1.94x |
-| 读 P50 延迟 | 394 μs | 141 μs | - |
+| 单表写（fsync-per-commit） | 213 ops/s | 79 ops/s | 2.70x |
+| 4 actor / 4表 写 P99 延迟 | 31.0 ms | 52.7 ms | 1.70x（低更好） |
+| 4 actor / 4表 Group Commit | 259 ops/s | 154 ops/s | 1.69x |
+| 读 P50 延迟 | 306 μs | 133 μs | - |
 
 性能优化不以关闭 WAL 持久化或弱化恢复语义换取数字。默认 250μs Group Commit 窗口优先并发吞吐，checkpoint 按 1024 个已提交请求触发；不声明未经实测证明的固定倍数。
 
@@ -627,9 +627,9 @@ bash scripts/docker-smoke.sh
 
 当前开发状态、已完成项、未完成项、差分证据统一维护在 [CheckList.md](CheckList.md)。只有可复现实测证明的项目才会打勾。
 
-### v0.1.18 稳定版
+### v0.1.19 稳定版
 
-本版面向单机 MySQL 8.4 常用生产工作负载：3306 提供 MySQL 协议，4306 提供登录保护的 Web SQL IDE/管理 API；补齐基础 POINT/LINESTRING/POLYGON 空间构造器、度量、访问器、SRID 轴序和空间谓词，并保留 JSON 搜索、浅层/递归通配路径、数组范围与动态 `last` 下标、基础 `JSON_TABLE`（含按前置表行隐式关联的文档列、标量列、序号、存在性、嵌套路径、默认/错误行为）、JSON_ARRAYAGG/JSON_OBJECTAGG（含窗口聚合）、数组追加/插入、RFC 7396 合并、深度/键枚举/美化输出、全文自然语言 TF-IDF 基础相关性、布尔短语/前缀、基础查询扩展、`mydb update` 跨平台事务替换/失败回滚和非 ASCII tar 文件名校验。发布不宣称复制/集群、完整 InnoDB 全部锁边界、完整 GIS/OGC 语义、全部冷门字符集或全部 MySQL 错误码已完成；显式 `LATERAL` 前缀属于额外超集能力，不作为 MySQL 8.4 差分承诺；逐项状态见 [CheckList.md](CheckList.md) 和 [SYNTAX_MATRIX.md](SYNTAX_MATRIX.md)。
+本版面向单机 MySQL 8.4 常用生产工作负载：3306 提供 MySQL 协议，4306 提供登录保护的 Web SQL IDE/管理 API；补齐基础 POINT/LINESTRING/POLYGON/MULTI*/GEOMETRYCOLLECTION 空间构造器、度量、访问器、SRID 轴序和空间谓词，并保留 JSON 搜索、浅层/递归通配路径、数组范围与动态 `last` 下标、基础 `JSON_TABLE`（含按前置表行隐式关联的文档列、标量列、序号、存在性、嵌套路径、默认/错误行为）、JSON_ARRAYAGG/JSON_OBJECTAGG（含窗口聚合）、数组追加/插入、RFC 7396 合并、深度/键枚举/美化输出、全文自然语言 TF-IDF 基础相关性、布尔短语/前缀、基础查询扩展、`mydb update` 跨平台事务替换/失败回滚和非 ASCII tar 文件名校验。发布不宣称复制/集群、完整 InnoDB 全部锁边界、完整 GIS/OGC 语义、全部冷门字符集或全部 MySQL 错误码已完成；显式 `LATERAL` 前缀属于额外超集能力，不作为 MySQL 8.4 差分承诺；逐项状态见 [CheckList.md](CheckList.md) 和 [SYNTAX_MATRIX.md](SYNTAX_MATRIX.md)。
 
 **本轮本地门槛（2026-08-15）：**
 - ✅ `cargo test --workspace --locked`：Docker Linux 门禁通过；wire 269（含权限委派/角色 ADMIN OPTION/ALL 部分撤销），其他 workspace 测试与文档测试全部通过
@@ -640,8 +640,8 @@ bash scripts/docker-smoke.sh
 - ✅ Connector/J 9.1.0、Node mysql2 3.23.3 已完成 3306 普通/预处理查询 smoke；Go `database/sql` + go-sql-driver/mysql 1.10.0 已完成当前 release 3306 服务的 Ping、中文、DATE、普通/预处理查询回归
 - ✅ MySQL `'user'@'host'` 基础账户匹配：精确主机优先于通配主机，握手按账户插件选择认证方式
 - ✅ `scripts/bench.ps1`：Docker Linux Rust gate、release build 与同条件 MySQL 8.4 持久化基准通过；性能阶段无预热、60 秒硬截止（报告见 [性能报告.md](性能报告.md)）
-- ✅ `scripts/mysql84-diff.ps1`：当前源码隔离端口与同机 Docker MySQL 8.4，116/116 差分通过；新增基础 JSON_TABLE 标量/嵌套/序号/存在性/默认与错误行为、按前置表行隐式关联 JSON_TABLE、POINT/LINESTRING/POLYGON 空间构造器/度量/访问器/SRID 轴序/谓词，以及 JSON 搜索、浅层/递归通配路径、数组范围/`last` 下标、JSON 聚合/窗口聚合、数组追加/插入、合并、深度/键/美化输出及全文相关性、布尔短语/前缀、停止词/短词边界与查询扩展覆盖
-- ✅ 本轮同条件持久化基准：单表写 MyDB/MySQL `209/75 ops/s`，4 actor P99 `43.0/77.1 ms`，并发吞吐 `267/159 ops/s`，读 P50 `264/136 μs`；1 次样本、无预热，原始数据见 [性能报告.md](性能报告.md)
+- ✅ `scripts/mysql84-diff.ps1`：当前源码隔离端口与同机 Docker MySQL 8.4，117/117 差分通过；新增基础 JSON_TABLE 标量/嵌套/序号/存在性/默认与错误行为、按前置表行隐式关联 JSON_TABLE、POINT/LINESTRING/POLYGON/MULTI*/GEOMETRYCOLLECTION 空间构造器/度量/访问器/SRID 轴序/谓词，以及 JSON 搜索、浅层/递归通配路径、数组范围/`last` 下标、JSON 聚合/窗口聚合、数组追加/插入、合并、深度/键/美化输出及全文相关性、布尔短语/前缀、停止词/短词边界与查询扩展覆盖
+- ✅ 本轮同条件持久化基准：单表写 MyDB/MySQL `213/79 ops/s`，4 actor P99 `31.0/52.7 ms`，并发吞吐 `259/154 ops/s`，读 P50 `306/133 μs`；1 次样本、无预热，原始数据见 [性能报告.md](性能报告.md)
 - ⏳ Ubuntu 24.04 物理性能、macOS 原生验收、宿主断电/恢复中断、大数据压力与生产安全运维验收：以 [CheckList.md](CheckList.md) 与 [性能报告.md](性能报告.md) 为准
 
 ---
