@@ -166,7 +166,7 @@ cargo build --release
 
 # 正式包只包含 server/cli/mydb/migrate/dump、配置、安装脚本和文档；
 # mydb-bench、测试结果与 target/bench 不进入发布包
-.\scripts\build-release.ps1 -Version "0.1.26"
+.\scripts\build-release.ps1 -Version "0.1.27"
 # 发布包同时生成同名 `.sha256` 校验文件；发布脚本会拒绝覆盖已存在的 GitHub Release。
 
 # 安装到系统
@@ -188,7 +188,7 @@ mydb update --check
 mydb update
 
 # 指定版本
-mydb update --version v0.1.26
+mydb update --version v0.1.27
 ```
 
 Windows 服务更新会在当前 CLI 退出后由后台 helper 完成；服务运行时自动请求 UAC 提权，日志写入安装目录的 `mydb-update.log`；Linux 更新会自动处理同名 systemd 服务。
@@ -627,9 +627,9 @@ bash scripts/docker-smoke.sh
 
 当前开发状态、已完成项、未完成项、差分证据统一维护在 [CheckList.md](CheckList.md)。只有可复现实测证明的项目才会打勾。
 
-### v0.1.26 稳定版
+### v0.1.27 稳定版
 
-本版面向单机 MySQL 8.4 常用生产工作负载：3306 提供 MySQL 协议，4306 提供登录保护的 Web SQL IDE/管理 API；补齐 `GROUP_CONCAT` 的 `group_concat_max_len` SESSION/GLOBAL 变量、4 字节下限、UTF-8 安全截断和 1260 警告，并保留多表达式 NULL、元组 DISTINCT、排序和分隔符语义，以及多列/表达式 `COUNT(DISTINCT ...)`、`REGEXP_INSTR`、`REGEXP_SUBSTR`、`REGEXP_REPLACE` 的已验证行为。发布不宣称复制/集群、完整 InnoDB 全部锁边界、完整 GIS/OGC 语义、全部冷门字符集或全部 MySQL 错误码已完成；显式 `LATERAL` 前缀属于额外超集能力，不作为 MySQL 8.4 差分承诺；逐项状态见 [CheckList.md](CheckList.md) 和 [SYNTAX_MATRIX.md](SYNTAX_MATRIX.md)。
+本版面向单机 MySQL 8.4 常用生产工作负载：3306 提供 MySQL 协议，4306 提供登录保护的 Web SQL IDE/管理 API；补齐 `GROUP_CONCAT` 的 `group_concat_max_len` SESSION/GLOBAL 变量、4 字节下限、UTF-8 安全截断和 1260 警告，以及无 `FROM`、单表和 JOIN 投影中的嵌套聚合与算术/标量函数组合，并保留多表达式 NULL、元组 DISTINCT、排序和分隔符语义，以及多列/表达式 `COUNT(DISTINCT ...)`、`REGEXP_INSTR`、`REGEXP_SUBSTR`、`REGEXP_REPLACE` 的已验证行为。发布不宣称复制/集群、完整 InnoDB 全部锁边界、完整 GIS/OGC 语义、全部冷门字符集或全部 MySQL 错误码已完成；显式 `LATERAL` 前缀属于额外超集能力，不作为 MySQL 8.4 差分承诺；逐项状态见 [CheckList.md](CheckList.md) 和 [SYNTAX_MATRIX.md](SYNTAX_MATRIX.md)。
 
 **本轮本地门槛（2026-08-15）：**
 - ✅ `cargo test --workspace --locked`：Docker Linux 门禁通过；wire 270（含 `group_concat_max_len` SESSION/GLOBAL、截断和 1260 警告），其他 workspace 测试与文档测试全部通过
@@ -640,7 +640,7 @@ bash scripts/docker-smoke.sh
 - ✅ Connector/J 9.1.0、Node mysql2 3.23.3 已完成 3306 普通/预处理查询 smoke；Go `database/sql` + go-sql-driver/mysql 1.10.0 已完成当前 release 3306 服务的 Ping、中文、DATE、普通/预处理查询回归
 - ✅ MySQL `'user'@'host'` 基础账户匹配：精确主机优先于通配主机，握手按账户插件选择认证方式
 - ✅ `scripts/bench.ps1`：Docker Linux Rust gate、release build 与同条件 MySQL 8.4 持久化基准通过；性能阶段无预热、60 秒硬截止（报告见 [性能报告.md](性能报告.md)）
-- ✅ `scripts/mysql84-diff.ps1`：当前源码隔离端口与同机 Docker MySQL 8.4，121/121 差分通过；新增 `group_concat_max_len` 的 SESSION/GLOBAL、下限、截断和 1260 警告覆盖，并保留多表达式 `GROUP_CONCAT` 的 NULL、元组 DISTINCT、ORDER BY、SEPARATOR 以及多列/表达式 `COUNT(DISTINCT ...)`、正则、JSON_TABLE、空间、JSON 搜索/路径/聚合、全文相关性/布尔短语/前缀/停止词/查询扩展覆盖
+- ✅ `scripts/mysql84-diff.ps1`：当前源码隔离端口与同机 Docker MySQL 8.4，122/122 差分通过；新增 `group_concat_max_len` 的 SESSION/GLOBAL、下限、截断和 1260 警告，以及无 `FROM`、单表和 JOIN 的嵌套聚合标量投影覆盖，并保留多表达式 `GROUP_CONCAT` 的 NULL、元组 DISTINCT、ORDER BY、SEPARATOR 以及多列/表达式 `COUNT(DISTINCT ...)`、正则、JSON_TABLE、空间、JSON 搜索/路径/聚合、全文相关性/布尔短语/前缀/停止词/查询扩展覆盖
 - ✅ 本轮同条件持久化基准（v0.1.26、`group_concat_max_len` 修复后）：单表写 MyDB/MySQL `221/79 ops/s`，4 actor P99 `35.6/68.9 ms`，并发吞吐 `336/151 ops/s`，读 P50 `279/128 μs`；1 次样本、无预热、性能阶段 21.7 秒，原始数据见 [性能报告.md](性能报告.md)
 - ⏳ Ubuntu 24.04 物理性能、macOS 原生验收、宿主断电/恢复中断、大数据压力与生产安全运维验收：以 [CheckList.md](CheckList.md) 与 [性能报告.md](性能报告.md) 为准
 
