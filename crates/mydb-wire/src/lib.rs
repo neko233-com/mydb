@@ -45,7 +45,7 @@ use mydb_storage::{
     TriggerDefinition, TriggerEvent, TriggerTiming, UpdateValueExpression, WriteCommand,
 };
 
-pub const SERVER_VERSION: &str = "8.4.0-mydb-0.1.26";
+pub const SERVER_VERSION: &str = "8.4.0-mydb-0.1.27";
 pub const MYSQL84_DEFAULT_SQL_MODE: &str = "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION";
 /// MySQL 8.4 default `innodb_lock_wait_timeout`, in seconds.
 pub const MYSQL84_DEFAULT_INNODB_LOCK_WAIT_TIMEOUT_SECONDS: u64 = 50;
@@ -5807,14 +5807,25 @@ impl Backend {
     }
 
     fn evaluate_aggregate_projection(
-        &self,
+        &mut self,
         projection: &str,
         row: &Row,
+        rows: &[Row],
         schema: &TableSchema,
     ) -> anyhow::Result<Option<Vec<u8>>> {
         let expression = projection_without_alias(projection).trim();
         if expression.eq_ignore_ascii_case("DATABASE()") {
             return Ok((!self.database.is_empty()).then(|| self.database.as_bytes().to_vec()));
+        }
+        if collect_contains_aggregate(expression) {
+            let materialized = materialize_group_aggregates(
+                expression,
+                rows,
+                schema,
+                &mut self.aggregate_context,
+            )?
+            .ok_or_else(|| anyhow::anyhow!("Invalid nested aggregate expression"))?;
+            return evaluate_scalar_expression_with_schema(&materialized, row, schema);
         }
         evaluate_scalar_expression_with_schema(expression, row, schema)
     }
@@ -16304,6 +16315,7 @@ impl Backend {
             let mut columns = Vec::new();
             let mut row = Vec::new();
             let empty_row = Row::new();
+            let empty_schema = virtual_table_schema("dual", &[]);
             for item in items {
                 if item.trim() == "$$" {
                     anyhow::bail!(
@@ -16312,14 +16324,23 @@ impl Backend {
                 }
                 let item_upper = item.to_ascii_uppercase();
                 let alias = parse_alias(&item);
+                let scalar_expression = projection_without_alias(&item).trim();
                 let value = if let Some(aggregate) = parse_aggregate_expression(&item) {
-                    let empty_schema = virtual_table_schema("dual", &[]);
                     evaluate_aggregate(
                         aggregate,
                         std::slice::from_ref(&empty_row),
                         &empty_schema,
                         &mut self.aggregate_context,
                     )?
+                } else if collect_contains_aggregate(scalar_expression) {
+                    let materialized = materialize_group_aggregates(
+                        scalar_expression,
+                        std::slice::from_ref(&empty_row),
+                        &empty_schema,
+                        &mut self.aggregate_context,
+                    )?
+                    .ok_or_else(|| anyhow::anyhow!("Invalid nested aggregate expression"))?;
+                    evaluate_scalar_expression(&materialized, &empty_row)?
                 } else if let Some(argument) =
                     last_insert_id_argument(projection_without_alias(&item))
                 {
@@ -16635,7 +16656,11 @@ impl Backend {
             .iter()
             .map(|item| parse_aggregate_expression(item))
             .collect::<Vec<_>>();
-        if aggregates.iter().any(Option::is_some) {
+        if aggregates.iter().any(Option::is_some)
+            || projection_items
+                .iter()
+                .any(|item| collect_contains_aggregate(projection_without_alias(item)))
+        {
             let strict_grouping = self.only_full_group_by_enabled();
             if strict_grouping
                 && aggregates
@@ -16665,7 +16690,9 @@ impl Backend {
                     }
                     None => rows
                         .first()
-                        .map(|row| self.evaluate_aggregate_projection(projection, row, &schema))
+                        .map(|row| {
+                            self.evaluate_aggregate_projection(projection, row, &rows, &schema)
+                        })
                         .unwrap_or_else(|| Ok(None)),
                 })
                 .collect::<anyhow::Result<Vec<_>>>()?];
@@ -17171,7 +17198,11 @@ impl Backend {
             .iter()
             .map(|item| parse_aggregate_expression(item))
             .collect::<Vec<_>>();
-        if aggregates.iter().any(Option::is_some) {
+        if aggregates.iter().any(Option::is_some)
+            || raw_projection
+                .iter()
+                .any(|item| collect_contains_aggregate(projection_without_alias(item)))
+        {
             let strict_grouping = self.only_full_group_by_enabled();
             if strict_grouping
                 && aggregates
@@ -17205,7 +17236,12 @@ impl Backend {
                     None => rows
                         .first()
                         .map(|row| {
-                            self.evaluate_aggregate_projection(projection, row, &aggregate_schema)
+                            self.evaluate_aggregate_projection(
+                                projection,
+                                row,
+                                &rows,
+                                &aggregate_schema,
+                            )
                         })
                         .unwrap_or_else(|| Ok(None)),
                 })
@@ -17803,7 +17839,11 @@ impl Backend {
             .iter()
             .map(|item| parse_aggregate_expression(item))
             .collect::<Vec<_>>();
-        if aggregates.iter().any(Option::is_some) {
+        if aggregates.iter().any(Option::is_some)
+            || raw_projection
+                .iter()
+                .any(|item| collect_contains_aggregate(projection_without_alias(item)))
+        {
             let strict_grouping = self.only_full_group_by_enabled();
             if strict_grouping
                 && aggregates
@@ -17837,7 +17877,12 @@ impl Backend {
                     None => rows
                         .first()
                         .map(|row| {
-                            self.evaluate_aggregate_projection(projection, row, &aggregate_schema)
+                            self.evaluate_aggregate_projection(
+                                projection,
+                                row,
+                                &rows,
+                                &aggregate_schema,
+                            )
                         })
                         .unwrap_or_else(|| Ok(None)),
                 })
@@ -36843,7 +36888,10 @@ fn parse_aggregate_expression(value: &str) -> Option<AggregateExpression> {
         .unwrap_or(value)
         .trim();
     let open = expression.find('(')?;
-    let close = expression.rfind(')')?;
+    let close = matching_parenthesis(expression, open)?;
+    if close != expression.len() - 1 {
+        return None;
+    }
     let function = expression[..open].trim().to_ascii_uppercase();
     let raw_argument = expression[open + 1..close].trim();
     let distinct_argument = raw_argument
@@ -71979,6 +72027,27 @@ mod tests {
             )
             .await
             .unwrap();
+        let QueryOutcome::Rows { rows, .. } = backend
+            .execute(
+                "SELECT CONCAT('x=',COUNT(*)) AS nested_count,
+                        COUNT(*)+1 AS plus_count,
+                        COALESCE(SUM(1),0) AS nested_sum,
+                        HEX(GROUP_CONCAT('😀a','b')) AS nested_group_concat",
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected nested aggregate projection rows")
+        };
+        assert_eq!(
+            rows,
+            vec![vec![
+                Some(b"x=1".to_vec()),
+                Some(b"2".to_vec()),
+                Some(b"1".to_vec()),
+                Some(b"F09F98806162".to_vec()),
+            ]]
+        );
         assert_eq!(
             single_value(
                 backend
@@ -72014,6 +72083,37 @@ mod tests {
             .execute("SET GLOBAL group_concat_max_len=DEFAULT")
             .await
             .unwrap();
+
+        let QueryOutcome::Rows { rows, .. } = backend
+            .execute(
+                "SELECT CONCAT('x=',COUNT(*)),COUNT(*)+1,COALESCE(SUM(1),0)
+                 FROM group_concat_limits",
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected nested aggregate table projection rows")
+        };
+        assert_eq!(
+            rows,
+            vec![vec![
+                Some(b"x=4".to_vec()),
+                Some(b"5".to_vec()),
+                Some(b"4".to_vec()),
+            ]]
+        );
+        let QueryOutcome::Rows { rows, .. } = backend
+            .execute(
+                "SELECT CONCAT('x=',COUNT(*)),COUNT(*)+1
+                 FROM group_concat_limits a JOIN group_concat_limits b
+                 ON a.group_id=b.group_id",
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected nested aggregate join projection rows")
+        };
+        assert_eq!(rows, vec![vec![Some(b"x=8".to_vec()), Some(b"9".to_vec())]]);
 
         backend
             .execute("SET SESSION group_concat_max_len=4")
