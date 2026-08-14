@@ -166,7 +166,7 @@ cargo build --release
 
 # 正式包只包含 server/cli/mydb/migrate/dump、配置、安装脚本和文档；
 # mydb-bench、测试结果与 target/bench 不进入发布包
-.\scripts\build-release.ps1 -Version "0.1.7"
+.\scripts\build-release.ps1 -Version "0.1.8"
 # 发布包同时生成同名 `.sha256` 校验文件；发布脚本会拒绝覆盖已存在的 GitHub Release。
 
 # 安装到系统
@@ -188,7 +188,7 @@ mydb update --check
 mydb update
 
 # 指定版本
-mydb update --version v0.1.7
+mydb update --version v0.1.8
 ```
 
 Windows 服务更新会在当前 CLI 退出后由后台 helper 完成，日志写入安装目录的 `mydb-update.log`；Linux 更新会自动处理同名 systemd 服务。
@@ -508,7 +508,7 @@ mysql -h 127.0.0.1 -P 3306 game < game.sql
 
 - `CREATE DATABASE`/`DROP DATABASE`
 - `CREATE TABLE`（含列定义、主键、索引、外键、CHECK 约束）
-- `FULLTEXT`/`SPATIAL` 索引：类型持久化、CREATE/ALTER、SHOW INDEX、`information_schema.STATISTICS`，以及基础全文布尔检索和 POINT 空间函数；完整倒排索引/相关性评分与 GIS 类型仍按兼容矩阵推进
+- `FULLTEXT`/`SPATIAL` 索引：类型持久化、CREATE/ALTER、SHOW INDEX、`information_schema.STATISTICS`，以及全文 TF-IDF 基础相关性、布尔必选/排除/短语/前缀检索和 POINT 空间函数；完整倒排索引/停止词与查询扩展、GIS 类型仍按兼容矩阵推进
 - `CREATE TABLE ... LIKE ...`（跨 schema 复制结构）
 - `CREATE TABLE ... AS SELECT ...`（快照建表）
 - `ALTER TABLE`（ADD/DROP/MODIFY/CHANGE COLUMN、ADD/DROP INDEX/PRIMARY KEY/FOREIGN KEY/CHECK）
@@ -627,9 +627,9 @@ bash scripts/docker-smoke.sh
 
 当前开发状态、已完成项、未完成项、差分证据统一维护在 [CheckList.md](CheckList.md)。只有可复现实测证明的项目才会打勾。
 
-### v0.1.7 发布
+### v0.1.8 发布
 
-本版面向单机 MySQL 8.4 常用生产工作负载：3306 提供 MySQL 协议，4306 提供登录保护的 Web SQL IDE/管理 API；补齐 `GRANT OPTION` 越权委派防护、角色 `ADMIN OPTION` 授权/撤销/元数据、`GRANT ALL` 后各层部分 `REVOKE` 的实际权限降级，以及 `mydb update` 在线更新命令。发布不宣称复制/集群、完整 InnoDB 全部锁边界、全部冷门字符集或全部 MySQL 错误码已完成；逐项状态见 [CheckList.md](CheckList.md) 和 [SYNTAX_MATRIX.md](SYNTAX_MATRIX.md)。
+本版面向单机 MySQL 8.4 常用生产工作负载：3306 提供 MySQL 协议，4306 提供登录保护的 Web SQL IDE/管理 API；补齐全文自然语言 TF-IDF 基础相关性、布尔短语/前缀查询以及嵌套全文条件的全表评分上下文。发布不宣称复制/集群、完整 InnoDB 全部锁边界、全部冷门字符集或全部 MySQL 错误码已完成；逐项状态见 [CheckList.md](CheckList.md) 和 [SYNTAX_MATRIX.md](SYNTAX_MATRIX.md)。
 
 **本轮本地门槛（2026-08-14）：**
 - ✅ `cargo test --workspace --locked`：Docker Linux 门禁通过；wire 269（含权限委派/角色 ADMIN OPTION/ALL 部分撤销），其他 workspace 测试与文档测试全部通过
@@ -640,7 +640,7 @@ bash scripts/docker-smoke.sh
 - ✅ Connector/J 9.1.0、Node mysql2 3.23.3 已完成 3306 普通/预处理查询 smoke；Go `database/sql` + go-sql-driver/mysql 1.10.0 已完成当前 release 3306 服务的 Ping、中文、DATE、普通/预处理查询回归
 - ✅ MySQL `'user'@'host'` 基础账户匹配：精确主机优先于通配主机，握手按账户插件选择认证方式
 - ✅ `scripts/bench.ps1`：Docker Linux Rust gate、release build 与同条件 MySQL 8.4 持久化基准通过；性能阶段无预热、60 秒硬截止（报告见 [性能报告.md](性能报告.md)）
-- ✅ `scripts/mysql84-diff.ps1`：当前 release 隔离 13307 与同机 Docker MySQL 8.4，102/102 差分通过；新增 JSON 路径/重叠、位聚合、常量聚合投影、未知线程 KILL 错误、角色授权、ai_ci 字符集比较、视图/例程/触发器、FK/CHECK、EXPLAIN 语义和状态接口覆盖
+- ✅ `scripts/mysql84-diff.ps1`：当前 release 隔离端口与同机 Docker MySQL 8.4，103/103 差分通过；新增全文相关性、布尔短语/前缀与必选/排除查询覆盖
 - ⏳ Ubuntu 24.04 物理性能、macOS 原生验收、宿主断电/恢复中断、大数据压力与生产安全运维验收：以 [CheckList.md](CheckList.md) 与 [性能报告.md](性能报告.md) 为准
 
 ---

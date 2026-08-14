@@ -45,7 +45,7 @@ use mydb_storage::{
     TriggerDefinition, TriggerEvent, TriggerTiming, UpdateValueExpression, WriteCommand,
 };
 
-pub const SERVER_VERSION: &str = "8.4.0-mydb-0.1.7";
+pub const SERVER_VERSION: &str = "8.4.0-mydb-0.1.8";
 pub const MYSQL84_DEFAULT_SQL_MODE: &str = "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION";
 /// MySQL 8.4 default `innodb_lock_wait_timeout`, in seconds.
 pub const MYSQL84_DEFAULT_INNODB_LOCK_WAIT_TIMEOUT_SECONDS: u64 = 50;
@@ -16280,6 +16280,18 @@ impl Backend {
         let database = source.database.clone();
         let table = source.table.clone();
         let schema = source.schema.clone();
+        let fulltext_collection = if upper.contains("MATCH(") {
+            let mut collection = match source_rows.as_ref() {
+                Some(rows) => rows.clone(),
+                None => self.rows_with_transaction_overlay(&database, &table, None, None)?,
+            };
+            for row in &mut collection {
+                materialize_generated_columns(row, &schema)?;
+            }
+            Some(collection)
+        } else {
+            None
+        };
         let correlated_filter = correlated_row_filter_clause(sql, std::slice::from_ref(&source))?;
         let mut scalar_filter = None;
         let mut filter = if correlated_filter.is_some() {
@@ -16577,7 +16589,14 @@ impl Backend {
                 } else {
                     projection_items
                         .iter()
-                        .map(|item| evaluate_scalar_expression_with_schema(item, &row, &schema))
+                        .map(|item| {
+                            evaluate_scalar_expression_with_schema_and_collection(
+                                item,
+                                &row,
+                                &schema,
+                                fulltext_collection.as_deref(),
+                            )
+                        })
                         .collect::<anyhow::Result<Vec<_>>>()?
                 };
                 Ok(values)
@@ -29870,7 +29889,7 @@ fn evaluate_scalar_expression(value: &str, row: &Row) -> anyhow::Result<Option<V
             .to_vec(),
         ));
     }
-    if let Some(value) = evaluate_fulltext_match(expression, row, None)? {
+    if let Some(value) = evaluate_fulltext_match(expression, row, None, None)? {
         return Ok(Some(value));
     }
     if let Some(value) = evaluate_spatial_expression(expression, row)? {
@@ -32475,10 +32494,11 @@ fn evaluate_scalar_condition_with_locals(
     evaluate_scalar_condition(&value, row)
 }
 
-fn evaluate_scalar_condition_with_schema(
+fn evaluate_scalar_condition_with_schema_and_collection(
     value: &str,
     row: &Row,
     schema: &TableSchema,
+    fulltext_collection: Option<&[Row]>,
 ) -> anyhow::Result<bool> {
     let value = trim_outer_parentheses(value.trim());
     for (operator, predicate) in [
@@ -32500,8 +32520,18 @@ fn evaluate_scalar_condition_with_schema(
         if let Some(position) = find_scalar_condition_operator(value, operator) {
             let left_expression = &value[..position];
             let right_expression = &value[position + operator.len()..];
-            let left = evaluate_scalar_expression(left_expression, row)?;
-            let right = evaluate_scalar_expression(right_expression, row)?;
+            let left = evaluate_scalar_expression_with_schema_and_collection(
+                left_expression,
+                row,
+                schema,
+                fulltext_collection,
+            )?;
+            let right = evaluate_scalar_expression_with_schema_and_collection(
+                right_expression,
+                row,
+                schema,
+                fulltext_collection,
+            )?;
             return Ok(match (left.as_deref(), right.as_deref()) {
                 (None, None) if operator == "<=>" => true,
                 (Some(left), Some(right)) => predicate(compare_scalar_expressions(
@@ -32654,6 +32684,15 @@ fn evaluate_scalar_expression_with_schema(
     row: &Row,
     schema: &TableSchema,
 ) -> anyhow::Result<Option<Vec<u8>>> {
+    evaluate_scalar_expression_with_schema_and_collection(value, row, schema, None)
+}
+
+fn evaluate_scalar_expression_with_schema_and_collection(
+    value: &str,
+    row: &Row,
+    schema: &TableSchema,
+    fulltext_collection: Option<&[Row]>,
+) -> anyhow::Result<Option<Vec<u8>>> {
     let expression = trim_outer_parentheses(projection_without_alias(value).trim());
     let upper = expression.to_ascii_uppercase();
     if upper == "TRUE" {
@@ -32702,7 +32741,9 @@ fn evaluate_scalar_expression_with_schema(
             ));
         }
     }
-    if let Some(value) = evaluate_fulltext_match(expression, row, Some(schema))? {
+    if let Some(value) =
+        evaluate_fulltext_match(expression, row, Some(schema), fulltext_collection)?
+    {
         return Ok(Some(value));
     }
     if let Some(value) = evaluate_spatial_expression(expression, row)? {
@@ -32730,7 +32771,12 @@ fn evaluate_scalar_expression_with_schema(
         || upper.starts_with("NOT ");
     if is_condition {
         return Ok(Some(
-            if evaluate_scalar_condition_with_schema(expression, row, schema)? {
+            if evaluate_scalar_condition_with_schema_and_collection(
+                expression,
+                row,
+                schema,
+                fulltext_collection,
+            )? {
                 b"1"
             } else {
                 b"0"
@@ -32740,17 +32786,26 @@ fn evaluate_scalar_expression_with_schema(
     }
     if upper.starts_with("ROUND(") && expression.ends_with(')') {
         let arguments = split_csv(&expression[6..expression.len() - 1]);
-        if matches!(arguments.len(), 1 | 2) && is_identifier_reference(&arguments[0]) {
-            let column = unqualified_column(&arguments[0]);
-            let Some(data_type) = schema
-                .columns
-                .iter()
-                .find(|item| item.name.eq_ignore_ascii_case(column))
-                .map(|item| &item.data_type)
-            else {
-                return evaluate_scalar_expression(value, row);
+        if matches!(arguments.len(), 1 | 2) {
+            let data_type = if is_identifier_reference(&arguments[0]) {
+                schema
+                    .columns
+                    .iter()
+                    .find(|item| {
+                        item.name
+                            .eq_ignore_ascii_case(unqualified_column(&arguments[0]))
+                    })
+                    .map(|item| &item.data_type)
+            } else {
+                None
             };
-            let Some(raw_value) = evaluate_scalar_expression(&arguments[0], row)? else {
+            let Some(raw_value) = evaluate_scalar_expression_with_schema_and_collection(
+                &arguments[0],
+                row,
+                schema,
+                fulltext_collection,
+            )?
+            else {
                 return Ok(None);
             };
             let number = parse_scalar_number(&raw_value)?;
@@ -32763,8 +32818,8 @@ fn evaluate_scalar_expression_with_schema(
                 .transpose()?
                 .unwrap_or(0);
             let factor = 10_f64.powi(digits);
-            let approximate = matches!(data_type, DataType::Float | DataType::Double)
-                || matches!(data_type, DataType::Raw(value) if decimal_scale(value).is_none());
+            let approximate = matches!(data_type, Some(DataType::Float | DataType::Double))
+                || matches!(data_type, Some(DataType::Raw(value)) if decimal_scale(value).is_none());
             let rounded = if approximate {
                 round_mysql_approximate(number, digits)
             } else {
@@ -32774,7 +32829,7 @@ fn evaluate_scalar_expression_with_schema(
                 return Ok(Some(format_mysql_number(rounded).into_bytes()));
             }
             let scale = match data_type {
-                DataType::Raw(value) => decimal_scale(value).unwrap_or(0),
+                Some(DataType::Raw(value)) => decimal_scale(value).unwrap_or(0),
                 _ => 0,
             }
             .min(digits as usize);
@@ -32786,11 +32841,21 @@ fn evaluate_scalar_expression_with_schema(
     if let Some((position, operator)) = find_scalar_arithmetic_operator(expression) {
         let left_expression = &expression[..position];
         let right_expression = &expression[position + 1..];
-        let Some(left) = evaluate_scalar_expression_with_schema(left_expression, row, schema)?
+        let Some(left) = evaluate_scalar_expression_with_schema_and_collection(
+            left_expression,
+            row,
+            schema,
+            fulltext_collection,
+        )?
         else {
             return Ok(None);
         };
-        let Some(right) = evaluate_scalar_expression_with_schema(right_expression, row, schema)?
+        let Some(right) = evaluate_scalar_expression_with_schema_and_collection(
+            right_expression,
+            row,
+            schema,
+            fulltext_collection,
+        )?
         else {
             return Ok(None);
         };
@@ -32815,6 +32880,7 @@ fn evaluate_fulltext_match(
     expression: &str,
     row: &Row,
     schema: Option<&TableSchema>,
+    collection: Option<&[Row]>,
 ) -> anyhow::Result<Option<Vec<u8>>> {
     let Some(against_position) = find_top_level_keyword(expression, " AGAINST ", 0) else {
         if expression.trim().to_ascii_uppercase().starts_with("MATCH(") {
@@ -32887,27 +32953,54 @@ fn evaluate_fulltext_match(
     for raw in query.split_whitespace() {
         let required = raw.starts_with('+');
         let excluded = raw.starts_with('-');
+        let prefix = raw.ends_with('*');
         let token = raw
             .trim_start_matches(['+', '-', '~', '>', '<'])
             .trim_matches('"')
             .trim_end_matches('*')
             .to_ascii_lowercase();
-        if !token.is_empty() {
-            terms.push((token, required, excluded));
+        if fulltext_searchable_term(&token) {
+            terms.push((token, required, excluded, prefix));
         }
     }
     if terms.is_empty() {
         return Ok(Some(b"0".to_vec()));
     }
+    let documents = collection
+        .unwrap_or_else(|| std::slice::from_ref(row))
+        .iter()
+        .map(|candidate| {
+            columns
+                .iter()
+                .filter_map(|column| candidate.get(column))
+                .map(|value| String::from_utf8_lossy(value).into_owned())
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect::<Vec<_>>();
     let document = columns
         .iter()
         .filter_map(|column| row.get(column))
-        .map(|value| String::from_utf8_lossy(value).to_ascii_lowercase())
+        .map(|value| String::from_utf8_lossy(value).into_owned())
         .collect::<Vec<_>>()
         .join(" ");
+    if boolean_mode {
+        for phrase in query
+            .split('"')
+            .enumerate()
+            .filter_map(|(index, value)| (index % 2 == 1).then_some(value.trim()))
+        {
+            let phrase_terms = fulltext_tokens(phrase);
+            if !phrase_terms.is_empty() && !fulltext_phrase_matches(&document, &phrase_terms) {
+                return Ok(Some(b"0".to_vec()));
+            }
+        }
+    }
     let mut matched = 0usize;
-    for (term, required, excluded) in &terms {
-        let count = fulltext_term_count(&document, term);
+    let total_documents = documents.len().max(1) as f64;
+    let mut score = 0.0;
+    for (term, required, excluded, prefix) in &terms {
+        let count = fulltext_term_count(&document, term, *prefix);
         if *excluded && count > 0 {
             return Ok(Some(b"0".to_vec()));
         }
@@ -32916,24 +33009,78 @@ fn evaluate_fulltext_match(
         }
         if count > 0 {
             matched += 1;
+            let matching_documents = documents
+                .iter()
+                .filter(|candidate| fulltext_term_count(candidate, term, *prefix) > 0)
+                .count();
+            if matching_documents > 0 {
+                let inverse_document_frequency =
+                    (total_documents / matching_documents as f64).log10();
+                score += count as f64 * inverse_document_frequency * inverse_document_frequency;
+            }
         }
     }
     if matched == 0 {
         return Ok(Some(b"0".to_vec()));
     }
-    let score = if boolean_mode {
-        1.0
-    } else {
-        matched as f64 / terms.len() as f64
-    };
     Ok(Some(format_mysql_number(score).into_bytes()))
 }
 
-fn fulltext_term_count(document: &str, term: &str) -> usize {
+fn fulltext_searchable_term(term: &str) -> bool {
+    term.chars().count() >= 3
+        && !matches!(
+            term,
+            "a" | "an"
+                | "and"
+                | "are"
+                | "as"
+                | "at"
+                | "be"
+                | "by"
+                | "for"
+                | "from"
+                | "in"
+                | "is"
+                | "it"
+                | "of"
+                | "on"
+                | "or"
+                | "that"
+                | "the"
+                | "this"
+                | "to"
+                | "was"
+                | "with"
+        )
+}
+
+fn fulltext_tokens(document: &str) -> Vec<String> {
     document
         .split(|character: char| !character.is_alphanumeric() && character != '_')
-        .filter(|word| *word == term)
+        .filter(|word| !word.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
+fn fulltext_term_count(document: &str, term: &str, prefix: bool) -> usize {
+    fulltext_tokens(document)
+        .into_iter()
+        .filter(|word| {
+            if prefix {
+                word.starts_with(term)
+            } else {
+                word == term
+            }
+        })
         .count()
+}
+
+fn fulltext_phrase_matches(document: &str, phrase: &[String]) -> bool {
+    let tokens = fulltext_tokens(document);
+    !phrase.is_empty()
+        && tokens
+            .windows(phrase.len())
+            .any(|window| window.iter().zip(phrase).all(|(left, right)| left == right))
 }
 
 fn evaluate_spatial_expression(expression: &str, row: &Row) -> anyhow::Result<Option<Vec<u8>>> {
@@ -62188,13 +62335,24 @@ mod tests {
             let mut connection = mysql::Conn::new(options).unwrap();
             let scores: Vec<(f64,)> = connection
                 .query(
-                    "SELECT MATCH(title,body) AGAINST ('database')
+                    "SELECT ROUND(MATCH(title,body) AGAINST ('database'), 6)
                      FROM wire_fulltext ORDER BY id",
                 )
                 .unwrap();
             assert_eq!(scores.len(), 2);
-            assert!(scores[0].0 > 0.0);
+            assert!(
+                (scores[0].0 - 0.181238).abs() < 0.000001,
+                "unexpected fulltext score: {:?}",
+                scores
+            );
             assert_eq!(scores[1].0, 0.0);
+            let prefix_matches: Vec<(u8,)> = connection
+                .query(
+                    "SELECT MATCH(title,body) AGAINST ('dat*' IN BOOLEAN MODE) > 0
+                     FROM wire_fulltext ORDER BY id",
+                )
+                .unwrap();
+            assert_eq!(prefix_matches, vec![(1,), (0,)]);
             let spatial: Option<(String, String, String, String)> = connection
                 .query_first(
                     "SELECT ST_AsText(point_value),ST_X(point_value),

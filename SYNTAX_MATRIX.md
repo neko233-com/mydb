@@ -52,7 +52,7 @@
 | `RENAME TABLE`（多项）、`ALTER TABLE RENAME` | ✅ Verified | 原子镜像、跨库 |
 | 表/列 `COMMENT` 持久化 | ✅ Verified | CREATE/ALTER TABLE comment 通过 CREATE SQL 持久化；SHOW FULL COLUMNS、SHOW TABLE STATUS、information_schema.tables/columns、SHOW CREATE TABLE 已回归；复杂 MODIFY 边界仍待补 |
 | `PARTITION BY`（表级） | 🟡 Partial | 逻辑表级 RANGE/LIST/HASH/KEY、`RANGE/LIST COLUMNS`、常用表达式 `YEAR/MONTH/DAY/QUARTER/TO_DAYS/TO_SECONDS/UNIX_TIMESTAMP/ABS/MOD` 与基础算术的写入校验、重启恢复和 `information_schema.PARTITIONS` 元数据已验证；数据仍保持单表物理布局，子分区、在线重组与物理分区裁剪 Deferred；窗口函数 `PARTITION BY` 为独立语义 |
-| `SPATIAL` / `FULLTEXT` 索引 | 🟡 Partial | `IndexKind` 已持久化区分 BTREE/FULLTEXT/SPATIAL；CREATE/ALTER、SHOW INDEX、`information_schema.STATISTICS`、FULLTEXT 布尔检索、基础 `ST_GeomFromText`/`ST_AsText`/`ST_X`/`ST_Y`/`ST_GeometryType` 已与 MySQL 8.4 真实差分覆盖。完整 InnoDB 全文倒排索引/相关性评分、停止词/查询扩展、完整 GIS 类型与空间谓词/优化仍待落地。 |
+| `SPATIAL` / `FULLTEXT` 索引 | 🟡 Partial | `IndexKind` 已持久化区分 BTREE/FULLTEXT/SPATIAL；CREATE/ALTER、SHOW INDEX、`information_schema.STATISTICS`、FULLTEXT TF-IDF 基础相关性、布尔必选/排除/短语/前缀检索、基础 `ST_GeomFromText`/`ST_AsText`/`ST_X`/`ST_Y`/`ST_GeometryType` 已与 MySQL 8.4 真实差分覆盖。完整 InnoDB 倒排索引/停止词与查询扩展、完整 GIS 类型与空间谓词/优化仍待落地。 |
 | `ENGINE=` 其它引擎（除 InnoDB/MEMORY） | ⚪ Absent | 返回错误（InnoDB 为 Neko233 别名） |
 | `CREATE TABLESPACE` | ⚪ Absent | 仅权限名占位 |
 
