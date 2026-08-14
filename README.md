@@ -521,9 +521,9 @@ mysql -h 127.0.0.1 -P 3306 game < game.sql
 ### 函数
 
 - **字符串**：CONCAT、SUBSTRING、TRIM、REPLACE、LPAD/RPAD、UPPER/LOWER、HEX/UNHEX、Base64、MD5、SHA1、SHA2、CRC32、REGEXP 等
-- **数值**：ABS、CEIL/FLOOR、ROUND、MOD、POW/SQRT、RAND、PI、三角函数、BIT_COUNT、CONV 等
+- **数值**：ABS、CEIL/FLOOR、ROUND、MOD、POW/SQRT、RAND、PI、三角函数、BIT_COUNT、BIT_AND、BIT_OR、BIT_XOR、CONV 等
 - **日期时间**：NOW、CURDATE、CURTIME、DATE_ADD/DATE_SUB、DATEDIFF、TIMESTAMPDIFF、DATE_FORMAT、UNIX_TIMESTAMP/FROM_UNIXTIME、CONVERT_TZ（内置 IANA 时区）、WEEK/YEARWEEK、EXTRACT 等
-- **JSON**：JSON_EXTRACT、JSON_UNQUOTE、JSON_OBJECT、JSON_ARRAY、JSON_VALID、JSON_TYPE、JSON_LENGTH、JSON_CONTAINS、JSON_SET、JSON_REMOVE
+- **JSON**：JSON_EXTRACT、JSON_UNQUOTE、JSON_OBJECT、JSON_ARRAY、JSON_VALID、JSON_TYPE、JSON_LENGTH、JSON_CONTAINS、JSON_CONTAINS_PATH、JSON_OVERLAPS、JSON_SET、JSON_REMOVE
 - **其他**：UUID、INET_ATON/INET_NTOA、INET6_ATON/INET6_NTOA、GROUP_CONCAT、IF、CASE、NULLIF、COALESCE、CAST/CONVERT 等
 
 ### 系统表
@@ -582,14 +582,14 @@ bash scripts/docker-smoke.sh
 
 > 完整测试方法、运行指标和发布前验证见 [性能报告.md](性能报告.md)。下表为 2026-08-14 本机 Windows 实测；MyDB 与 MySQL 8.4.11 均使用 fsync 持久化，3 次采样取中位数。
 >
-> 本轮数据：2026-08-14，本机 Windows；MySQL 8.4.11，`innodb_flush_log_at_trx_commit=1`、`sync_binlog=1`。MySQL 基准服务为同机 Docker `127.0.0.1:3306`，MyDB 隔离 release 服务为 `127.0.0.1:13307`。
+> 本轮数据：2026-08-14，本机 Windows；MySQL 8.4.11，`innodb_flush_log_at_trx_commit=1`、`sync_binlog=1`。MySQL 基准服务为同机 Docker `127.0.0.1:13306`，MyDB 隔离 release 服务为 `127.0.0.1:13307`；本机开发 MyDB 继续保留在 3306。
 
 | 场景 | MyDB | MySQL 8.4.11 | MyDB / MySQL |
 |------|------|--------------|--------------|
-| 单表写（fsync-per-commit） | 207 ops/s | 66 ops/s | 3.15x |
-| 8 actor / 8表 写 P99 延迟 | 29.9 ms | 74.2 ms | 2.48x（低更好） |
-| 8 actor / 8表 Group Commit | 1290 ops/s | 964 ops/s | 1.34x |
-| 读 P50 延迟 | 353 μs | 631 μs | - |
+| 单表写（fsync-per-commit） | 201 ops/s | 69 ops/s | 2.91x |
+| 8 actor / 8表 写 P99 延迟 | 32.5 ms | 95.9 ms | 2.95x（低更好） |
+| 8 actor / 8表 Group Commit | 739 ops/s | 275 ops/s | 2.69x |
+| 读 P50 延迟 | 399 μs | 610 μs | - |
 
 性能优化不以关闭 WAL 持久化或弱化恢复语义换取数字。默认 250μs Group Commit 窗口优先并发吞吐，checkpoint 按 1024 个已提交请求触发；不声明未经实测证明的固定倍数。
 
@@ -607,7 +607,7 @@ bash scripts/docker-smoke.sh
 - ✅ Connector/J 9.1.0、Node mysql2 3.23.3 已完成 3306 普通/预处理查询 smoke；Go `database/sql` + go-sql-driver/mysql 1.10.0 已完成当前 release 3306 服务的 Ping、中文、DATE、普通/预处理查询回归
 - ✅ MySQL `'user'@'host'` 基础账户匹配：精确主机优先于通配主机，握手按账户插件选择认证方式
 - ✅ `scripts/docker-smoke.ps1`：当前源码 Docker release 镜像通过 SIGKILL、WAL 损坏、只读/ENOSPC、事务锁、LOAD DATA、备份/PITR 与 Web/Agent smoke
-- ✅ `scripts/mysql84-diff.ps1`：当前 release 物理 3306 与同机 Docker MySQL 8.4，98/98 差分通过；新增角色授权、ai_ci 字符集比较、视图/例程/触发器、FK/CHECK、EXPLAIN 语义和状态接口覆盖
+- ✅ `scripts/mysql84-diff.ps1`：当前 release 隔离 13307 与同机 Docker MySQL 8.4，100/100 差分通过；新增 JSON 路径/重叠、位聚合、角色授权、ai_ci 字符集比较、视图/例程/触发器、FK/CHECK、EXPLAIN 语义和状态接口覆盖
 - ⏳ Ubuntu 24.04 物理性能、macOS 原生验收、宿主断电/恢复中断、大数据压力与生产安全运维验收：以 [CheckList.md](CheckList.md) 与 [性能报告.md](性能报告.md) 为准
 
 ---

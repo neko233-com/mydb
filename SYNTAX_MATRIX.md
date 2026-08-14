@@ -90,7 +90,7 @@
 | 非递归 & 常用递归 CTE | ✅ Verified | 前向引用/互递归按 MySQL 8.4 明确拒绝；`cte_max_recursion_depth` 的 SESSION/GLOBAL 默认传播、递归成员禁止聚合/窗口/GROUP BY/ORDER BY/DISTINCT 已验证；MySQL 8.4 无 `CYCLE` 语法 |
 | 窗口函数（ROW_NUMBER…NTILE/CUME_DIST、命名 WINDOW、ROWS/RANGE frame） | ✅ Verified | |
 | `GROUP BY` 表达式/别名/序号、`HAVING` | ✅ Verified | 未关联标量子查询、`IN (SELECT ...)`、按分组外层行绑定的关联标量子查询及 `AND` 组合的关联 `EXISTS` 已覆盖；更复杂关联谓词树 🔴 Deferred；显式 `ONLY_FULL_GROUP_BY` 与主键/非空唯一键函数依赖已覆盖 |
-| JSON（`JSON_EXTRACT/UNQUOTE/OBJECT/ARRAY/VALID/TYPE/LENGTH/CONTAINS/SET/REMOVE`） | ✅ Verified | |
+| JSON（`JSON_EXTRACT/UNQUOTE/OBJECT/ARRAY/VALID/TYPE/LENGTH/CONTAINS/CONTAINS_PATH/OVERLAPS/SET/REMOVE`） | ✅ Verified | |
 | 常用字符串/数值/日期/网络/摘要/进制/三角/UUID 函数 | ✅ Verified | 见 README “当前 SQL 范围” |
 
 ---
@@ -213,5 +213,5 @@
 
 - **已实现并经测试**：DDL 全量、DML 全量、事务与锁常用面、存储函数/事件调度、账号/角色/审计、information_schema+mysql 虚拟库、时区、错误码、协议与迁移。
 - **本轮补齐（兼容 no-op / 虚拟表 / 表面）**：performance_schema、sys、RENAME USER、SET PASSWORD、ALTER DATABASE 选项、ANALYZE/OPTIMIZE/CHECK/REPAIR/CHECKSUM TABLE、FLUSH、CACHE INDEX、复制 SHOW 表面；本地 XA 已从兼容 no-op 提升为跨连接 prepared 分支与锁生命周期语义。
-- **明确不支持（设计决定，非临时延迟 ❌）**：binlog 复制拓扑 / GTID、读写分离、Group Replication / Galera、分布式 XA 两阶段协调、跨节点一致性。这些是**非单机能力**，与 MyDB“替代 SQLite 的单机高性能数据库”定位相悖，不会实现，也不计入“缺失”。复制 SHOW 表面（空结果）与本地 XA（会话内事务）仍作为兼容表面保留。
+- **明确不支持（设计决定，非临时延迟 ❌）**：binlog 复制拓扑 / GTID、读写分离、Group Replication / Galera、分布式 XA 两阶段协调、跨节点一致性。这些是**非单机能力**，与 MyDB“替代 MySQL 的单机数据库”定位相悖，不会实现，也不计入“缺失”。复制 SHOW 表面（空结果）与本地 XA（会话内事务）仍作为兼容表面保留。
 - **尚未完成（单机范围内的语义 🔴 Deferred）**：完整 next-key/gap 锁与全部隐式锁边界、复杂 UPSERT 表达式的全语法逐列权限与完整授权委托边界、排序规则在所有 `ORDER BY`/JOIN/GROUP BY 路径的真实权重（`*_general_ci`/`*_ai_ci`）、更复杂关联 HAVING 谓词树、routine 局部变量 charset/collation、冷门语句清理边缘。基础多方死锁与成本化 victim、分组相关标量 HAVING、`AND`+关联 EXISTS、复杂 JOIN 的 SELECT 基表/列授权、JOIN DML 与 `INSERT ... SELECT` 的核心列授权、递归 CTE 的 MySQL 拒绝边界已完成。它们仍是“完整 MySQL 8.4 对外表现”目标的未完成项。

@@ -15672,6 +15672,7 @@ impl Backend {
     }
 
     async fn select(&mut self, sql: &str) -> anyhow::Result<QueryOutcome> {
+        reject_unsupported_order_by_nulls(sql)?;
         let materialized_sql = if sql.to_ascii_uppercase().contains(" HAVING ") {
             self.materialize_having_subqueries(sql).await?
         } else {
@@ -15700,7 +15701,10 @@ impl Backend {
                 }
                 let item_upper = item.to_ascii_uppercase();
                 let alias = parse_alias(&item);
-                let value = if let Some(argument) =
+                let value = if let Some(aggregate) = parse_aggregate_expression(&item) {
+                    let empty_schema = virtual_table_schema("dual", &[]);
+                    evaluate_aggregate(aggregate, std::slice::from_ref(&empty_row), &empty_schema)?
+                } else if let Some(argument) =
                     last_insert_id_argument(projection_without_alias(&item))
                 {
                     let value = evaluate_scalar_expression(argument, &empty_row)?;
@@ -18186,11 +18190,15 @@ fn mysql_expression_column(name: &str, expression: &str) -> MysqlColumn {
         || upper.starts_with("JSON_LENGTH(")
         || upper.starts_with("JSON_CONTAINS(")
         || upper.starts_with("JSON_CONTAINS_PATH(")
+        || upper.starts_with("JSON_OVERLAPS(")
         || upper.starts_with("JSON_VALID(")
         || upper.starts_with("LOCATE(")
         || upper.starts_with("INSTR(")
         || upper.starts_with("FIELD(")
         || upper.starts_with("BIT_COUNT(")
+        || upper.starts_with("BIT_AND(")
+        || upper.starts_with("BIT_OR(")
+        || upper.starts_with("BIT_XOR(")
         || upper.starts_with("SIGN(")
         || upper.starts_with("ROW_COUNT(")
         || upper.starts_with("FOUND_ROWS(")
@@ -26798,6 +26806,9 @@ enum AggregateExpression {
     Avg(String),
     Max(String),
     Min(String),
+    BitAnd(String),
+    BitOr(String),
+    BitXor(String),
 }
 
 #[derive(Debug, Clone)]
@@ -27028,7 +27039,15 @@ fn collect_innermost_aggregate_expressions(value: &str, output: &mut HashSet<Str
         let function = value[start..cursor].to_ascii_uppercase();
         if !matches!(
             function.as_str(),
-            "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "GROUP_CONCAT"
+            "COUNT"
+                | "SUM"
+                | "AVG"
+                | "MIN"
+                | "MAX"
+                | "BIT_AND"
+                | "BIT_OR"
+                | "BIT_XOR"
+                | "GROUP_CONCAT"
         ) || !value[cursor..].starts_with('(')
         {
             continue;
@@ -27121,7 +27140,7 @@ fn parse_window_expression(value: &str, sql: &str) -> anyhow::Result<Option<Wind
         }
         "CUME_DIST" if arguments.is_empty() => WindowFunction::CumeDist,
         "PERCENT_RANK" if arguments.is_empty() => WindowFunction::PercentRank,
-        "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" => {
+        "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "BIT_AND" | "BIT_OR" | "BIT_XOR" => {
             let aggregate = parse_aggregate_expression(function_expression)
                 .ok_or_else(|| anyhow::anyhow!("Invalid window aggregate"))?;
             if matches!(aggregate, AggregateExpression::CountDistinct(_)) {
@@ -30408,6 +30427,62 @@ fn evaluate_scalar_expression(value: &str, row: &Row) -> anyhow::Result<Option<V
         };
         return Ok(Some(length.to_string().into_bytes()));
     }
+    if upper.starts_with("JSON_CONTAINS_PATH(") && expression.ends_with(')') {
+        let arguments = split_csv(&expression[19..expression.len() - 1]);
+        if arguments.len() < 3 {
+            anyhow::bail!("JSON_CONTAINS_PATH requires a document, a mode, and at least one path");
+        }
+        let Some(document) = evaluate_scalar_expression(&arguments[0], row)? else {
+            return Ok(None);
+        };
+        let Some(mode) = evaluate_scalar_expression(&arguments[1], row)? else {
+            return Ok(None);
+        };
+        let mode = String::from_utf8(mode)?.to_ascii_lowercase();
+        if mode != "one" && mode != "all" {
+            anyhow::bail!("JSON_CONTAINS_PATH mode must be 'one' or 'all'");
+        }
+        let document: serde_json::Value = serde_json::from_slice(&document)
+            .map_err(|error| anyhow::anyhow!("Invalid JSON document: {error}"))?;
+        let mut matches = Vec::with_capacity(arguments.len() - 2);
+        for argument in &arguments[2..] {
+            let Some(path) = evaluate_scalar_expression(argument, row)? else {
+                return Ok(None);
+            };
+            let path = String::from_utf8(path)?;
+            matches.push(json_extract_path(&document, &path)?.is_some());
+        }
+        let matched = if mode == "one" {
+            matches.into_iter().any(std::convert::identity)
+        } else {
+            matches.into_iter().all(std::convert::identity)
+        };
+        return Ok(Some(if matched { b"1" } else { b"0" }.to_vec()));
+    }
+    if upper.starts_with("JSON_OVERLAPS(") && expression.ends_with(')') {
+        let arguments = split_csv(&expression[14..expression.len() - 1]);
+        if arguments.len() != 2 {
+            anyhow::bail!("JSON_OVERLAPS requires two arguments");
+        }
+        let Some(left) = evaluate_scalar_expression(&arguments[0], row)? else {
+            return Ok(None);
+        };
+        let Some(right) = evaluate_scalar_expression(&arguments[1], row)? else {
+            return Ok(None);
+        };
+        let left: serde_json::Value = serde_json::from_slice(&left)
+            .map_err(|error| anyhow::anyhow!("Invalid JSON document: {error}"))?;
+        let right: serde_json::Value = serde_json::from_slice(&right)
+            .map_err(|error| anyhow::anyhow!("Invalid JSON document: {error}"))?;
+        return Ok(Some(
+            if json_overlaps(&left, &right) {
+                b"1"
+            } else {
+                b"0"
+            }
+            .to_vec(),
+        ));
+    }
     if upper.starts_with("JSON_CONTAINS(") && expression.ends_with(')') {
         let arguments = split_csv(&expression[14..expression.len() - 1]);
         if !matches!(arguments.len(), 2 | 3) {
@@ -32458,7 +32533,7 @@ fn mysql_bit_mask(value: &[u8]) -> anyhow::Result<u64> {
     if !value.is_finite() {
         anyhow::bail!("Invalid bit mask '{}'", text);
     }
-    Ok((value.trunc() as i64) as u64)
+    Ok((value.round() as i64) as u64)
 }
 
 fn mysql_hex(value: &[u8]) -> Vec<u8> {
@@ -33134,6 +33209,20 @@ fn json_contains(target: &serde_json::Value, candidate: &serde_json::Value) -> b
     }
 }
 
+fn json_overlaps(left: &serde_json::Value, right: &serde_json::Value) -> bool {
+    match (left, right) {
+        (serde_json::Value::Array(left), serde_json::Value::Array(right)) => left
+            .iter()
+            .any(|left| right.iter().any(|right| left == right)),
+        (serde_json::Value::Array(left), right) => left.iter().any(|value| value == right),
+        (left, serde_json::Value::Array(right)) => right.iter().any(|value| value == left),
+        (serde_json::Value::Object(left), serde_json::Value::Object(right)) => left
+            .iter()
+            .any(|(key, value)| right.get(key).is_some_and(|other| other == value)),
+        _ => left == right,
+    }
+}
+
 fn json_set_path(
     current: &mut serde_json::Value,
     path: &[JsonPathSegment],
@@ -33236,6 +33325,9 @@ fn parse_aggregate_expression(value: &str) -> Option<AggregateExpression> {
         "AVG" => Some(AggregateExpression::Avg(argument)),
         "MAX" => Some(AggregateExpression::Max(argument)),
         "MIN" => Some(AggregateExpression::Min(argument)),
+        "BIT_AND" => Some(AggregateExpression::BitAnd(argument)),
+        "BIT_OR" => Some(AggregateExpression::BitOr(argument)),
+        "BIT_XOR" => Some(AggregateExpression::BitXor(argument)),
         _ => None,
     }
 }
@@ -33371,6 +33463,9 @@ fn evaluate_aggregate(
                     .into_bytes(),
             ))
         }
+        AggregateExpression::BitAnd(expression) => evaluate_bit_aggregate(&expression, rows, '&'),
+        AggregateExpression::BitOr(expression) => evaluate_bit_aggregate(&expression, rows, '|'),
+        AggregateExpression::BitXor(expression) => evaluate_bit_aggregate(&expression, rows, '^'),
         AggregateExpression::GroupConcat {
             expression,
             distinct,
@@ -33485,6 +33580,27 @@ fn evaluate_aggregate(
     }
 }
 
+fn evaluate_bit_aggregate(
+    expression: &str,
+    rows: &[Row],
+    operation: char,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    let mut value = if operation == '&' { u64::MAX } else { 0 };
+    for row in rows {
+        let Some(raw) = aggregate_row_value(row, expression)? else {
+            continue;
+        };
+        let mask = mysql_bit_mask(&raw)?;
+        value = match operation {
+            '&' => value & mask,
+            '|' => value | mask,
+            '^' => value ^ mask,
+            _ => unreachable!("bit aggregate operation is fixed"),
+        };
+    }
+    Ok(Some(value.to_string().into_bytes()))
+}
+
 fn aggregate_row_value(row: &Row, expression: &str) -> anyhow::Result<Option<Vec<u8>>> {
     evaluate_scalar_expression(expression, row)
 }
@@ -33536,6 +33652,9 @@ fn aggregate_numeric_exactness(
                     _ => None,
                 })
         }
+        AggregateExpression::BitAnd(_)
+        | AggregateExpression::BitOr(_)
+        | AggregateExpression::BitXor(_) => Some(true),
         AggregateExpression::GroupConcat { .. } => None,
     }
 }
@@ -33598,7 +33717,12 @@ fn materialize_group_aggregates(
                     | AggregateExpression::Count(_)
                     | AggregateExpression::CountDistinct(_)
                     | AggregateExpression::Sum(_)
-                    | AggregateExpression::Avg(_) => String::from_utf8_lossy(&value).into_owned(),
+                    | AggregateExpression::Avg(_)
+                    | AggregateExpression::BitAnd(_)
+                    | AggregateExpression::BitOr(_)
+                    | AggregateExpression::BitXor(_) => {
+                        String::from_utf8_lossy(&value).into_owned()
+                    }
                     _ => hex_literal(&value),
                 };
                 if round_context {
@@ -45451,6 +45575,21 @@ fn parse_order_by_items(sql: &str) -> Option<Vec<OrderByExpression>> {
         })
         .collect::<Vec<_>>();
     (!items.is_empty()).then_some(items)
+}
+
+fn reject_unsupported_order_by_nulls(sql: &str) -> anyhow::Result<()> {
+    let Some(order_by) = find_top_level_keyword(sql, " ORDER BY ", 0) else {
+        return Ok(());
+    };
+    for keyword in [" NULLS FIRST", " NULLS LAST"] {
+        if find_top_level_keyword(sql, keyword, order_by + 10).is_some() {
+            anyhow::bail!(
+                "You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near '{}' at line 1",
+                keyword.trim()
+            );
+        }
+    }
+    Ok(())
 }
 
 fn resolve_row_order_expressions(
@@ -66598,6 +66737,80 @@ mod tests {
             ),
             b"7"
         );
+    }
+
+    #[tokio::test]
+    async fn mysql84_json_bit_aggregate_and_order_syntax_match_mysql() {
+        let (_temp, _storage, mut backend, _second) = transaction_backends().await;
+
+        let QueryOutcome::Rows { rows, .. } = backend
+            .execute("SELECT BIT_AND(7),BIT_OR(3),BIT_XOR(1)")
+            .await
+            .expect("evaluate aggregates without a FROM clause")
+        else {
+            panic!("expected scalar aggregate row")
+        };
+        assert_eq!(
+            rows,
+            vec![vec![
+                Some(b"7".to_vec()),
+                Some(b"3".to_vec()),
+                Some(b"1".to_vec())
+            ]]
+        );
+
+        backend
+            .execute(
+                "CREATE TABLE mysql84_expression_edges (id BIGINT PRIMARY KEY, value BIGINT NULL)",
+            )
+            .await
+            .expect("create aggregate compatibility table");
+        backend
+            .execute("INSERT INTO mysql84_expression_edges VALUES (1,7),(2,3),(3,NULL)")
+            .await
+            .expect("insert aggregate compatibility rows");
+        let QueryOutcome::Rows { rows, .. } = backend
+            .execute(
+                "SELECT BIT_AND(value),BIT_OR(value),BIT_XOR(value) FROM mysql84_expression_edges",
+            )
+            .await
+            .expect("evaluate bit aggregates")
+        else {
+            panic!("expected bit aggregate row")
+        };
+        assert_eq!(
+            rows,
+            vec![vec![
+                Some(b"3".to_vec()),
+                Some(b"7".to_vec()),
+                Some(b"4".to_vec())
+            ]]
+        );
+
+        let QueryOutcome::Rows { rows, .. } = backend
+            .execute(
+                "SELECT JSON_OVERLAPS('[1,2]','[2,3]'),JSON_OVERLAPS('{\"a\":1}','{\"a\":1,\"b\":2}'),JSON_CONTAINS_PATH('{\"a\":1}','one','$.a','$.missing'),JSON_CONTAINS_PATH('{\"a\":1}','all','$.a','$.missing')",
+            )
+            .await
+            .expect("evaluate JSON overlap and path functions")
+        else {
+            panic!("expected JSON function row")
+        };
+        assert_eq!(
+            rows,
+            vec![vec![
+                Some(b"1".to_vec()),
+                Some(b"1".to_vec()),
+                Some(b"1".to_vec()),
+                Some(b"0".to_vec())
+            ]]
+        );
+
+        let error = backend
+            .execute("SELECT 1 AS one ORDER BY one NULLS LAST")
+            .await
+            .expect_err("MySQL rejects NULLS FIRST/LAST syntax");
+        assert!(error.to_string().contains("NULLS LAST"));
     }
 
     #[tokio::test]
