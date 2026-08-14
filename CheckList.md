@@ -223,6 +223,7 @@
 - [x] 2026-08-15 v0.1.25 同条件持久化基准：MyDB 与 MySQL 8.4.11 使用相同 Docker 资源和持久化设置；性能阶段无预热、21.8/60 秒、1 次采样，单表写 218/80 ops/s、4 actor P99 26.2/70.4 ms、并发吞吐 316/155 ops/s、读 P50 311/126 μs；原始结果见 `性能报告.md`，不硬编码历史比值
 - [x] 2026-08-15 v0.1.26 `group_concat_max_len` 阶段：Rust wire 270 测试通过；覆盖 SESSION/GLOBAL 读取与写入、DEFAULT、4 字节下限、UTF-8 字符边界、分组原始 row-id 警告行号和 1260 警告；`scripts/mysql84-diff.ps1` 121/121 通过，隔离 Docker 端口 13316/14316，未触碰物理 3306/4306
 - [x] 2026-08-15 v0.1.27 嵌套聚合阶段：修复 `COUNT(*)+1` 被误识别为顶层聚合，以及无 `FROM`、单表 `FROM`、JOIN 投影中的 `CONCAT`/`COALESCE`/`HEX(GROUP_CONCAT(...))` 聚合组合；Rust wire 270 测试通过，`scripts/mysql84-diff.ps1` 122/122 通过，隔离 Docker 端口 13316/14316，未触碰物理 3306/4306
+- [x] 2026-08-15 v0.1.27 同条件持久化基准：MyDB 与 MySQL 8.4.11 使用相同 Docker 资源和持久化设置；性能阶段无预热、15.1/60 秒、1 次采样，单表写 212/77 ops/s、4 actor P99 26.1/43.1 ms、并发吞吐 1148/571 ops/s、读 P50 396/140 μs；原始结果见 `性能报告.md`，不硬编码历史比值
 - [x] 2026-08-15 v0.1.26 同条件持久化基准：MyDB 与 MySQL 8.4.11 使用相同 Docker 资源和持久化设置；性能阶段无预热、21.7/60 秒、1 次采样，单表写 221/79 ops/s、4 actor P99 35.6/68.9 ms、并发吞吐 336/151 ops/s、读 P50 279/128 μs；原始结果见 `性能报告.md`，不硬编码历史比值
 - [x] 2026-08-14 Windows 隔离安装回归：管理员本地发布包安装 exit 0，生成 ACL 受限 root/admin 强密钥并创建配置/数据目录；新包仅含 server/cli/migrate/dump，不含 mydb-router
 - [x] 2026-08-14 安装包完整性回归：Linux 容器本地 tar.gz 与 Windows 本地 zip 均完成 `.sha256` 校验、强密钥配置和无 router 文件检查；远程安装路径强制下载 sidecar
