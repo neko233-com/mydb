@@ -6,7 +6,7 @@ use std::io::{self, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -34,15 +34,18 @@ use tracing::{debug, info};
 
 use mydb_storage::{
     apply_expression_assignments, is_current_timestamp_default, is_memory_schema,
-    table_engine_from_sql, AlterTableOperation, Column, ColumnPosition, DataType, EventDefinition,
-    EventFinishAction, EventMetadata, EventSchedule, ExpressionAssignment, FunctionDefinition,
-    FunctionParameter, Index, IsolationLevel as MvccIsolation, NumericOperator,
-    ProcedureDefinition, ProcedureMetadata, ProcedureParameter, ProcedureParameterMode, Row,
-    RowPredicate, StorageEngineManager, TableEngine, TableSchema, TransactionId, TriggerDefinition,
-    TriggerEvent, TriggerTiming, UpdateValueExpression, WriteCommand,
+    partition_for_row, table_engine_from_sql, table_partition_info,
+    validate_table_partition_definition, AlterTableOperation, Column, ColumnPosition, DataType,
+    EventDefinition, EventFinishAction, EventMetadata, EventSchedule, ExpressionAssignment,
+    ForeignKeyDefinition, FunctionDefinition, FunctionParameter, Index, IndexKind,
+    IsolationLevel as MvccIsolation, NumericOperator, ProcedureDefinition, ProcedureMetadata,
+    ProcedureParameter, ProcedureParameterMode, Row, RowPredicate, RowPredicateColumnOperator,
+    StorageEngineManager, TableEngine, TablePartitionInfo, TableSchema, TransactionId,
+    TriggerDefinition, TriggerEvent, TriggerTiming, UpdateValueExpression, WriteCommand,
 };
 
 pub const SERVER_VERSION: &str = "8.4.0-mydb-0.1.0";
+pub const MYSQL84_DEFAULT_SQL_MODE: &str = "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION";
 const MAX_SCALAR_RESULT_BYTES: usize = 64 * 1024 * 1024;
 const REGEX_CACHE_CAPACITY: usize = 256;
 const READ_ONLY_TRANSACTION_ERROR: &str = "Cannot execute statement in a READ ONLY transaction.";
@@ -71,6 +74,7 @@ struct StoredFunctionCatalog {
     functions: HashMap<(String, String), FunctionDefinition>,
     auth_catalog: Arc<AuthCatalog>,
     authenticated_user: String,
+    active_roles: HashSet<String>,
 }
 
 impl StoredFunctionCatalog {
@@ -79,6 +83,7 @@ impl StoredFunctionCatalog {
         default_database: &str,
         auth_catalog: Arc<AuthCatalog>,
         authenticated_user: String,
+        active_roles: HashSet<String>,
     ) -> Self {
         let mut functions = HashMap::new();
         for database_name in storage.list_databases() {
@@ -100,6 +105,7 @@ impl StoredFunctionCatalog {
             functions,
             auth_catalog,
             authenticated_user,
+            active_roles,
         }
     }
 
@@ -113,12 +119,13 @@ impl StoredFunctionCatalog {
     }
 
     fn require_execute(&self, database: &str, function: &str) -> anyhow::Result<()> {
-        if self.auth_catalog.has_routine_privilege(
+        if self.auth_catalog.has_routine_privilege_with_roles(
             &self.authenticated_user,
             RoutineKind::Function,
             database,
             function,
             "EXECUTE",
+            &self.active_roles,
         ) {
             return Ok(());
         }
@@ -132,6 +139,7 @@ impl StoredFunctionCatalog {
 }
 
 type Predicate = Option<RowPredicate>;
+type GroupRows = std::collections::BTreeMap<Vec<Option<Vec<u8>>>, Vec<Row>>;
 type LiteralAssignments = Vec<(String, Option<Vec<u8>>)>;
 type ParsedUpdate = (
     String,
@@ -221,6 +229,16 @@ impl TriggerLocalScopes {
             .and_then(|scope| scope.get(name))
     }
 
+    fn declared_type(&self, name: &str) -> Option<&str> {
+        self.scopes
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, scope)| scope.contains(name))
+            .and_then(|(index, _)| self.types[index].get(&name.to_ascii_lowercase()))
+            .map(String::as_str)
+    }
+
     fn declare(
         &mut self,
         name: &str,
@@ -286,6 +304,7 @@ struct LoadDataSpec {
     table: String,
     replace: bool,
     ignore: bool,
+    partitions: Option<Vec<String>>,
     field_terminator: Vec<u8>,
     enclosed_by: Option<u8>,
     optionally_enclosed: bool,
@@ -381,6 +400,8 @@ enum ConflictOperand {
 pub struct ProtocolConfig {
     pub username: String,
     pub password: String,
+    pub authentication: String,
+    pub default_sql_mode: String,
     pub default_database: String,
     pub slow_query_threshold_ms: u64,
     pub max_slow_queries: usize,
@@ -399,6 +420,8 @@ impl Default for ProtocolConfig {
         Self {
             username: "root".to_string(),
             password: "root".to_string(),
+            authentication: "caching_sha2_password".to_string(),
+            default_sql_mode: String::new(),
             default_database: "mydb".to_string(),
             slow_query_threshold_ms: 100,
             max_slow_queries: 1024,
@@ -557,9 +580,49 @@ fn audit_worker(
     let mut pending = Vec::with_capacity(256);
     loop {
         match receiver.recv_timeout(Duration::from_millis(10)) {
-            Ok(AuditCommand::Record(event)) => pending.push(event),
+            Ok(AuditCommand::Record(event)) => {
+                pending.push(event);
+                let deadline = Instant::now() + Duration::from_millis(10);
+                let mut flushed = false;
+                while pending.len() < 256 {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    match receiver.recv_timeout(remaining) {
+                        Ok(AuditCommand::Record(event)) => pending.push(event),
+                        Ok(AuditCommand::Flush(reply)) => {
+                            let result =
+                                write_audit_batch(&path, max_bytes, max_files, &mut pending, true);
+                            if let Err(error) = &result {
+                                *failure.lock() = Some(error.to_string());
+                            }
+                            let _ = reply.send(result);
+                            flushed = true;
+                            break;
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => break,
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            let result =
+                                write_audit_batch(&path, max_bytes, max_files, &mut pending, false);
+                            if let Err(error) = result {
+                                *failure.lock() = Some(error.to_string());
+                            }
+                            return;
+                        }
+                    }
+                }
+                if !flushed && !pending.is_empty() {
+                    if let Err(error) =
+                        write_audit_batch(&path, max_bytes, max_files, &mut pending, false)
+                    {
+                        *failure.lock() = Some(error.to_string());
+                        break;
+                    }
+                }
+            }
             Ok(AuditCommand::Flush(reply)) => {
-                let result = write_audit_batch(&path, max_bytes, max_files, &mut pending);
+                let result = write_audit_batch(&path, max_bytes, max_files, &mut pending, true);
                 if let Err(error) = &result {
                     *failure.lock() = Some(error.to_string());
                 }
@@ -568,30 +631,19 @@ fn audit_worker(
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                let result = write_audit_batch(&path, max_bytes, max_files, &mut pending);
+                let result = write_audit_batch(&path, max_bytes, max_files, &mut pending, true);
                 if let Err(error) = result {
                     *failure.lock() = Some(error.to_string());
                 }
                 break;
             }
         }
-        while pending.len() < 256 {
-            match receiver.try_recv() {
-                Ok(AuditCommand::Record(event)) => pending.push(event),
-                Ok(AuditCommand::Flush(reply)) => {
-                    let result = write_audit_batch(&path, max_bytes, max_files, &mut pending);
-                    if let Err(error) = &result {
-                        *failure.lock() = Some(error.to_string());
-                    }
-                    let _ = reply.send(result);
-                }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => break,
+        if pending.len() >= 256 {
+            if let Err(error) = write_audit_batch(&path, max_bytes, max_files, &mut pending, false)
+            {
+                *failure.lock() = Some(error.to_string());
+                break;
             }
-        }
-        if let Err(error) = write_audit_batch(&path, max_bytes, max_files, &mut pending) {
-            *failure.lock() = Some(error.to_string());
-            break;
         }
     }
 }
@@ -601,6 +653,7 @@ fn write_audit_batch(
     max_bytes: u64,
     max_files: u32,
     pending: &mut Vec<Vec<u8>>,
+    sync_data: bool,
 ) -> anyhow::Result<()> {
     if pending.is_empty() {
         return Ok(());
@@ -612,8 +665,12 @@ fn write_audit_batch(
     for event in pending.drain(..) {
         let event_bytes = event.len() as u64 + 1;
         if current_bytes.saturating_add(event_bytes) > max_bytes && current_bytes > 0 {
-            if let Some(file) = file.take() {
-                file.sync_data()?;
+            if sync_data {
+                if let Some(file) = file.take() {
+                    file.sync_data()?;
+                }
+            } else {
+                file.take();
             }
             rotate_audit_log(path, max_files)?;
             current_bytes = 0;
@@ -631,8 +688,10 @@ fn write_audit_batch(
         file.write_all(b"\n")?;
         current_bytes = current_bytes.saturating_add(event_bytes);
     }
-    if let Some(file) = file {
-        file.sync_data()?;
+    if sync_data {
+        if let Some(file) = file {
+            file.sync_data()?;
+        }
     }
     Ok(())
 }
@@ -674,13 +733,40 @@ fn rotate_audit_log(path: &Path, max_files: u32) -> anyhow::Result<()> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AuthUser {
     password_sha1: String,
+    #[serde(default)]
+    password_sha256: String,
+    #[serde(default = "default_authentication_plugin")]
+    plugin: String,
     global_privileges: HashSet<String>,
     database_privileges: HashMap<String, HashSet<String>>,
     #[serde(default)]
     table_privileges: AuthTablePrivileges,
     #[serde(default)]
+    column_privileges: AuthColumnPrivileges,
+    #[serde(default)]
     routine_privileges: AuthRoutinePrivileges,
     roles: HashSet<String>,
+    #[serde(default)]
+    default_roles: AuthDefaultRoles,
+}
+
+fn default_authentication_plugin() -> String {
+    "caching_sha2_password".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct AuthDefaultRoles {
+    #[serde(default)]
+    all: bool,
+    #[serde(default)]
+    roles: HashSet<String>,
+}
+
+#[derive(Debug, Clone)]
+enum DefaultRoleSelection {
+    None,
+    All,
+    Roles(Vec<String>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -690,6 +776,8 @@ struct AuthRole {
     #[serde(default)]
     table_privileges: AuthTablePrivileges,
     #[serde(default)]
+    column_privileges: AuthColumnPrivileges,
+    #[serde(default)]
     routine_privileges: AuthRoutinePrivileges,
     #[serde(default)]
     roles: HashSet<String>,
@@ -698,6 +786,11 @@ struct AuthRole {
 /// Table grants use database/table keys so legacy auth JSON remains readable
 /// while `GRANT ... ON db.table` can be enforced without broad database grants.
 type AuthTablePrivileges = HashMap<String, HashMap<String, HashSet<String>>>;
+
+/// Column grants use database/table/column keys so MySQL's column-level
+/// `GRANT SELECT (column)` and `GRANT UPDATE (column)` survive restarts.
+type AuthColumnPrivileges = HashMap<String, HashMap<String, HashMap<String, HashSet<String>>>>;
+type GrantPrivilegeSpec = (HashSet<String>, HashMap<String, HashSet<String>>);
 
 /// Routine grants use nested maps so their durable JSON representation stays
 /// readable and unambiguous even when object names contain punctuation.
@@ -849,7 +942,7 @@ impl AuthCatalog {
         bootstrap_password: &str,
     ) -> anyhow::Result<Self> {
         let path = data_dir.join("auth.json");
-        let data = if path.exists() {
+        let mut data = if path.exists() {
             serde_json::from_slice(&fs::read(&path)?)?
         } else {
             let mut data = AuthCatalogData {
@@ -860,11 +953,15 @@ impl AuthCatalog {
                 normalize_auth_name(bootstrap_user),
                 AuthUser {
                     password_sha1: password_sha1_hex(bootstrap_password),
+                    password_sha256: password_sha256_hex(bootstrap_password),
+                    plugin: default_authentication_plugin(),
                     global_privileges: HashSet::from(["ALL".to_string()]),
                     database_privileges: HashMap::new(),
                     table_privileges: AuthTablePrivileges::default(),
+                    column_privileges: AuthColumnPrivileges::default(),
                     routine_privileges: AuthRoutinePrivileges::default(),
                     roles: HashSet::new(),
+                    default_roles: AuthDefaultRoles::default(),
                 },
             );
             write_auth_catalog(&path, &data)?;
@@ -872,6 +969,17 @@ impl AuthCatalog {
         };
         if data.format_version != 1 {
             anyhow::bail!("unsupported authentication catalog version");
+        }
+        let bootstrap_user = normalize_auth_name(bootstrap_user);
+        let needs_bootstrap_sha256 = data
+            .users
+            .get(&bootstrap_user)
+            .is_some_and(|user| user.password_sha256.is_empty());
+        if needs_bootstrap_sha256 {
+            if let Some(user) = data.users.get_mut(&bootstrap_user) {
+                user.password_sha256 = password_sha256_hex(bootstrap_password);
+            }
+            write_auth_catalog(&path, &data)?;
         }
         Ok(Self {
             path: Some(path),
@@ -886,11 +994,15 @@ impl AuthCatalog {
             normalize_auth_name(bootstrap_user),
             AuthUser {
                 password_sha1: password_sha1_hex(bootstrap_password),
+                password_sha256: password_sha256_hex(bootstrap_password),
+                plugin: default_authentication_plugin(),
                 global_privileges: HashSet::from(["ALL".to_string()]),
                 database_privileges: HashMap::new(),
                 table_privileges: AuthTablePrivileges::default(),
+                column_privileges: AuthColumnPrivileges::default(),
                 routine_privileges: AuthRoutinePrivileges::default(),
                 roles: HashSet::new(),
+                default_roles: AuthDefaultRoles::default(),
             },
         );
         Self {
@@ -904,9 +1016,37 @@ impl AuthCatalog {
         }
     }
 
-    fn authenticate(&self, source: &str, user: &str, salt: &[u8], response: &[u8]) -> bool {
-        let user = normalize_auth_name(user);
-        let key = format!("{source}|{user}");
+    pub fn verify_password(&self, user: &str, password: &str) -> Option<String> {
+        let data = self.data.read();
+        let user = resolve_auth_user_key_for_host(&data.users, user, "localhost")?;
+        let accepted = data.users.get(&user).is_some_and(|entry| {
+            entry.password_sha1 == password_sha1_hex(password)
+                || (!entry.password_sha256.is_empty()
+                    && entry.password_sha256 == password_sha256_hex(password))
+        });
+        accepted.then_some(user)
+    }
+
+    fn authentication_plugin(&self, user: &str, source: &str) -> String {
+        let data = self.data.read();
+        resolve_auth_user_key_for_host(&data.users, user, source)
+            .and_then(|key| data.users.get(&key).map(|entry| entry.plugin.clone()))
+            .filter(|plugin| is_supported_authentication_plugin(plugin))
+            .unwrap_or_else(default_authentication_plugin)
+    }
+
+    fn authenticate(
+        &self,
+        source: &str,
+        user: &str,
+        auth_plugin: &str,
+        salt: &[u8],
+        response: &[u8],
+    ) -> Option<String> {
+        let requested_user = normalize_auth_name(user);
+        let data = self.data.read();
+        let resolved_user = resolve_auth_user_key_for_host(&data.users, &requested_user, source);
+        let key = format!("{source}|{requested_user}");
         let now = Instant::now();
         if self
             .failures
@@ -914,11 +1054,21 @@ impl AuthCatalog {
             .get(&key)
             .is_some_and(|state| state.blocked_until > now)
         {
-            return false;
+            return None;
         }
-        let accepted = self.data.read().users.get(&user).is_some_and(|entry| {
-            verify_mysql_native_password_sha1(&entry.password_sha1, salt, response)
-        });
+        let accepted = resolved_user
+            .as_ref()
+            .and_then(|user| data.users.get(user))
+            .is_some_and(|entry| match auth_plugin {
+                "mysql_native_password" => {
+                    verify_mysql_native_password_sha1(&entry.password_sha1, salt, response)
+                }
+                "caching_sha2_password" => {
+                    verify_caching_sha2_password_sha256(&entry.password_sha256, salt, response)
+                }
+                _ => false,
+            });
+        drop(data);
         let mut failures = self.failures.lock();
         if accepted {
             failures.remove(&key);
@@ -937,7 +1087,7 @@ impl AuthCatalog {
                 state.blocked_until = now + Duration::from_secs(seconds);
             }
         }
-        accepted
+        accepted.then(|| resolved_user.expect("accepted authentication has a user key"))
     }
 
     fn has_privilege(&self, user: &str, database: &str, privilege: &str) -> bool {
@@ -985,6 +1135,39 @@ impl AuthCatalog {
             })
     }
 
+    fn has_column_privilege(
+        &self,
+        user: &str,
+        database: &str,
+        table: &str,
+        column: &str,
+        privilege: &str,
+    ) -> bool {
+        let data = self.data.read();
+        let Some(user) = data.users.get(&normalize_auth_name(user)) else {
+            return false;
+        };
+        let database = database.to_ascii_lowercase();
+        let table = table.to_ascii_lowercase();
+        let column = column.to_ascii_lowercase();
+        user.column_privileges
+            .get(&database)
+            .and_then(|tables| tables.get(&table))
+            .and_then(|columns| columns.get(&column))
+            .is_some_and(|set| privilege_set_allows(set, privilege))
+            || user.roles.iter().any(|role| {
+                role_has_column_privilege(
+                    &data,
+                    role,
+                    &database,
+                    &table,
+                    &column,
+                    privilege,
+                    &mut HashSet::new(),
+                )
+            })
+    }
+
     fn has_routine_privilege(
         &self,
         user: &str,
@@ -1019,6 +1202,195 @@ impl AuthCatalog {
             })
     }
 
+    fn granted_roles(&self, user: &str) -> HashSet<String> {
+        let data = self.data.read();
+        let Some(user_key) = resolve_auth_user_key(&data.users, user) else {
+            return HashSet::new();
+        };
+        data.users
+            .get(&user_key)
+            .map(|entry| entry.roles.clone())
+            .unwrap_or_default()
+    }
+
+    fn default_roles(&self, user: &str) -> HashSet<String> {
+        let data = self.data.read();
+        let Some(user_key) = resolve_auth_user_key(&data.users, user) else {
+            return HashSet::new();
+        };
+        let Some(entry) = data.users.get(&user_key) else {
+            return HashSet::new();
+        };
+        if entry.default_roles.all {
+            return entry.roles.clone();
+        }
+        entry
+            .default_roles
+            .roles
+            .iter()
+            .filter(|role| entry.roles.contains(*role) && data.roles.contains_key(*role))
+            .cloned()
+            .collect()
+    }
+
+    fn available_roles(&self, user: &str) -> HashSet<String> {
+        let data = self.data.read();
+        let Some(user_key) = resolve_auth_user_key(&data.users, user) else {
+            return HashSet::new();
+        };
+        let Some(entry) = data.users.get(&user_key) else {
+            return HashSet::new();
+        };
+        expand_role_names(&data, &entry.roles)
+    }
+
+    fn expand_roles(&self, roots: &HashSet<String>) -> HashSet<String> {
+        let data = self.data.read();
+        expand_role_names(&data, roots)
+    }
+
+    fn set_default_roles(
+        &self,
+        principals: &[String],
+        selection: DefaultRoleSelection,
+    ) -> anyhow::Result<()> {
+        let principals = normalize_auth_names(principals)?;
+        self.mutate(|data| apply_default_role_selection(data, &principals, &selection))
+    }
+
+    fn has_privilege_with_roles(
+        &self,
+        user: &str,
+        database: &str,
+        privilege: &str,
+        active_roles: &HashSet<String>,
+    ) -> bool {
+        let data = self.data.read();
+        let Some(user_key) = resolve_auth_user_key(&data.users, user) else {
+            return false;
+        };
+        let Some(user) = data.users.get(&user_key) else {
+            return false;
+        };
+        let database = database.to_ascii_lowercase();
+        privilege_set_allows(&user.global_privileges, privilege)
+            || user
+                .database_privileges
+                .get(&database)
+                .is_some_and(|set| privilege_set_allows(set, privilege))
+            || active_roles.iter().any(|role| {
+                role_has_privilege(&data, role, &database, privilege, &mut HashSet::new())
+            })
+    }
+
+    fn has_table_privilege_with_roles(
+        &self,
+        user: &str,
+        database: &str,
+        table: &str,
+        privilege: &str,
+        active_roles: &HashSet<String>,
+    ) -> bool {
+        let data = self.data.read();
+        let Some(user_key) = resolve_auth_user_key(&data.users, user) else {
+            return false;
+        };
+        let Some(user) = data.users.get(&user_key) else {
+            return false;
+        };
+        let database = database.to_ascii_lowercase();
+        let table = table.to_ascii_lowercase();
+        user.table_privileges
+            .get(&database)
+            .and_then(|tables| tables.get(&table))
+            .is_some_and(|set| privilege_set_allows(set, privilege))
+            || active_roles.iter().any(|role| {
+                role_has_table_privilege(
+                    &data,
+                    role,
+                    &database,
+                    &table,
+                    privilege,
+                    &mut HashSet::new(),
+                )
+            })
+    }
+
+    fn has_column_privilege_with_roles(
+        &self,
+        user: &str,
+        database: &str,
+        table: &str,
+        column: &str,
+        privilege: &str,
+        active_roles: &HashSet<String>,
+    ) -> bool {
+        let data = self.data.read();
+        let Some(user_key) = resolve_auth_user_key(&data.users, user) else {
+            return false;
+        };
+        let Some(user) = data.users.get(&user_key) else {
+            return false;
+        };
+        let database = database.to_ascii_lowercase();
+        let table = table.to_ascii_lowercase();
+        let column = column.to_ascii_lowercase();
+        user.column_privileges
+            .get(&database)
+            .and_then(|tables| tables.get(&table))
+            .and_then(|columns| columns.get(&column))
+            .is_some_and(|set| privilege_set_allows(set, privilege))
+            || active_roles.iter().any(|role| {
+                role_has_column_privilege(
+                    &data,
+                    role,
+                    &database,
+                    &table,
+                    &column,
+                    privilege,
+                    &mut HashSet::new(),
+                )
+            })
+    }
+
+    fn has_routine_privilege_with_roles(
+        &self,
+        user: &str,
+        kind: RoutineKind,
+        database: &str,
+        routine: &str,
+        privilege: &str,
+        active_roles: &HashSet<String>,
+    ) -> bool {
+        let data = self.data.read();
+        let Some(user_key) = resolve_auth_user_key(&data.users, user) else {
+            return false;
+        };
+        let Some(user) = data.users.get(&user_key) else {
+            return false;
+        };
+        let database = database.to_ascii_lowercase();
+        privilege_set_allows(&user.global_privileges, privilege)
+            || user
+                .database_privileges
+                .get(&database)
+                .is_some_and(|set| privilege_set_allows(set, privilege))
+            || user
+                .routine_privileges
+                .has(kind, &database, routine, privilege)
+            || active_roles.iter().any(|role| {
+                role_has_routine_privilege(
+                    &data,
+                    role,
+                    kind,
+                    &database,
+                    routine,
+                    privilege,
+                    &mut HashSet::new(),
+                )
+            })
+    }
+
     fn mutate(
         &self,
         operation: impl FnOnce(&mut AuthCatalogData) -> anyhow::Result<()>,
@@ -1033,28 +1405,33 @@ impl AuthCatalog {
         Ok(())
     }
 
-    fn create_users(&self, users: &[(String, String)], if_not_exists: bool) -> anyhow::Result<()> {
+    fn create_users(
+        &self,
+        users: &[(String, String, String)],
+        if_not_exists: bool,
+    ) -> anyhow::Result<()> {
         if users.is_empty() {
             anyhow::bail!("CREATE USER requires at least one user");
         }
         let users = users
             .iter()
-            .map(|(user, password)| (normalize_auth_name(user), password.clone()))
+            .map(|(user, password, plugin)| {
+                (normalize_auth_name(user), password.clone(), plugin.clone())
+            })
             .collect::<Vec<_>>();
-        if users
-            .iter()
-            .any(|(user, password)| user.is_empty() || password.is_empty())
-        {
+        if users.iter().any(|(user, password, plugin)| {
+            user.is_empty() || password.is_empty() || !is_supported_authentication_plugin(plugin)
+        }) {
             anyhow::bail!("user name and password must not be empty");
         }
         self.mutate(|data| {
             let mut seen = HashSet::new();
-            for (user, _) in &users {
+            for (user, _, _) in &users {
                 if !seen.insert(user) || (!if_not_exists && data.users.contains_key(user)) {
                     anyhow::bail!("Operation CREATE USER failed for '{}'", user);
                 }
             }
-            for (user, password) in users {
+            for (user, password, plugin) in users {
                 if if_not_exists && data.users.contains_key(&user) {
                     continue;
                 }
@@ -1062,11 +1439,15 @@ impl AuthCatalog {
                     user,
                     AuthUser {
                         password_sha1: password_sha1_hex(&password),
+                        password_sha256: password_sha256_hex(&password),
+                        plugin,
                         global_privileges: HashSet::new(),
                         database_privileges: HashMap::new(),
                         table_privileges: AuthTablePrivileges::default(),
+                        column_privileges: AuthColumnPrivileges::default(),
                         routine_privileges: AuthRoutinePrivileges::default(),
                         roles: HashSet::new(),
+                        default_roles: AuthDefaultRoles::default(),
                     },
                 );
             }
@@ -1074,27 +1455,140 @@ impl AuthCatalog {
         })
     }
 
-    fn alter_user_passwords(&self, users: &[(String, String)]) -> anyhow::Result<()> {
+    fn create_users_with_default_roles(
+        &self,
+        users: &[(String, String, String)],
+        if_not_exists: bool,
+        selection: DefaultRoleSelection,
+    ) -> anyhow::Result<()> {
+        if users.is_empty() {
+            anyhow::bail!("CREATE USER requires at least one user");
+        }
+        let users = users
+            .iter()
+            .map(|(user, password, plugin)| {
+                (normalize_auth_name(user), password.clone(), plugin.clone())
+            })
+            .collect::<Vec<_>>();
+        if users.iter().any(|(user, password, plugin)| {
+            user.is_empty() || password.is_empty() || !is_supported_authentication_plugin(plugin)
+        }) {
+            anyhow::bail!("user name and password must not be empty");
+        }
+        let principals = users
+            .iter()
+            .map(|(user, _, _)| user.clone())
+            .collect::<Vec<_>>();
+        self.mutate(|data| {
+            let mut seen = HashSet::new();
+            for (user, _, _) in &users {
+                if !seen.insert(user) || (!if_not_exists && data.users.contains_key(user)) {
+                    anyhow::bail!("Operation CREATE USER failed for '{}'", user);
+                }
+            }
+            for (user, password, plugin) in &users {
+                if if_not_exists && data.users.contains_key(user) {
+                    continue;
+                }
+                data.users.insert(
+                    user.clone(),
+                    AuthUser {
+                        password_sha1: password_sha1_hex(password),
+                        password_sha256: password_sha256_hex(password),
+                        plugin: plugin.clone(),
+                        global_privileges: HashSet::new(),
+                        database_privileges: HashMap::new(),
+                        table_privileges: AuthTablePrivileges::default(),
+                        column_privileges: AuthColumnPrivileges::default(),
+                        routine_privileges: AuthRoutinePrivileges::default(),
+                        roles: HashSet::new(),
+                        default_roles: AuthDefaultRoles::default(),
+                    },
+                );
+            }
+            apply_default_role_selection(data, &principals, &selection)
+        })
+    }
+
+    fn alter_user_passwords(&self, users: &[(String, String, String)]) -> anyhow::Result<()> {
         if users.is_empty() {
             anyhow::bail!("ALTER USER requires at least one user");
         }
         let users = users
             .iter()
-            .map(|(user, password)| (normalize_auth_name(user), password.clone()))
+            .map(|(user, password, plugin)| {
+                (normalize_auth_name(user), password.clone(), plugin.clone())
+            })
             .collect::<Vec<_>>();
         self.mutate(|data| {
-            for (user, _) in &users {
+            for (user, _, plugin) in &users {
                 if !data.users.contains_key(user) {
                     anyhow::bail!("Operation ALTER USER failed for '{}'", user);
                 }
+                if !is_supported_authentication_plugin(plugin) {
+                    anyhow::bail!(
+                        "unsupported authentication plugin '{}', user '{}'",
+                        plugin,
+                        user
+                    );
+                }
             }
-            for (user, password) in users {
+            for (user, password, plugin) in users {
                 data.users
                     .get_mut(&user)
                     .expect("user was checked above")
                     .password_sha1 = password_sha1_hex(&password);
+                data.users
+                    .get_mut(&user)
+                    .expect("user was checked above")
+                    .password_sha256 = password_sha256_hex(&password);
+                data.users
+                    .get_mut(&user)
+                    .expect("user was checked above")
+                    .plugin = plugin;
             }
             Ok(())
+        })
+    }
+
+    fn alter_user_passwords_with_default_roles(
+        &self,
+        users: &[(String, String, String)],
+        selection: DefaultRoleSelection,
+    ) -> anyhow::Result<()> {
+        if users.is_empty() {
+            anyhow::bail!("ALTER USER requires at least one user");
+        }
+        let users = users
+            .iter()
+            .map(|(user, password, plugin)| {
+                (normalize_auth_name(user), password.clone(), plugin.clone())
+            })
+            .collect::<Vec<_>>();
+        let principals = users
+            .iter()
+            .map(|(user, _, _)| user.clone())
+            .collect::<Vec<_>>();
+        self.mutate(|data| {
+            for (user, _, plugin) in &users {
+                if !data.users.contains_key(user) {
+                    anyhow::bail!("Operation ALTER USER failed for '{}'", user);
+                }
+                if !is_supported_authentication_plugin(plugin) {
+                    anyhow::bail!(
+                        "unsupported authentication plugin '{}', user '{}'",
+                        plugin,
+                        user
+                    );
+                }
+            }
+            for (user, password, plugin) in &users {
+                let entry = data.users.get_mut(user).expect("user was checked above");
+                entry.password_sha1 = password_sha1_hex(password);
+                entry.password_sha256 = password_sha256_hex(password);
+                entry.plugin = plugin.clone();
+            }
+            apply_default_role_selection(data, &principals, &selection)
         })
     }
 
@@ -1251,6 +1745,99 @@ impl AuthCatalog {
                     if let Some(current) = tables.get_mut(&table) {
                         for privilege in privileges {
                             current.remove(privilege);
+                        }
+                        if current.is_empty() {
+                            tables.remove(&table);
+                        }
+                    }
+                    if tables.is_empty() {
+                        grants.remove(&database);
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn grant_column_privileges(
+        &self,
+        principals: &[String],
+        database: &str,
+        table: &str,
+        columns: &HashMap<String, HashSet<String>>,
+    ) -> anyhow::Result<()> {
+        let principals = normalize_auth_names(principals)?;
+        let database = database.to_ascii_lowercase();
+        let table = table.to_ascii_lowercase();
+        self.mutate(|data| {
+            for principal in &principals {
+                if !data.users.contains_key(principal) && !data.roles.contains_key(principal) {
+                    anyhow::bail!("Unknown user or role '{}'", principal);
+                }
+            }
+            for principal in principals {
+                let grants = if let Some(user) = data.users.get_mut(&principal) {
+                    &mut user.column_privileges
+                } else {
+                    &mut data
+                        .roles
+                        .get_mut(&principal)
+                        .expect("principal was checked above")
+                        .column_privileges
+                };
+                let target = grants
+                    .entry(database.clone())
+                    .or_default()
+                    .entry(table.clone())
+                    .or_default();
+                for (column, privileges) in columns {
+                    target
+                        .entry(column.to_ascii_lowercase())
+                        .or_default()
+                        .extend(privileges.iter().cloned());
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn revoke_column_privileges(
+        &self,
+        principals: &[String],
+        database: &str,
+        table: &str,
+        columns: &HashMap<String, HashSet<String>>,
+    ) -> anyhow::Result<()> {
+        let principals = normalize_auth_names(principals)?;
+        let database = database.to_ascii_lowercase();
+        let table = table.to_ascii_lowercase();
+        self.mutate(|data| {
+            for principal in &principals {
+                if !data.users.contains_key(principal) && !data.roles.contains_key(principal) {
+                    anyhow::bail!("Unknown user or role '{}'", principal);
+                }
+            }
+            for principal in principals {
+                let grants = if let Some(user) = data.users.get_mut(&principal) {
+                    &mut user.column_privileges
+                } else {
+                    &mut data
+                        .roles
+                        .get_mut(&principal)
+                        .expect("principal was checked above")
+                        .column_privileges
+                };
+                if let Some(tables) = grants.get_mut(&database) {
+                    if let Some(current) = tables.get_mut(&table) {
+                        for (column, privileges) in columns {
+                            if let Some(existing) = current.get_mut(&column.to_ascii_lowercase()) {
+                                for privilege in privileges {
+                                    existing.remove(privilege);
+                                }
+                                if existing.is_empty() {
+                                    current.remove(&column.to_ascii_lowercase());
+                                }
+                            }
                         }
                         if current.is_empty() {
                             tables.remove(&table);
@@ -1447,12 +2034,13 @@ impl AuthCatalog {
     fn show_grants(&self, principal: &str, using_roles: &[String]) -> anyhow::Result<Vec<String>> {
         let principal = normalize_auth_name(principal);
         let data = self.data.read();
-        let (mut global, mut databases, mut tables, mut routines, roles) =
+        let (mut global, mut databases, mut tables, mut columns, mut routines, roles) =
             if let Some(user) = data.users.get(&principal) {
                 (
                     user.global_privileges.clone(),
                     user.database_privileges.clone(),
                     user.table_privileges.clone(),
+                    user.column_privileges.clone(),
                     user.routine_privileges.clone(),
                     user.roles.clone(),
                 )
@@ -1461,6 +2049,7 @@ impl AuthCatalog {
                     role.global_privileges.clone(),
                     role.database_privileges.clone(),
                     role.table_privileges.clone(),
+                    role.column_privileges.clone(),
                     role.routine_privileges.clone(),
                     role.roles.clone(),
                 )
@@ -1477,6 +2066,7 @@ impl AuthCatalog {
                 &mut global,
                 &mut databases,
                 &mut tables,
+                &mut columns,
                 &mut routines,
                 &mut HashSet::new(),
             )?;
@@ -1517,6 +2107,32 @@ impl AuthCatalog {
                         table.replace('`', "``"),
                         subject
                     ));
+                }
+            }
+        }
+        let mut columns = columns.into_iter().collect::<Vec<_>>();
+        columns.sort_by(|left, right| left.0.cmp(&right.0));
+        for (database, database_tables) in columns {
+            let mut database_tables = database_tables.into_iter().collect::<Vec<_>>();
+            database_tables.sort_by(|left, right| left.0.cmp(&right.0));
+            for (table, table_columns) in database_tables {
+                let mut table_columns = table_columns.into_iter().collect::<Vec<_>>();
+                table_columns.sort_by(|left, right| left.0.cmp(&right.0));
+                for (column, privileges) in table_columns {
+                    for privilege in {
+                        let mut values = privileges.iter().cloned().collect::<Vec<_>>();
+                        values.sort();
+                        values
+                    } {
+                        grants.push(format!(
+                            "GRANT {} (`{}`) ON `{}`.`{}` TO {}",
+                            privilege,
+                            column.replace('`', "``"),
+                            database.replace('`', "``"),
+                            table.replace('`', "``"),
+                            subject
+                        ));
+                    }
                 }
             }
         }
@@ -1577,11 +2193,171 @@ impl AuthCatalog {
     }
 }
 
+fn apply_default_role_selection(
+    data: &mut AuthCatalogData,
+    principals: &[String],
+    selection: &DefaultRoleSelection,
+) -> anyhow::Result<()> {
+    for principal in principals {
+        let user = data
+            .users
+            .get(principal)
+            .ok_or_else(|| anyhow::anyhow!("Unknown user '{}'", principal))?;
+        if let DefaultRoleSelection::Roles(roles) = selection {
+            for role in roles {
+                if !user.roles.contains(role) || !data.roles.contains_key(role) {
+                    anyhow::bail!("Role '{}' is not granted to user '{}'", role, principal);
+                }
+            }
+        }
+    }
+    for principal in principals {
+        let user = data
+            .users
+            .get_mut(principal)
+            .expect("user was checked above");
+        user.default_roles = match selection {
+            DefaultRoleSelection::None => AuthDefaultRoles::default(),
+            DefaultRoleSelection::All => AuthDefaultRoles {
+                all: true,
+                roles: HashSet::new(),
+            },
+            DefaultRoleSelection::Roles(roles) => AuthDefaultRoles {
+                all: false,
+                roles: roles.iter().cloned().collect(),
+            },
+        };
+    }
+    Ok(())
+}
+
 fn normalize_auth_name(name: &str) -> String {
-    name.trim()
-        .trim_matches('`')
-        .trim_matches('\'')
-        .to_ascii_lowercase()
+    let name = name.trim();
+    if let Some((user, host)) = name.split_once('@') {
+        return format!(
+            "{}@{}",
+            user.trim().trim_matches(['`', '\'', '"']),
+            host.trim().trim_matches(['`', '\'', '"'])
+        )
+        .to_ascii_lowercase();
+    }
+    name.trim_matches(['`', '\'', '"']).to_ascii_lowercase()
+}
+
+fn resolve_auth_user_key(users: &HashMap<String, AuthUser>, requested: &str) -> Option<String> {
+    let requested = normalize_auth_name(requested);
+    if users.contains_key(&requested) {
+        return Some(requested);
+    }
+    let wildcard = format!("{requested}@%");
+    if users.contains_key(&wildcard) {
+        return Some(wildcard);
+    }
+    let localhost = format!("{requested}@localhost");
+    users.contains_key(&localhost).then_some(localhost)
+}
+
+fn resolve_auth_user_key_for_host(
+    users: &HashMap<String, AuthUser>,
+    requested: &str,
+    source: &str,
+) -> Option<String> {
+    let requested = normalize_auth_name(requested);
+    let (user, embedded_host) = requested
+        .split_once('@')
+        .map(|(user, host)| (user.to_string(), Some(host.to_string())))
+        .unwrap_or((requested, None));
+    let source = source.trim().to_ascii_lowercase();
+    let source = if source.is_empty() {
+        "localhost".to_string()
+    } else {
+        source
+    };
+    let requested_host = embedded_host.unwrap_or_else(|| source.clone());
+    let mut candidates = users
+        .keys()
+        .filter_map(|key| {
+            let (candidate_user, candidate_host) = key.split_once('@').unwrap_or((key, "%"));
+            if candidate_user != user || !mysql_host_matches(candidate_host, &requested_host) {
+                return None;
+            }
+            Some((
+                mysql_host_specificity(candidate_host, &requested_host),
+                key.clone(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    candidates
+        .into_iter()
+        .next()
+        .map(|(_, key)| key)
+        .or_else(|| resolve_auth_user_key(users, &format!("{user}@{requested_host}")))
+}
+
+fn mysql_host_matches(pattern: &str, host: &str) -> bool {
+    let pattern = pattern.to_ascii_lowercase();
+    let host = host.to_ascii_lowercase();
+    if pattern == "%" || pattern == "_" {
+        return true;
+    }
+    if pattern == host {
+        return true;
+    }
+    if let Some((network, mask)) = pattern.split_once('/') {
+        if let (Ok(network), Ok(mask), Ok(host)) = (
+            network.parse::<std::net::Ipv4Addr>(),
+            mask.parse::<std::net::Ipv4Addr>(),
+            host.parse::<std::net::Ipv4Addr>(),
+        ) {
+            let network = u32::from(network);
+            let mask = u32::from(mask);
+            return (network & mask) == (u32::from(host) & mask);
+        }
+    }
+    let pattern = pattern.as_bytes();
+    let host = host.as_bytes();
+    let mut p = 0;
+    let mut h = 0;
+    let mut wildcard = None;
+    let mut checkpoint = 0;
+    while h < host.len() {
+        if p < pattern.len() && pattern[p] == b'%' {
+            wildcard = Some(p);
+            checkpoint = h;
+            p += 1;
+        } else if p < pattern.len()
+            && (pattern[p] == b'_' || pattern[p].eq_ignore_ascii_case(&host[h]))
+        {
+            p += 1;
+            h += 1;
+        } else if let Some(position) = wildcard {
+            p = position + 1;
+            checkpoint += 1;
+            h = checkpoint;
+        } else {
+            return false;
+        }
+    }
+    while p < pattern.len() && pattern[p] == b'%' {
+        p += 1;
+    }
+    p == pattern.len()
+}
+
+fn mysql_host_specificity(pattern: &str, host: &str) -> usize {
+    let pattern = pattern.trim();
+    if pattern.eq_ignore_ascii_case(host) {
+        return 1_000_000;
+    }
+    pattern
+        .bytes()
+        .filter(|byte| *byte != b'%' && *byte != b'_')
+        .count()
+}
+
+fn is_supported_authentication_plugin(plugin: &str) -> bool {
+    matches!(plugin, "mysql_native_password" | "caching_sha2_password")
 }
 
 fn normalize_auth_names(names: &[String]) -> anyhow::Result<Vec<String>> {
@@ -1596,9 +2372,18 @@ fn normalize_auth_names(names: &[String]) -> anyhow::Result<Vec<String>> {
 }
 
 const EMPTY_PASSWORD_SHA1_HEX: &str = "da39a3ee5e6b4b0d3255bfef95601890afd80709";
+const EMPTY_PASSWORD_SHA256_HEX: &str =
+    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
 fn password_sha1_hex(password: &str) -> String {
     Sha1::digest(password.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn password_sha256_hex(password: &str) -> String {
+    Sha256::digest(password.as_bytes())
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
@@ -1627,6 +2412,31 @@ fn verify_mysql_native_password_sha1(hash: &str, salt: &[u8], response: &[u8]) -
     response
         .iter()
         .zip(stage1.iter().zip(stage3.iter()))
+        .all(|(actual, (left, right))| *actual == (*left ^ *right))
+}
+
+fn verify_caching_sha2_password_sha256(hash: &str, salt: &[u8], response: &[u8]) -> bool {
+    if response.is_empty() {
+        return hash == EMPTY_PASSWORD_SHA256_HEX;
+    }
+    let Ok(stage1) = (0..hash.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&hash[index..index + 2], 16))
+        .collect::<Result<Vec<_>, _>>()
+    else {
+        return false;
+    };
+    if stage1.len() != 32 || response.len() != 32 {
+        return false;
+    }
+    let stage2 = Sha256::digest(&stage1);
+    let mut mask = Sha256::new();
+    mask.update(stage2);
+    mask.update(salt);
+    let mask = mask.finalize();
+    response
+        .iter()
+        .zip(stage1.iter().zip(mask.iter()))
         .all(|(actual, (left, right))| *actual == (*left ^ *right))
 }
 
@@ -1686,6 +2496,41 @@ fn role_has_table_privilege(
         })
 }
 
+fn role_has_column_privilege(
+    data: &AuthCatalogData,
+    role_name: &str,
+    database: &str,
+    table: &str,
+    column: &str,
+    privilege: &str,
+    visited: &mut HashSet<String>,
+) -> bool {
+    if !visited.insert(role_name.to_string()) {
+        return false;
+    }
+    let Some(role) = data.roles.get(role_name) else {
+        return false;
+    };
+    role.column_privileges
+        .get(database)
+        .and_then(|tables| tables.get(table))
+        .and_then(|columns| columns.get(column))
+        .is_some_and(|set| privilege_set_allows(set, privilege))
+        || privilege_set_allows(&role.global_privileges, privilege)
+        || role
+            .database_privileges
+            .get(database)
+            .is_some_and(|set| privilege_set_allows(set, privilege))
+        || role
+            .table_privileges
+            .get(database)
+            .and_then(|tables| tables.get(table))
+            .is_some_and(|set| privilege_set_allows(set, privilege))
+        || role.roles.iter().any(|nested| {
+            role_has_column_privilege(data, nested, database, table, column, privilege, visited)
+        })
+}
+
 fn role_has_routine_privilege(
     data: &AuthCatalogData,
     role_name: &str,
@@ -1714,12 +2559,29 @@ fn role_has_routine_privilege(
         })
 }
 
+fn expand_role_names(data: &AuthCatalogData, roots: &HashSet<String>) -> HashSet<String> {
+    let mut pending = roots.iter().cloned().collect::<Vec<_>>();
+    let mut expanded = HashSet::new();
+    while let Some(role_name) = pending.pop() {
+        if !expanded.insert(role_name.clone()) {
+            continue;
+        }
+        if let Some(role) = data.roles.get(&role_name) {
+            pending.extend(role.roles.iter().cloned());
+        }
+    }
+    expanded.retain(|role| data.roles.contains_key(role));
+    expanded
+}
+
+#[allow(clippy::too_many_arguments)]
 fn collect_role_privileges(
     data: &AuthCatalogData,
     role_name: &str,
     global_privileges: &mut HashSet<String>,
     database_privileges: &mut HashMap<String, HashSet<String>>,
     table_privileges: &mut AuthTablePrivileges,
+    column_privileges: &mut AuthColumnPrivileges,
     routine_privileges: &mut AuthRoutinePrivileges,
     visited: &mut HashSet<String>,
 ) -> anyhow::Result<()> {
@@ -1747,6 +2609,20 @@ fn collect_role_privileges(
                 .extend(privileges.iter().cloned());
         }
     }
+    for (database, tables) in &role.column_privileges {
+        for (table, columns) in tables {
+            for (column, privileges) in columns {
+                column_privileges
+                    .entry(database.clone())
+                    .or_default()
+                    .entry(table.clone())
+                    .or_default()
+                    .entry(column.clone())
+                    .or_default()
+                    .extend(privileges.iter().cloned());
+            }
+        }
+    }
     routine_privileges.extend_from(&role.routine_privileges);
     for nested in &role.roles {
         collect_role_privileges(
@@ -1755,6 +2631,7 @@ fn collect_role_privileges(
             global_privileges,
             database_privileges,
             table_privileges,
+            column_privileges,
             routine_privileges,
             visited,
         )?;
@@ -1862,14 +2739,57 @@ fn sql_string_literal(value: &str) -> anyhow::Result<String> {
     Ok(value.replace("''", "'"))
 }
 
-fn parse_user_identified_clause(clause: &str, statement: &str) -> anyhow::Result<(String, String)> {
-    let marker = clause
-        .to_ascii_uppercase()
-        .find(" IDENTIFIED BY ")
-        .ok_or_else(|| anyhow::anyhow!("{} requires IDENTIFIED BY", statement))?;
+fn parse_user_identified_clause(
+    clause: &str,
+    statement: &str,
+) -> anyhow::Result<(String, String, String)> {
+    let upper = clause.to_ascii_uppercase();
+    if let Some(marker) = upper.find(" IDENTIFIED BY ") {
+        let user = clause[..marker].trim();
+        let password = sql_string_literal(clause[marker + " IDENTIFIED BY ".len()..].trim())?;
+        return Ok((user.to_string(), password, default_authentication_plugin()));
+    }
+    let Some(marker) = upper.find(" IDENTIFIED WITH ") else {
+        anyhow::bail!(
+            "{} requires IDENTIFIED BY or IDENTIFIED WITH ... BY",
+            statement
+        );
+    };
     let user = clause[..marker].trim();
-    let password = sql_string_literal(clause[marker + " IDENTIFIED BY ".len()..].trim())?;
-    Ok((user.to_string(), password))
+    let authentication = clause[marker + " IDENTIFIED WITH ".len()..].trim();
+    let authentication_upper = authentication.to_ascii_uppercase();
+    let Some(by_marker) = authentication_upper.find(" BY ") else {
+        anyhow::bail!("{} requires IDENTIFIED WITH ... BY", statement);
+    };
+    let plugin = authentication[..by_marker].trim().to_ascii_lowercase();
+    if !is_supported_authentication_plugin(&plugin) {
+        anyhow::bail!(
+            "unsupported authentication plugin '{}', user '{}'",
+            plugin,
+            user
+        );
+    }
+    let password = sql_string_literal(authentication[by_marker + " BY ".len()..].trim())?;
+    Ok((user.to_string(), password, plugin))
+}
+
+fn parse_default_role_selection(value: &str) -> anyhow::Result<DefaultRoleSelection> {
+    let value = value.trim().trim_end_matches(';').trim();
+    if value.eq_ignore_ascii_case("NONE") {
+        return Ok(DefaultRoleSelection::None);
+    }
+    if value.eq_ignore_ascii_case("ALL") {
+        return Ok(DefaultRoleSelection::All);
+    }
+    let roles = split_csv(value)
+        .into_iter()
+        .map(|role| normalize_auth_name(&role))
+        .filter(|role| !role.is_empty())
+        .collect::<Vec<_>>();
+    if roles.is_empty() {
+        anyhow::bail!("SET DEFAULT ROLE requires NONE, ALL, or at least one role");
+    }
+    Ok(DefaultRoleSelection::Roles(roles))
 }
 
 fn parse_privilege_list(value: &str) -> anyhow::Result<HashSet<String>> {
@@ -1913,6 +2833,49 @@ fn parse_privilege_list(value: &str) -> anyhow::Result<HashSet<String>> {
     Ok(values)
 }
 
+fn parse_grant_privilege_spec(value: &str) -> anyhow::Result<GrantPrivilegeSpec> {
+    let mut table_privileges = HashSet::new();
+    let mut column_privileges = HashMap::new();
+    for item in split_csv(value) {
+        let item = item.trim();
+        let Some(open) = item.find('(') else {
+            table_privileges.extend(parse_privilege_list(item)?);
+            continue;
+        };
+        if !item.ends_with(')') || item[open + 1..item.len() - 1].trim().is_empty() {
+            anyhow::bail!("invalid column privilege specification '{}'", item);
+        }
+        let privilege = parse_privilege_list(item[..open].trim())?;
+        if privilege.len() != 1 || privilege.contains("ALL") {
+            anyhow::bail!("column-level privilege must name one column privilege");
+        }
+        let privilege = privilege.into_iter().next().expect("one privilege");
+        if !matches!(
+            privilege.as_str(),
+            "SELECT" | "INSERT" | "UPDATE" | "REFERENCES"
+        ) {
+            anyhow::bail!(
+                "privilege '{}' cannot be granted at column level",
+                privilege
+            );
+        }
+        for column in split_csv(&item[open + 1..item.len() - 1]) {
+            let column = column.trim().trim_matches(['\x60', '\'', '"']).to_string();
+            if column.is_empty() || column.chars().any(char::is_whitespace) {
+                anyhow::bail!("invalid column name in privilege specification");
+            }
+            column_privileges
+                .entry(column)
+                .or_insert_with(HashSet::new)
+                .insert(privilege.clone());
+        }
+    }
+    if table_privileges.is_empty() && column_privileges.is_empty() {
+        anyhow::bail!("unsupported privilege list");
+    }
+    Ok((table_privileges, column_privileges))
+}
+
 fn parse_routine_privilege_scope(scope: &str) -> anyhow::Result<Option<RoutinePrivilegeScope>> {
     let (kind, reference) = if let Some(reference) = strip_show_keyword_ci(scope, "FUNCTION") {
         (RoutineKind::Function, reference)
@@ -1948,7 +2911,7 @@ fn parse_table_privilege_scope(scope: &str) -> anyhow::Result<Option<(String, St
         return Ok(None);
     }
     if scope.contains('(') || scope.contains(')') {
-        anyhow::bail!("column-level privileges are not implemented yet");
+        anyhow::bail!("table privilege scope must be database.table without columns");
     }
     let (database, table) = split_table_reference(scope, "")?;
     if database.is_empty() || table.is_empty() || table == "*" {
@@ -2028,10 +2991,50 @@ pub struct WireStats {
     named_locks: parking_lot::Mutex<HashMap<String, u32>>,
     global_transaction_defaults: parking_lot::Mutex<TransactionDefaults>,
     event_scheduler_state: AtomicU8,
+    activate_all_roles_on_login: AtomicU8,
+    global_cte_max_recursion_depth: AtomicU64,
     waits_for: parking_lot::Mutex<HashMap<u32, HashSet<u32>>>,
     pending_transactions:
         parking_lot::Mutex<HashMap<u32, Weak<parking_lot::RwLock<Vec<WriteCommand>>>>>,
+    aborted_transactions: parking_lot::Mutex<HashSet<u32>>,
+    active_sessions: parking_lot::Mutex<HashMap<u32, ActiveSession>>,
+    prepared_xa: parking_lot::Mutex<HashMap<String, PreparedXaTransaction>>,
+    xa_catalog_path: parking_lot::Mutex<Option<PathBuf>>,
     lock_changed: tokio::sync::Notify,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveSession {
+    user: String,
+    host: String,
+    database: Option<String>,
+    command: String,
+    started: Instant,
+    state: Option<String>,
+    info: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct XaIdentifier {
+    key: String,
+    format_id: u32,
+    gtrid: Vec<u8>,
+    bqual: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PreparedXaTransaction {
+    identifier: XaIdentifier,
+    commands: Vec<WriteCommand>,
+    lock_owner: u32,
+    #[serde(default)]
+    committing: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum XaBranchState {
+    Active,
+    Ended,
 }
 
 #[derive(Default)]
@@ -2044,6 +3047,7 @@ enum LockMode {
     IntentionShared,
     IntentionExclusive,
     Shared,
+    GapShared,
     MetadataShared,
     InsertIntention,
     Exclusive,
@@ -2053,6 +3057,12 @@ enum LockMode {
 struct LockRequest {
     resource: String,
     mode: LockMode,
+}
+
+async fn yield_until_lock_deadline(deadline: Instant) {
+    while Instant::now() < deadline {
+        tokio::task::yield_now().await;
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2282,6 +3292,29 @@ impl WireStats {
         self.event_scheduler_state.store(value, Ordering::Release);
     }
 
+    fn activate_all_roles_on_login(&self) -> bool {
+        self.activate_all_roles_on_login.load(Ordering::Acquire) != 0
+    }
+
+    fn set_activate_all_roles_on_login(&self, enabled: bool) {
+        self.activate_all_roles_on_login
+            .store(u8::from(enabled), Ordering::Release);
+    }
+
+    fn global_cte_max_recursion_depth(&self) -> usize {
+        let value = self.global_cte_max_recursion_depth.load(Ordering::Acquire);
+        if value == 0 {
+            1000
+        } else {
+            value.saturating_sub(1) as usize
+        }
+    }
+
+    fn set_global_cte_max_recursion_depth(&self, value: u32) {
+        self.global_cte_max_recursion_depth
+            .store(u64::from(value) + 1, Ordering::Release);
+    }
+
     pub fn snapshot(&self) -> WireStatsSnapshot {
         WireStatsSnapshot {
             active_connections: self.active_connections.load(Ordering::Relaxed),
@@ -2325,10 +3358,320 @@ impl WireStats {
         self.next_connection_id.fetch_add(1, Ordering::Relaxed) + 1
     }
 
+    fn register_connection(&self, connection_id: u32, host: &str) {
+        self.active_sessions.lock().insert(
+            connection_id,
+            ActiveSession {
+                user: String::new(),
+                host: host.to_string(),
+                database: None,
+                command: "Sleep".into(),
+                started: Instant::now(),
+                state: None,
+                info: None,
+            },
+        );
+    }
+
+    fn unregister_connection(&self, connection_id: u32) {
+        self.active_sessions.lock().remove(&connection_id);
+    }
+
+    fn update_connection_identity(&self, connection_id: u32, user: &str) {
+        if let Some(session) = self.active_sessions.lock().get_mut(&connection_id) {
+            session.user = user.to_string();
+        }
+    }
+
+    fn update_connection_query(&self, connection_id: u32, user: &str, database: &str, query: &str) {
+        if let Some(session) = self.active_sessions.lock().get_mut(&connection_id) {
+            session.user = user.to_string();
+            session.database = (!database.is_empty()).then(|| database.to_string());
+            session.command = "Query".into();
+            session.started = Instant::now();
+            session.state = Some("executing".into());
+            session.info = Some(query.to_string());
+        }
+    }
+
+    fn update_connection_sleep(&self, connection_id: u32, user: &str, database: &str) {
+        if let Some(session) = self.active_sessions.lock().get_mut(&connection_id) {
+            session.user = user.to_string();
+            session.database = (!database.is_empty()).then(|| database.to_string());
+            session.command = "Sleep".into();
+            session.started = Instant::now();
+            session.state = None;
+            session.info = None;
+        }
+    }
+
+    fn processlist_rows(
+        &self,
+        viewer: &str,
+        can_view_all: bool,
+        full: bool,
+    ) -> Vec<Vec<Option<Vec<u8>>>> {
+        let mut sessions = self
+            .active_sessions
+            .lock()
+            .iter()
+            .filter(|(_, session)| can_view_all || session.user.eq_ignore_ascii_case(viewer))
+            .map(|(connection_id, session)| (*connection_id, session.clone()))
+            .collect::<Vec<_>>();
+        sessions.sort_by_key(|(connection_id, _)| *connection_id);
+        sessions
+            .into_iter()
+            .map(|(connection_id, session)| {
+                let info = session.info.map(|info| {
+                    if full {
+                        info.into_bytes()
+                    } else {
+                        info.chars().take(100).collect::<String>().into_bytes()
+                    }
+                });
+                vec![
+                    bytes(&connection_id.to_string()),
+                    bytes(&session.user),
+                    bytes(&session.host),
+                    session.database.map(|value| value.into_bytes()),
+                    bytes(&session.command),
+                    bytes(&session.started.elapsed().as_secs().to_string()),
+                    session.state.map(|value| value.into_bytes()),
+                    info,
+                ]
+            })
+            .collect()
+    }
+
+    fn processlist_rows_for_sys(&self) -> Vec<Vec<Option<Vec<u8>>>> {
+        let mut sessions = self
+            .active_sessions
+            .lock()
+            .iter()
+            .map(|(connection_id, session)| (*connection_id, session.clone()))
+            .collect::<Vec<_>>();
+        sessions.sort_by_key(|(connection_id, _)| *connection_id);
+        sessions
+            .into_iter()
+            .map(|(connection_id, session)| {
+                let id = bytes(&connection_id.to_string());
+                let elapsed = bytes(&session.started.elapsed().as_secs().to_string());
+                vec![
+                    id.clone(),
+                    id,
+                    bytes(&session.user),
+                    session.database.map(|value| value.into_bytes()),
+                    bytes(&session.command),
+                    session.state.map(|value| value.into_bytes()),
+                    elapsed,
+                    session.info.map(|value| value.into_bytes()),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ]
+            })
+            .collect()
+    }
+
     // Scheduler backends share the same lock/transaction registries but are
     // not client connections, so they must not affect connection metrics.
     fn internal_connection_id(&self) -> u32 {
         self.next_connection_id.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    fn transfer_transaction_locks(&self, from: u32, to: u32) {
+        let mut locks = self.transaction_locks.lock();
+        for lock in locks.values_mut() {
+            if let Some(mode) = lock.holders.remove(&from) {
+                lock.holders.insert(to, mode);
+            }
+        }
+        drop(locks);
+        let mut waits_for = self.waits_for.lock();
+        waits_for.remove(&from);
+        for blockers in waits_for.values_mut() {
+            blockers.remove(&from);
+        }
+        waits_for.retain(|_, blockers| !blockers.is_empty());
+        drop(waits_for);
+        self.lock_changed.notify_waiters();
+    }
+
+    pub fn initialize_xa_catalog(
+        &self,
+        catalog_dir: PathBuf,
+        storage: &StorageEngineManager,
+    ) -> anyhow::Result<()> {
+        std::fs::create_dir_all(&catalog_dir)?;
+        let active = catalog_dir.join("prepared.json");
+        let backup = catalog_dir.join("prepared.json.backup");
+        *self.xa_catalog_path.lock() = Some(catalog_dir.clone());
+        let path = if active.is_file() {
+            active
+        } else if backup.is_file() {
+            backup
+        } else {
+            return Ok(());
+        };
+        let bytes = std::fs::read(path)?;
+        let mut transactions = serde_json::from_slice::<Vec<PreparedXaTransaction>>(&bytes)?;
+        let mut removed_committed = false;
+        for transaction in &mut transactions {
+            if transaction.committing
+                && storage.xa_commit_marker_exists(&transaction.identifier.key)
+            {
+                removed_committed = true;
+                continue;
+            }
+            transaction.lock_owner = self.internal_connection_id();
+            let locks = write_lock_requests(storage, &transaction.commands)?;
+            if !self.try_acquire_locks(&locks, transaction.lock_owner) {
+                anyhow::bail!(
+                    "XA recovery could not reacquire locks for '{}'",
+                    transaction.identifier.key
+                );
+            }
+        }
+        let mut prepared = self.prepared_xa.lock();
+        for transaction in transactions {
+            if transaction.committing
+                && storage.xa_commit_marker_exists(&transaction.identifier.key)
+            {
+                continue;
+            }
+            prepared.insert(transaction.identifier.key.clone(), transaction);
+        }
+        let snapshot = removed_committed.then(|| prepared.values().cloned().collect::<Vec<_>>());
+        drop(prepared);
+        if let Some(snapshot) = snapshot {
+            self.persist_xa_catalog(&snapshot)?;
+        }
+        Ok(())
+    }
+
+    fn persist_xa_catalog(&self, transactions: &[PreparedXaTransaction]) -> anyhow::Result<()> {
+        let Some(catalog_dir) = self.xa_catalog_path.lock().clone() else {
+            return Ok(());
+        };
+        std::fs::create_dir_all(&catalog_dir)?;
+        let staging = catalog_dir.join("prepared.json.staging");
+        let active = catalog_dir.join("prepared.json");
+        let backup = catalog_dir.join("prepared.json.backup");
+        let bytes = serde_json::to_vec(transactions)?;
+        {
+            let mut file = std::fs::File::create(&staging)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+        }
+        if backup.exists() {
+            std::fs::remove_file(&backup)?;
+        }
+        if active.exists() {
+            std::fs::rename(&active, &backup)?;
+        }
+        std::fs::rename(&staging, &active)?;
+        if backup.exists() {
+            std::fs::remove_file(backup)?;
+        }
+        Ok(())
+    }
+
+    fn prepare_xa_transaction(&self, transaction: PreparedXaTransaction) -> anyhow::Result<()> {
+        let key = transaction.identifier.key.clone();
+        let mut prepared = self.prepared_xa.lock();
+        if prepared.contains_key(&key) {
+            anyhow::bail!("XAER_DUPID: XA transaction already exists");
+        }
+        prepared.insert(key.clone(), transaction);
+        let snapshot = prepared.values().cloned().collect::<Vec<_>>();
+        if let Err(error) = self.persist_xa_catalog(&snapshot) {
+            prepared.remove(&key);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn mark_prepared_xa_committing(&self, key: &str) -> anyhow::Result<()> {
+        let mut prepared = self.prepared_xa.lock();
+        let transaction = prepared
+            .get_mut(key)
+            .ok_or_else(|| anyhow::anyhow!("XAER_NOTA: XA transaction is not prepared"))?;
+        if transaction.committing {
+            return Ok(());
+        }
+        transaction.committing = true;
+        let snapshot = prepared.values().cloned().collect::<Vec<_>>();
+        if let Err(error) = self.persist_xa_catalog(&snapshot) {
+            if let Some(transaction) = prepared.get_mut(key) {
+                transaction.committing = false;
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn take_prepared_xa(&self, key: &str) -> anyhow::Result<Option<PreparedXaTransaction>> {
+        let mut prepared = self.prepared_xa.lock();
+        let transaction = prepared.remove(key);
+        if transaction.is_none() {
+            return Ok(None);
+        }
+        let snapshot = prepared.values().cloned().collect::<Vec<_>>();
+        if let Err(error) = self.persist_xa_catalog(&snapshot) {
+            let transaction = transaction.expect("removed prepared XA transaction");
+            prepared.insert(transaction.identifier.key.clone(), transaction);
+            return Err(error);
+        }
+        Ok(transaction)
+    }
+
+    fn prepared_xa(&self, key: &str) -> Option<PreparedXaTransaction> {
+        self.prepared_xa.lock().get(key).cloned()
+    }
+
+    fn remove_prepared_xa(&self, key: &str) -> anyhow::Result<()> {
+        let mut prepared = self.prepared_xa.lock();
+        let transaction = prepared.remove(key);
+        if transaction.is_none() {
+            return Ok(());
+        }
+        let snapshot = prepared.values().cloned().collect::<Vec<_>>();
+        if let Err(error) = self.persist_xa_catalog(&snapshot) {
+            let transaction = transaction.expect("removed prepared XA transaction");
+            prepared.insert(transaction.identifier.key.clone(), transaction);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn prepared_xa_rows(&self) -> Vec<Vec<Option<Vec<u8>>>> {
+        let mut transactions = self
+            .prepared_xa
+            .lock()
+            .values()
+            .map(|transaction| {
+                vec![
+                    Some(transaction.identifier.format_id.to_string().into_bytes()),
+                    Some(transaction.identifier.gtrid.len().to_string().into_bytes()),
+                    Some(transaction.identifier.bqual.len().to_string().into_bytes()),
+                    Some(
+                        transaction
+                            .identifier
+                            .gtrid
+                            .iter()
+                            .chain(transaction.identifier.bqual.iter())
+                            .copied()
+                            .collect(),
+                    ),
+                ]
+            })
+            .collect::<Vec<_>>();
+        transactions.sort_by(|left, right| left[3].cmp(&right[3]));
+        transactions
     }
 
     fn disconnected(&self) {
@@ -2340,6 +3683,7 @@ impl WireStats {
         connection_id: u32,
         writes: &Arc<parking_lot::RwLock<Vec<WriteCommand>>>,
     ) {
+        self.aborted_transactions.lock().remove(&connection_id);
         self.pending_transactions
             .lock()
             .insert(connection_id, Arc::downgrade(writes));
@@ -2347,6 +3691,64 @@ impl WireStats {
 
     fn unregister_transaction_buffer(&self, connection_id: u32) {
         self.pending_transactions.lock().remove(&connection_id);
+        self.aborted_transactions.lock().remove(&connection_id);
+    }
+
+    fn transaction_weight(&self, connection_id: u32) -> usize {
+        let pending_writes = self
+            .pending_transactions
+            .lock()
+            .get(&connection_id)
+            .and_then(Weak::upgrade)
+            .map(|writes| writes.read().len())
+            .unwrap_or(0);
+        let held_locks = self
+            .transaction_locks
+            .lock()
+            .values()
+            .filter(|lock| lock.holders.contains_key(&connection_id))
+            .count();
+        pending_writes.saturating_add(held_locks)
+    }
+
+    fn abort_transaction_for_deadlock(&self, connection_id: u32) {
+        self.aborted_transactions.lock().insert(connection_id);
+        if let Some(writes) = self
+            .pending_transactions
+            .lock()
+            .get(&connection_id)
+            .and_then(Weak::upgrade)
+        {
+            writes.write().clear();
+        }
+        self.release_all_locks(connection_id);
+    }
+
+    fn take_transaction_abort(&self, connection_id: u32) -> bool {
+        self.aborted_transactions.lock().remove(&connection_id)
+    }
+
+    fn detect_deadlock_victim(&self, connection_id: u32, blockers: &HashSet<u32>) -> Option<u32> {
+        let cycle = {
+            let mut waits_for = self.waits_for.lock();
+            waits_for.insert(connection_id, blockers.clone());
+            let has_cycle = blockers.iter().any(|blocker| {
+                wait_graph_reaches(&waits_for, *blocker, connection_id, &mut HashSet::new())
+            });
+            has_cycle.then(|| deadlock_cycle_members(&waits_for, connection_id))
+        }?;
+        let victim = cycle
+            .into_iter()
+            .min_by_key(|candidate| {
+                (
+                    self.transaction_weight(*candidate),
+                    *candidate != connection_id,
+                    std::cmp::Reverse(*candidate),
+                )
+            })
+            .unwrap_or(connection_id);
+        self.deadlocks.fetch_add(1, Ordering::Relaxed);
+        Some(victim)
     }
 
     fn pending_for_dirty_read(&self, reader_id: u32) -> Vec<WriteCommand> {
@@ -2374,13 +3776,24 @@ impl WireStats {
         connection_id: u32,
         timeout: std::time::Duration,
     ) -> anyhow::Result<()> {
+        if requests.is_empty() {
+            return Ok(());
+        }
+        if self.try_acquire_locks(requests, connection_id) {
+            return Ok(());
+        }
         let snapshot = self.connection_lock_snapshot(connection_id);
         for request in requests {
             if let Err(error) = self
                 .acquire_lock(&request.resource, connection_id, request.mode, timeout)
                 .await
             {
-                self.restore_connection_locks(connection_id, snapshot);
+                if !error
+                    .to_string()
+                    .starts_with("Deadlock found when trying to get lock")
+                {
+                    self.restore_connection_locks(connection_id, snapshot);
+                }
                 return Err(error);
             }
         }
@@ -2409,7 +3822,12 @@ impl WireStats {
                 )
                 .await
             {
-                self.restore_connection_locks(connection_id, snapshot);
+                if !error
+                    .to_string()
+                    .starts_with("Deadlock found when trying to get lock")
+                {
+                    self.restore_connection_locks(connection_id, snapshot);
+                }
                 return Err(error);
             }
         }
@@ -2442,14 +3860,17 @@ impl WireStats {
         }
         for request in requests {
             let lock = locks.entry(request.resource.clone()).or_default();
+            let was_held = lock.holders.contains_key(&connection_id);
             lock.holders
                 .entry(connection_id)
                 .and_modify(|held| *held = merge_lock_modes(*held, request.mode))
                 .or_insert(request.mode);
-            if request.resource.starts_with("row:") || request.resource.starts_with("unique:") {
-                self.row_lock_acquires.fetch_add(1, Ordering::Relaxed);
-            } else {
-                self.table_lock_acquires.fetch_add(1, Ordering::Relaxed);
+            if !was_held {
+                if request.resource.starts_with("row:") || request.resource.starts_with("unique:") {
+                    self.row_lock_acquires.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    self.table_lock_acquires.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
         true
@@ -2484,7 +3905,12 @@ impl WireStats {
                 // LOCK TABLES is a single operation.  A timeout/deadlock on a
                 // later table must not leave locks acquired earlier in this
                 // call (or upgrades of pre-existing explicit locks) behind.
-                self.restore_explicit_table_locks(connection_id, snapshot);
+                if !error
+                    .to_string()
+                    .starts_with("Deadlock found when trying to get lock")
+                {
+                    self.restore_explicit_table_locks(connection_id, snapshot);
+                }
                 return Err(error);
             }
         }
@@ -2498,23 +3924,34 @@ impl WireStats {
         mode: LockMode,
         timeout: std::time::Duration,
     ) -> anyhow::Result<()> {
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = Instant::now() + timeout;
         let mut waiting_recorded = false;
         loop {
+            if self.take_transaction_abort(connection_id) {
+                anyhow::bail!("Deadlock found when trying to get lock; try restarting transaction");
+            }
             let notified = self.lock_changed.notified();
-            let blockers = {
+            let (already_held, blockers) = {
                 let mut locks = self.transaction_locks.lock();
                 let explicit_table_locks = self.explicit_table_locks.lock();
-                let blockers = lock_request_blockers(&locks, resource, connection_id, mode)
-                    .into_iter()
-                    .chain(lock_request_blockers(
-                        &explicit_table_locks,
-                        resource,
-                        connection_id,
-                        mode,
-                    ))
-                    .collect::<HashSet<_>>();
-                if blockers.is_empty() {
+                let already_held = locks
+                    .get(resource)
+                    .and_then(|lock| lock.holders.get(&connection_id))
+                    .is_some_and(|held| merge_lock_modes(*held, mode) == *held);
+                let blockers = if already_held {
+                    lock_request_blockers(&explicit_table_locks, resource, connection_id, mode)
+                } else {
+                    lock_request_blockers(&locks, resource, connection_id, mode)
+                        .into_iter()
+                        .chain(lock_request_blockers(
+                            &explicit_table_locks,
+                            resource,
+                            connection_id,
+                            mode,
+                        ))
+                        .collect::<HashSet<_>>()
+                };
+                if blockers.is_empty() && !already_held {
                     locks
                         .entry(resource.to_string())
                         .or_default()
@@ -2523,10 +3960,13 @@ impl WireStats {
                         .and_modify(|held| *held = merge_lock_modes(*held, mode))
                         .or_insert(mode);
                 }
-                blockers
+                (already_held, blockers)
             };
             if blockers.is_empty() {
                 self.waits_for.lock().remove(&connection_id);
+                if already_held {
+                    return Ok(());
+                }
                 if resource.starts_with("row:") || resource.starts_with("unique:") {
                     self.row_lock_acquires.fetch_add(1, Ordering::Relaxed);
                 } else {
@@ -2534,25 +3974,25 @@ impl WireStats {
                 }
                 return Ok(());
             }
-            {
-                let mut waits_for = self.waits_for.lock();
-                waits_for.insert(connection_id, blockers.clone());
-                let deadlocked = blockers.iter().any(|blocker| {
-                    wait_graph_reaches(&waits_for, *blocker, connection_id, &mut HashSet::new())
-                });
-                if deadlocked {
-                    waits_for.remove(&connection_id);
-                    self.deadlocks.fetch_add(1, Ordering::Relaxed);
+            let victim = self.detect_deadlock_victim(connection_id, &blockers);
+            if let Some(victim) = victim {
+                self.abort_transaction_for_deadlock(victim);
+                if victim == connection_id {
                     anyhow::bail!(
                         "Deadlock found when trying to get lock; try restarting transaction"
                     );
                 }
+                continue;
             }
             if !waiting_recorded {
                 self.lock_waits.fetch_add(1, Ordering::Relaxed);
                 waiting_recorded = true;
             }
-            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+            let timed_out = tokio::select! {
+                _ = notified => false,
+                _ = yield_until_lock_deadline(deadline) => true,
+            };
+            if timed_out {
                 self.waits_for.lock().remove(&connection_id);
                 self.lock_timeouts.fetch_add(1, Ordering::Relaxed);
                 anyhow::bail!("Lock wait timeout exceeded for '{}'", resource);
@@ -2567,9 +4007,12 @@ impl WireStats {
         mode: LockMode,
         timeout: std::time::Duration,
     ) -> anyhow::Result<()> {
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = Instant::now() + timeout;
         let mut waiting_recorded = false;
         loop {
+            if self.take_transaction_abort(connection_id) {
+                anyhow::bail!("Deadlock found when trying to get lock; try restarting transaction");
+            }
             let notified = self.lock_changed.notified();
             let blockers = {
                 let mut transaction_locks = self.transaction_locks.lock();
@@ -2592,25 +4035,25 @@ impl WireStats {
                 self.table_lock_acquires.fetch_add(1, Ordering::Relaxed);
                 return Ok(());
             }
-            {
-                let mut waits_for = self.waits_for.lock();
-                waits_for.insert(connection_id, blockers.clone());
-                let deadlocked = blockers.iter().any(|blocker| {
-                    wait_graph_reaches(&waits_for, *blocker, connection_id, &mut HashSet::new())
-                });
-                if deadlocked {
-                    waits_for.remove(&connection_id);
-                    self.deadlocks.fetch_add(1, Ordering::Relaxed);
+            let victim = self.detect_deadlock_victim(connection_id, &blockers);
+            if let Some(victim) = victim {
+                self.abort_transaction_for_deadlock(victim);
+                if victim == connection_id {
                     anyhow::bail!(
                         "Deadlock found when trying to get lock; try restarting transaction"
                     );
                 }
+                continue;
             }
             if !waiting_recorded {
                 self.lock_waits.fetch_add(1, Ordering::Relaxed);
                 waiting_recorded = true;
             }
-            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+            let timed_out = tokio::select! {
+                _ = notified => false,
+                _ = yield_until_lock_deadline(deadline) => true,
+            };
+            if timed_out {
                 self.waits_for.lock().remove(&connection_id);
                 self.lock_timeouts.fetch_add(1, Ordering::Relaxed);
                 anyhow::bail!("Lock wait timeout exceeded for '{}'", resource);
@@ -2625,9 +4068,12 @@ impl WireStats {
         mode: LockMode,
         timeout: std::time::Duration,
     ) -> anyhow::Result<()> {
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = Instant::now() + timeout;
         let mut waiting_recorded = false;
         loop {
+            if self.take_transaction_abort(connection_id) {
+                anyhow::bail!("Deadlock found when trying to get lock; try restarting transaction");
+            }
             let notified = self.lock_changed.notified();
             let blockers = {
                 let transaction_locks = self.transaction_locks.lock();
@@ -2658,25 +4104,25 @@ impl WireStats {
                 self.table_lock_acquires.fetch_add(1, Ordering::Relaxed);
                 return Ok(());
             }
-            {
-                let mut waits_for = self.waits_for.lock();
-                waits_for.insert(connection_id, blockers.clone());
-                let deadlocked = blockers.iter().any(|blocker| {
-                    wait_graph_reaches(&waits_for, *blocker, connection_id, &mut HashSet::new())
-                });
-                if deadlocked {
-                    waits_for.remove(&connection_id);
-                    self.deadlocks.fetch_add(1, Ordering::Relaxed);
+            let victim = self.detect_deadlock_victim(connection_id, &blockers);
+            if let Some(victim) = victim {
+                self.abort_transaction_for_deadlock(victim);
+                if victim == connection_id {
                     anyhow::bail!(
                         "Deadlock found when trying to get lock; try restarting transaction"
                     );
                 }
+                continue;
             }
             if !waiting_recorded {
                 self.lock_waits.fetch_add(1, Ordering::Relaxed);
                 waiting_recorded = true;
             }
-            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+            let timed_out = tokio::select! {
+                _ = notified => false,
+                _ = yield_until_lock_deadline(deadline) => true,
+            };
+            if timed_out {
                 self.waits_for.lock().remove(&connection_id);
                 self.lock_timeouts.fetch_add(1, Ordering::Relaxed);
                 anyhow::bail!("Lock wait timeout exceeded for '{}'", resource);
@@ -2699,6 +4145,41 @@ impl WireStats {
         waits_for.retain(|_, blockers| !blockers.is_empty());
         drop(waits_for);
         self.lock_changed.notify_waiters();
+    }
+
+    fn release_connection_locks_for_resources(
+        &self,
+        connection_id: u32,
+        resources: &HashSet<String>,
+    ) {
+        if resources.is_empty() {
+            return;
+        }
+        let mut locks = self.transaction_locks.lock();
+        locks.retain(|resource, lock| {
+            if resources.contains(resource) {
+                lock.holders.remove(&connection_id);
+            }
+            !lock.holders.is_empty()
+        });
+        drop(locks);
+        let mut waits_for = self.waits_for.lock();
+        waits_for.remove(&connection_id);
+        for blockers in waits_for.values_mut() {
+            blockers.remove(&connection_id);
+        }
+        waits_for.retain(|_, blockers| !blockers.is_empty());
+        drop(waits_for);
+        self.lock_changed.notify_waiters();
+    }
+
+    fn connection_lock_resources(&self, connection_id: u32) -> HashSet<String> {
+        self.transaction_locks
+            .lock()
+            .iter()
+            .filter(|(_, lock)| lock.holders.contains_key(&connection_id))
+            .map(|(resource, _)| resource.clone())
+            .collect()
     }
 
     fn release_explicit_table_locks(&self, connection_id: u32) {
@@ -2875,12 +4356,52 @@ fn wait_graph_reaches(
     })
 }
 
+fn deadlock_cycle_members(graph: &HashMap<u32, HashSet<u32>>, start: u32) -> HashSet<u32> {
+    let mut reachable = HashSet::from([start]);
+    let mut stack = vec![start];
+    while let Some(current) = stack.pop() {
+        for blocker in graph.get(&current).into_iter().flatten() {
+            if reachable.insert(*blocker) {
+                stack.push(*blocker);
+            }
+        }
+    }
+    reachable
+        .into_iter()
+        .filter(|candidate| {
+            *candidate == start || wait_graph_reaches(graph, *candidate, start, &mut HashSet::new())
+        })
+        .collect()
+}
+
 fn lock_request_compatible(
     locks: &HashMap<String, LockState>,
     request: &LockRequest,
     connection_id: u32,
 ) -> bool {
     lock_request_blockers(locks, &request.resource, connection_id, request.mode).is_empty()
+}
+
+struct ConnectionRegistration {
+    stats: Arc<WireStats>,
+    connection_id: u32,
+}
+
+impl ConnectionRegistration {
+    fn new(stats: Arc<WireStats>, connection_id: u32, host: &str) -> Self {
+        stats.register_connection(connection_id, host);
+        Self {
+            stats,
+            connection_id,
+        }
+    }
+}
+
+impl Drop for ConnectionRegistration {
+    fn drop(&mut self) {
+        self.stats.unregister_connection(self.connection_id);
+        self.stats.disconnected();
+    }
 }
 
 fn lock_request_blockers(
@@ -2894,10 +4415,33 @@ fn lock_request_blockers(
         .filter(|(held_resource, _)| lock_resources_overlap(held_resource, resource))
         .flat_map(|(_, lock)| {
             lock.holders.iter().filter_map(|(holder, held)| {
-                (*holder != connection_id && !lock_modes_compatible(*held, mode)).then_some(*holder)
+                (*holder != connection_id && lock_request_conflicts(resource, mode, *held))
+                    .then_some(*holder)
             })
         })
         .collect()
+}
+
+/// InnoDB's record-lock compatibility is directional for gap locks. A pure
+/// gap request never waits for an existing gap/next-key lock, and an existing
+/// insert-intention lock never blocks another request. The insert itself must
+/// still wait for a granted gap/next-key lock.
+fn lock_request_conflicts(resource: &str, requested: LockMode, held: LockMode) -> bool {
+    if resource.starts_with("range:") {
+        if held == LockMode::InsertIntention {
+            return false;
+        }
+        if requested == LockMode::GapShared {
+            return false;
+        }
+        if requested == LockMode::InsertIntention {
+            return held != LockMode::InsertIntention;
+        }
+        if held == LockMode::GapShared {
+            return false;
+        }
+    }
+    !lock_modes_compatible(held, requested)
 }
 
 fn lock_resources_overlap(left: &str, right: &str) -> bool {
@@ -2994,17 +4538,99 @@ fn upper_before_lower(
 }
 
 fn compare_lock_key_values(left: &[u8], right: &[u8]) -> std::cmp::Ordering {
-    let numeric = std::str::from_utf8(left)
-        .ok()
-        .and_then(|value| value.parse::<f64>().ok())
-        .zip(
-            std::str::from_utf8(right)
-                .ok()
-                .and_then(|value| value.parse::<f64>().ok()),
-        );
-    numeric
-        .and_then(|(left, right)| left.partial_cmp(&right))
-        .unwrap_or_else(|| left.cmp(right))
+    let (left_kind, left_value) = left.split_first().unwrap_or((&b'S', left));
+    let (right_kind, right_value) = right.split_first().unwrap_or((&b'S', right));
+    if left_kind == right_kind && matches!(*left_kind, b'D' | b'N') {
+        if let Some(ordering) = compare_numeric_lock_values(left_value, right_value) {
+            return ordering;
+        }
+    }
+    left.cmp(right)
+}
+
+fn compare_numeric_lock_values(left: &[u8], right: &[u8]) -> Option<std::cmp::Ordering> {
+    fn split(value: &[u8]) -> Option<(bool, Vec<u8>, i64)> {
+        let value = std::str::from_utf8(value).ok()?.trim();
+        let negative = value.starts_with('-');
+        let value = value.strip_prefix(['+', '-']).unwrap_or(value);
+        let (mantissa, exponent) = value
+            .split_once(['e', 'E'])
+            .map_or((value, 0_i64), |(mantissa, exponent)| {
+                (mantissa, exponent.parse::<i64>().ok().unwrap_or(i64::MIN))
+            });
+        if exponent == i64::MIN {
+            return None;
+        }
+        let (integer, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+        if integer.is_empty() && fraction.is_empty()
+            || !integer.bytes().all(|byte| byte.is_ascii_digit())
+            || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return None;
+        }
+        let mut digits = integer
+            .bytes()
+            .chain(fraction.bytes())
+            .skip_while(|byte| *byte == b'0')
+            .collect::<Vec<_>>();
+        if digits.is_empty() {
+            return Some((false, Vec::new(), 0));
+        }
+        let mut scale = (fraction.len() as i64).checked_sub(exponent)?;
+        while digits.last() == Some(&b'0') {
+            digits.pop();
+            scale = scale.checked_sub(1)?;
+        }
+        Some((negative, digits, scale))
+    }
+
+    let (left_negative, left_digits, left_scale) = split(left)?;
+    let (right_negative, right_digits, right_scale) = split(right)?;
+    if left_digits.is_empty() && right_digits.is_empty() {
+        return Some(std::cmp::Ordering::Equal);
+    }
+    if left_digits.is_empty() {
+        return Some(if right_negative {
+            std::cmp::Ordering::Greater
+        } else {
+            std::cmp::Ordering::Less
+        });
+    }
+    if right_digits.is_empty() {
+        return Some(if left_negative {
+            std::cmp::Ordering::Less
+        } else {
+            std::cmp::Ordering::Greater
+        });
+    }
+    if left_negative != right_negative {
+        return Some(if left_negative {
+            std::cmp::Ordering::Less
+        } else {
+            std::cmp::Ordering::Greater
+        });
+    }
+    let left_integer_digits = (left_digits.len() as i64).checked_sub(left_scale)?;
+    let right_integer_digits = (right_digits.len() as i64).checked_sub(right_scale)?;
+    let magnitude = left_integer_digits
+        .cmp(&right_integer_digits)
+        .then_with(|| {
+            let common = left_digits.len().max(right_digits.len());
+            for index in 0..common {
+                let left = left_digits.get(index).copied().unwrap_or(b'0');
+                let right = right_digits.get(index).copied().unwrap_or(b'0');
+                match left.cmp(&right) {
+                    std::cmp::Ordering::Equal => continue,
+                    ordering => return ordering,
+                }
+            }
+            std::cmp::Ordering::Equal
+        });
+    Some(if left_negative {
+        magnitude.reverse()
+    } else {
+        magnitude
+    })
 }
 
 fn lock_modes_compatible(held: LockMode, requested: LockMode) -> bool {
@@ -3021,11 +4647,15 @@ fn lock_modes_compatible(held: LockMode, requested: LockMode) -> bool {
             | (LockMode::IntentionExclusive, LockMode::InsertIntention)
             | (LockMode::Shared, LockMode::IntentionShared)
             | (LockMode::Shared, LockMode::Shared)
+            | (LockMode::Shared, LockMode::GapShared)
+            | (LockMode::GapShared, LockMode::Shared)
+            | (LockMode::GapShared, LockMode::GapShared)
             | (LockMode::MetadataShared, LockMode::IntentionShared)
             | (LockMode::MetadataShared, LockMode::IntentionExclusive)
             | (LockMode::MetadataShared, LockMode::MetadataShared)
             | (LockMode::MetadataShared, LockMode::InsertIntention)
             | (LockMode::InsertIntention, LockMode::IntentionShared)
+            | (LockMode::InsertIntention, LockMode::Shared)
             | (LockMode::InsertIntention, LockMode::IntentionExclusive)
             | (LockMode::InsertIntention, LockMode::MetadataShared)
             | (LockMode::InsertIntention, LockMode::InsertIntention)
@@ -3042,6 +4672,11 @@ fn merge_lock_modes(held: LockMode, requested: LockMode) -> LockMode {
         | (LockMode::IntentionExclusive, LockMode::IntentionShared) => LockMode::IntentionExclusive,
         (LockMode::IntentionShared, LockMode::Shared)
         | (LockMode::Shared, LockMode::IntentionShared) => LockMode::Shared,
+        (LockMode::Shared, LockMode::GapShared) | (LockMode::GapShared, LockMode::Shared) => {
+            LockMode::Shared
+        }
+        (LockMode::GapShared, LockMode::InsertIntention)
+        | (LockMode::InsertIntention, LockMode::GapShared) => LockMode::GapShared,
         (LockMode::MetadataShared, LockMode::IntentionExclusive)
         | (LockMode::IntentionExclusive, LockMode::MetadataShared) => LockMode::IntentionExclusive,
         (LockMode::MetadataShared, LockMode::IntentionShared)
@@ -3103,7 +4738,10 @@ struct Backend {
     procedure_depth: u32,
     execution_mode: BackendExecutionMode,
     authenticated_user: parking_lot::Mutex<Option<String>>,
+    active_roles: parking_lot::Mutex<Option<HashSet<String>>>,
     client_address: String,
+    xa_identifier: Option<XaIdentifier>,
+    xa_branch_state: Option<XaBranchState>,
     // Names this connection currently holds, for RELEASE_ALL_LOCKS() counting
     // and to avoid re-registering the lease on a re-entrant GET_LOCK.
     held_named_locks: HashSet<String>,
@@ -3246,6 +4884,8 @@ fn split_top_level_commas(sql: &str) -> Vec<&str> {
 struct TransactionSavepoint {
     name: String,
     writes_len: usize,
+    implicit_insert_locks: HashSet<String>,
+    held_lock_resources: HashSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -3288,7 +4928,9 @@ impl Backend {
             ),
             ("character_set_server".into(), Some(b"utf8mb4".to_vec())),
             ("event_scheduler".into(), Some(b"ON".to_vec())),
+            ("activate_all_roles_on_login".into(), Some(b"0".to_vec())),
             ("sql_mode".into(), Some(Vec::new())),
+            ("cte_max_recursion_depth".into(), Some(b"1000".to_vec())),
             ("time_zone".into(), Some(b"SYSTEM".to_vec())),
             ("system_time_zone".into(), Some(b"UTC".to_vec())),
             ("autocommit".into(), Some(b"1".to_vec())),
@@ -3312,9 +4954,20 @@ impl Backend {
             ("license".into(), Some(b"GPL".to_vec())),
             ("auto_increment_increment".into(), Some(b"1".to_vec())),
             ("auto_increment_offset".into(), Some(b"1".to_vec())),
+            ("default_storage_engine".into(), Some(b"InnoDB".to_vec())),
+            (
+                "default_tmp_storage_engine".into(),
+                Some(b"InnoDB".to_vec()),
+            ),
+            (
+                "default_authentication_plugin".into(),
+                Some(b"caching_sha2_password".to_vec()),
+            ),
+            ("authentication_policy".into(), Some(b"*,,".to_vec())),
+            ("old_passwords".into(), Some(b"0".to_vec())),
             ("max_allowed_packet".into(), Some(b"67108864".to_vec())),
             ("net_buffer_length".into(), Some(b"16384".to_vec())),
-            ("performance_schema".into(), Some(b"0".to_vec())),
+            ("performance_schema".into(), Some(b"1".to_vec())),
             ("have_openssl".into(), Some(b"DISABLED".to_vec())),
             ("have_ssl".into(), Some(b"DISABLED".to_vec())),
             ("sql_safe_updates".into(), Some(b"0".to_vec())),
@@ -3345,6 +4998,33 @@ impl Backend {
         let transaction_writes = Arc::new(parking_lot::RwLock::new(Vec::new()));
         stats.register_transaction_buffer(connection_id, &transaction_writes);
         let transaction_defaults = *stats.global_transaction_defaults.lock();
+        let mut session_variables = Self::default_session_variables();
+        if !config.default_sql_mode.is_empty() {
+            session_variables.insert(
+                "sql_mode".into(),
+                Some(config.default_sql_mode.as_bytes().to_vec()),
+            );
+        }
+        session_variables.insert(
+            "activate_all_roles_on_login".into(),
+            Some(
+                if stats.activate_all_roles_on_login() {
+                    b"1"
+                } else {
+                    b"0"
+                }
+                .to_vec(),
+            ),
+        );
+        session_variables.insert(
+            "cte_max_recursion_depth".into(),
+            Some(
+                stats
+                    .global_cte_max_recursion_depth()
+                    .to_string()
+                    .into_bytes(),
+            ),
+        );
         Self {
             database: config.default_database.clone(),
             storage,
@@ -3372,7 +5052,7 @@ impl Backend {
             session_warning_count: 0,
             session_error_count: 0,
             user_variables: HashMap::new(),
-            session_variables: Self::default_session_variables(),
+            session_variables,
             named_prepared: HashMap::new(),
             session_last_insert_id: 0,
             session_row_count: 0,
@@ -3387,7 +5067,10 @@ impl Backend {
             procedure_depth: 0,
             execution_mode: BackendExecutionMode::Client,
             authenticated_user: parking_lot::Mutex::new(None),
+            active_roles: parking_lot::Mutex::new(None),
             client_address: "local".to_string(),
+            xa_identifier: None,
+            xa_branch_state: None,
             held_named_locks: HashSet::new(),
         }
     }
@@ -3406,6 +5089,8 @@ impl Backend {
         self.plain_select_lock_scope = false;
         self.in_transaction = false;
         self.transaction_read_only = false;
+        self.xa_identifier = None;
+        self.xa_branch_state = None;
 
         let temporary_drops = self
             .temporary_tables
@@ -3436,6 +5121,33 @@ impl Backend {
         self.session_error_count = 0;
         self.user_variables.clear();
         self.session_variables = Self::default_session_variables();
+        if !self.config.default_sql_mode.is_empty() {
+            self.session_variables.insert(
+                "sql_mode".into(),
+                Some(self.config.default_sql_mode.as_bytes().to_vec()),
+            );
+        }
+        self.session_variables.insert(
+            "activate_all_roles_on_login".into(),
+            Some(
+                if self.stats.activate_all_roles_on_login() {
+                    b"1"
+                } else {
+                    b"0"
+                }
+                .to_vec(),
+            ),
+        );
+        self.session_variables.insert(
+            "cte_max_recursion_depth".into(),
+            Some(
+                self.stats
+                    .global_cte_max_recursion_depth()
+                    .to_string()
+                    .into_bytes(),
+            ),
+        );
+        *self.active_roles.lock() = None;
         self.named_prepared.clear();
         self.session_last_insert_id = 0;
         self.session_row_count = 0;
@@ -3513,12 +5225,19 @@ impl Backend {
 
     async fn execute(&mut self, sql: &str) -> anyhow::Result<QueryOutcome> {
         let normalized = normalize_sql_whitespace(sql.trim().trim_end_matches(';').trim());
+        self.stats.update_connection_query(
+            self.connection_id,
+            &self.authenticated_username(),
+            &self.database,
+            &normalized,
+        );
         let diagnostic_statement = is_session_diagnostic_statement(&normalized);
         let function_catalog = StoredFunctionCatalog::from_storage(
             &self.storage,
             &self.database,
             self.config.auth_catalog.clone(),
             self.authenticated_username(),
+            self.active_role_set(),
         );
         let session_zone = self
             .session_variables
@@ -3551,6 +5270,11 @@ impl Backend {
                 .to_string()
                 .starts_with("Deadlock found when trying to get lock")
         }) {
+            // A victim may have been woken after the lock was released and
+            // before its next lock-attempt loop observed the abort marker.
+            // Consume any leftover marker while the statement performs the
+            // mandatory full transaction rollback.
+            self.stats.take_transaction_abort(self.connection_id);
             self.end_mvcc_transaction();
             self.transaction_writes.write().clear();
             self.clear_transaction_snapshot();
@@ -3597,6 +5321,8 @@ impl Backend {
             &statement_type,
             if outcome.is_ok() { "ok" } else { "error" },
         )?;
+        self.stats
+            .update_connection_sleep(self.connection_id, &user, &self.database);
         outcome
     }
 
@@ -3686,12 +5412,82 @@ impl Backend {
             .unwrap_or_default()
     }
 
+    fn strict_insert_mode(&self) -> bool {
+        self.session_sql_mode().split(',').any(|mode| {
+            matches!(
+                mode.trim().to_ascii_uppercase().as_str(),
+                "STRICT_TRANS_TABLES" | "STRICT_ALL_TABLES"
+            )
+        })
+    }
+
+    fn prepare_insert_write_rows(
+        &mut self,
+        writes: Vec<WriteCommand>,
+    ) -> anyhow::Result<Vec<WriteCommand>> {
+        let strict = self.strict_insert_mode();
+        writes
+            .into_iter()
+            .enumerate()
+            .map(|(index, mut write)| {
+                let (database, table, row, ignore) = match &mut write {
+                    WriteCommand::Insert {
+                        database,
+                        table,
+                        row,
+                    } => (database.as_str(), table.as_str(), row, false),
+                    WriteCommand::Upsert {
+                        database,
+                        table,
+                        row,
+                        ignore,
+                        ..
+                    } => (database.as_str(), table.as_str(), row, *ignore),
+                    _ => return Ok(write),
+                };
+                let schema = self
+                    .storage
+                    .get_database(database)
+                    .and_then(|database| database.get_table(table))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("Table '{}.{}' does not exist", database, table)
+                    })?;
+                coerce_insert_row_lengths(row, &schema, index + 1, strict, ignore, |warning| {
+                    self.record_warning(warning)
+                })?;
+                Ok(write)
+            })
+            .collect()
+    }
+
+    fn only_full_group_by_enabled(&self) -> bool {
+        self.session_sql_mode()
+            .split(',')
+            .any(|mode| mode.trim().eq_ignore_ascii_case("ONLY_FULL_GROUP_BY"))
+    }
+
     fn session_time_zone_name(&self) -> String {
         self.session_variables
             .get("time_zone")
             .and_then(Option::as_deref)
             .map(|value| String::from_utf8_lossy(value).into_owned())
             .unwrap_or_else(|| "SYSTEM".into())
+    }
+
+    fn auto_increment_settings(&self) -> (u64, u64) {
+        let value = |name: &str, default| {
+            self.session_variables
+                .get(name)
+                .and_then(Option::as_deref)
+                .and_then(|value| std::str::from_utf8(value).ok())
+                .and_then(|value| value.parse::<u64>().ok())
+                .filter(|value| (1..=65_535).contains(value))
+                .unwrap_or(default)
+        };
+        (
+            value("auto_increment_increment", 1),
+            value("auto_increment_offset", 1),
+        )
     }
 
     fn transaction_defaults_for_next(&mut self) -> TransactionDefaults {
@@ -3781,11 +5577,7 @@ impl Backend {
                     .lock()
                     .clone()
                     .unwrap_or_else(|| self.config.username.clone());
-                if !self
-                    .config
-                    .auth_catalog
-                    .has_privilege(&user, "", "CONNECTION_ADMIN")
-                {
+                if !self.auth_has_privilege(&user, "", "CONNECTION_ADMIN") {
                     anyhow::bail!(
                         "Access denied; user '{}' lacks CONNECTION_ADMIN privilege",
                         user
@@ -3841,6 +5633,16 @@ impl Backend {
         )
     }
 
+    fn cte_max_recursion_depth(&self) -> usize {
+        self.session_variables
+            .get("cte_max_recursion_depth")
+            .and_then(|value| value.as_deref())
+            .and_then(|value| std::str::from_utf8(value).ok())
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(1000)
+            .min(1_000_000)
+    }
+
     fn clear_statement_messages(&mut self) {
         self.warnings.clear();
         self.session_warning_count = 0;
@@ -3849,6 +5651,53 @@ impl Backend {
 
     fn clear_transaction_snapshot(&mut self) {
         self.transaction_snapshot.clear();
+    }
+
+    fn implicit_insert_lock_resources(
+        &self,
+        writes: &[WriteCommand],
+    ) -> anyhow::Result<HashSet<String>> {
+        let insert_writes = writes
+            .iter()
+            .filter(|write| matches!(write, WriteCommand::Insert { .. }))
+            .cloned()
+            .collect::<Vec<_>>();
+        let requests = write_lock_requests_with_gap_locks(
+            &self.storage,
+            &insert_writes,
+            self.gap_locks_enabled(),
+        )?;
+        let mut resources = HashSet::new();
+        for write in insert_writes {
+            let WriteCommand::Insert {
+                database,
+                table,
+                row,
+            } = write
+            else {
+                continue;
+            };
+            let Some(schema) = self
+                .storage
+                .get_database(&database)
+                .and_then(|database| database.get_table(&table))
+            else {
+                continue;
+            };
+            let primary = table_primary_key_columns(&schema);
+            if let Some(key) = row_lock_key_for_schema(&row, &primary, &schema) {
+                resources.insert(format!("row:{database}.{table}:PRIMARY:{key}"));
+            }
+        }
+        resources.extend(
+            requests
+                .into_iter()
+                .map(|request| request.resource)
+                .filter(|resource| {
+                    resource.starts_with("unique:") || resource.starts_with("range:")
+                }),
+        );
+        Ok(resources)
     }
 
     fn record_warning(&mut self, warning: SqlWarning) {
@@ -3897,8 +5746,37 @@ impl Backend {
             "version_comment" => Some(b"MyDB Server (Neko233 engine)".to_vec()),
             "version_compile_os" => Some(std::env::consts::OS.as_bytes().to_vec()),
             "version_compile_machine" => Some(std::env::consts::ARCH.as_bytes().to_vec()),
-            "default_storage_engine" | "storage_engine" => Some(b"InnoDB".to_vec()),
+            "default_storage_engine" | "default_tmp_storage_engine" | "storage_engine" => {
+                Some(b"InnoDB".to_vec())
+            }
+            "default_authentication_plugin" => Some(b"caching_sha2_password".to_vec()),
+            "activate_all_roles_on_login" => Some(
+                if self.stats.activate_all_roles_on_login() {
+                    b"1"
+                } else {
+                    b"0"
+                }
+                .to_vec(),
+            ),
+            "old_passwords" => Some(b"0".to_vec()),
+            // MySQL 8.4 exposes this policy during IDE metadata discovery.
+            "authentication_policy" => Some(b"*,,".to_vec()),
             "port" => Some(b"3306".to_vec()),
+            "cte_max_recursion_depth" if scope == SystemVariableScope::Global => Some(
+                self.stats
+                    .global_cte_max_recursion_depth()
+                    .to_string()
+                    .into_bytes(),
+            ),
+            // MyDB's WAL commit path is durable at transaction commit. These
+            // MySQL/InnoDB compatibility values are queried by JDBC and tools.
+            "innodb_flush_log_at_trx_commit" => Some(b"1".to_vec()),
+            "sync_binlog" => Some(b"1".to_vec()),
+            "innodb_doublewrite" => Some(b"ON".to_vec()),
+            "innodb_file_per_table" => Some(b"ON".to_vec()),
+            "innodb_support_xa" => Some(b"ON".to_vec()),
+            "innodb_autoinc_lock_mode" => Some(b"2".to_vec()),
+            "innodb_status_output" => Some(b"OFF".to_vec()),
             "autocommit" => Some(if self.autocommit { b"1" } else { b"0" }.to_vec()),
             "innodb_lock_wait_timeout" => Some(
                 self.lock_wait_timeout
@@ -3938,6 +5816,8 @@ impl Backend {
             "LAST_INSERT_ID",
             &self.session_last_insert_id.to_string(),
         );
+        let current_role = self.current_role_value().replace('\'', "''");
+        let sql = replace_no_arg_function(&sql, "CURRENT_ROLE", &format!("'{}'", current_role));
         let sql = replace_no_arg_function(&sql, "ROW_COUNT", &self.session_row_count.to_string());
         Ok(replace_no_arg_function(
             &sql,
@@ -4001,10 +5881,31 @@ impl Backend {
             }
             return self.apply_transaction_characteristics(scope, characteristics);
         }
-        if variable_scope == SystemVariableScope::Global && name != "event_scheduler" {
+        if variable_scope == SystemVariableScope::Global
+            && !matches!(
+                name.as_str(),
+                "event_scheduler" | "cte_max_recursion_depth" | "activate_all_roles_on_login"
+            )
+        {
             anyhow::bail!("Global system variable '{}' is not supported", name);
         }
         match name.as_str() {
+            "activate_all_roles_on_login" => {
+                if variable_scope != SystemVariableScope::Global {
+                    anyhow::bail!("Variable 'activate_all_roles_on_login' is a GLOBAL variable");
+                }
+                let user = self.authenticated_username();
+                if !self.auth_has_privilege(&user, "", "SYSTEM_VARIABLES_ADMIN")
+                    && !self.auth_has_privilege(&user, "", "SUPER")
+                {
+                    anyhow::bail!(
+                        "Access denied; user '{}' lacks SYSTEM_VARIABLES_ADMIN privilege",
+                        user
+                    );
+                }
+                self.stats
+                    .set_activate_all_roles_on_login(mysql_truthy(value.as_deref()));
+            }
             "event_scheduler" => {
                 if variable_scope != SystemVariableScope::Global {
                     anyhow::bail!("Variable 'event_scheduler' is a GLOBAL variable");
@@ -4026,11 +5927,8 @@ impl Backend {
                     .lock()
                     .clone()
                     .unwrap_or_else(|| self.config.username.clone());
-                if !self
-                    .config
-                    .auth_catalog
-                    .has_privilege(&user, "", "SYSTEM_VARIABLES_ADMIN")
-                    && !self.config.auth_catalog.has_privilege(&user, "", "SUPER")
+                if !self.auth_has_privilege(&user, "", "SYSTEM_VARIABLES_ADMIN")
+                    && !self.auth_has_privilege(&user, "", "SUPER")
                 {
                     anyhow::bail!(
                         "Access denied; user '{}' lacks SYSTEM_VARIABLES_ADMIN privilege",
@@ -4065,6 +5963,31 @@ impl Backend {
             "foreign_key_checks" => {
                 self.foreign_key_checks = mysql_truthy(value.as_deref());
             }
+            "auto_increment_increment" | "auto_increment_offset" => {
+                let parsed = match value.as_deref() {
+                    None => 1,
+                    Some(value) => std::str::from_utf8(value)
+                        .map_err(|_| anyhow::anyhow!("{} must be an integer", name))?
+                        .parse::<u64>()
+                        .map_err(|_| anyhow::anyhow!("{} must be an integer", name))?,
+                };
+                if !(1..=65_535).contains(&parsed) {
+                    anyhow::bail!("Variable '{}' must be between 1 and 65535", name);
+                }
+                let (current_increment, current_offset) = self.auto_increment_settings();
+                if name == "auto_increment_increment" && current_offset > parsed {
+                    anyhow::bail!(
+                        "auto_increment_offset must not be greater than auto_increment_increment"
+                    );
+                }
+                if name == "auto_increment_offset" && parsed > current_increment {
+                    anyhow::bail!(
+                        "auto_increment_offset must not be greater than auto_increment_increment"
+                    );
+                }
+                self.session_variables
+                    .insert(name, Some(parsed.to_string().into_bytes()));
+            }
             "innodb_lock_wait_timeout" => {
                 let seconds = value
                     .as_deref()
@@ -4091,6 +6014,41 @@ impl Backend {
                     "max_error_count".into(),
                     Some(count.to_string().into_bytes()),
                 );
+            }
+            "cte_max_recursion_depth" => {
+                let depth = match value.as_deref() {
+                    None => 1000,
+                    Some(value) => std::str::from_utf8(value)
+                        .map_err(|_| anyhow::anyhow!("cte_max_recursion_depth must be an integer"))?
+                        .parse::<u64>()
+                        .map_err(|_| {
+                            anyhow::anyhow!("cte_max_recursion_depth must be an integer")
+                        })?,
+                };
+                if depth > 4_294_967_295 {
+                    anyhow::bail!("cte_max_recursion_depth is out of range");
+                }
+                if variable_scope == SystemVariableScope::Global {
+                    let user = self
+                        .authenticated_user
+                        .lock()
+                        .clone()
+                        .unwrap_or_else(|| self.config.username.clone());
+                    if !self.auth_has_privilege(&user, "", "SYSTEM_VARIABLES_ADMIN")
+                        && !self.auth_has_privilege(&user, "", "SUPER")
+                    {
+                        anyhow::bail!(
+                            "Access denied; user '{}' lacks SYSTEM_VARIABLES_ADMIN privilege",
+                            user
+                        );
+                    }
+                    self.stats.set_global_cte_max_recursion_depth(depth as u32);
+                } else {
+                    self.session_variables.insert(
+                        "cte_max_recursion_depth".into(),
+                        Some(depth.to_string().into_bytes()),
+                    );
+                }
             }
             "time_zone" => {
                 let value = value.unwrap_or_else(|| b"SYSTEM".to_vec());
@@ -4137,9 +6095,11 @@ impl Backend {
             } else {
                 user
             };
-            self.config
-                .auth_catalog
-                .alter_user_passwords(&[(user, password)])?;
+            self.config.auth_catalog.alter_user_passwords(&[(
+                user,
+                password,
+                default_authentication_plugin(),
+            )])?;
             return Ok(QueryOutcome::ok(0));
         }
         if let Some(transaction) = parse_set_transaction_statement(body) {
@@ -4218,6 +6178,9 @@ impl Backend {
     }
 
     fn ensure_transaction_writable(&self) -> anyhow::Result<()> {
+        if self.xa_branch_state == Some(XaBranchState::Ended) {
+            anyhow::bail!("XAER_PROTO: XA branch has been ended");
+        }
         if self.transaction_read_only
             || (!self.in_transaction
                 && self.autocommit
@@ -4257,11 +6220,7 @@ impl Backend {
                 continue;
             }
             for privilege in ["LOCK TABLES", "SELECT"] {
-                if !self
-                    .config
-                    .auth_catalog
-                    .has_privilege(&user, &database, privilege)
-                {
+                if !self.auth_has_privilege(&user, &database, privilege) {
                     anyhow::bail!(
                         "Access denied; user '{}' lacks {} privilege on '{}.{}'",
                         user,
@@ -4829,7 +6788,8 @@ impl Backend {
                         continue;
                     }
                     if is_trigger_signal_statement(statement) {
-                        let condition = procedure_signal_condition(statement, &context)?;
+                        let statement = bind_trigger_local_references(statement, locals);
+                        let condition = procedure_signal_condition(&statement, &context)?;
                         if let Some(control) = Box::pin(
                             self.execute_procedure_condition_handler(condition, locals, state),
                         )
@@ -4933,7 +6893,7 @@ impl Backend {
                     let mut selected = otherwise.as_slice();
                     for (condition, statements) in branches {
                         let context = trigger_context_with_locals(Row::new(), locals);
-                        if evaluate_scalar_condition(condition, &context)? {
+                        if evaluate_scalar_condition_with_locals(condition, &context, locals)? {
                             selected = statements;
                             break;
                         }
@@ -4951,8 +6911,9 @@ impl Backend {
                     has_else,
                 } => {
                     let context = trigger_context_with_locals(Row::new(), locals);
-                    let selected =
-                        trigger_case_branch(selector, branches, otherwise, *has_else, &context)?;
+                    let selected = trigger_case_branch(
+                        selector, branches, otherwise, *has_else, &context, locals,
+                    )?;
                     if let Some(control) =
                         Box::pin(self.execute_procedure_nodes(selected, locals, state)).await?
                     {
@@ -4963,7 +6924,7 @@ impl Backend {
                     let mut finished = false;
                     for _ in 0..MAX_TRIGGER_LOOP_ITERATIONS {
                         let context = trigger_context_with_locals(Row::new(), locals);
-                        if matches!(kind, TriggerLoopKind::While(condition) if !evaluate_scalar_condition(condition, &context)?)
+                        if matches!(kind, TriggerLoopKind::While(condition) if !evaluate_scalar_condition_with_locals(condition, &context, locals)?)
                         {
                             finished = true;
                             break;
@@ -4987,7 +6948,7 @@ impl Backend {
                         }
                         if let TriggerLoopKind::RepeatUntil(condition) = kind {
                             let context = trigger_context_with_locals(Row::new(), locals);
-                            if evaluate_scalar_condition(condition, &context)? {
+                            if evaluate_scalar_condition_with_locals(condition, &context, locals)? {
                                 finished = true;
                                 break;
                             }
@@ -5038,6 +6999,7 @@ impl Backend {
         for (target, expression) in assignments {
             let expression = self.substitute_session_references(&expression)?;
             let context = trigger_context_with_locals(Row::new(), locals);
+            let expression = bind_trigger_local_references(&expression, locals);
             let value = evaluate_scalar_expression(&expression, &context)?;
             if target.starts_with('@') && !target.starts_with("@@") {
                 self.user_variables.insert(
@@ -5081,6 +7043,7 @@ impl Backend {
         for (item, expression) in &resignal.assignments {
             let expression = self.substitute_session_references(expression)?;
             let context = trigger_context_with_locals(Row::new(), locals);
+            let expression = bind_trigger_local_references(&expression, locals);
             let value = evaluate_scalar_expression(&expression, &context)?
                 .ok_or_else(|| anyhow::anyhow!("RESIGNAL information items cannot be NULL"))?;
             let value = String::from_utf8_lossy(&value).into_owned();
@@ -5189,6 +7152,7 @@ impl Backend {
         let values = if let Some(number) = &diagnostics.condition_number {
             let expression = self.substitute_session_references(number)?;
             let context = trigger_context_with_locals(Row::new(), locals);
+            let expression = bind_trigger_local_references(&expression, locals);
             let number = evaluate_scalar_expression(&expression, &context)?
                 .and_then(|value| String::from_utf8(value).ok())
                 .and_then(|value| value.parse::<usize>().ok())
@@ -5396,6 +7360,15 @@ impl Backend {
             (sql, false)
         };
         let upper = sql.to_ascii_uppercase();
+        if let Some(state) = self.xa_branch_state {
+            if !upper.starts_with("XA ")
+                && (state == XaBranchState::Ended || xa_statement_forbidden_in_branch(&upper))
+            {
+                anyhow::bail!(
+                    "XAER_PROTO: statement is not allowed in the current XA branch state"
+                );
+            }
+        }
         if self.execution_mode == BackendExecutionMode::EventAtomic
             && event_atomic_statement_forbidden(&upper)
         {
@@ -5509,11 +7482,16 @@ impl Backend {
                 return Ok(QueryOutcome::ok(0));
             }
             let name = last_identifier(sql)?;
+            let implicit_insert_locks =
+                self.implicit_insert_lock_resources(&self.transaction_writes.read())?;
+            let held_lock_resources = self.stats.connection_lock_resources(self.connection_id);
             self.savepoints
                 .retain(|savepoint| !savepoint.name.eq_ignore_ascii_case(&name));
             self.savepoints.push(TransactionSavepoint {
                 name,
                 writes_len: self.transaction_writes.read().len(),
+                implicit_insert_locks,
+                held_lock_resources,
             });
             return Ok(QueryOutcome::ok(0));
         }
@@ -5525,7 +7503,19 @@ impl Backend {
                 .rposition(|savepoint| savepoint.name.eq_ignore_ascii_case(&name))
                 .ok_or_else(|| anyhow::anyhow!("SAVEPOINT {} does not exist", name))?;
             let writes_len = self.savepoints[position].writes_len;
+            let retained_implicit_insert_locks =
+                self.savepoints[position].implicit_insert_locks.clone();
+            let held_lock_resources = self.savepoints[position].held_lock_resources.clone();
+            let held_implicit_insert_locks =
+                self.implicit_insert_lock_resources(&self.transaction_writes.read())?;
             self.transaction_writes.write().truncate(writes_len);
+            let released = held_implicit_insert_locks
+                .difference(&retained_implicit_insert_locks)
+                .filter(|resource| !held_lock_resources.contains(*resource))
+                .cloned()
+                .collect::<HashSet<_>>();
+            self.stats
+                .release_connection_locks_for_resources(self.connection_id, &released);
             self.savepoints.truncate(position + 1);
             return Ok(QueryOutcome::ok(0));
         }
@@ -5540,6 +7530,12 @@ impl Backend {
             return Ok(QueryOutcome::ok(0));
         }
         if upper.starts_with("SET ") {
+            if upper.starts_with("SET ROLE ") {
+                return self.execute_set_role_statement(sql);
+            }
+            if upper.starts_with("SET DEFAULT ROLE ") {
+                return self.execute_auth_statement(sql);
+            }
             return self.execute_set_statement(sql).await;
         }
         if upper.starts_with("PREPARE ") {
@@ -5607,6 +7603,17 @@ impl Backend {
             return Ok(QueryOutcome::rows(vec!["Level", "Code", "Message"], rows));
         }
 
+        if upper == "SHOW PROCESSLIST" || upper == "SHOW FULL PROCESSLIST" {
+            let user = self.authenticated_username();
+            let can_view_all = self.auth_has_privilege(&user, "", "PROCESS");
+            return Ok(QueryOutcome::byte_rows(
+                vec![
+                    "Id", "User", "Host", "db", "Command", "Time", "State", "Info",
+                ],
+                self.stats
+                    .processlist_rows(&user, can_view_all, upper == "SHOW FULL PROCESSLIST"),
+            ));
+        }
         if upper.starts_with("SHOW GRANTS") {
             let (requested_principal, using_roles) = parse_show_grants_options(sql)?;
             let current_principal = self.authenticated_username();
@@ -5835,25 +7842,28 @@ impl Backend {
             ));
         }
         if upper.starts_with("SHOW CREATE TABLE ") {
-            let table = sql
+            let reference = sql
                 .split_whitespace()
                 .last()
                 .unwrap_or("")
                 .trim_matches('`');
-            let schema = self.table_schema(table)?;
+            let (database, physical) = self.resolve_table_reference(reference)?;
+            let schema = self.table_schema(reference)?;
             if view_select_sql(&schema).is_some() {
-                anyhow::bail!("'{}' is not BASE TABLE", table);
+                anyhow::bail!("'{}' is not BASE TABLE", reference);
             }
             let mut create_sql = render_create_table(&schema);
-            if let Ok((database, physical)) = self.resolve_table_reference(table) {
-                if let Some(logical) = self.temporary_logical_name(&database, &physical) {
-                    create_sql = create_sql.replacen(&physical, logical, 1);
-                    create_sql = create_sql.replacen("CREATE TABLE", "CREATE TEMPORARY TABLE", 1);
-                }
+            let output_table = self
+                .temporary_logical_name(&database, &physical)
+                .unwrap_or(&physical)
+                .to_string();
+            if let Some(logical) = self.temporary_logical_name(&database, &physical) {
+                create_sql = create_sql.replacen(&physical, logical, 1);
+                create_sql = create_sql.replacen("CREATE TABLE", "CREATE TEMPORARY TABLE", 1);
             }
             return Ok(QueryOutcome::rows(
                 vec!["Table", "Create Table"],
-                vec![vec![Some(table.to_string()), Some(create_sql)]],
+                vec![vec![Some(output_table), Some(create_sql)]],
             ));
         }
         if upper.starts_with("SHOW CREATE TRIGGER ") {
@@ -6045,14 +8055,40 @@ impl Backend {
                     bytes("version_compile_machine"),
                     bytes(std::env::consts::ARCH),
                 ],
+                vec![bytes("innodb_flush_log_at_trx_commit"), bytes("1")],
+                vec![bytes("sync_binlog"), bytes("1")],
+                vec![bytes("innodb_doublewrite"), bytes("ON")],
+                vec![bytes("innodb_file_per_table"), bytes("ON")],
+                vec![bytes("innodb_support_xa"), bytes("ON")],
+                vec![bytes("innodb_autoinc_lock_mode"), bytes("2")],
                 vec![
                     bytes("autocommit"),
                     bytes(if self.autocommit { "ON" } else { "OFF" }),
                 ],
                 vec![bytes("character_set_server"), bytes("utf8mb4")],
+                vec![bytes("default_storage_engine"), bytes("InnoDB")],
+                vec![bytes("default_tmp_storage_engine"), bytes("InnoDB")],
+                vec![
+                    bytes("default_authentication_plugin"),
+                    bytes("caching_sha2_password"),
+                ],
+                vec![bytes("authentication_policy"), bytes("*,,")],
+                vec![bytes("old_passwords"), bytes("0")],
+                vec![bytes("lower_case_table_names"), bytes("1")],
                 vec![
                     bytes("event_scheduler"),
                     bytes(self.stats.event_scheduler_value()),
+                ],
+                vec![
+                    bytes("cte_max_recursion_depth"),
+                    bytes(
+                        &if upper.starts_with("SHOW GLOBAL VARIABLES") {
+                            self.stats.global_cte_max_recursion_depth()
+                        } else {
+                            self.cte_max_recursion_depth()
+                        }
+                        .to_string(),
+                    ),
                 ],
                 vec![
                     bytes("max_error_count"),
@@ -6094,6 +8130,9 @@ impl Backend {
                     bytes(&stats.active_connections.to_string()),
                 ],
                 vec![bytes("Questions"), bytes(&stats.queries.to_string())],
+                // The default listener is plaintext, matching MySQL's
+                // SHOW STATUS surface when SSL is not negotiated.
+                vec![bytes("Ssl_version"), bytes("")],
             ];
             return Ok(QueryOutcome::byte_rows(
                 columns.clone(),
@@ -6242,10 +8281,7 @@ impl Backend {
                 .lock()
                 .clone()
                 .unwrap_or_else(|| self.config.username.clone());
-            let can_set_user_id =
-                self.config
-                    .auth_catalog
-                    .has_privilege(&creator, "", "SET_USER_ID");
+            let can_set_user_id = self.auth_has_privilege(&creator, "", "SET_USER_ID");
             let (database, mut event, if_not_exists) = parse_create_event(
                 sql,
                 &self.database,
@@ -6377,10 +8413,7 @@ impl Backend {
         }
         if is_alter_event_statement(sql) {
             let creator = self.authenticated_username();
-            let can_set_user_id =
-                self.config
-                    .auth_catalog
-                    .has_privilege(&creator, "", "SET_USER_ID");
+            let can_set_user_id = self.auth_has_privilege(&creator, "", "SET_USER_ID");
             let header = parse_alter_event_header(sql, &self.database, &creator)?;
             self.require_database_privilege(&header.database, "EVENT")?;
             let rename_database = parse_event_clauses(header.tail, false, false, true)?
@@ -6633,7 +8666,7 @@ impl Backend {
                 next_page_number: 0,
                 generation: 0,
                 create_sql: Some(format!(
-                    "CREATE VIEW `{}`{} AS {}",
+                    "CREATE VIEW `{}`{} AS {}{}",
                     table,
                     if columns.is_empty() {
                         String::new()
@@ -6647,7 +8680,8 @@ impl Backend {
                                 .join(",")
                         )
                     },
-                    definition.query
+                    definition.query,
+                    view_check_option_sql(definition.check_option)
                 )),
                 engine: TableEngine::Neko233,
             };
@@ -6890,7 +8924,11 @@ impl Backend {
                 self.submit_ddl(writes).await
             };
         }
-        if upper.starts_with("CREATE INDEX ") || upper.starts_with("CREATE UNIQUE INDEX ") {
+        if upper.starts_with("CREATE INDEX ")
+            || upper.starts_with("CREATE UNIQUE INDEX ")
+            || upper.starts_with("CREATE FULLTEXT INDEX ")
+            || upper.starts_with("CREATE SPATIAL INDEX ")
+        {
             let (reference, index) = parse_create_index(sql)?;
             let (database, table) = self.resolve_table_reference(&reference)?;
             let temporary = table.starts_with("__mydb_tmp_");
@@ -6928,15 +8966,29 @@ impl Backend {
             }
             let (database, schema) = self.table_schema_from_insert(sql)?;
             if view_select_sql(&schema).is_some() {
-                anyhow::bail!("The target table is not insertable-into");
+                let (_reference, rows) = parse_insert(sql, &schema)?;
+                let Some(view) =
+                    simple_updatable_view_definition(&self.storage, &database, &schema)?
+                else {
+                    anyhow::bail!("The target table is not insertable-into");
+                };
+                if upper.starts_with("REPLACE ")
+                    || parse_insert_conflict_action(sql, &schema)?.is_some()
+                {
+                    anyhow::bail!("INSERT conflict modifiers are not supported for this view");
+                }
+                return self.submit_updatable_view_insert(view, rows).await;
             }
             let (reference, rows) = parse_insert(sql, &schema)?;
             let (_, table) = self.resolve_table_reference(&reference)?;
+            if let Some(value) = insert_last_insert_id_value(sql)? {
+                self.session_last_insert_id = value;
+            }
             let predicted = rows.len() as u64;
             if let Some(action) = parse_insert_conflict_action(sql, &schema)? {
                 match action {
                     InsertConflictAction::Ignore => {
-                        return self.submit_ignore_insert(database, table, rows).await;
+                        return self.submit_ignore_insert(database, table, rows, true).await;
                     }
                     InsertConflictAction::Replace(_) => {
                         return self.submit_replace_insert(database, table, rows).await;
@@ -7016,8 +9068,16 @@ impl Backend {
                 .get_database(&database)
                 .and_then(|database| database.get_table(&table))
                 .ok_or_else(|| anyhow::anyhow!("Table '{}.{}' does not exist", database, table))?;
+            reject_generated_update_assignments(&schema, &assignments)?;
             if view_select_sql(&schema).is_some() {
-                anyhow::bail!("The target table is not updatable");
+                let Some(view) =
+                    simple_updatable_view_definition(&self.storage, &database, &schema)?
+                else {
+                    anyhow::bail!("The target table is not updatable");
+                };
+                return self
+                    .submit_updatable_view_update(sql, reference, view)
+                    .await;
             }
             if update_has_scalar_assignments(sql)
                 || options.order_by.as_ref().is_some_and(|(column, _)| {
@@ -7071,7 +9131,14 @@ impl Backend {
                 .and_then(|database| database.get_table(&table))
                 .ok_or_else(|| anyhow::anyhow!("Table '{}.{}' does not exist", database, table))?;
             if view_select_sql(&schema).is_some() {
-                anyhow::bail!("The target table is not updatable");
+                let Some(view) =
+                    simple_updatable_view_definition(&self.storage, &database, &schema)?
+                else {
+                    anyhow::bail!("The target table is not updatable");
+                };
+                return self
+                    .submit_updatable_view_delete(sql, reference, view)
+                    .await;
             }
             if options
                 .order_by
@@ -7143,8 +9210,7 @@ impl Backend {
             let locking_read = upper.contains(" FOR UPDATE")
                 || upper.contains(" FOR SHARE")
                 || upper.contains(" LOCK IN SHARE MODE")
-                || (self.in_transaction
-                    && self.transaction_isolation == TransactionIsolation::Serializable);
+                || self.transaction_isolation == TransactionIsolation::Serializable;
             let statement_lock_snapshot =
                 (!locking_read).then(|| self.stats.connection_lock_snapshot(self.connection_id));
             let previous_plain_select_lock_scope = self.plain_select_lock_scope;
@@ -7265,7 +9331,8 @@ impl Backend {
             anyhow::bail!("Replication is not supported in single-node MyDB");
         }
         // ---- Local XA transactions ----
-        if let Some(rest) = upper.strip_prefix("XA ") {
+        if upper.starts_with("XA ") {
+            let rest = sql["XA ".len()..].trim_start();
             return self.execute_xa(rest).await;
         }
 
@@ -7303,75 +9370,229 @@ impl Backend {
         Ok(list)
     }
 
-    async fn execute_xa(&mut self, rest: &str) -> anyhow::Result<QueryOutcome> {
-        let rest = rest.trim();
-        let upper = rest.to_ascii_uppercase();
-        if let Some(xid) = upper.strip_prefix("START ") {
-            self.begin_xa(xid.trim()).await?;
-            return Ok(QueryOutcome::ok(0));
+    fn parse_xa_identifier(value: &str) -> anyhow::Result<XaIdentifier> {
+        let parts = split_csv(value);
+        if parts.is_empty() || parts.len() > 3 {
+            anyhow::bail!("XAER_INVAL: invalid XA identifier");
         }
-        if let Some(xid) = upper.strip_prefix("BEGIN ") {
-            self.begin_xa(xid.trim()).await?;
-            return Ok(QueryOutcome::ok(0));
+        let gtrid = parse_xa_value(&parts[0])?;
+        let bqual = if parts.len() >= 2 {
+            parse_xa_value(&parts[1])?
+        } else {
+            Vec::new()
+        };
+        let format_id = parts
+            .get(2)
+            .map(|value| {
+                value
+                    .trim()
+                    .parse::<u32>()
+                    .map_err(|_| anyhow::anyhow!("XAER_INVAL: invalid XA format ID"))
+            })
+            .transpose()?
+            .unwrap_or(1);
+        if gtrid.is_empty() || gtrid.len() > 64 || bqual.len() > 64 {
+            anyhow::bail!("XAER_INVAL: XA identifier length is out of range");
         }
-        if upper == "END" || upper.starts_with("END ") {
-            return Ok(QueryOutcome::ok(0));
-        }
-        if upper.starts_with("PREPARE ") || upper == "PREPARE" {
-            return Ok(QueryOutcome::ok(0));
-        }
-        if let Some(xid) = upper.strip_prefix("COMMIT ") {
-            let _ = xid;
-            self.in_transaction = false;
-            self.commit_pending().await?;
-            return Ok(QueryOutcome::ok(0));
-        }
-        if upper == "COMMIT" {
-            self.in_transaction = false;
-            self.commit_pending().await?;
-            return Ok(QueryOutcome::ok(0));
-        }
-        if let Some(xid) = upper.strip_prefix("ROLLBACK ") {
-            let _ = xid;
-            self.transaction_writes.write().clear();
-            self.clear_transaction_snapshot();
-            self.end_mvcc_transaction();
-            self.savepoints.clear();
-            self.stats.release_all_locks(self.connection_id);
-            self.in_transaction = false;
-            self.reset_transaction_characteristics();
-            return Ok(QueryOutcome::ok(0));
-        }
-        if upper == "ROLLBACK" {
-            self.transaction_writes.write().clear();
-            self.clear_transaction_snapshot();
-            self.end_mvcc_transaction();
-            self.savepoints.clear();
-            self.stats.release_all_locks(self.connection_id);
-            self.in_transaction = false;
-            self.reset_transaction_characteristics();
-            return Ok(QueryOutcome::ok(0));
-        }
-        if upper == "RECOVER" {
-            return Ok(QueryOutcome::byte_rows(
-                vec!["formatID", "gtrid_length", "bqual_length", "data"],
-                vec![],
-            ));
-        }
-        anyhow::bail!("Unsupported XA statement")
+        let key = format!("{}:{}:{}", format_id, hex_bytes(&gtrid), hex_bytes(&bqual));
+        Ok(XaIdentifier {
+            key,
+            format_id,
+            gtrid,
+            bqual,
+        })
     }
 
-    async fn begin_xa(&mut self, _xid: &str) -> anyhow::Result<()> {
-        // Local single-node XA: open an in-session transaction that is later
-        // closed by XA COMMIT / XA ROLLBACK. The xid is accepted for protocol
-        // compatibility but a single-node engine has no external coordinator.
-        self.commit_pending().await?;
+    async fn execute_xa(&mut self, rest: &str) -> anyhow::Result<QueryOutcome> {
+        let rest = rest.trim();
+        let (command, tail) = take_sql_keyword(rest)
+            .ok_or_else(|| anyhow::anyhow!("XAER_PROTO: missing XA command"))?;
+        let tail = tail.trim();
+        if command.eq_ignore_ascii_case("START") || command.eq_ignore_ascii_case("BEGIN") {
+            if tail.to_ascii_uppercase().ends_with(" JOIN")
+                || tail.to_ascii_uppercase().ends_with(" RESUME")
+            {
+                anyhow::bail!("XAER_RMFAIL: XA JOIN/RESUME is not supported");
+            }
+            let identifier = Self::parse_xa_identifier(tail)?;
+            self.begin_xa(identifier).await?;
+            return Ok(QueryOutcome::ok(0));
+        }
+        if command.eq_ignore_ascii_case("END") {
+            if tail.is_empty() {
+                anyhow::bail!("XAER_PROTO: XA END requires an XID");
+            }
+            let identifier =
+                Self::parse_xa_identifier(strip_xa_modifier(tail, &["SUSPEND", "FAIL"]).0)?;
+            let current = self
+                .xa_identifier
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("XAER_NOTA: no active XA transaction"))?;
+            if current.key != identifier.key || self.xa_branch_state != Some(XaBranchState::Active)
+            {
+                anyhow::bail!("XAER_PROTO: XA END does not match the active branch");
+            }
+            self.xa_branch_state = Some(XaBranchState::Ended);
+            return Ok(QueryOutcome::ok(0));
+        }
+        if command.eq_ignore_ascii_case("PREPARE") {
+            let identifier = if tail.is_empty() {
+                self.xa_identifier
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("XAER_NOTA: no active XA transaction"))?
+            } else {
+                Self::parse_xa_identifier(tail)?
+            };
+            self.prepare_xa(identifier).await?;
+            return Ok(QueryOutcome::ok(0));
+        }
+        if command.eq_ignore_ascii_case("COMMIT") {
+            let (xid, one_phase) = strip_xa_modifier(tail, &["ONE PHASE"]);
+            if xid.is_empty() {
+                anyhow::bail!("XAER_PROTO: XA COMMIT requires an XID");
+            }
+            let identifier = Self::parse_xa_identifier(xid)?;
+            self.commit_xa(identifier, one_phase).await?;
+            return Ok(QueryOutcome::ok(0));
+        }
+        if command.eq_ignore_ascii_case("ROLLBACK") {
+            if tail.is_empty() {
+                anyhow::bail!("XAER_PROTO: XA ROLLBACK requires an XID");
+            }
+            self.rollback_xa(Self::parse_xa_identifier(tail)?).await?;
+            return Ok(QueryOutcome::ok(0));
+        }
+        if command.eq_ignore_ascii_case("RECOVER") {
+            if !tail.is_empty() {
+                anyhow::bail!("XAER_PROTO: XA RECOVER takes no arguments");
+            }
+            return Ok(QueryOutcome::byte_rows(
+                vec!["formatID", "gtrid_length", "bqual_length", "data"],
+                self.stats.prepared_xa_rows(),
+            ));
+        }
+        anyhow::bail!("XAER_INVAL: unsupported XA command")
+    }
+
+    async fn begin_xa(&mut self, identifier: XaIdentifier) -> anyhow::Result<()> {
+        if self.in_transaction || self.xa_identifier.is_some() {
+            anyhow::bail!("XAER_PROTO: a transaction is already active");
+        }
+        if self.stats.prepared_xa.lock().contains_key(&identifier.key) {
+            anyhow::bail!("XAER_DUPID: XA transaction already exists");
+        }
+        self.storage
+            .clear_xa_commit_marker(&identifier.key)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         self.clear_explicit_table_locks();
         self.clear_transaction_snapshot();
         self.savepoints.clear();
         self.in_transaction = true;
         self.activate_transaction_defaults(None);
         self.begin_mvcc_transaction(false)?;
+        self.xa_identifier = Some(identifier);
+        self.xa_branch_state = Some(XaBranchState::Active);
+        Ok(())
+    }
+
+    async fn prepare_xa(&mut self, identifier: XaIdentifier) -> anyhow::Result<()> {
+        let current = self
+            .xa_identifier
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("XAER_NOTA: no active XA transaction"))?;
+        if current.key != identifier.key || self.xa_branch_state != Some(XaBranchState::Ended) {
+            anyhow::bail!("XAER_PROTO: XA branch must be ended before prepare");
+        }
+        let lock_owner = self.stats.internal_connection_id();
+        let transaction = PreparedXaTransaction {
+            identifier,
+            commands: self.transaction_writes.read().clone(),
+            lock_owner,
+            committing: false,
+        };
+        self.stats.prepare_xa_transaction(transaction)?;
+        self.stats
+            .transfer_transaction_locks(self.connection_id, lock_owner);
+        self.transaction_writes.write().clear();
+        self.clear_transaction_snapshot();
+        self.end_mvcc_transaction();
+        self.savepoints.clear();
+        self.in_transaction = false;
+        self.xa_identifier = None;
+        self.xa_branch_state = None;
+        self.reset_transaction_characteristics();
+        Ok(())
+    }
+
+    async fn commit_xa(&mut self, identifier: XaIdentifier, one_phase: bool) -> anyhow::Result<()> {
+        if one_phase {
+            let current = self
+                .xa_identifier
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("XAER_NOTA: no active XA transaction"))?;
+            if current.key != identifier.key || self.xa_branch_state != Some(XaBranchState::Ended) {
+                anyhow::bail!("XAER_PROTO: XA ONE PHASE branch does not match");
+            }
+            self.in_transaction = false;
+            self.commit_pending().await?;
+            self.xa_identifier = None;
+            self.xa_branch_state = None;
+            return Ok(());
+        }
+        if let Some(transaction) = self.stats.prepared_xa(&identifier.key) {
+            if transaction.committing && self.storage.xa_commit_marker_exists(&identifier.key) {
+                self.stats.remove_prepared_xa(&identifier.key)?;
+                self.stats.release_all_locks(transaction.lock_owner);
+                self.storage
+                    .clear_xa_commit_marker(&identifier.key)
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                return Ok(());
+            }
+            self.stats.mark_prepared_xa_committing(&identifier.key)?;
+            let mut commands = transaction.commands.clone();
+            commands.push(WriteCommand::XaCommitMarker {
+                key: identifier.key.clone(),
+            });
+            let result = self.storage.execute_prepared_batch(commands).await;
+            match result {
+                Ok(_) => {
+                    self.stats.remove_prepared_xa(&identifier.key)?;
+                    self.stats.release_all_locks(transaction.lock_owner);
+                    self.storage
+                        .clear_xa_commit_marker(&identifier.key)
+                        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                    Ok(())
+                }
+                Err(error) => Err(error),
+            }
+        } else {
+            anyhow::bail!("XAER_NOTA: XA transaction is not prepared")
+        }
+    }
+
+    async fn rollback_xa(&mut self, identifier: XaIdentifier) -> anyhow::Result<()> {
+        if self
+            .xa_identifier
+            .as_ref()
+            .is_some_and(|current| current.key == identifier.key)
+        {
+            self.transaction_writes.write().clear();
+            self.clear_transaction_snapshot();
+            self.end_mvcc_transaction();
+            self.savepoints.clear();
+            self.stats.release_all_locks(self.connection_id);
+            self.in_transaction = false;
+            self.xa_identifier = None;
+            self.xa_branch_state = None;
+            self.reset_transaction_characteristics();
+            return Ok(());
+        }
+        if let Some(transaction) = self.stats.take_prepared_xa(&identifier.key)? {
+            self.stats.release_all_locks(transaction.lock_owner);
+            self.storage
+                .clear_xa_commit_marker(&identifier.key)
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        }
         Ok(())
     }
 
@@ -7382,13 +9603,166 @@ impl Backend {
             .unwrap_or_else(|| self.config.username.clone())
     }
 
-    fn require_database_privilege(&self, database: &str, privilege: &str) -> anyhow::Result<()> {
+    fn active_role_set(&self) -> HashSet<String> {
+        let mut active = self.active_roles.lock();
+        if let Some(roles) = active.as_ref() {
+            return roles.clone();
+        }
         let user = self.authenticated_username();
-        if self
+        let activate_all = self
+            .session_variables
+            .get("activate_all_roles_on_login")
+            .and_then(|value| value.as_deref())
+            .is_some_and(|value| mysql_truthy(Some(value)));
+        let roles = if activate_all {
+            self.config.auth_catalog.granted_roles(&user)
+        } else {
+            self.config.auth_catalog.default_roles(&user)
+        };
+        *active = Some(roles.clone());
+        roles
+    }
+
+    fn set_active_roles(&self, roles: HashSet<String>) -> anyhow::Result<()> {
+        let user = self.authenticated_username();
+        let available = self.config.auth_catalog.available_roles(&user);
+        if let Some(role) = roles.iter().find(|role| !available.contains(*role)) {
+            anyhow::bail!("Role '{}' is not granted to '{}'", role, user);
+        }
+        *self.active_roles.lock() = Some(roles);
+        Ok(())
+    }
+
+    fn auth_has_privilege(&self, user: &str, database: &str, privilege: &str) -> bool {
+        if normalize_auth_name(user) == normalize_auth_name(&self.authenticated_username()) {
+            let roles = self.active_role_set();
+            self.config
+                .auth_catalog
+                .has_privilege_with_roles(user, database, privilege, &roles)
+        } else {
+            self.config
+                .auth_catalog
+                .has_privilege(user, database, privilege)
+        }
+    }
+
+    fn auth_has_table_privilege(
+        &self,
+        user: &str,
+        database: &str,
+        table: &str,
+        privilege: &str,
+    ) -> bool {
+        if normalize_auth_name(user) == normalize_auth_name(&self.authenticated_username()) {
+            let roles = self.active_role_set();
+            self.config
+                .auth_catalog
+                .has_table_privilege_with_roles(user, database, table, privilege, &roles)
+        } else {
+            self.config
+                .auth_catalog
+                .has_table_privilege(user, database, table, privilege)
+        }
+    }
+
+    fn auth_has_column_privilege(
+        &self,
+        user: &str,
+        database: &str,
+        table: &str,
+        column: &str,
+        privilege: &str,
+    ) -> bool {
+        if normalize_auth_name(user) == normalize_auth_name(&self.authenticated_username()) {
+            let roles = self.active_role_set();
+            self.config
+                .auth_catalog
+                .has_column_privilege_with_roles(user, database, table, column, privilege, &roles)
+        } else {
+            self.config
+                .auth_catalog
+                .has_column_privilege(user, database, table, column, privilege)
+        }
+    }
+
+    fn auth_has_routine_privilege(
+        &self,
+        user: &str,
+        kind: RoutineKind,
+        database: &str,
+        routine: &str,
+        privilege: &str,
+    ) -> bool {
+        if normalize_auth_name(user) == normalize_auth_name(&self.authenticated_username()) {
+            let roles = self.active_role_set();
+            self.config
+                .auth_catalog
+                .has_routine_privilege_with_roles(user, kind, database, routine, privilege, &roles)
+        } else {
+            self.config
+                .auth_catalog
+                .has_routine_privilege(user, kind, database, routine, privilege)
+        }
+    }
+
+    fn current_role_value(&self) -> String {
+        let roles = self
             .config
             .auth_catalog
-            .has_privilege(&user, database, privilege)
-        {
+            .expand_roles(&self.active_role_set());
+        let mut roles = roles
+            .into_iter()
+            .map(|role| {
+                let (user, host) = mysql_account_parts(&role);
+                mysql_grantee(&format!("{}@{}", user, host))
+            })
+            .collect::<Vec<_>>();
+        roles.sort();
+        if roles.is_empty() {
+            "NONE".to_string()
+        } else {
+            roles.join(",")
+        }
+    }
+
+    fn execute_set_role_statement(&self, sql: &str) -> anyhow::Result<QueryOutcome> {
+        let body = sql["SET ROLE".len()..].trim();
+        let upper = body.to_ascii_uppercase();
+        let roles = if upper == "NONE" {
+            HashSet::new()
+        } else if upper == "DEFAULT" {
+            self.config
+                .auth_catalog
+                .default_roles(&self.authenticated_username())
+        } else if upper == "ALL" {
+            self.config
+                .auth_catalog
+                .granted_roles(&self.authenticated_username())
+        } else if upper.starts_with("ALL EXCEPT ") {
+            let all = self
+                .config
+                .auth_catalog
+                .granted_roles(&self.authenticated_username());
+            let excluded = split_csv(&body["ALL EXCEPT ".len()..])
+                .into_iter()
+                .map(|role| normalize_auth_name(&role))
+                .collect::<HashSet<_>>();
+            all.into_iter()
+                .filter(|role| !excluded.contains(role))
+                .collect()
+        } else {
+            split_csv(body)
+                .into_iter()
+                .map(|role| normalize_auth_name(&role))
+                .collect()
+        };
+        self.set_active_roles(roles)?;
+        Ok(QueryOutcome::ok(0))
+    }
+
+    fn require_database_privilege(&self, database: &str, privilege: &str) -> anyhow::Result<()> {
+        let user = self.authenticated_username();
+        if self.auth_has_privilege(&user, database, privilege) {
             Ok(())
         } else {
             anyhow::bail!(
@@ -7407,11 +9781,7 @@ impl Backend {
         privilege: &str,
     ) -> anyhow::Result<()> {
         let user = self.authenticated_username();
-        if self
-            .config
-            .auth_catalog
-            .has_routine_privilege(&user, kind, database, routine, privilege)
-        {
+        if self.auth_has_routine_privilege(&user, kind, database, routine, privilege) {
             return Ok(());
         }
         anyhow::bail!(
@@ -7455,7 +9825,10 @@ impl Backend {
         {
             return Ok(());
         }
-        let privilege = if upper.starts_with("SHOW GRANTS") {
+        let privilege = if upper.starts_with("SHOW GRANTS")
+            || upper == "SHOW PROCESSLIST"
+            || upper == "SHOW FULL PROCESSLIST"
+        {
             None
         } else if upper.starts_with("SELECT ")
             || upper.starts_with("SHOW ")
@@ -7474,6 +9847,7 @@ impl Backend {
             || upper.starts_with("DROP USER")
             || upper.starts_with("ALTER USER")
             || upper.starts_with("RENAME USER")
+            || upper.starts_with("SET DEFAULT ROLE ")
         {
             Some("CREATE USER")
         } else if upper.starts_with("GRANT ")
@@ -7507,6 +9881,42 @@ impl Backend {
             return Ok(());
         };
         let user = self.authenticated_username();
+        if matches!(privilege, "INSERT" | "UPDATE" | "DELETE")
+            && self.require_complex_dml_privileges(sql, upper, privilege, &user)?
+        {
+            return Ok(());
+        }
+        if privilege == "SELECT"
+            && (upper.starts_with("SELECT ")
+                || upper.starts_with("SHOW ")
+                || upper.starts_with("EXPLAIN "))
+        {
+            let tables = statement_privilege_tables(sql, upper, &self.database);
+            if tables.len() > 1 {
+                for (table_database, table) in tables {
+                    if table_database.eq_ignore_ascii_case("information_schema")
+                        || table_database.eq_ignore_ascii_case("performance_schema")
+                        || table_database.eq_ignore_ascii_case("sys")
+                    {
+                        continue;
+                    }
+                    if !self.has_table_or_column_select_privilege(
+                        &user,
+                        &table_database,
+                        &table,
+                        sql,
+                    ) {
+                        anyhow::bail!(
+                            "Access denied; user '{}' lacks SELECT privilege on '{}.{}'",
+                            user,
+                            table_database,
+                            table
+                        );
+                    }
+                }
+                return Ok(());
+            }
+        }
         // Resolve simple DML targets before falling back to the conservative
         // cross-schema rule. A decimal literal or a same-database qualified
         // table must not spuriously require a global grant (notably in EVENT
@@ -7522,27 +9932,48 @@ impl Backend {
         // performance_schema and sys are read-only introspection schemas that
         // MySQL makes visible to every account; do not require an explicit
         // grant for statements scoped to them.
-        if database.eq_ignore_ascii_case("performance_schema")
+        if database.eq_ignore_ascii_case("information_schema")
+            || database.eq_ignore_ascii_case("performance_schema")
             || database.eq_ignore_ascii_case("sys")
         {
             return Ok(());
         }
-        let table_granted = statement_privilege_table(sql, upper, &self.database).is_some_and(
-            |(table_database, table)| {
-                self.config.auth_catalog.has_table_privilege(
-                    &user,
-                    &table_database,
-                    &table,
-                    privilege,
-                )
-            },
-        );
-        if self
-            .config
-            .auth_catalog
-            .has_privilege(&user, &database, privilege)
-            || table_granted
+        if privilege == "SELECT"
+            && statement_privilege_tables(sql, upper, &self.database).is_empty()
+            && statement_privilege_table(sql, upper, &self.database).is_none()
         {
+            return Ok(());
+        }
+        let table_reference = statement_privilege_table(sql, upper, &self.database);
+        let table_granted = table_reference
+            .as_ref()
+            .is_some_and(|(table_database, table)| {
+                self.auth_has_table_privilege(&user, table_database, table, privilege)
+            });
+        let column_granted = matches!(privilege, "SELECT" | "INSERT" | "UPDATE" | "REFERENCES")
+            && table_reference
+                .as_ref()
+                .is_some_and(|(table_database, table)| {
+                    self.storage
+                        .get_database(table_database)
+                        .and_then(|database| database.get_table(table))
+                        .as_ref()
+                        .and_then(|schema| {
+                            statement_privilege_columns(sql, upper, schema, privilege)
+                        })
+                        .is_some_and(|columns| {
+                            columns.iter().all(|column| {
+                                self.auth_has_column_privilege(
+                                    &user,
+                                    table_database,
+                                    table,
+                                    column,
+                                    privilege,
+                                )
+                            })
+                        })
+                });
+        if self.auth_has_privilege(&user, &database, privilege) || table_granted || column_granted {
             Ok(())
         } else {
             anyhow::bail!(
@@ -7553,9 +9984,523 @@ impl Backend {
         }
     }
 
+    fn require_complex_dml_privileges(
+        &self,
+        sql: &str,
+        upper: &str,
+        privilege: &str,
+        user: &str,
+    ) -> anyhow::Result<bool> {
+        let sources = statement_privilege_source_entries(sql, upper, &self.database);
+        let insert_select = matches!(privilege, "INSERT")
+            && (upper.starts_with("INSERT ") || upper.starts_with("REPLACE "))
+            && find_top_level_keyword(sql, " SELECT ", 0).is_some();
+        let duplicate_key_update = (matches!(privilege, "INSERT")
+            && (upper.starts_with("INSERT ") || upper.starts_with("REPLACE ")))
+        .then(|| find_top_level_keyword(sql, " ON DUPLICATE KEY UPDATE ", 0))
+        .flatten();
+        if sources.len() <= 1 && !insert_select && duplicate_key_update.is_none() {
+            return Ok(false);
+        }
+        let mut requirements = Vec::<(String, String, String, HashSet<String>)>::new();
+        if upper.starts_with("UPDATE ") && privilege == "UPDATE" {
+            let set_position = find_top_level_keyword(sql, " SET ", 0)
+                .ok_or_else(|| anyhow::anyhow!("UPDATE requires SET"))?;
+            let assignments_end = [" WHERE ", " ORDER BY ", " LIMIT "]
+                .into_iter()
+                .filter_map(|keyword| find_top_level_keyword(sql, keyword, set_position + 5))
+                .min()
+                .unwrap_or(sql.len());
+            let targets = self.statement_privilege_update_targets(
+                sql,
+                set_position + 5,
+                assignments_end,
+                &sources,
+            );
+            let rhs = split_csv(&sql[set_position + 5..assignments_end])
+                .into_iter()
+                .filter_map(|assignment| {
+                    assignment
+                        .split_once('=')
+                        .map(|(_, expression)| expression.to_string())
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            let read_sql = format!(
+                "{} {} {}",
+                &sql["UPDATE".len()..set_position],
+                rhs,
+                &sql[assignments_end..]
+            );
+            for (index, (database, table, _)) in sources.iter().enumerate() {
+                if let Some(columns) = targets.get(&index) {
+                    requirements.push((
+                        database.clone(),
+                        table.clone(),
+                        "UPDATE".to_string(),
+                        columns.clone(),
+                    ));
+                }
+                let columns =
+                    self.statement_privilege_source_columns(&read_sql, &sources, database, table);
+                if !columns.is_empty() {
+                    requirements.push((
+                        database.clone(),
+                        table.clone(),
+                        "SELECT".to_string(),
+                        columns,
+                    ));
+                }
+            }
+        } else if upper.starts_with("DELETE ") && privilege == "DELETE" {
+            let targets = statement_privilege_delete_target_indices(sql, upper, &sources);
+            for (index, (database, table, _)) in sources.iter().enumerate() {
+                if targets.contains(&index) {
+                    requirements.push((
+                        database.clone(),
+                        table.clone(),
+                        "DELETE".to_string(),
+                        HashSet::new(),
+                    ));
+                }
+                let columns =
+                    self.statement_privilege_source_columns(sql, &sources, database, table);
+                if !columns.is_empty() {
+                    requirements.push((
+                        database.clone(),
+                        table.clone(),
+                        "SELECT".to_string(),
+                        columns,
+                    ));
+                }
+            }
+        } else if matches!(privilege, "INSERT")
+            && (upper.starts_with("INSERT ") || upper.starts_with("REPLACE "))
+        {
+            let Some((target_database, target_table)) =
+                statement_privilege_table(sql, upper, &self.database)
+            else {
+                return Ok(false);
+            };
+            let select_position = find_top_level_keyword(sql, " SELECT ", 0);
+            if select_position.is_none() && duplicate_key_update.is_none() {
+                return Ok(false);
+            }
+            let target_columns = self.statement_privilege_insert_columns(
+                sql,
+                upper,
+                &target_database,
+                &target_table,
+            );
+            requirements.push((
+                target_database.clone(),
+                target_table.clone(),
+                "INSERT".to_string(),
+                target_columns,
+            ));
+            if let Some(position) = duplicate_key_update {
+                const ON_DUPLICATE: &str = " ON DUPLICATE KEY UPDATE ";
+                let target_sources = vec![(
+                    target_database.clone(),
+                    target_table.clone(),
+                    target_table.clone(),
+                )];
+                let mut update_columns = HashSet::new();
+                let mut read_sql = Vec::new();
+                for assignment in split_csv(&sql[position + ON_DUPLICATE.len()..]) {
+                    if let Some((left, right)) = assignment.split_once('=') {
+                        update_columns
+                            .insert(unqualified_column(&identifier(left)).to_ascii_lowercase());
+                        read_sql.push(strip_upsert_incoming_references(right));
+                    }
+                }
+                if !update_columns.is_empty() {
+                    requirements.push((
+                        target_database.clone(),
+                        target_table.clone(),
+                        "UPDATE".to_string(),
+                        update_columns,
+                    ));
+                }
+                let columns = self.statement_privilege_source_columns(
+                    &read_sql.join(" "),
+                    &target_sources,
+                    &target_database,
+                    &target_table,
+                );
+                if !columns.is_empty() {
+                    requirements.push((
+                        target_database.clone(),
+                        target_table.clone(),
+                        "SELECT".to_string(),
+                        columns,
+                    ));
+                }
+            }
+            if let Some(select_position) = select_position {
+                let select_sql = sql[select_position + 1..].trim_start();
+                for (database, table, _) in &sources {
+                    let columns = self
+                        .statement_privilege_source_columns(select_sql, &sources, database, table);
+                    if !columns.is_empty() {
+                        requirements.push((
+                            database.clone(),
+                            table.clone(),
+                            "SELECT".to_string(),
+                            columns,
+                        ));
+                    }
+                }
+            }
+        } else {
+            return Ok(false);
+        }
+        if requirements.is_empty() {
+            return Ok(false);
+        }
+        for (database, table, required_privilege, columns) in requirements {
+            if is_virtual_schema_name(&database) {
+                continue;
+            }
+            if !self.has_table_or_column_privilege(
+                user,
+                &database,
+                &table,
+                &required_privilege,
+                &columns,
+            ) {
+                anyhow::bail!(
+                    "Access denied; user '{}' lacks {} privilege on '{}.{}'",
+                    user,
+                    required_privilege,
+                    database,
+                    table
+                );
+            }
+        }
+        Ok(true)
+    }
+
+    fn statement_privilege_update_targets(
+        &self,
+        sql: &str,
+        start: usize,
+        end: usize,
+        sources: &[(String, String, String)],
+    ) -> HashMap<usize, HashSet<String>> {
+        let mut targets = HashMap::new();
+        for assignment in split_csv(&sql[start..end]) {
+            let Some((left, _)) = assignment.split_once('=') else {
+                continue;
+            };
+            let reference = normalize_column_reference(left);
+            let parts = reference.split('.').collect::<Vec<_>>();
+            let index = if parts.len() >= 2 {
+                sources.iter().position(|(_, table, alias)| {
+                    alias.eq_ignore_ascii_case(parts[parts.len() - 2])
+                        || table.eq_ignore_ascii_case(parts[parts.len() - 2])
+                })
+            } else {
+                sources
+                    .iter()
+                    .enumerate()
+                    .find_map(|(index, (database, table, _))| {
+                        self.storage
+                            .get_database(database)
+                            .and_then(|database| database.get_table(table))
+                            .is_some_and(|schema| {
+                                schema
+                                    .columns
+                                    .iter()
+                                    .any(|column| column.name.eq_ignore_ascii_case(&reference))
+                            })
+                            .then_some(index)
+                    })
+            };
+            let Some(index) = index else {
+                continue;
+            };
+            targets
+                .entry(index)
+                .or_insert_with(HashSet::new)
+                .insert(unqualified_column(&reference).to_ascii_lowercase());
+        }
+        targets
+    }
+
+    fn statement_privilege_source_columns(
+        &self,
+        sql: &str,
+        sources: &[(String, String, String)],
+        database: &str,
+        table: &str,
+    ) -> HashSet<String> {
+        let Some(schema) = self
+            .storage
+            .get_database(database)
+            .and_then(|database| database.get_table(table))
+        else {
+            return HashSet::new();
+        };
+        let mut required = HashSet::new();
+        for (_, _, token) in sql_identifier_token_ranges(sql) {
+            let parts = token.split('.').collect::<Vec<_>>();
+            if parts.len() < 2 {
+                continue;
+            }
+            let qualifier = parts[..parts.len() - 1].join(".");
+            if statement_privilege_source_matches_qualifier(sources, database, table, &qualifier) {
+                let column = parts.last().copied().unwrap_or_default();
+                if schema
+                    .columns
+                    .iter()
+                    .any(|item| item.name.eq_ignore_ascii_case(column))
+                {
+                    required.insert(column.to_ascii_lowercase());
+                }
+            }
+        }
+        for token in sql_identifier_tokens(sql) {
+            if !schema
+                .columns
+                .iter()
+                .any(|column| column.name.eq_ignore_ascii_case(&token))
+            {
+                continue;
+            }
+            let matches = sources
+                .iter()
+                .filter(|(source_database, source_table, _)| {
+                    self.storage
+                        .get_database(source_database)
+                        .and_then(|database| database.get_table(source_table))
+                        .is_some_and(|source_schema| {
+                            source_schema
+                                .columns
+                                .iter()
+                                .any(|column| column.name.eq_ignore_ascii_case(&token))
+                        })
+                })
+                .count();
+            if matches == 1 {
+                required.insert(token.to_ascii_lowercase());
+            }
+        }
+        required
+    }
+
+    fn statement_privilege_insert_columns(
+        &self,
+        sql: &str,
+        upper: &str,
+        database: &str,
+        table: &str,
+    ) -> HashSet<String> {
+        let Some(schema) = self
+            .storage
+            .get_database(database)
+            .and_then(|database| database.get_table(table))
+        else {
+            return HashSet::new();
+        };
+        let Some(into) = upper.find("INTO ") else {
+            return schema
+                .columns
+                .iter()
+                .filter(|column| generated_column_definition(&schema, &column.name).is_none())
+                .map(|column| column.name.to_ascii_lowercase())
+                .collect();
+        };
+        let tail = sql[into + "INTO ".len()..].trim_start();
+        let Some(open) = tail.find('(') else {
+            return schema
+                .columns
+                .iter()
+                .filter(|column| generated_column_definition(&schema, &column.name).is_none())
+                .map(|column| column.name.to_ascii_lowercase())
+                .collect();
+        };
+        let Some(close) = tail[open + 1..].find(')') else {
+            return HashSet::new();
+        };
+        split_csv(&tail[open + 1..open + 1 + close])
+            .into_iter()
+            .map(|column| identifier(&column).to_ascii_lowercase())
+            .collect()
+    }
+
+    fn has_table_or_column_privilege(
+        &self,
+        user: &str,
+        database: &str,
+        table: &str,
+        privilege: &str,
+        columns: &HashSet<String>,
+    ) -> bool {
+        if self.auth_has_privilege(user, database, privilege)
+            || self.auth_has_table_privilege(user, database, table, privilege)
+        {
+            return true;
+        }
+        !columns.is_empty()
+            && columns.iter().all(|column| {
+                self.auth_has_column_privilege(user, database, table, column, privilege)
+            })
+    }
+
+    fn has_table_or_column_select_privilege(
+        &self,
+        user: &str,
+        database: &str,
+        table: &str,
+        sql: &str,
+    ) -> bool {
+        if self.auth_has_privilege(user, database, "SELECT")
+            || self.auth_has_table_privilege(user, database, table, "SELECT")
+        {
+            return true;
+        }
+        let Some(schema) = self
+            .storage
+            .get_database(database)
+            .and_then(|database| database.get_table(table))
+        else {
+            return false;
+        };
+        let sources = statement_privilege_tables(sql, &sql.to_ascii_uppercase(), database)
+            .into_iter()
+            .filter(|(source_database, _)| source_database.eq_ignore_ascii_case(database))
+            .collect::<Vec<_>>();
+        let aliases = statement_privilege_source_aliases(sql, database, table);
+        let all_columns = schema
+            .columns
+            .iter()
+            .map(|column| column.name.to_ascii_lowercase())
+            .collect::<HashSet<_>>();
+        let mut required = HashSet::new();
+        let upper = sql.to_ascii_uppercase();
+        if upper.contains(".*") || upper.contains("SELECT *") {
+            required.extend(all_columns.iter().cloned());
+        }
+        for (_, _, token) in sql_identifier_token_ranges(sql) {
+            let parts = token.split('.').collect::<Vec<_>>();
+            if parts.len() < 2 {
+                continue;
+            }
+            let qualifier = parts[..parts.len() - 1].join(".");
+            if aliases
+                .iter()
+                .any(|alias| alias.eq_ignore_ascii_case(&qualifier))
+            {
+                required.insert(parts.last().unwrap_or(&"").to_ascii_lowercase());
+            }
+        }
+        for token in sql_identifier_tokens(sql) {
+            if all_columns.contains(&token.to_ascii_lowercase())
+                && sources
+                    .iter()
+                    .filter(|(source_database, source)| {
+                        self.storage
+                            .get_database(source_database)
+                            .and_then(|database| database.get_table(source))
+                            .is_some_and(|source_schema| {
+                                source_schema
+                                    .columns
+                                    .iter()
+                                    .any(|column| column.name.eq_ignore_ascii_case(&token))
+                            })
+                    })
+                    .count()
+                    == 1
+            {
+                required.insert(token.to_ascii_lowercase());
+            }
+        }
+        !required.is_empty()
+            && required.iter().all(|column| {
+                self.auth_has_column_privilege(user, database, table, column, "SELECT")
+            })
+    }
+
     fn execute_auth_statement(&self, sql: &str) -> anyhow::Result<QueryOutcome> {
         self.ensure_transaction_writable()?;
         let upper = sql.to_ascii_uppercase();
+        if upper.starts_with("SET DEFAULT ROLE ") {
+            let remainder = sql["SET DEFAULT ROLE ".len()..].trim();
+            let upper_remainder = remainder.to_ascii_uppercase();
+            let marker = upper_remainder
+                .find(" TO ")
+                .ok_or_else(|| anyhow::anyhow!("SET DEFAULT ROLE requires TO"))?;
+            let selection = parse_default_role_selection(&remainder[..marker])?;
+            let principals = split_csv(&remainder[marker + " TO ".len()..]);
+            self.config
+                .auth_catalog
+                .set_default_roles(&principals, selection)?;
+            return Ok(QueryOutcome::ok(0));
+        }
+        if upper.starts_with("ALTER USER ") {
+            if let Some(marker) = upper.find(" DEFAULT ROLE ") {
+                let account_clause = sql["ALTER USER ".len()..marker].trim();
+                let clauses = split_csv(account_clause);
+                let principals = clauses
+                    .iter()
+                    .map(|clause| {
+                        clause
+                            .to_ascii_uppercase()
+                            .find(" IDENTIFIED ")
+                            .map_or_else(
+                                || clause.trim().to_string(),
+                                |position| clause[..position].trim().to_string(),
+                            )
+                    })
+                    .collect::<Vec<_>>();
+                if clauses
+                    .iter()
+                    .any(|clause| clause.to_ascii_uppercase().contains(" IDENTIFIED "))
+                {
+                    let users = clauses
+                        .iter()
+                        .map(|clause| parse_user_identified_clause(clause, "ALTER USER"))
+                        .collect::<anyhow::Result<Vec<_>>>()?;
+                    let selection =
+                        parse_default_role_selection(&sql[marker + " DEFAULT ROLE ".len()..])?;
+                    self.config
+                        .auth_catalog
+                        .alter_user_passwords_with_default_roles(&users, selection)?;
+                    return Ok(QueryOutcome::ok(0));
+                }
+                let selection =
+                    parse_default_role_selection(&sql[marker + " DEFAULT ROLE ".len()..])?;
+                self.config
+                    .auth_catalog
+                    .set_default_roles(&principals, selection)?;
+                return Ok(QueryOutcome::ok(0));
+            }
+        }
+        if (upper.starts_with("CREATE USER ") || upper.starts_with("CREATE USER IF NOT EXISTS "))
+            && upper.contains(" DEFAULT ROLE ")
+        {
+            let if_not_exists = upper.starts_with("CREATE USER IF NOT EXISTS ");
+            let prefix = if if_not_exists {
+                "CREATE USER IF NOT EXISTS"
+            } else {
+                "CREATE USER"
+            };
+            let marker = upper
+                .find(" DEFAULT ROLE ")
+                .expect("CREATE USER contains DEFAULT ROLE");
+            let users = split_csv(sql[prefix.len()..marker].trim())
+                .iter()
+                .map(|clause| parse_user_identified_clause(clause, prefix))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            let selection = parse_default_role_selection(&sql[marker + " DEFAULT ROLE ".len()..])?;
+            self.config.auth_catalog.create_users_with_default_roles(
+                &users,
+                if_not_exists,
+                selection,
+            )?;
+            return Ok(QueryOutcome::ok(0));
+        }
         if upper.starts_with("CREATE USER ")
             || upper.starts_with("CREATE USER IF NOT EXISTS ")
             || upper.starts_with("ALTER USER ")
@@ -7640,11 +10585,13 @@ impl Backend {
                 && remainder[..on]
                     .to_ascii_uppercase()
                     .starts_with("GRANT OPTION FOR ");
-            let listed_privileges = if grant_option_only {
-                parse_privilege_list(&remainder["GRANT OPTION FOR ".len()..on])?
+            let privilege_spec = if grant_option_only {
+                &remainder["GRANT OPTION FOR ".len()..on]
             } else {
-                parse_privilege_list(&remainder[..on])?
+                &remainder[..on]
             };
+            let (listed_privileges, mut column_privileges) =
+                parse_grant_privilege_spec(privilege_spec)?;
             let mut privileges = if grant_option_only {
                 HashSet::from(["GRANT OPTION".to_string()])
             } else {
@@ -7669,6 +10616,9 @@ impl Backend {
             };
             let principals = split_csv(principal_clause);
             if let Some(scope) = parse_routine_privilege_scope(scope)? {
+                if !column_privileges.is_empty() {
+                    anyhow::bail!("column privileges require a table scope");
+                }
                 validate_routine_privileges(scope.kind, &listed_privileges)?;
                 if revoke {
                     self.config.auth_catalog.revoke_routine_privileges(
@@ -7694,24 +10644,50 @@ impl Backend {
             }
             if let Some((database, table)) = parse_table_privilege_scope(scope)? {
                 if revoke {
-                    self.config.auth_catalog.revoke_table_privileges(
-                        &principals,
-                        &database,
-                        &table,
-                        &privileges,
-                    )?;
+                    if !privileges.is_empty() {
+                        self.config.auth_catalog.revoke_table_privileges(
+                            &principals,
+                            &database,
+                            &table,
+                            &privileges,
+                        )?;
+                    }
+                    if !column_privileges.is_empty() {
+                        self.config.auth_catalog.revoke_column_privileges(
+                            &principals,
+                            &database,
+                            &table,
+                            &column_privileges,
+                        )?;
+                    }
                 } else {
                     if with_grant_option {
                         privileges.insert("GRANT OPTION".to_string());
+                        for privileges in column_privileges.values_mut() {
+                            privileges.insert("GRANT OPTION".to_string());
+                        }
                     }
-                    self.config.auth_catalog.grant_table_privileges(
-                        &principals,
-                        &database,
-                        &table,
-                        privileges,
-                    )?;
+                    if !privileges.is_empty() {
+                        self.config.auth_catalog.grant_table_privileges(
+                            &principals,
+                            &database,
+                            &table,
+                            privileges,
+                        )?;
+                    }
+                    if !column_privileges.is_empty() {
+                        self.config.auth_catalog.grant_column_privileges(
+                            &principals,
+                            &database,
+                            &table,
+                            &column_privileges,
+                        )?;
+                    }
                 }
                 return Ok(QueryOutcome::ok(0));
+            }
+            if !column_privileges.is_empty() {
+                anyhow::bail!("column privileges require a database.table scope");
             }
             let database = if scope == "*.*" {
                 None
@@ -7775,7 +10751,10 @@ impl Backend {
         }
         let decoded = decode_load_data_rows(data, &spec, &schema)?;
         self.extend_warnings(decoded.warnings);
-        let rows = decoded.rows;
+        let rows = validate_load_data_partitions(decoded.rows, &spec, &schema)?;
+        for row in &rows {
+            reject_generated_insert_row(&schema, row)?;
+        }
         if rows.is_empty() {
             return Ok(QueryOutcome::ok(0));
         }
@@ -7835,7 +10814,7 @@ impl Backend {
         self.extend_warnings(duplicate_warnings);
         if spec.ignore || spec.local {
             return self
-                .submit_ignore_insert(spec.database, spec.table, rows)
+                .submit_ignore_insert(spec.database, spec.table, rows, false)
                 .await;
         }
         self.submit_writes_after_lock(writes, predicted).await
@@ -7906,6 +10885,11 @@ impl Backend {
                     .find(|item| item.name.eq_ignore_ascii_case(&target_column))
                     .map(|item| item.name.clone())
                     .ok_or_else(|| anyhow::anyhow!("Unknown target column '{}'", target_column))?;
+                reject_generated_update_expression(
+                    &sources[target_index].schema,
+                    &target_column,
+                    expression,
+                )?;
                 let expression = expand_update_default_expression(
                     expression,
                     &target_column,
@@ -8146,6 +11130,53 @@ impl Backend {
                 return Err(error);
             }
         };
+        let generated_columns = generated_column_names(&schema);
+        if !generated_columns.is_empty() {
+            let mut written_columns = assignments
+                .iter()
+                .map(|(column, _)| column.clone())
+                .collect::<Vec<_>>();
+            written_columns.extend(auto_timestamps.iter().map(|(column, _)| column.clone()));
+            written_columns.extend(generated_columns);
+            let writes = rows
+                .into_iter()
+                .map(|original| -> anyhow::Result<Option<WriteCommand>> {
+                    let mut updated = original.clone();
+                    for (column, value) in &assignments {
+                        if let Some(value) = value {
+                            updated.set(column, value.clone());
+                        } else {
+                            updated.set_null(column);
+                        }
+                    }
+                    apply_automatic_update_timestamps(&original, &mut updated, &auto_timestamps);
+                    materialize_generated_columns(&mut updated, &schema)?;
+                    if updated == original {
+                        return Ok(None);
+                    }
+                    Ok(Some(WriteCommand::Update {
+                        database: database.clone(),
+                        table: table.clone(),
+                        filter: Some(exact_row_predicate(&schema, &original)),
+                        assignments: literal_assignments_from_row(
+                            &updated,
+                            written_columns.iter().map(String::as_str),
+                        )?,
+                    }))
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+            if writes.is_empty() {
+                if !self.in_transaction && self.autocommit {
+                    self.stats.release_all_locks(self.connection_id);
+                }
+                return Ok(QueryOutcome::ok(0));
+            }
+            let changed = writes.len() as u64;
+            return self.submit_writes_after_lock(writes, changed).await;
+        }
         if !auto_timestamps.is_empty() {
             let mut written_columns = assignments
                 .iter()
@@ -8213,7 +11244,8 @@ impl Backend {
         let set_position = find_top_level_keyword(sql, " SET ", 0)
             .ok_or_else(|| anyhow::anyhow!("UPDATE requires SET"))?;
         let reference = sql[7..set_position].trim();
-        let (database, table) = self.resolve_table_reference(reference)?;
+        let target = parse_update_target_reference(reference)?;
+        let (database, table) = self.resolve_table_reference(&target)?;
         let schema = self
             .storage
             .get_database(&database)
@@ -8239,6 +11271,7 @@ impl Backend {
                     .find(|item| item.name.eq_ignore_ascii_case(&column))
                     .map(|item| item.name.clone())
                     .ok_or_else(|| anyhow::anyhow!("Unknown target column '{}'", column))?;
+                reject_generated_update_expression(&schema, &column, expression)?;
                 let expression = expand_update_default_expression(expression, &column, &schema)?;
                 Ok((column, expression))
             })
@@ -8255,6 +11288,7 @@ impl Backend {
             .map(|(column, _)| column.clone())
             .collect::<Vec<_>>();
         written_columns.extend(auto_timestamps.iter().map(|(column, _)| column.clone()));
+        written_columns.extend(generated_column_names(&schema));
         let tail = sql[tail_start..].trim();
         let select = format!(
             "SELECT * FROM {}{} FOR UPDATE",
@@ -8314,6 +11348,7 @@ impl Backend {
                 }
             }
             apply_automatic_update_timestamps(&original, &mut updated, &auto_timestamps);
+            materialize_generated_columns(&mut updated, &schema)?;
             if updated == original {
                 continue;
             }
@@ -8411,6 +11446,255 @@ impl Backend {
         self.submit_writes(writes, predicted).await
     }
 
+    async fn submit_updatable_view_insert(
+        &mut self,
+        view: UpdatableView,
+        rows: Vec<Row>,
+    ) -> anyhow::Result<QueryOutcome> {
+        let source_schema = self
+            .storage
+            .get_database(&view.source_database)
+            .and_then(|database| database.get_table(&view.source_table))
+            .ok_or_else(|| anyhow::anyhow!("View source table does not exist"))?;
+        let mut mapped = Vec::with_capacity(rows.len());
+        for row in rows {
+            let mut base = Row::new();
+            for (column, value) in row.values {
+                let base_column = view
+                    .columns
+                    .iter()
+                    .find(|(view_column, _)| view_column.eq_ignore_ascii_case(&column))
+                    .map(|(_, base_column)| base_column)
+                    .ok_or_else(|| anyhow::anyhow!("Unknown column '{}' in view", column))?;
+                base.push(base_column, value);
+            }
+            reject_generated_insert_row(&source_schema, &base)?;
+            mapped.push(base);
+        }
+        if view.check_option != ViewCheckOption::None {
+            let database = self
+                .storage
+                .get_database(&view.source_database)
+                .ok_or_else(|| anyhow::anyhow!("Unknown database '{}'", view.source_database))?;
+            let (materialized, _) = database.materialize_insert_rows(&view.source_table, mapped)?;
+            if let Some(predicate) = &view.view_predicate {
+                if materialized
+                    .iter()
+                    .any(|row| !predicate.matches_with_schema(row, Some(&source_schema)))
+                {
+                    anyhow::bail!("CHECK OPTION failed for view");
+                }
+            }
+            mapped = materialized;
+        }
+        let predicted = mapped.len() as u64;
+        let writes = mapped
+            .into_iter()
+            .map(|row| WriteCommand::Insert {
+                database: view.source_database.clone(),
+                table: view.source_table.clone(),
+                row,
+            })
+            .collect();
+        self.submit_writes(writes, predicted).await
+    }
+
+    async fn submit_updatable_view_update(
+        &mut self,
+        sql: &str,
+        reference: String,
+        view: UpdatableView,
+    ) -> anyhow::Result<QueryOutcome> {
+        let source_schema = self
+            .storage
+            .get_database(&view.source_database)
+            .and_then(|database| database.get_table(&view.source_table))
+            .ok_or_else(|| anyhow::anyhow!("View source table does not exist"))?;
+        let primary_key = table_primary_key_columns(&source_schema);
+        let set_position = find_top_level_keyword(sql, " SET ", 0)
+            .ok_or_else(|| anyhow::anyhow!("UPDATE requires SET"))?;
+        let tail_start = [" WHERE ", " ORDER BY ", " LIMIT "]
+            .into_iter()
+            .filter_map(|keyword| find_top_level_keyword(sql, keyword, set_position + 5))
+            .min()
+            .unwrap_or(sql.len());
+        let assignments = split_csv(sql[set_position + 5..tail_start].trim())
+            .into_iter()
+            .map(|assignment| parse_assignment(&assignment))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let assignments = map_view_assignments(assignments, &view.columns)?;
+        let tail = sql[tail_start..].trim();
+        let selected = Box::pin(self.select(&format!(
+            "SELECT * FROM {}{} FOR UPDATE",
+            reference,
+            if tail.is_empty() {
+                String::new()
+            } else {
+                format!(" {tail}")
+            }
+        )))
+        .await?;
+        let values = match selected {
+            QueryOutcome::Rows { columns, rows } => query_rows_to_storage_rows(&columns, rows),
+            QueryOutcome::Ok { .. } => Vec::new(),
+            QueryOutcome::Multiple { .. } => {
+                anyhow::bail!("View UPDATE selection returned multiple results")
+            }
+        };
+        let written_columns = assignments
+            .iter()
+            .map(|assignment| assignment.target_column.clone())
+            .collect::<Vec<_>>();
+        let auto_timestamps = automatic_update_timestamp_values(
+            &source_schema,
+            written_columns.iter().map(String::as_str),
+        );
+        let mut written_columns = written_columns;
+        written_columns.extend(auto_timestamps.iter().map(|(column, _)| column.clone()));
+        let source_rows = self.rows_with_local_transaction_overlay(
+            &view.source_database,
+            &view.source_table,
+            None,
+            None,
+        )?;
+        let mut seen = HashSet::new();
+        let mut writes = Vec::new();
+        for view_row in values {
+            let original = source_rows
+                .iter()
+                .find(|row| {
+                    primary_key.iter().all(|base_column| {
+                        let Some((view_column, _)) = view
+                            .columns
+                            .iter()
+                            .find(|(_, column)| column.eq_ignore_ascii_case(base_column))
+                        else {
+                            return false;
+                        };
+                        let source = row.get(base_column);
+                        let selected = (!view_row.is_null(view_column))
+                            .then(|| view_row.get(view_column).map(ToOwned::to_owned))
+                            .flatten();
+                        source == selected.as_deref()
+                    })
+                })
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("View UPDATE target row is stale"))?;
+            let key = primary_key
+                .iter()
+                .map(|column| {
+                    (!original.is_null(column))
+                        .then(|| original.get(column).map(ToOwned::to_owned))
+                        .flatten()
+                })
+                .collect::<Vec<_>>();
+            if !seen.insert(key.clone()) {
+                continue;
+            }
+            let mut updated = original.clone();
+            apply_expression_assignments(&mut updated, &source_schema, &assignments)?;
+            apply_automatic_update_timestamps(&original, &mut updated, &auto_timestamps);
+            if view.check_option != ViewCheckOption::None
+                && view.view_predicate.as_ref().is_some_and(|predicate| {
+                    !predicate.matches_with_schema(&updated, Some(&source_schema))
+                })
+            {
+                anyhow::bail!("CHECK OPTION failed for view");
+            }
+            if updated != original {
+                writes.push(WriteCommand::Update {
+                    database: view.source_database.clone(),
+                    table: view.source_table.clone(),
+                    filter: Some(primary_key_predicate(&primary_key, &key)?),
+                    assignments: literal_assignments_from_row(
+                        &updated,
+                        written_columns.iter().map(String::as_str),
+                    )?,
+                });
+            }
+        }
+        if writes.is_empty() {
+            if !self.in_transaction && self.autocommit {
+                self.stats.release_all_locks(self.connection_id);
+            }
+            return Ok(QueryOutcome::ok(0));
+        }
+        let predicted = writes.len() as u64;
+        self.submit_writes(writes, predicted).await
+    }
+
+    async fn submit_updatable_view_delete(
+        &mut self,
+        sql: &str,
+        reference: String,
+        view: UpdatableView,
+    ) -> anyhow::Result<QueryOutcome> {
+        let source_schema = self
+            .storage
+            .get_database(&view.source_database)
+            .and_then(|database| database.get_table(&view.source_table))
+            .ok_or_else(|| anyhow::anyhow!("View source table does not exist"))?;
+        let primary_key = table_primary_key_columns(&source_schema);
+        let key_columns = primary_key
+            .iter()
+            .map(|base_column| {
+                view.columns
+                    .iter()
+                    .find(|(_, column)| column.eq_ignore_ascii_case(base_column))
+                    .map(|(view_column, _)| view_column.clone())
+                    .ok_or_else(|| anyhow::anyhow!("View does not expose primary key"))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let tail_start = [" WHERE ", " ORDER BY ", " LIMIT "]
+            .into_iter()
+            .filter_map(|keyword| find_top_level_keyword(sql, keyword, 12))
+            .min()
+            .unwrap_or(sql.len());
+        let tail = sql[tail_start..].trim();
+        let selected = Box::pin(self.select(&format!(
+            "SELECT {} FROM {}{} FOR UPDATE",
+            key_columns.join(","),
+            reference,
+            if tail.is_empty() {
+                String::new()
+            } else {
+                format!(" {tail}")
+            }
+        )))
+        .await?;
+        let values = match selected {
+            QueryOutcome::Rows { columns, rows } => query_rows_to_storage_rows(&columns, rows),
+            QueryOutcome::Ok { .. } => Vec::new(),
+            QueryOutcome::Multiple { .. } => {
+                anyhow::bail!("View DELETE selection returned multiple results")
+            }
+        };
+        let mut seen = HashSet::new();
+        let mut writes = Vec::new();
+        for row in values {
+            let key = primary_key
+                .iter()
+                .zip(&key_columns)
+                .map(|(_, view_column)| row.get(view_column).map(ToOwned::to_owned))
+                .collect::<Vec<_>>();
+            if seen.insert(key.clone()) {
+                writes.push(WriteCommand::Delete {
+                    database: view.source_database.clone(),
+                    table: view.source_table.clone(),
+                    filter: Some(primary_key_predicate(&primary_key, &key)?),
+                });
+            }
+        }
+        if writes.is_empty() {
+            if !self.in_transaction && self.autocommit {
+                self.stats.release_all_locks(self.connection_id);
+            }
+            return Ok(QueryOutcome::ok(0));
+        }
+        let predicted = writes.len() as u64;
+        self.submit_writes(writes, predicted).await
+    }
+
     async fn submit_insert_select(
         &mut self,
         sql: &str,
@@ -8446,6 +11730,7 @@ impl Backend {
         if target_columns.is_empty() {
             anyhow::bail!("INSERT SELECT target column list is empty");
         }
+        reject_generated_insert_columns(&schema, &target_columns)?;
         let mut unique = HashSet::new();
         for column in &target_columns {
             if !schema
@@ -8463,10 +11748,20 @@ impl Backend {
         let conflict_position =
             find_top_level_keyword(sql, " ON DUPLICATE KEY UPDATE ", select_start);
         let select_end = conflict_position.unwrap_or(sql.len());
-        let select_sql = format!(
-            "{} LOCK IN SHARE MODE",
-            sql[select_start..select_end].trim()
-        );
+        let conflict_action = parse_insert_conflict_action(sql, &schema)?;
+        let source_requires_locks = self.gap_locks_enabled()
+            || matches!(
+                conflict_action.as_ref(),
+                Some(InsertConflictAction::Replace(_))
+            );
+        let select_sql = if source_requires_locks {
+            format!(
+                "{} LOCK IN SHARE MODE",
+                sql[select_start..select_end].trim()
+            )
+        } else {
+            sql[select_start..select_end].trim().to_string()
+        };
         let selected = Box::pin(self.select(&select_sql)).await;
         let selected_rows = match selected {
             Ok(QueryOutcome::Rows { columns, rows }) => {
@@ -8510,10 +11805,10 @@ impl Backend {
             return Ok(QueryOutcome::ok(0));
         }
         let predicted = rows.len() as u64;
-        if let Some(action) = parse_insert_conflict_action(sql, &schema)? {
+        if let Some(action) = conflict_action {
             match action {
                 InsertConflictAction::Ignore => {
-                    return self.submit_ignore_insert(database, table, rows).await;
+                    return self.submit_ignore_insert(database, table, rows, true).await;
                 }
                 InsertConflictAction::Replace(_) => {
                     return self.submit_replace_insert(database, table, rows).await;
@@ -8696,13 +11991,14 @@ impl Backend {
         writes: Vec<WriteCommand>,
         predicted: u64,
     ) -> anyhow::Result<QueryOutcome> {
+        let writes = self.prepare_insert_write_rows(writes)?;
         self.ensure_transaction_writable()?;
         self.ensure_explicit_write_access(&writes)?;
-        let locks =
+        let initial_locks =
             write_lock_requests_with_gap_locks(&self.storage, &writes, self.gap_locks_enabled())?;
         if let Err(error) = self
             .stats
-            .acquire_locks(&locks, self.connection_id, self.lock_wait_timeout)
+            .acquire_locks(&initial_locks, self.connection_id, self.lock_wait_timeout)
             .await
         {
             if !self.in_transaction && self.autocommit {
@@ -8718,8 +12014,14 @@ impl Backend {
             self.expand_trigger_writes(writes, true)?;
         let locks =
             write_lock_requests_with_gap_locks(&self.storage, &writes, self.gap_locks_enabled())?;
+        let planned_locks = [&initial_locks[..], &trigger_locks[..]].concat();
+        let additional_locks = missing_lock_requests(&planned_locks, &locks);
         self.stats
-            .acquire_locks(&locks, self.connection_id, self.lock_wait_timeout)
+            .acquire_locks(
+                &additional_locks,
+                self.connection_id,
+                self.lock_wait_timeout,
+            )
             .await?;
         self.submit_writes_after_lock_inner(
             writes,
@@ -9123,7 +12425,19 @@ impl Backend {
             .storage
             .get_database(database)
             .ok_or_else(|| anyhow::anyhow!("Unknown database '{}'", database))?;
-        let (mut rows, generated_id) = database.materialize_insert_rows(table, vec![row])?;
+        let (increment, offset) = self.auto_increment_settings();
+        let (mut rows, generated_id) = database.materialize_insert_rows_with_auto_increment(
+            table,
+            vec![row],
+            increment,
+            offset,
+        )?;
+        let row = rows
+            .first_mut()
+            .ok_or_else(|| anyhow::anyhow!("Trigger INSERT materialization returned no row"))?;
+        if let Some(schema) = database.get_table(table) {
+            materialize_generated_columns(row, &schema)?;
+        }
         Ok((
             rows.pop()
                 .ok_or_else(|| anyhow::anyhow!("Trigger INSERT materialization returned no row"))?,
@@ -9500,6 +12814,8 @@ impl Backend {
                                 ),
                                 &trigger.locals,
                             );
+                            let expression =
+                                bind_trigger_local_references(&expression, &trigger.locals);
                             let value = evaluate_scalar_expression(&expression, &context)?;
                             if let Some(column) = target
                                 .get(.."NEW.".len())
@@ -9559,7 +12875,11 @@ impl Backend {
                             ),
                             &trigger.locals,
                         );
-                        if evaluate_scalar_condition(condition, &context)? {
+                        if evaluate_scalar_condition_with_locals(
+                            condition,
+                            &context,
+                            &trigger.locals,
+                        )? {
                             selected = statements;
                             break;
                         }
@@ -9583,8 +12903,14 @@ impl Backend {
                         trigger_old_new_row_context(trigger.schema, Some(trigger.old), Some(new)),
                         &trigger.locals,
                     );
-                    let selected =
-                        trigger_case_branch(selector, branches, otherwise, *has_else, &context)?;
+                    let selected = trigger_case_branch(
+                        selector,
+                        branches,
+                        otherwise,
+                        *has_else,
+                        &context,
+                        &trigger.locals,
+                    )?;
                     if let Some(control) =
                         self.execute_before_update_trigger_nodes(trigger, new, selected, generated)?
                     {
@@ -9602,7 +12928,7 @@ impl Backend {
                             ),
                             &trigger.locals,
                         );
-                        if matches!(kind, TriggerLoopKind::While(condition) if !evaluate_scalar_condition(condition, &context)?)
+                        if matches!(kind, TriggerLoopKind::While(condition) if !evaluate_scalar_condition_with_locals(condition, &context, &trigger.locals)?)
                         {
                             finished = true;
                             break;
@@ -9633,7 +12959,11 @@ impl Backend {
                                 ),
                                 &trigger.locals,
                             );
-                            if evaluate_scalar_condition(condition, &context)? {
+                            if evaluate_scalar_condition_with_locals(
+                                condition,
+                                &context,
+                                &trigger.locals,
+                            )? {
                                 finished = true;
                                 break;
                             }
@@ -9776,6 +13106,8 @@ impl Backend {
                                 trigger_new_row_context(trigger.schema, row),
                                 &trigger.locals,
                             );
+                            let expression =
+                                bind_trigger_local_references(&expression, &trigger.locals);
                             let value = evaluate_scalar_expression(&expression, &context)?;
                             if let Some(column) = target
                                 .get(.."NEW.".len())
@@ -9832,7 +13164,11 @@ impl Backend {
                             trigger_new_row_context(trigger.schema, row),
                             &trigger.locals,
                         );
-                        if evaluate_scalar_condition(condition, &context)? {
+                        if evaluate_scalar_condition_with_locals(
+                            condition,
+                            &context,
+                            &trigger.locals,
+                        )? {
                             selected = statements;
                             break;
                         }
@@ -9856,8 +13192,14 @@ impl Backend {
                         trigger_new_row_context(trigger.schema, row),
                         &trigger.locals,
                     );
-                    let selected =
-                        trigger_case_branch(selector, branches, otherwise, *has_else, &context)?;
+                    let selected = trigger_case_branch(
+                        selector,
+                        branches,
+                        otherwise,
+                        *has_else,
+                        &context,
+                        &trigger.locals,
+                    )?;
                     if let Some(control) =
                         self.execute_before_insert_trigger_nodes(trigger, row, selected, generated)?
                     {
@@ -9871,7 +13213,7 @@ impl Backend {
                             trigger_new_row_context(trigger.schema, row),
                             &trigger.locals,
                         );
-                        if matches!(kind, TriggerLoopKind::While(condition) if !evaluate_scalar_condition(condition, &context)?)
+                        if matches!(kind, TriggerLoopKind::While(condition) if !evaluate_scalar_condition_with_locals(condition, &context, &trigger.locals)?)
                         {
                             finished = true;
                             break;
@@ -9898,7 +13240,11 @@ impl Backend {
                                 trigger_new_row_context(trigger.schema, row),
                                 &trigger.locals,
                             );
-                            if evaluate_scalar_condition(condition, &context)? {
+                            if evaluate_scalar_condition_with_locals(
+                                condition,
+                                &context,
+                                &trigger.locals,
+                            )? {
                                 finished = true;
                                 break;
                             }
@@ -10624,7 +13970,24 @@ impl Backend {
         database: String,
         table: String,
         incoming_rows: Vec<Row>,
+        record_duplicate_warnings: bool,
     ) -> anyhow::Result<QueryOutcome> {
+        let schema = self
+            .storage
+            .get_database(&database)
+            .and_then(|database| database.get_table(&table))
+            .ok_or_else(|| anyhow::anyhow!("Table '{}.{}' does not exist", database, table))?;
+        let mut incoming_rows = incoming_rows;
+        for (index, row) in incoming_rows.iter_mut().enumerate() {
+            coerce_insert_row_lengths(
+                row,
+                &schema,
+                index + 1,
+                self.strict_insert_mode(),
+                true,
+                |warning| self.record_warning(warning),
+            )?;
+        }
         let lock_commands = incoming_rows
             .iter()
             .cloned()
@@ -10672,10 +14035,17 @@ impl Backend {
                 writes.extend(before_effects);
                 let (row, generated_id) =
                     self.materialize_trigger_insert_row(&database, &table, row)?;
-                if visible
+                if let Some(existing) = visible
                     .iter()
-                    .any(|existing| rows_have_key_conflict(existing, &row, &schema))
+                    .find(|existing| rows_have_key_conflict(existing, &row, &schema))
                 {
+                    let (key_name, value) = duplicate_key_label(&row, existing, &schema);
+                    if record_duplicate_warnings {
+                        self.record_warning(SqlWarning::warning(
+                            1062,
+                            format!("Duplicate entry '{value}' for key '{}.{key_name}'", table),
+                        ));
+                    }
                     continue;
                 }
                 if first_insert_id == 0 {
@@ -11543,11 +14913,20 @@ impl Backend {
             .clone()
             .unwrap_or_else(|| self.config.username.clone());
         let tables = if database.eq_ignore_ascii_case("information_schema") {
-            information_schema_virtual_tables(&self.storage, &self.config.auth_catalog, &viewer)?
+            information_schema_virtual_tables(
+                &self.storage,
+                &self.config.auth_catalog,
+                &viewer,
+                &self.active_role_set(),
+            )?
         } else if database.eq_ignore_ascii_case("performance_schema") {
-            performance_schema_virtual_tables()
+            performance_schema_virtual_tables(
+                &self.stats,
+                &viewer,
+                self.auth_has_privilege(&viewer, "", "PROCESS"),
+            )
         } else if database.eq_ignore_ascii_case("sys") {
-            sys_virtual_tables()
+            sys_virtual_tables(&self.stats)
         } else {
             mysql_virtual_tables(&self.config.auth_catalog, &viewer)
         };
@@ -11716,15 +15095,22 @@ impl Backend {
                     &self.storage,
                     &self.config.auth_catalog,
                     &viewer,
+                    &self.active_role_set(),
                 )?
                 .into_keys()
                 .collect::<Vec<_>>()
             } else if database_name.eq_ignore_ascii_case("performance_schema") {
-                performance_schema_virtual_tables()
+                performance_schema_virtual_tables(
+                    &self.stats,
+                    &viewer,
+                    self.auth_has_privilege(&viewer, "", "PROCESS"),
+                )
+                .into_keys()
+                .collect::<Vec<_>>()
+            } else if database_name.eq_ignore_ascii_case("sys") {
+                sys_virtual_tables(&self.stats)
                     .into_keys()
                     .collect::<Vec<_>>()
-            } else if database_name.eq_ignore_ascii_case("sys") {
-                sys_virtual_tables().into_keys().collect::<Vec<_>>()
             } else {
                 mysql_virtual_tables(&self.config.auth_catalog, &viewer)
                     .into_keys()
@@ -11827,17 +15213,29 @@ impl Backend {
             .map(|column| {
                 let data_type = data_type_name(&column.data_type);
                 let key = information_schema_column_key(&schema, &column.name);
-                let extra = if auto_increment.as_deref() == Some(column.name.as_str()) {
-                    "auto_increment"
-                } else {
-                    ""
-                };
+                let generated = generated_column_definition(&schema, &column.name);
+                let extra = generated
+                    .as_ref()
+                    .map(|(_, stored)| {
+                        if *stored {
+                            "STORED GENERATED"
+                        } else {
+                            "VIRTUAL GENERATED"
+                        }
+                    })
+                    .unwrap_or_else(|| {
+                        if auto_increment.as_deref() == Some(column.name.as_str()) {
+                            "auto_increment"
+                        } else {
+                            ""
+                        }
+                    });
                 if full {
                     vec![
                         bytes(&column.name),
                         bytes(&data_type),
-                        matches!(column.data_type, DataType::Varchar(_) | DataType::Text)
-                            .then(|| b"utf8mb4_0900_ai_ci".to_vec()),
+                        column_collation_name(&schema, &column.name)
+                            .map(|value| value.into_bytes()),
                         bytes(if column.nullable { "YES" } else { "NO" }),
                         bytes(&key),
                         column
@@ -11846,7 +15244,8 @@ impl Backend {
                             .map(|value| value.as_bytes().to_vec()),
                         bytes(extra),
                         bytes("select,insert,update,references"),
-                        Some(Vec::new()),
+                        column_comment_from_schema(&schema, &column.name)
+                            .map_or_else(|| Some(Vec::new()), |comment| Some(comment.into_bytes())),
                     ]
                 } else {
                     vec![
@@ -11903,6 +15302,7 @@ impl Backend {
                     name: "PRIMARY".into(),
                     columns: primary_key,
                     unique: true,
+                    kind: IndexKind::BTree,
                 },
             );
         }
@@ -11914,22 +15314,31 @@ impl Backend {
                     .iter()
                     .find(|column| column.name.eq_ignore_ascii_case(column_name))
                     .is_some_and(|column| column.nullable);
+                let (collation, sub_part, index_type) = match index.kind {
+                    IndexKind::BTree => (Some(b"A".to_vec()), None, b"BTREE".to_vec()),
+                    IndexKind::FullText => (None, None, b"FULLTEXT".to_vec()),
+                    IndexKind::Spatial => (
+                        Some(b"A".to_vec()),
+                        Some(b"32".to_vec()),
+                        b"SPATIAL".to_vec(),
+                    ),
+                };
                 rows.push(vec![
                     Some(logical.as_bytes().to_vec()),
                     Some(if index.unique { b"0" } else { b"1" }.to_vec()),
                     Some(index.name.as_bytes().to_vec()),
                     Some((position + 1).to_string().into_bytes()),
                     Some(column_name.as_bytes().to_vec()),
-                    Some(b"A".to_vec()),
+                    collation,
                     Some(cardinality.as_bytes().to_vec()),
-                    None,
+                    sub_part,
                     None,
                     Some(if nullable {
                         b"YES".to_vec()
                     } else {
                         Vec::new()
                     }),
-                    Some(b"BTREE".to_vec()),
+                    Some(index_type),
                     Some(Vec::new()),
                     Some(Vec::new()),
                     Some(b"YES".to_vec()),
@@ -12024,14 +15433,11 @@ impl Backend {
                 None,
                 None,
                 None,
-                (!view).then(|| b"utf8mb4_0900_ai_ci".to_vec()),
+                (!view).then(|| table_collation_name(&schema).into_bytes()),
                 None,
                 Some(Vec::new()),
-                Some(if view {
-                    b"VIEW".to_vec()
-                } else {
-                    b"Neko233 engine".to_vec()
-                }),
+                table_comment_from_schema(&schema)
+                    .map_or_else(|| Some(Vec::new()), |comment| Some(comment.into_bytes())),
             ]);
         }
         let columns = vec![
@@ -12144,7 +15550,7 @@ impl Backend {
             .unwrap_or(usize::MAX);
         let mut locked = Vec::new();
         for row in rows {
-            let Some(key) = row_lock_key(&row, &primary_key) else {
+            let Some(key) = row_lock_key_for_schema(&row, &primary_key, schema) else {
                 continue;
             };
             let mut lock_map = HashMap::from([
@@ -12162,6 +15568,7 @@ impl Backend {
             ]);
             if primary_key.len() == 1 {
                 if let Some(value) = row.get(&primary_key[0]).map(ToOwned::to_owned) {
+                    let value = normalize_index_value(schema, &primary_key[0], &value);
                     let point = KeyRange {
                         lower: Some(value.clone()),
                         lower_inclusive: true,
@@ -12189,7 +15596,73 @@ impl Backend {
         }
     }
 
+    async fn materialize_having_subqueries(&mut self, sql: &str) -> anyhow::Result<Option<String>> {
+        let Some((start, end)) = having_expression_bounds(sql) else {
+            return Ok(None);
+        };
+        let expression = &sql[start..end];
+        let outer_aliases = query_source_aliases(sql);
+        let ranges = scalar_subquery_ranges(expression);
+        if ranges.is_empty() {
+            return Ok(None);
+        }
+        let mut materialized = expression.to_string();
+        for (open, close) in ranges.into_iter().rev() {
+            let subquery = expression[open + 1..close - 1].trim();
+            if subquery_has_outer_reference(subquery, &outer_aliases) {
+                return Ok(None);
+            }
+            let values = match Box::pin(self.select(subquery)).await {
+                Ok(outcome) => single_column_subquery_values(outcome)?,
+                // Correlated HAVING subqueries cannot be evaluated before the
+                // grouping row exists. Leave the original expression intact;
+                // grouped evaluation resolves it with the outer row below.
+                Err(_) => return Ok(None),
+            };
+            let prefix = expression[..open].trim_end().to_ascii_uppercase();
+            let in_context = prefix.ends_with(" IN") || prefix.ends_with(" NOT IN");
+            if values.len() > 1 && !in_context {
+                anyhow::bail!("Subquery returns more than 1 row");
+            }
+            let literal = if in_context {
+                let values = values
+                    .into_iter()
+                    .map(|value| {
+                        value
+                            .map(|value| scalar_subquery_literal(&value))
+                            .unwrap_or_else(|| "NULL".to_string())
+                    })
+                    .collect::<Vec<_>>();
+                format!(
+                    "({})",
+                    if values.is_empty() {
+                        "NULL".to_string()
+                    } else {
+                        values.join(",")
+                    }
+                )
+            } else {
+                values
+                    .into_iter()
+                    .next()
+                    .flatten()
+                    .map(|value| scalar_subquery_literal(&value))
+                    .unwrap_or_else(|| "NULL".to_string())
+            };
+            materialized.replace_range(open..close, &literal);
+        }
+        let mut output = sql.to_string();
+        output.replace_range(start..end, &materialized);
+        Ok(Some(output))
+    }
+
     async fn select(&mut self, sql: &str) -> anyhow::Result<QueryOutcome> {
+        let materialized_sql = if sql.to_ascii_uppercase().contains(" HAVING ") {
+            self.materialize_having_subqueries(sql).await?
+        } else {
+            None
+        };
+        let sql = materialized_sql.as_deref().unwrap_or(sql);
         let upper = sql.to_ascii_uppercase();
         if upper.starts_with("WITH ") {
             return self.select_with(sql).await;
@@ -12205,6 +15678,11 @@ impl Backend {
             let mut row = Vec::new();
             let empty_row = Row::new();
             for item in items {
+                if item.trim() == "$$" {
+                    anyhow::bail!(
+                    "You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near '$$' at line 1"
+                );
+                }
                 let item_upper = item.to_ascii_uppercase();
                 let alias = parse_alias(&item);
                 let value = if let Some(argument) =
@@ -12229,7 +15707,7 @@ impl Backend {
                 } else if item_upper.contains("VERSION()") || item_upper.contains("@@VERSION") {
                     Some(SERVER_VERSION.as_bytes().to_vec())
                 } else if item_upper.contains("DATABASE()") {
-                    Some(self.database.as_bytes().to_vec())
+                    (!self.database.is_empty()).then(|| self.database.as_bytes().to_vec())
                 } else if item_upper.contains("CONNECTION_ID()") {
                     Some(self.connection_id.to_string().into_bytes())
                 } else if item_upper.contains("@@PORT") {
@@ -12265,6 +15743,19 @@ impl Backend {
 
         let outer_from = find_top_level_keyword(sql, " FROM ", 0)
             .ok_or_else(|| anyhow::anyhow!("Missing FROM"))?;
+        let from_start = outer_from + 6;
+        let from_end = select_from_clause_end(sql, from_start);
+        let source_spec = sql[from_start..from_end].trim();
+        let comma_sources = split_csv(source_spec);
+        if comma_sources.len() > 1 {
+            let rewritten = format!(
+                "{}{}{}",
+                &sql[..from_start],
+                comma_sources.join(" CROSS JOIN "),
+                &sql[from_end..]
+            );
+            return Box::pin(self.select(&rewritten)).await;
+        }
         let join_clause = find_join_clause(sql);
         if join_clause.is_none() && sql[outer_from + 6..].trim_start().starts_with('(') {
             return self.select_derived(sql).await;
@@ -12276,12 +15767,16 @@ impl Backend {
 
         let from = outer_from;
         let (distinct, projection) = distinct_projection(sql[6..from].trim());
-        let from_start = from + 6;
         let source_spec = sql[from_start..select_from_clause_end(sql, from_start)]
             .trim()
             .trim_end_matches(';')
             .trim();
         let (source, source_rows) = self.join_source_with_rows(source_spec).await?;
+        let projection = if single_source_wildcard_projection(projection, &source)? {
+            "*"
+        } else {
+            projection
+        };
         let database = source.database.clone();
         let table = source.table.clone();
         let schema = source.schema.clone();
@@ -12315,8 +15810,7 @@ impl Backend {
         let for_update = upper.contains(" FOR UPDATE");
         let share_mode = upper.contains(" FOR SHARE")
             || upper.contains(" LOCK IN SHARE MODE")
-            || (self.in_transaction
-                && self.transaction_isolation == TransactionIsolation::Serializable);
+            || self.transaction_isolation == TransactionIsolation::Serializable;
         let skip_locked = upper.contains(" SKIP LOCKED");
         if skip_locked && upper.contains(" NOWAIT") {
             anyhow::bail!("NOWAIT and SKIP LOCKED cannot be used together");
@@ -12335,7 +15829,25 @@ impl Backend {
                 )?;
                 record_lock_requests(&database, &table, &schema, &visible_rows, for_update)
             } else {
-                read_lock_requests(&database, &table, &schema, filter.as_ref(), for_update)
+                let locking_limit =
+                    parse_limit_range(sql).map(|(offset, count)| offset.saturating_add(count));
+                let visible_rows = self.rows_with_local_transaction_overlay(
+                    &database,
+                    &table,
+                    filter.as_ref(),
+                    locking_limit,
+                )?;
+                let index_rows =
+                    self.rows_with_local_transaction_overlay(&database, &table, None, None)?;
+                read_lock_requests(
+                    &database,
+                    &table,
+                    &schema,
+                    filter.as_ref(),
+                    for_update,
+                    Some(&visible_rows),
+                    Some(&index_rows),
+                )
             };
             if upper.contains(" NOWAIT") {
                 self.stats
@@ -12361,10 +15873,15 @@ impl Backend {
                 .map(|(_, count)| count)
         })
         .flatten();
+        let generated_columns = generated_column_names(&schema);
+        let filter_uses_generated_column = filter.as_ref().is_some_and(|filter| {
+            filter.columns().iter().any(|column| {
+                generated_columns
+                    .iter()
+                    .any(|generated| generated.eq_ignore_ascii_case(column))
+            })
+        });
         let mut rows = if let Some(mut rows) = source_rows {
-            if let Some(filter) = &filter {
-                rows.retain(|row| filter.matches(row));
-            }
             if let Some(limit) = pushdown_limit {
                 rows.truncate(limit);
             }
@@ -12374,18 +15891,28 @@ impl Backend {
                 self.rows_with_local_transaction_overlay(
                     &database,
                     &table,
-                    filter.as_ref(),
+                    (!filter_uses_generated_column)
+                        .then_some(filter.as_ref())
+                        .flatten(),
                     pushdown_limit,
                 )?
             } else {
                 self.rows_with_transaction_overlay(
                     &database,
                     &table,
-                    filter.as_ref(),
+                    (!filter_uses_generated_column)
+                        .then_some(filter.as_ref())
+                        .flatten(),
                     pushdown_limit,
                 )?
             }
         };
+        for row in &mut rows {
+            materialize_generated_columns(row, &schema)?;
+        }
+        if let Some(filter) = &filter {
+            rows.retain(|row| filter.matches_with_schema(row, Some(&schema)));
+        }
         for row in &mut rows {
             qualify_single_source_row(row, &source);
         }
@@ -12416,14 +15943,13 @@ impl Backend {
         if let Some(group_columns) = parse_group_by(sql) {
             let projection_items = split_csv(projection);
             let group_columns = resolve_group_by_expressions(group_columns, &projection_items)?;
-            let mut groups = std::collections::BTreeMap::<Vec<Option<Vec<u8>>>, Vec<Row>>::new();
-            for row in rows {
-                let key = group_columns
-                    .iter()
-                    .map(|expression| evaluate_scalar_expression(expression, &row))
-                    .collect::<anyhow::Result<Vec<_>>>()?;
-                groups.entry(key).or_default().push(row);
+            let strict_grouping = self.only_full_group_by_enabled();
+            if strict_grouping {
+                validate_grouped_projection(&projection_items, &group_columns, &schema)?;
             }
+            let allow_nondeterministic = !strict_grouping
+                || grouped_projection_allows_nondeterministic(&group_columns, &schema);
+            let groups = group_rows_by_collation(rows, &group_columns, Some(&schema))?;
             if let Some(outcome) = evaluate_grouped_window_projection(
                 sql,
                 projection,
@@ -12435,13 +15961,17 @@ impl Backend {
                 return Ok(outcome);
             }
             return evaluate_regular_grouped_projection(
+                self,
                 sql,
                 &projection_items,
                 groups,
                 &group_columns,
                 &schema,
                 distinct,
-            );
+                allow_nondeterministic,
+                std::slice::from_ref(&source),
+            )
+            .await;
         }
         let projection_items = split_csv(projection);
         let aggregates = projection_items
@@ -12449,7 +15979,8 @@ impl Backend {
             .map(|item| parse_aggregate_expression(item))
             .collect::<Vec<_>>();
         if aggregates.iter().any(Option::is_some) {
-            if aggregates.iter().any(Option::is_none) {
+            let strict_grouping = self.only_full_group_by_enabled();
+            if strict_grouping && aggregates.iter().any(Option::is_none) {
                 anyhow::bail!("Nonaggregated column without GROUP BY");
             }
             let columns = projection_items
@@ -12458,7 +15989,14 @@ impl Backend {
                 .collect::<Vec<_>>();
             let mut values = vec![aggregates
                 .into_iter()
-                .map(|aggregate| evaluate_aggregate(aggregate.unwrap(), &rows, &schema))
+                .zip(projection_items.iter())
+                .map(|(aggregate, projection)| match aggregate {
+                    Some(aggregate) => evaluate_aggregate(aggregate, &rows, &schema),
+                    None => rows
+                        .first()
+                        .map(|row| evaluate_scalar_expression_with_schema(projection, row, &schema))
+                        .unwrap_or_else(|| Ok(None)),
+                })
                 .collect::<anyhow::Result<Vec<_>>>()?];
             filter_projected_having(sql, &columns, &mut values, &rows, &schema)?;
             return Ok(QueryOutcome::byte_rows(columns, values));
@@ -12473,7 +16011,7 @@ impl Backend {
             })
             .collect::<Vec<_>>();
         let order_items = resolve_row_order_expressions(sql, &order_projections);
-        sort_rows_by_expressions(&mut rows, &order_items)?;
+        sort_rows_by_expressions(&mut rows, &order_items, Some(&schema))?;
         if skip_locked_plain {
             rows = self.lock_skip_locked_rows(
                 rows,
@@ -12527,14 +16065,23 @@ impl Backend {
                 } else {
                     projection_items
                         .iter()
-                        .map(|item| evaluate_scalar_expression(item, &row))
+                        .map(|item| evaluate_scalar_expression_with_schema(item, &row, &schema))
                         .collect::<anyhow::Result<Vec<_>>>()?
                 };
                 Ok(values)
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
         if distinct {
-            deduplicate_projected_rows(&mut values);
+            let distinct_items = if projection == "*" {
+                schema
+                    .columns
+                    .iter()
+                    .map(|column| column.name.clone())
+                    .collect::<Vec<_>>()
+            } else {
+                projection_items.clone()
+            };
+            deduplicate_projected_rows_with_schema(&mut values, &distinct_items, Some(&schema));
             if let Some((offset, count)) = parse_limit_range(sql) {
                 values = values.into_iter().skip(offset).take(count).collect();
             }
@@ -12544,6 +16091,17 @@ impl Backend {
 
     async fn select_with(&mut self, sql: &str) -> anyhow::Result<QueryOutcome> {
         let (recursive, definitions, main_query) = parse_with_clause(sql)?;
+        for (index, definition) in definitions.iter().enumerate() {
+            for later in definitions.iter().skip(index + 1) {
+                if cte_query_reference_count(&definition.query, &later.name) > 0 {
+                    anyhow::bail!(
+                        "CTE '{}' cannot reference later CTE '{}'",
+                        definition.name,
+                        later.name
+                    );
+                }
+            }
+        }
         self.cte_scopes.push(HashMap::new());
         let result = async {
             for definition in definitions {
@@ -12628,6 +16186,7 @@ impl Backend {
                 {
                     anyhow::bail!("Recursive CTE arms must be UNION queries referencing the CTE");
                 }
+                validate_recursive_cte_arm(arm, &definition.name)?;
                 Ok((clause.operator, arm))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
@@ -12647,15 +16206,19 @@ impl Backend {
         let mut delta = accumulated.clone();
         let mut seen = accumulated.iter().cloned().collect::<HashSet<_>>();
         let name = definition.name.to_ascii_lowercase();
-        for iteration in 0..=1000 {
+        let recursion_limit = self.cte_max_recursion_depth();
+        for iteration in 0..=recursion_limit {
             if delta.is_empty() {
                 return Ok(VirtualTable {
                     columns,
                     rows: accumulated,
                 });
             }
-            if iteration == 1000 {
-                anyhow::bail!("Recursive query aborted after 1001 iterations");
+            if iteration == recursion_limit {
+                anyhow::bail!(
+                    "Recursive query aborted after {} iterations",
+                    recursion_limit.saturating_add(1)
+                );
             }
             self.cte_scopes
                 .last_mut()
@@ -12753,7 +16316,7 @@ impl Backend {
         for (operator, right) in operators.into_iter().zip(operands) {
             rows = apply_set_operator(rows, right, operator);
         }
-        sort_projected_values(sql, &columns, &columns, &mut rows);
+        sort_projected_values(sql, &columns, &columns, &mut rows, None);
         if let Some((offset, count)) = parse_limit_range(sql) {
             rows = rows.into_iter().skip(offset).take(count).collect();
         }
@@ -12863,14 +16426,13 @@ impl Backend {
         }
         if let Some(group_columns) = parse_group_by(sql) {
             let group_columns = resolve_group_by_expressions(group_columns, &raw_projection)?;
-            let mut groups = std::collections::BTreeMap::<Vec<Option<Vec<u8>>>, Vec<Row>>::new();
-            for row in rows {
-                let key = group_columns
-                    .iter()
-                    .map(|expression| evaluate_scalar_expression(expression, &row))
-                    .collect::<anyhow::Result<Vec<_>>>()?;
-                groups.entry(key).or_default().push(row);
+            let strict_grouping = self.only_full_group_by_enabled();
+            if strict_grouping {
+                validate_grouped_projection(&raw_projection, &group_columns, &aggregate_schema)?;
             }
+            let allow_nondeterministic = !strict_grouping
+                || grouped_projection_allows_nondeterministic(&group_columns, &aggregate_schema);
+            let groups = group_rows_by_collation(rows, &group_columns, Some(&aggregate_schema))?;
             if let Some(outcome) = evaluate_grouped_window_projection(
                 sql,
                 projection,
@@ -12882,20 +16444,25 @@ impl Backend {
                 return Ok(outcome);
             }
             return evaluate_regular_grouped_projection(
+                self,
                 sql,
                 &raw_projection,
                 groups,
                 &group_columns,
                 &aggregate_schema,
                 distinct,
-            );
+                allow_nondeterministic,
+                sources,
+            )
+            .await;
         }
         let aggregates = raw_projection
             .iter()
             .map(|item| parse_aggregate_expression(item))
             .collect::<Vec<_>>();
         if aggregates.iter().any(Option::is_some) {
-            if aggregates.iter().any(Option::is_none) {
+            let strict_grouping = self.only_full_group_by_enabled();
+            if strict_grouping && aggregates.iter().any(Option::is_none) {
                 anyhow::bail!("Nonaggregated column without GROUP BY");
             }
             let columns = raw_projection
@@ -12904,7 +16471,20 @@ impl Backend {
                 .collect::<Vec<_>>();
             let mut values = vec![aggregates
                 .into_iter()
-                .map(|aggregate| evaluate_aggregate(aggregate.unwrap(), &rows, &aggregate_schema))
+                .zip(raw_projection.iter())
+                .map(|(aggregate, projection)| match aggregate {
+                    Some(aggregate) => evaluate_aggregate(aggregate, &rows, &aggregate_schema),
+                    None => rows
+                        .first()
+                        .map(|row| {
+                            evaluate_scalar_expression_with_schema(
+                                projection,
+                                row,
+                                &aggregate_schema,
+                            )
+                        })
+                        .unwrap_or_else(|| Ok(None)),
+                })
                 .collect::<anyhow::Result<Vec<_>>>()?];
             filter_projected_having(sql, &columns, &mut values, &rows, &aggregate_schema)?;
             return Ok(QueryOutcome::byte_rows(columns, values));
@@ -12916,7 +16496,7 @@ impl Backend {
             .map(|item| (item.alias.clone(), item.expression.clone()))
             .collect::<Vec<_>>();
         let order_items = resolve_row_order_expressions(sql, &order_projections);
-        sort_rows_by_expressions(&mut rows, &order_items)?;
+        sort_rows_by_expressions(&mut rows, &order_items, Some(&aggregate_schema))?;
         if !distinct {
             if let Some((offset, count)) = parse_limit_range(sql) {
                 rows = rows.into_iter().skip(offset).take(count).collect();
@@ -12931,12 +16511,26 @@ impl Backend {
             .map(|row| {
                 projection_items
                     .iter()
-                    .map(|item| evaluate_scalar_expression(&item.expression, &row))
+                    .map(|item| {
+                        evaluate_scalar_expression_with_schema(
+                            &item.expression,
+                            &row,
+                            &source.schema,
+                        )
+                    })
                     .collect::<anyhow::Result<Vec<_>>>()
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
         if distinct {
-            deduplicate_projected_rows(&mut values);
+            let distinct_items = projection_items
+                .iter()
+                .map(|item| item.expression.clone())
+                .collect::<Vec<_>>();
+            deduplicate_projected_rows_with_schema(
+                &mut values,
+                &distinct_items,
+                Some(&aggregate_schema),
+            );
             if let Some((offset, count)) = parse_limit_range(sql) {
                 values = values.into_iter().skip(offset).take(count).collect();
             }
@@ -12962,6 +16556,7 @@ impl Backend {
         let mut sources = vec![first_source];
         let mut source_overrides = vec![first_rows];
         let mut steps = Vec::<JoinStep>::new();
+        let mut join_predicates = Vec::<Option<JoinPredicate>>::new();
         for (index, (join_position, join_length, join_kind, natural)) in
             join_clauses.iter().copied().enumerate()
         {
@@ -13014,14 +16609,38 @@ impl Backend {
         let for_update = upper.contains(" FOR UPDATE");
         let share_mode = upper.contains(" FOR SHARE")
             || upper.contains(" LOCK IN SHARE MODE")
-            || (self.in_transaction
-                && self.transaction_isolation == TransactionIsolation::Serializable);
-        if for_update || share_mode {
+            || self.transaction_isolation == TransactionIsolation::Serializable;
+        let skip_locked = upper.contains(" SKIP LOCKED");
+        if skip_locked && upper.contains(" NOWAIT") {
+            anyhow::bail!("NOWAIT and SKIP LOCKED cannot be used together");
+        }
+        let source_is_derived = source_overrides
+            .iter()
+            .map(Option::is_some)
+            .collect::<Vec<_>>();
+        let correlated_filter = correlated_row_filter_clause(sql, &sources)?;
+        let mut scalar_filter = None;
+        let mut filter = if correlated_filter.is_some() {
+            None
+        } else {
+            match self.parse_where_with_subquery(sql).await {
+                Ok(filter) => filter,
+                Err(error) => {
+                    if let Some(expression) = scalar_where_expression(sql) {
+                        scalar_filter = Some(expression.to_string());
+                        None
+                    } else {
+                        return Err(error);
+                    }
+                }
+            }
+        };
+        if (for_update || share_mode) && !skip_locked {
             let mut locks = HashMap::new();
-            let (intent, table_mode) = if for_update {
-                (LockMode::IntentionExclusive, LockMode::Exclusive)
+            let intent = if for_update {
+                LockMode::IntentionExclusive
             } else {
-                (LockMode::IntentionShared, LockMode::Shared)
+                LockMode::IntentionShared
             };
             for (source_index, source) in sources.iter().enumerate() {
                 if source_overrides[source_index].is_some() {
@@ -13031,7 +16650,7 @@ impl Backend {
                 add_lock_request(
                     &mut locks,
                     format!("table:{}.{}", source.database, source.table),
-                    table_mode,
+                    intent,
                 );
             }
             let locks = sorted_lock_requests(locks);
@@ -13047,17 +16666,32 @@ impl Backend {
 
         let mut source_rows = Vec::with_capacity(sources.len());
         for (source_index, source) in sources.iter().enumerate() {
+            let source_filter = filter
+                .as_ref()
+                .and_then(|predicate| predicate_for_source(predicate, source_index, &sources))
+                .map(unqualify_row_predicate);
             source_rows.push(if let Some(rows) = source_overrides[source_index].take() {
-                rows
+                if let Some(predicate) = source_filter.as_ref() {
+                    rows.into_iter()
+                        .filter(|row| predicate.matches_with_schema(row, Some(&source.schema)))
+                        .collect()
+                } else {
+                    rows
+                }
             } else if for_update || share_mode {
                 self.rows_with_local_transaction_overlay(
                     &source.database,
                     &source.table,
-                    None,
+                    source_filter.as_ref(),
                     None,
                 )?
             } else {
-                self.rows_with_transaction_overlay(&source.database, &source.table, None, None)?
+                self.rows_with_transaction_overlay(
+                    &source.database,
+                    &source.table,
+                    source_filter.as_ref(),
+                    None,
+                )?
             });
         }
         let mut combinations = (0..source_rows[0].len())
@@ -13079,33 +16713,54 @@ impl Backend {
                     new_source,
                     &mut natural_columns,
                 )?)
+            } else if step.kind == JoinKind::Cross {
+                filter
+                    .as_ref()
+                    .and_then(|filter| row_filter_join_predicate(filter, new_source, &sources))
             } else {
                 step.on
                     .as_deref()
                     .map(|on| parse_join_predicate(on, &sources[..=new_source]))
                     .transpose()?
             };
-            let indexed_equality = predicate
+            join_predicates.push(predicate.clone());
+            let indexed_equalities = predicate
                 .as_ref()
-                .and_then(|predicate| find_indexable_join_equality(predicate, new_source))
-                .and_then(|equality| {
-                    match (
-                        equality.left.0 == new_source,
-                        equality.right.0 == new_source,
-                    ) {
-                        (true, false) => Some((equality.right.clone(), equality.left.1.clone())),
-                        (false, true) => Some((equality.left.clone(), equality.right.1.clone())),
-                        _ => None,
-                    }
-                });
-            let right_index = indexed_equality.as_ref().map(|(_, right_column)| {
-                let mut index = HashMap::<Vec<u8>, Vec<usize>>::new();
+                .map(|predicate| find_indexable_join_equalities(predicate, new_source))
+                .unwrap_or_default();
+            let indexed_equality = indexed_equalities.first().cloned();
+            if step.kind != JoinKind::Right {
+                if let Some((prior, right_column)) = indexed_equality.as_ref() {
+                    let allowed = source_rows[prior.0]
+                        .iter()
+                        .filter_map(|row| row.get(&prior.1))
+                        .map(|value| value.to_vec())
+                        .collect::<HashSet<_>>();
+                    source_rows[new_source].retain(|row| {
+                        row.get(&right_column.1)
+                            .is_some_and(|value| allowed.contains(value))
+                    });
+                }
+            }
+            let right_index = (!indexed_equalities.is_empty()).then(|| {
+                let mut index = HashMap::<Vec<Vec<u8>>, Vec<usize>>::new();
                 for (row_index, row) in source_rows[new_source].iter().enumerate() {
-                    if !row.is_null(right_column) {
-                        if let Some(value) = row.get(right_column) {
-                            index.entry(value.to_vec()).or_default().push(row_index);
-                        }
-                    }
+                    let Some(key) = indexed_equalities
+                        .iter()
+                        .map(|(_, right)| {
+                            row.get(&right.1).map(|value| {
+                                mysql_collation_key_bytes(
+                                    value,
+                                    column_collation_name(&sources[new_source].schema, &right.1)
+                                        .as_deref(),
+                                )
+                            })
+                        })
+                        .collect::<Option<Vec<_>>>()
+                    else {
+                        continue;
+                    };
+                    index.entry(key).or_default().push(row_index);
                 }
                 index
             });
@@ -13113,13 +16768,22 @@ impl Backend {
             let mut matched_right = HashSet::new();
             for combination in &combinations {
                 let mut matched = false;
-                let candidates = if step.kind == JoinKind::Cross {
+                let candidates = if step.kind == JoinKind::Cross && indexed_equalities.is_empty() {
                     (0..source_rows[new_source].len()).collect::<Vec<_>>()
-                } else if let (Some((prior, _)), Some(index)) =
-                    (indexed_equality.as_ref(), right_index.as_ref())
-                {
-                    join_combination_value(prior, combination, &source_rows)
-                        .and_then(|value| index.get(value))
+                } else if !indexed_equalities.is_empty() {
+                    indexed_equalities
+                        .iter()
+                        .map(|(left, right)| {
+                            join_combination_value(left, combination, &source_rows).map(|value| {
+                                mysql_collation_key_bytes(
+                                    value,
+                                    column_collation_name(&sources[new_source].schema, &right.1)
+                                        .as_deref(),
+                                )
+                            })
+                        })
+                        .collect::<Option<Vec<_>>>()
+                        .and_then(|key| right_index.as_ref().and_then(|index| index.get(&key)))
                         .cloned()
                         .unwrap_or_default()
                 } else {
@@ -13127,7 +16791,7 @@ impl Backend {
                 };
                 for right_index in candidates {
                     let right_row = &source_rows[new_source][right_index];
-                    if step.kind == JoinKind::Cross
+                    if (step.kind == JoinKind::Cross && predicate.is_none())
                         || predicate.as_ref().is_some_and(|predicate| {
                             join_predicate_matches(
                                 predicate,
@@ -13135,6 +16799,7 @@ impl Backend {
                                 new_source,
                                 right_row,
                                 &source_rows,
+                                &sources,
                             )
                         })
                     {
@@ -13177,23 +16842,6 @@ impl Backend {
             .collect::<Vec<_>>();
 
         let valid_columns = join_column_names(&sources, &unqualified);
-        let correlated_filter = correlated_row_filter_clause(sql, &sources)?;
-        let mut scalar_filter = None;
-        let mut filter = if correlated_filter.is_some() {
-            None
-        } else {
-            match self.parse_where_with_subquery(sql).await {
-                Ok(filter) => filter,
-                Err(error) => {
-                    if let Some(expression) = scalar_where_expression(sql) {
-                        scalar_filter = Some(expression.to_string());
-                        None
-                    } else {
-                        return Err(error);
-                    }
-                }
-            }
-        };
         let invalid_filter = filter.as_ref().is_some_and(|filter| {
             filter
                 .columns()
@@ -13206,7 +16854,8 @@ impl Backend {
             filter = None;
         }
         if let Some(filter) = &filter {
-            rows.retain(|row| filter.matches(row));
+            let filter_schema = join_aggregate_schema(&sources, &unqualified);
+            rows.retain(|row| filter.matches_with_schema(row, Some(&filter_schema)));
         }
         if let Some(expression) = &scalar_filter {
             rows = filter_scalar_expression_rows(rows, expression)?;
@@ -13215,6 +16864,118 @@ impl Backend {
             rows = self
                 .filter_correlated_subquery_rows(rows, correlated, &sources)
                 .await?;
+        }
+        if skip_locked && (for_update || share_mode) {
+            rows.retain(|joined| {
+                let mut requests = HashMap::new();
+                for (source_index, source) in sources.iter().enumerate() {
+                    if source_is_derived[source_index] {
+                        continue;
+                    }
+                    let marker = format!("__mydb_row_index_{source_index}");
+                    let Some(row_index) = joined
+                        .get(&marker)
+                        .and_then(|value| std::str::from_utf8(value).ok())
+                        .and_then(|value| value.parse::<usize>().ok())
+                    else {
+                        continue;
+                    };
+                    let Some(row) = source_rows[source_index].get(row_index) else {
+                        continue;
+                    };
+                    add_record_locks(
+                        &mut requests,
+                        &source.database,
+                        &source.table,
+                        &source.schema,
+                        std::slice::from_ref(row),
+                        if for_update {
+                            LockMode::Exclusive
+                        } else {
+                            LockMode::Shared
+                        },
+                    );
+                    add_locking_read_index_points(
+                        &mut requests,
+                        &source.database,
+                        &source.table,
+                        &source.schema,
+                        std::slice::from_ref(row),
+                        for_update,
+                        join_index_rows_for_source(
+                            source_index,
+                            &source.schema,
+                            &join_predicates,
+                            &source_rows[source_index],
+                        ),
+                    );
+                }
+                add_locking_read_join_ranges(
+                    &mut requests,
+                    std::slice::from_ref(joined),
+                    &join_predicates,
+                    &sources,
+                    &source_rows,
+                    &source_is_derived,
+                    for_update,
+                );
+                self.stats
+                    .try_acquire_locks(&sorted_lock_requests(requests), self.connection_id)
+            });
+        }
+        if (for_update || share_mode) && !skip_locked {
+            let mut all_locks = HashMap::new();
+            for (source_index, source) in sources.iter().enumerate() {
+                if source_is_derived[source_index] {
+                    continue;
+                }
+                let marker = format!("__mydb_row_index_{source_index}");
+                let selected_rows = rows
+                    .iter()
+                    .filter_map(|joined| {
+                        joined
+                            .get(&marker)
+                            .and_then(|value| std::str::from_utf8(value).ok())
+                            .and_then(|value| value.parse::<usize>().ok())
+                            .and_then(|row_index| source_rows[source_index].get(row_index))
+                            .cloned()
+                    })
+                    .collect::<Vec<_>>();
+                let requests = locking_read_requests_for_rows(
+                    &source.database,
+                    &source.table,
+                    &source.schema,
+                    &selected_rows,
+                    for_update,
+                    join_index_rows_for_source(
+                        source_index,
+                        &source.schema,
+                        &join_predicates,
+                        &source_rows[source_index],
+                    ),
+                );
+                for request in requests {
+                    add_lock_request(&mut all_locks, request.resource, request.mode);
+                }
+            }
+            add_locking_read_join_ranges(
+                &mut all_locks,
+                &rows,
+                &join_predicates,
+                &sources,
+                &source_rows,
+                &source_is_derived,
+                for_update,
+            );
+            let requests = sorted_lock_requests(all_locks);
+            if upper.contains(" NOWAIT") {
+                self.stats
+                    .acquire_locks_nowait(&requests, self.connection_id)?;
+            } else {
+                self.stats
+                    .acquire_locks(&requests, self.connection_id, self.lock_wait_timeout)
+                    .await?;
+            }
         }
         let raw_projection = split_csv(projection);
         let aggregate_schema = join_aggregate_schema(&sources, &unqualified);
@@ -13225,14 +16986,13 @@ impl Backend {
         }
         if let Some(group_columns) = parse_group_by(sql) {
             let group_columns = resolve_group_by_expressions(group_columns, &raw_projection)?;
-            let mut groups = std::collections::BTreeMap::<Vec<Option<Vec<u8>>>, Vec<Row>>::new();
-            for row in rows {
-                let key = group_columns
-                    .iter()
-                    .map(|expression| evaluate_scalar_expression(expression, &row))
-                    .collect::<anyhow::Result<Vec<_>>>()?;
-                groups.entry(key).or_default().push(row);
+            let strict_grouping = self.only_full_group_by_enabled();
+            if strict_grouping {
+                validate_grouped_projection(&raw_projection, &group_columns, &aggregate_schema)?;
             }
+            let allow_nondeterministic = !strict_grouping
+                || grouped_projection_allows_nondeterministic(&group_columns, &aggregate_schema);
+            let groups = group_rows_by_collation(rows, &group_columns, Some(&aggregate_schema))?;
             if let Some(outcome) = evaluate_grouped_window_projection(
                 sql,
                 projection,
@@ -13244,20 +17004,25 @@ impl Backend {
                 return Ok(outcome);
             }
             return evaluate_regular_grouped_projection(
+                self,
                 sql,
                 &raw_projection,
                 groups,
                 &group_columns,
                 &aggregate_schema,
                 distinct,
-            );
+                allow_nondeterministic,
+                &sources,
+            )
+            .await;
         }
         let aggregates = raw_projection
             .iter()
             .map(|item| parse_aggregate_expression(item))
             .collect::<Vec<_>>();
         if aggregates.iter().any(Option::is_some) {
-            if aggregates.iter().any(Option::is_none) {
+            let strict_grouping = self.only_full_group_by_enabled();
+            if strict_grouping && aggregates.iter().any(Option::is_none) {
                 anyhow::bail!("Nonaggregated column without GROUP BY");
             }
             let columns = raw_projection
@@ -13266,7 +17031,20 @@ impl Backend {
                 .collect::<Vec<_>>();
             let mut values = vec![aggregates
                 .into_iter()
-                .map(|aggregate| evaluate_aggregate(aggregate.unwrap(), &rows, &aggregate_schema))
+                .zip(raw_projection.iter())
+                .map(|(aggregate, projection)| match aggregate {
+                    Some(aggregate) => evaluate_aggregate(aggregate, &rows, &aggregate_schema),
+                    None => rows
+                        .first()
+                        .map(|row| {
+                            evaluate_scalar_expression_with_schema(
+                                projection,
+                                row,
+                                &aggregate_schema,
+                            )
+                        })
+                        .unwrap_or_else(|| Ok(None)),
+                })
                 .collect::<anyhow::Result<Vec<_>>>()?];
             filter_projected_having(sql, &columns, &mut values, &rows, &aggregate_schema)?;
             return Ok(QueryOutcome::byte_rows(columns, values));
@@ -13278,7 +17056,7 @@ impl Backend {
             .map(|item| (item.alias.clone(), item.expression.clone()))
             .collect::<Vec<_>>();
         let order_items = resolve_row_order_expressions(sql, &order_projections);
-        sort_rows_by_expressions(&mut rows, &order_items)?;
+        sort_rows_by_expressions(&mut rows, &order_items, Some(&aggregate_schema))?;
         if !distinct {
             if let Some((offset, count)) = parse_limit_range(sql) {
                 rows = rows.into_iter().skip(offset).take(count).collect();
@@ -13293,12 +17071,26 @@ impl Backend {
             .map(|row| {
                 projection_items
                     .iter()
-                    .map(|item| evaluate_scalar_expression(&item.expression, &row))
+                    .map(|item| {
+                        evaluate_scalar_expression_with_schema(
+                            &item.expression,
+                            &row,
+                            &aggregate_schema,
+                        )
+                    })
                     .collect::<anyhow::Result<Vec<_>>>()
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
         if distinct {
-            deduplicate_projected_rows(&mut values);
+            let distinct_items = projection_items
+                .iter()
+                .map(|item| item.expression.clone())
+                .collect::<Vec<_>>();
+            deduplicate_projected_rows_with_schema(
+                &mut values,
+                &distinct_items,
+                Some(&aggregate_schema),
+            );
             if let Some((offset, count)) = parse_limit_range(sql) {
                 values = values.into_iter().skip(offset).take(count).collect();
             }
@@ -13334,6 +17126,9 @@ impl Backend {
         Box::pin(async move {
             match filter {
                 CorrelatedRowFilter::Predicate(predicate) => Ok(predicate.matches(row)),
+                CorrelatedRowFilter::Scalar(expression) => {
+                    evaluate_scalar_condition(expression, row)
+                }
                 CorrelatedRowFilter::Subquery(filter) => {
                     self.evaluate_correlated_subquery_filter(filter, row, sources)
                         .await
@@ -13393,7 +17188,7 @@ impl Backend {
                 let values = single_column_subquery_values(outcome)?;
                 let has_null = values.iter().any(Option::is_none);
                 let outer = correlated_outer_value(row, &filter.column)?;
-                let matched = outer.is_some_and(|outer| {
+                let matched = outer.as_deref().is_some_and(|outer| {
                     values
                         .iter()
                         .flatten()
@@ -13414,7 +17209,7 @@ impl Backend {
                 let scalar = values.pop().flatten();
                 Ok(sql_optional_comparison(
                     filter.operator,
-                    outer,
+                    outer.as_deref(),
                     scalar.as_deref(),
                 ))
             }
@@ -13530,6 +17325,8 @@ impl Backend {
                     &source.schema,
                     None,
                     false,
+                    None,
+                    None,
                 );
                 self.stats
                     .acquire_read_locks_against_explicit(
@@ -13993,14 +17790,22 @@ impl Backend {
                     &self.storage,
                     &self.config.auth_catalog,
                     &viewer,
+                    &self.active_role_set(),
                 )?,
             ),
             (
                 "mysql",
                 mysql_virtual_tables(&self.config.auth_catalog, &viewer),
             ),
-            ("performance_schema", performance_schema_virtual_tables()),
-            ("sys", sys_virtual_tables()),
+            (
+                "performance_schema",
+                performance_schema_virtual_tables(
+                    &self.stats,
+                    &viewer,
+                    self.auth_has_privilege(&viewer, "", "PROCESS"),
+                ),
+            ),
+            ("sys", sys_virtual_tables(&self.stats)),
         ];
         let mut scope = HashMap::new();
         let mut rewritten = sql.to_string();
@@ -14039,7 +17844,11 @@ impl Backend {
         if !matched {
             return Ok(None);
         }
-        let database_literal = format!("'{}'", self.database.replace('\'', "''"));
+        let database_literal = if self.database.is_empty() {
+            "NULL".to_string()
+        } else {
+            format!("'{}'", self.database.replace('\'', "''"))
+        };
         rewritten = replace_ascii_case_insensitive(&rewritten, "DATABASE()", &database_literal).0;
         self.cte_scopes.push(scope);
         let result = Box::pin(self.select(&rewritten)).await;
@@ -14250,6 +18059,497 @@ impl Backend {
     }
 }
 
+fn mysql_text_column(name: &str) -> MysqlColumn {
+    MysqlColumn {
+        table: String::new(),
+        column: name.to_string(),
+        collen: 0,
+        coltype: ColumnType::MYSQL_TYPE_VAR_STRING,
+        colflags: ColumnFlags::empty(),
+    }
+}
+
+fn mysql_expression_column(name: &str, expression: &str) -> MysqlColumn {
+    let expression = projection_without_alias(expression).trim();
+    let upper = expression.to_ascii_uppercase();
+    let coltype = if upper.starts_with("SUM(") || upper.starts_with("AVG(") {
+        ColumnType::MYSQL_TYPE_NEWDECIMAL
+    } else if upper.starts_with("MATCH(") && upper.contains(" AGAINST ") {
+        ColumnType::MYSQL_TYPE_DOUBLE
+    } else if !upper.starts_with("CASE ")
+        && (["<=>", ">=", "<=", "<>", "!=", ">", "<", "="]
+            .into_iter()
+            .any(|operator| find_scalar_condition_operator(expression, operator).is_some())
+            || upper.contains(" IS NULL")
+            || upper.contains(" IS NOT NULL")
+            || upper.contains(" LIKE ")
+            || upper.contains(" IN (")
+            || upper.contains(" BETWEEN ")
+            || upper.starts_with("EXISTS(")
+            || upper.starts_with("NOT EXISTS("))
+    {
+        ColumnType::MYSQL_TYPE_LONGLONG
+    } else if upper.starts_with("JSON_EXTRACT(")
+        || upper.starts_with("JSON_SET(")
+        || upper.starts_with("JSON_INSERT(")
+        || upper.starts_with("JSON_REPLACE(")
+        || upper.starts_with("JSON_REMOVE(")
+        || upper.starts_with("JSON_ARRAY(")
+        || upper.starts_with("JSON_OBJECT(")
+    {
+        ColumnType::MYSQL_TYPE_JSON
+    } else if upper.starts_with("FIND_IN_SET(")
+        || upper.starts_with("JSON_LENGTH(")
+        || upper.starts_with("JSON_CONTAINS(")
+        || upper.starts_with("JSON_CONTAINS_PATH(")
+        || upper.starts_with("JSON_VALID(")
+        || upper.starts_with("LOCATE(")
+        || upper.starts_with("INSTR(")
+        || upper.starts_with("FIELD(")
+        || upper.starts_with("BIT_COUNT(")
+        || upper.starts_with("SIGN(")
+        || upper.starts_with("ROW_COUNT(")
+        || upper.starts_with("FOUND_ROWS(")
+        || upper.starts_with("LAST_INSERT_ID(")
+        || upper.starts_with("COUNT(")
+    {
+        ColumnType::MYSQL_TYPE_LONGLONG
+    } else if upper.starts_with("MIN(") || upper.starts_with("MAX(") {
+        ColumnType::MYSQL_TYPE_VAR_STRING
+    } else if upper.starts_with("NOW(")
+        || upper.starts_with("CURRENT_TIMESTAMP")
+        || upper.starts_with("LOCALTIME")
+        || upper.starts_with("LOCALTIMESTAMP")
+    {
+        ColumnType::MYSQL_TYPE_DATETIME
+    } else if upper.starts_with("DATE(") || upper.starts_with("CURRENT_DATE") {
+        ColumnType::MYSQL_TYPE_DATE
+    } else if upper.starts_with("TIME(") || upper.starts_with("CURRENT_TIME") {
+        ColumnType::MYSQL_TYPE_TIME
+    } else if upper.starts_with("CONCAT(")
+        || upper.starts_with("CONCAT_WS(")
+        || upper.starts_with("DATE_FORMAT(")
+        || upper.starts_with("UPPER(")
+        || upper.starts_with("LOWER(")
+        || upper.starts_with("SUBSTRING(")
+        || upper.starts_with("LEFT(")
+        || upper.starts_with("RIGHT(")
+        || upper.starts_with("TRIM(")
+        || upper.starts_with("LTRIM(")
+        || upper.starts_with("RTRIM(")
+        || upper.starts_with("REPLACE(")
+        || upper.starts_with("CASE ")
+        || expression.starts_with('\'')
+        || expression.starts_with('"')
+    {
+        ColumnType::MYSQL_TYPE_VAR_STRING
+    } else if upper.starts_with("CAST(") || upper.starts_with("CONVERT(") {
+        let data_type = upper
+            .split_once(" AS ")
+            .and_then(|(_, value)| value.trim_end_matches(')').split_whitespace().next())
+            .unwrap_or_default();
+        procedure_parameter_column(name, data_type).coltype
+    } else if expression.parse::<i64>().is_ok()
+        || expression.eq_ignore_ascii_case("TRUE")
+        || expression.eq_ignore_ascii_case("FALSE")
+    {
+        ColumnType::MYSQL_TYPE_LONGLONG
+    } else if expression.parse::<f64>().is_ok()
+        || upper.contains("+")
+        || upper.contains("-")
+        || upper.contains("*")
+        || upper.contains("/")
+    {
+        ColumnType::MYSQL_TYPE_DOUBLE
+    } else {
+        ColumnType::MYSQL_TYPE_VAR_STRING
+    };
+    MysqlColumn {
+        table: String::new(),
+        column: name.to_string(),
+        collen: 0,
+        coltype,
+        colflags: ColumnFlags::empty(),
+    }
+}
+
+fn mysql_column_from_storage(column: &Column, schema: Option<&TableSchema>) -> MysqlColumn {
+    let upper = schema
+        .and_then(|schema| schema.create_sql.as_deref())
+        .and_then(|sql| {
+            split_csv(sql.get(sql.find('(')? + 1..sql.rfind(')')?)?)
+                .into_iter()
+                .find(|definition| {
+                    definition.split_whitespace().next().is_some_and(|name| {
+                        name.trim_matches('`').eq_ignore_ascii_case(&column.name)
+                    })
+                })
+        })
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    let coltype = match &column.data_type {
+        DataType::Int => {
+            if upper.starts_with("TINYINT") {
+                ColumnType::MYSQL_TYPE_TINY
+            } else if upper.starts_with("SMALLINT") {
+                ColumnType::MYSQL_TYPE_SHORT
+            } else if upper.starts_with("MEDIUMINT") {
+                ColumnType::MYSQL_TYPE_INT24
+            } else {
+                ColumnType::MYSQL_TYPE_LONG
+            }
+        }
+        DataType::BigInt => ColumnType::MYSQL_TYPE_LONGLONG,
+        DataType::Float => ColumnType::MYSQL_TYPE_FLOAT,
+        DataType::Double => ColumnType::MYSQL_TYPE_DOUBLE,
+        DataType::Varchar(_) => {
+            if upper.starts_with("CHAR") {
+                ColumnType::MYSQL_TYPE_STRING
+            } else {
+                ColumnType::MYSQL_TYPE_VAR_STRING
+            }
+        }
+        DataType::Text => ColumnType::MYSQL_TYPE_BLOB,
+        DataType::Blob => {
+            if upper.starts_with("TINYBLOB") {
+                ColumnType::MYSQL_TYPE_TINY_BLOB
+            } else if upper.starts_with("MEDIUMBLOB") {
+                ColumnType::MYSQL_TYPE_MEDIUM_BLOB
+            } else if upper.starts_with("LONGBLOB") {
+                ColumnType::MYSQL_TYPE_LONG_BLOB
+            } else {
+                ColumnType::MYSQL_TYPE_BLOB
+            }
+        }
+        DataType::Date => ColumnType::MYSQL_TYPE_DATE,
+        DataType::DateTime => ColumnType::MYSQL_TYPE_DATETIME,
+        DataType::Timestamp => ColumnType::MYSQL_TYPE_TIMESTAMP,
+        DataType::Boolean => ColumnType::MYSQL_TYPE_TINY,
+        DataType::Raw(value) if value.trim().to_ascii_uppercase().starts_with("ENUM") => {
+            ColumnType::MYSQL_TYPE_STRING
+        }
+        DataType::Raw(value) if value.trim().to_ascii_uppercase().starts_with("SET") => {
+            ColumnType::MYSQL_TYPE_STRING
+        }
+        DataType::Raw(value) => procedure_parameter_column(&column.name, value).coltype,
+    };
+    let mut colflags = ColumnFlags::empty();
+    if !column.nullable {
+        colflags.insert(ColumnFlags::NOT_NULL_FLAG);
+    }
+    if upper.contains("UNSIGNED") {
+        colflags.insert(ColumnFlags::UNSIGNED_FLAG);
+    }
+    MysqlColumn {
+        table: schema.map(|schema| schema.name.clone()).unwrap_or_default(),
+        column: column.name.clone(),
+        collen: information_schema_column_wire_length(column, &upper),
+        coltype,
+        colflags,
+    }
+}
+
+fn information_schema_column_wire_length(column: &Column, definition: &str) -> u32 {
+    match &column.data_type {
+        DataType::Varchar(length) => length.saturating_mul(4),
+        DataType::Text => 65_535,
+        DataType::Blob => {
+            if definition.starts_with("TINYBLOB") {
+                255
+            } else if definition.starts_with("MEDIUMBLOB") {
+                16_777_215
+            } else if definition.starts_with("LONGBLOB") {
+                u32::MAX
+            } else {
+                65_535
+            }
+        }
+        DataType::Int => 11,
+        DataType::BigInt => 20,
+        DataType::Float => 12,
+        DataType::Double => 22,
+        DataType::Date => 10,
+        DataType::DateTime | DataType::Timestamp => 19,
+        DataType::Boolean => 1,
+        DataType::Raw(value) => {
+            let upper = value.trim().to_ascii_uppercase();
+            if upper.starts_with("DATETIME") || upper.starts_with("TIMESTAMP") {
+                19
+            } else if upper.starts_with("TIME") {
+                10
+            } else if upper.starts_with("BIT(") {
+                raw_type_arguments(value)
+                    .and_then(|value| value.trim().parse().ok())
+                    .unwrap_or(1)
+            } else if upper.starts_with("YEAR") {
+                4
+            } else {
+                raw_character_length(value)
+                    .map(|value| value.saturating_mul(4).min(u64::from(u32::MAX)) as u32)
+                    .unwrap_or(0)
+            }
+        }
+    }
+}
+
+fn query_source_table_reference(query: &str) -> Option<String> {
+    let trimmed = query.trim_start();
+    let upper = trimmed.to_ascii_uppercase();
+    let offset = if upper.starts_with("INSERT ") || upper.starts_with("REPLACE ") {
+        let position = find_top_level_sql_keyword(trimmed, "INTO", 0)?;
+        position + "INTO".len()
+    } else if upper.starts_with("UPDATE ") {
+        find_top_level_sql_keyword(trimmed, "UPDATE", 0)? + "UPDATE".len()
+    } else {
+        let position = find_top_level_sql_keyword(trimmed, "FROM", 0)?;
+        position + "FROM".len()
+    };
+    let tail = trimmed[offset..].trim_start();
+    if tail.starts_with('(') {
+        return None;
+    }
+    let end = tail
+        .find(|character: char| character.is_whitespace() || character == ',' || character == ';')
+        .unwrap_or(tail.len());
+    Some(tail[..end].trim_matches('`').to_string())
+}
+
+fn select_metadata_projection_items(query: &str) -> Option<Vec<String>> {
+    let trimmed = query.trim_start();
+    let start = if trimmed
+        .get(.."SELECT".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("SELECT"))
+    {
+        "SELECT".len()
+    } else {
+        return None;
+    };
+    let from = find_top_level_sql_keyword(trimmed, "FROM", start)?;
+    let projection = trimmed[start..from].trim();
+    let projection = projection
+        .strip_prefix("DISTINCT ")
+        .or_else(|| projection.strip_prefix("ALL "))
+        .unwrap_or(projection);
+    Some(split_csv(projection))
+}
+
+fn find_top_level_sql_keyword(value: &str, keyword: &str, start: usize) -> Option<usize> {
+    let keyword = keyword.as_bytes();
+    let bytes = value.as_bytes();
+    let mut depth = 0_u32;
+    let mut quote = None;
+    let mut escaped = false;
+    let mut index = start;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if let Some(active) = quote {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' && active != b'`' {
+                escaped = true;
+            } else if byte == active {
+                quote = None;
+            }
+            index += 1;
+            continue;
+        }
+        if matches!(byte, b'\'' | b'"' | b'`') {
+            quote = Some(byte);
+            index += 1;
+            continue;
+        }
+        match byte {
+            b'(' => depth = depth.saturating_add(1),
+            b')' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        if depth == 0
+            && bytes
+                .get(index..index.saturating_add(keyword.len()))
+                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(keyword))
+            && (index == 0 || !is_sql_identifier_byte(bytes[index - 1]))
+            && (index + keyword.len() == bytes.len()
+                || !is_sql_identifier_byte(bytes[index + keyword.len()]))
+        {
+            return Some(index);
+        }
+        index += 1;
+    }
+    None
+}
+
+fn is_sql_identifier_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$')
+}
+
+fn metadata_projection_column<'a>(
+    item: &str,
+    schema: &'a Option<TableSchema>,
+) -> Option<&'a Column> {
+    let expression = projection_without_alias(item).trim();
+    if !is_column_reference(expression) {
+        return None;
+    }
+    let name = expression.rsplit('.').next()?.trim_matches('`');
+    schema
+        .as_ref()?
+        .columns
+        .iter()
+        .find(|column| column.name.eq_ignore_ascii_case(name))
+}
+
+fn prepared_parameter_column_names(
+    query: &str,
+    schema: Option<TableSchema>,
+) -> Vec<Option<String>> {
+    let Some(schema) = schema else {
+        return vec![None; count_placeholders(query)];
+    };
+    let positions = placeholder_positions(query);
+    let insert_columns = insert_parameter_columns(query);
+    let mut names = Vec::with_capacity(positions.len());
+    for (placeholder_index, position) in positions.into_iter().enumerate() {
+        let prefix = query[..position]
+            .trim_end()
+            .trim_end_matches(|character: char| {
+                character.is_whitespace()
+                    || matches!(
+                        character,
+                        '=' | '>' | '<' | '!' | '+' | '-' | '*' | '/' | '%'
+                    )
+            })
+            .trim_end();
+        let name_start = prefix
+            .char_indices()
+            .rev()
+            .find(|(_, character)| {
+                character.is_whitespace() || matches!(character, '(' | ',' | '=' | '>' | '<' | '!')
+            })
+            .map(|(index, _)| index + 1)
+            .unwrap_or(0);
+        let name = prefix[name_start..].trim_matches('`').trim().to_string();
+        let name = (!name.is_empty()).then_some(name).filter(|value| {
+            schema
+                .columns
+                .iter()
+                .any(|column| column.name.eq_ignore_ascii_case(value))
+        });
+        names.push(name.or_else(|| {
+            insert_columns
+                .as_ref()
+                .and_then(|columns| columns.get(placeholder_index % columns.len()).cloned())
+        }));
+    }
+    names.resize(count_placeholders(query), None);
+    names
+}
+
+fn prepared_output_value_for_column(
+    value: Option<Vec<u8>>,
+    column: &MysqlColumn,
+) -> io::Result<PreparedOutputValue> {
+    let Some(value) = value else {
+        return Ok(PreparedOutputValue::Null);
+    };
+    let text = || {
+        std::str::from_utf8(&value).map(str::trim).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{error}; value={}",
+                    value
+                        .iter()
+                        .map(|byte| format!("{byte:02X}"))
+                        .collect::<String>()
+                ),
+            )
+        })
+    };
+    match column.coltype {
+        ColumnType::MYSQL_TYPE_TINY
+        | ColumnType::MYSQL_TYPE_SHORT
+        | ColumnType::MYSQL_TYPE_INT24
+        | ColumnType::MYSQL_TYPE_LONG
+        | ColumnType::MYSQL_TYPE_LONGLONG
+        | ColumnType::MYSQL_TYPE_YEAR => {
+            if column.colflags.contains(ColumnFlags::UNSIGNED_FLAG) {
+                text()?
+                    .parse::<u64>()
+                    .map(PreparedOutputValue::UInt)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+            } else {
+                text()?
+                    .parse::<i64>()
+                    .map(PreparedOutputValue::Int)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+            }
+        }
+        ColumnType::MYSQL_TYPE_FLOAT => text()?
+            .parse::<f32>()
+            .map(PreparedOutputValue::Float)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error)),
+        ColumnType::MYSQL_TYPE_DOUBLE => text()?
+            .parse::<f64>()
+            .map(PreparedOutputValue::Double)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error)),
+        ColumnType::MYSQL_TYPE_DATE => NaiveDate::parse_from_str(text()?, "%Y-%m-%d")
+            .map(PreparedOutputValue::Date)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error)),
+        ColumnType::MYSQL_TYPE_DATETIME | ColumnType::MYSQL_TYPE_TIMESTAMP => {
+            ["%Y-%m-%d %H:%M:%S%.f", "%Y-%m-%d %H:%M:%S"]
+                .into_iter()
+                .find_map(|format| NaiveDateTime::parse_from_str(text().ok()?, format).ok())
+                .map(PreparedOutputValue::DateTime)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid datetime value"))
+        }
+        ColumnType::MYSQL_TYPE_TIME => prepared_output_time(value),
+        _ => Ok(PreparedOutputValue::Bytes(value)),
+    }
+}
+
+fn placeholder_positions(query: &str) -> Vec<usize> {
+    let mut positions = Vec::new();
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, character) in query.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if let Some(active) = quote {
+            if character == '\\' {
+                escaped = true;
+            } else if character == active {
+                quote = None;
+            }
+            continue;
+        }
+        if matches!(character, '\'' | '"') {
+            quote = Some(character);
+        } else if character == '?' {
+            positions.push(index);
+        }
+    }
+    positions
+}
+
+fn insert_parameter_columns(query: &str) -> Option<Vec<String>> {
+    let upper = query.to_ascii_uppercase();
+    if !upper.starts_with("INSERT ") && !upper.starts_with("REPLACE ") {
+        return None;
+    }
+    let into = find_top_level_keyword(query, "INTO ", 0)? + "INTO ".len();
+    let tail = query[into..].trim_start();
+    let open = tail.find('(')?;
+    let close = tail[open + 1..].find(')')? + open + 1;
+    let columns = split_csv(&tail[open + 1..close])
+        .into_iter()
+        .map(|column| column.trim().trim_matches('`').to_string())
+        .filter(|column| !column.is_empty())
+        .collect::<Vec<_>>();
+    (!columns.is_empty()).then_some(columns)
+}
+
 fn generate_auth_salt() -> [u8; 20] {
     const AUTH_SALT_ALPHABET: &[u8] =
         b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
@@ -14300,6 +18600,442 @@ fn statement_privilege_table(
     split_table_reference(reference, default_database)
         .ok()
         .filter(|(database, table)| !database.is_empty() && !table.is_empty())
+}
+
+fn statement_privilege_tables(
+    sql: &str,
+    upper: &str,
+    default_database: &str,
+) -> Vec<(String, String)> {
+    statement_privilege_source_entries(sql, upper, default_database)
+        .into_iter()
+        .map(|(database, table, _)| (database, table))
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn statement_privilege_source_aliases(
+    sql: &str,
+    default_database: &str,
+    table: &str,
+) -> Vec<String> {
+    statement_privilege_source_entries(sql, &sql.to_ascii_uppercase(), default_database)
+        .into_iter()
+        .filter(|(_, source_table, _)| source_table.eq_ignore_ascii_case(table))
+        .flat_map(|(database, source_table, alias)| {
+            [
+                source_table.clone(),
+                alias,
+                format!("{database}.{source_table}"),
+            ]
+            .into_iter()
+        })
+        .collect()
+}
+
+fn strip_upsert_incoming_references(value: &str) -> String {
+    let upper = value.to_ascii_uppercase();
+    let mut output = String::with_capacity(value.len());
+    let mut cursor = 0;
+    let mut search = 0;
+    while let Some(relative) = upper[search..].find("VALUES") {
+        let start = search + relative;
+        let is_boundary = |byte: u8| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$');
+        if (start > 0 && is_boundary(value.as_bytes()[start - 1]))
+            || (start + "VALUES".len() < value.len()
+                && is_boundary(value.as_bytes()[start + "VALUES".len()]))
+        {
+            search = start + "VALUES".len();
+            continue;
+        }
+        let mut open = start + "VALUES".len();
+        while value
+            .as_bytes()
+            .get(open)
+            .is_some_and(u8::is_ascii_whitespace)
+        {
+            open += 1;
+        }
+        let Some(close) = value
+            .as_bytes()
+            .get(open)
+            .is_some_and(|byte| *byte == b'(')
+            .then(|| matching_parenthesis(value, open))
+            .flatten()
+        else {
+            search = start + "VALUES".len();
+            continue;
+        };
+        output.push_str(&value[cursor..start]);
+        output.extend(std::iter::repeat_n(' ', close + 1 - start));
+        cursor = close + 1;
+        search = cursor;
+    }
+    output.push_str(&value[cursor..]);
+    output
+}
+
+fn statement_privilege_source_entries(
+    sql: &str,
+    upper: &str,
+    default_database: &str,
+) -> Vec<(String, String, String)> {
+    let query = if upper.starts_with("EXPLAIN ") {
+        sql["EXPLAIN ".len()..].trim_start()
+    } else {
+        sql
+    };
+    let query_upper = query.to_ascii_uppercase();
+    if query_upper.starts_with("INSERT ") || query_upper.starts_with("REPLACE ") {
+        let Some(select) = find_top_level_keyword(query, " SELECT ", 0) else {
+            return Vec::new();
+        };
+        let select_query = query[select + 1..].trim_start();
+        let select_upper = select_query.to_ascii_uppercase();
+        return statement_privilege_source_entries(select_query, &select_upper, default_database);
+    }
+    let (from_start, from_end) = if query_upper.starts_with("UPDATE ") {
+        let Some(set) = find_top_level_keyword(query, " SET ", 0) else {
+            return Vec::new();
+        };
+        ("UPDATE".len() + 1, set)
+    } else if query_upper.starts_with("DELETE ") {
+        let using = find_top_level_keyword(query, " USING ", 0);
+        let from = find_top_level_keyword(query, " FROM ", 0);
+        if let Some(using) = using {
+            (
+                using + " USING ".len(),
+                statement_privilege_source_clause_end(query, using),
+            )
+        } else if let Some(from) = from {
+            (
+                from + " FROM ".len(),
+                statement_privilege_source_clause_end(query, from),
+            )
+        } else {
+            return Vec::new();
+        }
+    } else {
+        let Some(from) = find_top_level_keyword(query, " FROM ", 0) else {
+            return Vec::new();
+        };
+        let from_start = from + 6;
+        (from_start, select_from_clause_end(query, from_start))
+    };
+    let clauses = find_join_clauses(query, from_start, from_end);
+    let mut ranges = Vec::with_capacity(clauses.len() + 1);
+    ranges.push((
+        from_start,
+        clauses.first().map(|clause| clause.0).unwrap_or(from_end),
+    ));
+    for (index, clause) in clauses.iter().enumerate() {
+        ranges.push((
+            clause.0 + clause.1,
+            clauses
+                .get(index + 1)
+                .map(|next| next.0)
+                .unwrap_or(from_end),
+        ));
+    }
+    let mut entries = Vec::new();
+    for (start, end) in ranges {
+        let segment = &query[start..end];
+        let source_end = [
+            find_top_level_keyword(segment, " ON ", 0),
+            find_top_level_keyword(segment, " USING ", 0),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(segment.len());
+        for source in split_csv(&segment[..source_end]) {
+            let words = source.split_whitespace().collect::<Vec<_>>();
+            let Some(reference) = words.first() else {
+                continue;
+            };
+            if reference.starts_with('(')
+                || reference.eq_ignore_ascii_case("LATERAL")
+                || reference.eq_ignore_ascii_case("ONLY")
+            {
+                continue;
+            }
+            let Ok((database, table)) =
+                split_table_reference(reference.trim_matches(['`', '(', ')']), default_database)
+            else {
+                continue;
+            };
+            if database.is_empty() || table.is_empty() {
+                continue;
+            }
+            let alias = if words
+                .get(1)
+                .is_some_and(|word| word.eq_ignore_ascii_case("AS"))
+            {
+                words.get(2).copied().unwrap_or(table.as_str()).to_string()
+            } else {
+                words.get(1).copied().unwrap_or(table.as_str()).to_string()
+            };
+            entries.push((database, table, alias.trim_matches('`').to_string()));
+        }
+    }
+    entries
+}
+
+fn statement_privilege_source_clause_end(query: &str, start: usize) -> usize {
+    [
+        " WHERE ",
+        " ORDER BY ",
+        " LIMIT ",
+        " SET ",
+        " ON DUPLICATE KEY UPDATE ",
+    ]
+    .into_iter()
+    .filter_map(|keyword| find_top_level_keyword(query, keyword, start))
+    .min()
+    .unwrap_or(query.len())
+}
+
+fn statement_privilege_source_matches_qualifier(
+    sources: &[(String, String, String)],
+    database: &str,
+    table: &str,
+    qualifier: &str,
+) -> bool {
+    sources
+        .iter()
+        .any(|(source_database, source_table, alias)| {
+            source_database.eq_ignore_ascii_case(database)
+                && source_table.eq_ignore_ascii_case(table)
+                && (alias.eq_ignore_ascii_case(qualifier)
+                    || source_table.eq_ignore_ascii_case(qualifier)
+                    || format!("{source_database}.{source_table}").eq_ignore_ascii_case(qualifier))
+        })
+}
+
+fn statement_privilege_delete_target_indices(
+    sql: &str,
+    upper: &str,
+    sources: &[(String, String, String)],
+) -> HashSet<usize> {
+    let Some(from) = find_top_level_keyword(sql, " FROM ", 0) else {
+        return HashSet::new();
+    };
+    let using = find_top_level_keyword(sql, " USING ", 0);
+    let target_list = if upper.starts_with("DELETE FROM ") {
+        using
+            .map(|using| &sql[from + " FROM ".len()..using])
+            .unwrap_or_else(|| &sql[from + " FROM ".len()..])
+    } else {
+        &sql["DELETE".len()..from]
+    };
+    let names = split_csv(target_list)
+        .into_iter()
+        .map(|name| normalize_column_reference(&name))
+        .map(|name| name.trim().to_ascii_lowercase())
+        .filter(|name| !name.is_empty())
+        .collect::<HashSet<_>>();
+    if names.is_empty() {
+        return sources
+            .first()
+            .map(|_| HashSet::from([0]))
+            .unwrap_or_default();
+    }
+    sources
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, table, alias))| {
+            names
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(table) || name.eq_ignore_ascii_case(alias))
+        })
+        .map(|(index, _)| index)
+        .collect()
+}
+
+fn sql_identifier_tokens(value: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut start = None;
+    let mut quote = None;
+    for (index, character) in value.char_indices() {
+        if let Some(active) = quote {
+            if character == active {
+                quote = None;
+            }
+            continue;
+        }
+        if matches!(character, '\'' | '"') {
+            if let Some(start) = start.take() {
+                tokens.push(value[start..index].to_ascii_lowercase());
+            }
+            quote = Some(character);
+        } else if character.is_ascii_alphanumeric() || matches!(character, '_' | '$') {
+            start.get_or_insert(index);
+        } else if let Some(start) = start.take() {
+            tokens.push(value[start..index].to_ascii_lowercase());
+        }
+    }
+    if let Some(start) = start {
+        tokens.push(value[start..].to_ascii_lowercase());
+    }
+    tokens
+}
+
+fn statement_privilege_columns(
+    sql: &str,
+    upper: &str,
+    schema: &TableSchema,
+    privilege: &str,
+) -> Option<Vec<String>> {
+    if upper.contains(" JOIN ")
+        || upper.contains(" WHERE ")
+        || upper.contains(" GROUP BY ")
+        || upper.contains(" ORDER BY ")
+        || upper.contains(" HAVING ")
+        || upper.contains(" UNION ")
+    {
+        return None;
+    }
+    let all_columns = || {
+        schema
+            .columns
+            .iter()
+            .map(|column| column.name.to_ascii_lowercase())
+            .collect::<Vec<_>>()
+    };
+    let expressions = if upper.starts_with("SELECT ") {
+        let from = find_top_level_keyword(sql, " FROM ", 0)?;
+        let mut projection = sql["SELECT".len()..from].trim();
+        loop {
+            let projection_upper = projection.to_ascii_uppercase();
+            if let Some(rest) = projection_upper.strip_prefix("DISTINCT ") {
+                projection = &projection[projection.len() - rest.len()..];
+            } else if let Some(rest) = projection_upper.strip_prefix("ALL ") {
+                projection = &projection[projection.len() - rest.len()..];
+            } else {
+                break;
+            }
+        }
+        if projection.trim() == "*" || projection.trim().ends_with(".*") {
+            return Some(all_columns());
+        }
+        split_csv(projection)
+    } else if upper.starts_with("INSERT ") || upper.starts_with("REPLACE ") {
+        let into = upper.find("INTO ")? + "INTO ".len();
+        let tail = sql[into..].trim_start();
+        let open = tail.find('(')?;
+        let close = tail[open + 1..].find(')')? + open + 1;
+        split_csv(&tail[open + 1..close])
+    } else if upper.starts_with("UPDATE ") {
+        let set = find_top_level_keyword(sql, " SET ", 0)? + " SET ".len();
+        split_csv(&sql[set..])
+            .into_iter()
+            .map(|assignment| {
+                assignment
+                    .split_once('=')
+                    .map(|(column, _)| column.to_string())
+            })
+            .collect::<Option<Vec<_>>>()?
+    } else {
+        return None;
+    };
+    let mut columns = Vec::with_capacity(expressions.len());
+    for expression in expressions {
+        let expression = expression.trim();
+        if expression == "*" || expression.ends_with(".*") {
+            return Some(all_columns());
+        }
+        let expression = expression
+            .split_once(" AS ")
+            .map_or(expression, |(column, _)| column)
+            .trim();
+        if expression.contains('(')
+            || expression.contains(')')
+            || expression.contains('+')
+            || expression.contains('-')
+            || expression.contains('/')
+            || expression.contains('*')
+        {
+            return None;
+        }
+        let column = expression
+            .rsplit('.')
+            .next()?
+            .trim()
+            .trim_matches(['\x60', '\'', '"']);
+        if column.is_empty()
+            || !column.chars().all(|character| {
+                character.is_ascii_alphanumeric() || character == '_' || character == '$'
+            })
+        {
+            return None;
+        }
+        columns.push(column.to_ascii_lowercase());
+    }
+    (!columns.is_empty() && !privilege.is_empty()).then_some(columns)
+}
+
+fn parse_xa_value(value: &str) -> anyhow::Result<Vec<u8>> {
+    let value = value.trim();
+    let bytes = value.as_bytes();
+    if bytes.len() >= 3
+        && bytes[..2].eq_ignore_ascii_case(b"0x")
+        && value[2..]
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
+        && value[2..].len().is_multiple_of(2)
+    {
+        return Ok(hex_to_bytes(&value[2..]));
+    }
+    if bytes.len() >= 3 && bytes[..2].eq_ignore_ascii_case(b"X'") && value.ends_with('\'') {
+        let hex = &value[2..value.len() - 1];
+        if !hex.chars().all(|character| character.is_ascii_hexdigit())
+            || !hex.len().is_multiple_of(2)
+        {
+            anyhow::bail!("XAER_INVAL: invalid XA binary identifier");
+        }
+        return Ok(hex_to_bytes(hex));
+    }
+    let value = unescape_mysql_literal(value);
+    if value.starts_with(b"'") || value.starts_with(b"\"") {
+        anyhow::bail!("XAER_INVAL: invalid XA identifier literal");
+    }
+    Ok(value)
+}
+
+fn strip_xa_modifier<'a>(value: &'a str, modifiers: &[&str]) -> (&'a str, bool) {
+    let trimmed = value.trim();
+    for modifier in modifiers {
+        let suffix = format!(" {modifier}");
+        if trimmed.len() > suffix.len()
+            && trimmed[trimmed.len() - suffix.len()..].eq_ignore_ascii_case(&suffix)
+        {
+            return (trimmed[..trimmed.len() - suffix.len()].trim_end(), true);
+        }
+    }
+    (trimmed, false)
+}
+
+fn xa_statement_forbidden_in_branch(upper: &str) -> bool {
+    [
+        "BEGIN",
+        "START TRANSACTION",
+        "COMMIT",
+        "ROLLBACK",
+        "SAVEPOINT ",
+        "RELEASE SAVEPOINT ",
+        "LOCK TABLE",
+        "UNLOCK TABLE",
+        "CREATE ",
+        "ALTER ",
+        "DROP ",
+        "TRUNCATE ",
+        "RENAME ",
+        "GRANT ",
+        "REVOKE ",
+    ]
+    .iter()
+    .any(|prefix| upper == *prefix || upper.starts_with(prefix))
 }
 
 impl Drop for Backend {
@@ -14515,6 +19251,11 @@ fn write_lock_requests_with_gap_locks(
                     .ok_or_else(|| {
                         anyhow::anyhow!("Table '{}.{}' does not exist", database, table)
                     })?;
+                let (is_insert, ignore) = match write {
+                    WriteCommand::Insert { .. } => (true, false),
+                    WriteCommand::Upsert { ignore, .. } => (false, *ignore),
+                    _ => unreachable!(),
+                };
                 add_lock_request(
                     &mut requests,
                     format!("database:{database}"),
@@ -14534,52 +19275,79 @@ fn write_lock_requests_with_gap_locks(
                     WriteCommand::Insert { row, .. } | WriteCommand::Upsert { row, .. } => row,
                     _ => unreachable!(),
                 };
-                let secondary_insert_mode = if matches!(write, WriteCommand::Insert { .. }) {
-                    LockMode::InsertIntention
-                } else {
-                    LockMode::Exclusive
-                };
+                let unique_indexes = unique_key_columns(&schema)
+                    .iter()
+                    .map(|(name, _)| name.clone())
+                    .collect::<HashSet<_>>();
+                let mut duplicate_unique_secondary_indexes = HashSet::new();
                 for (key_name, columns) in unique_key_columns(&schema) {
-                    if let Some(key) = row_lock_key(row, &columns) {
+                    if let Some(key) = row_lock_key_for_schema(row, &columns, &schema) {
                         let prefix = if key_name == "PRIMARY" {
                             "row"
                         } else {
                             "unique"
                         };
+                        let existing = storage
+                            .constraint_key_exists_for_row(database, table, &key_name, row)?;
+                        if existing && key_name != "PRIMARY" {
+                            duplicate_unique_secondary_indexes.insert(key_name.clone());
+                        }
+                        let record_mode = if is_insert && existing {
+                            LockMode::Shared
+                        } else {
+                            LockMode::Exclusive
+                        };
                         add_lock_request(
                             &mut requests,
                             format!("{prefix}:{database}.{table}:{key_name}:{key}"),
-                            LockMode::Exclusive,
+                            record_mode,
                         );
                     }
                 }
                 for (index, column) in single_column_index_definitions(&schema) {
                     if let Some(value) = row.get(&column).filter(|_| !row.is_null(&column)) {
-                        let point = KeyRange {
-                            lower: Some(value.to_vec()),
-                            lower_inclusive: true,
-                            upper: Some(value.to_vec()),
-                            upper_inclusive: true,
-                        };
-                        add_lock_request(
-                            &mut requests,
-                            range_lock_resource(database, table, &index, &point),
-                            secondary_insert_mode,
-                        );
-                    }
-                }
-                for (index, columns) in composite_index_definitions(&schema) {
-                    if let Some(value) = composite_index_key_from_row(row, &columns) {
+                        let value = normalize_index_value(&schema, &column, value);
                         let point = KeyRange {
                             lower: Some(value.clone()),
                             lower_inclusive: true,
                             upper: Some(value),
                             upper_inclusive: true,
                         };
+                        let mode = if !ignore
+                            && ((!is_insert && unique_indexes.contains(&index))
+                                || duplicate_unique_secondary_indexes.contains(&index))
+                        {
+                            LockMode::Exclusive
+                        } else {
+                            LockMode::InsertIntention
+                        };
                         add_lock_request(
                             &mut requests,
                             range_lock_resource(database, table, &index, &point),
-                            secondary_insert_mode,
+                            mode,
+                        );
+                    }
+                }
+                for (index, columns) in composite_index_definitions(&schema) {
+                    if let Some(value) = composite_index_key_from_row(row, &columns, &schema) {
+                        let point = KeyRange {
+                            lower: Some(value.clone()),
+                            lower_inclusive: true,
+                            upper: Some(value),
+                            upper_inclusive: true,
+                        };
+                        let mode = if !ignore
+                            && ((!is_insert && unique_indexes.contains(&index))
+                                || duplicate_unique_secondary_indexes.contains(&index))
+                        {
+                            LockMode::Exclusive
+                        } else {
+                            LockMode::InsertIntention
+                        };
+                        add_lock_request(
+                            &mut requests,
+                            range_lock_resource(database, table, &index, &point),
+                            mode,
                         );
                     }
                 }
@@ -14593,7 +19361,7 @@ fn write_lock_requests_with_gap_locks(
                     .ok_or_else(|| {
                         anyhow::anyhow!("Table '{}.{}' does not exist", database, table)
                     })?;
-                add_mutation_locks(&mut requests, database, table, &schema, None, true);
+                add_mutation_locks(&mut requests, database, table, &schema, None, true, None);
             }
             WriteCommand::Update {
                 database, table, ..
@@ -14634,6 +19402,11 @@ fn write_lock_requests_with_gap_locks(
                     ),
                     _ => unreachable!(),
                 };
+                let index_rows = if gap_locks {
+                    Some(storage.scan_table(database, table)?)
+                } else {
+                    None
+                };
                 if !gap_locks && !changes_key {
                     let rows = storage.scan_table_filtered_limit(database, table, filter, None)?;
                     add_record_locks(
@@ -14652,7 +19425,95 @@ fn write_lock_requests_with_gap_locks(
                         &schema,
                         filter,
                         changes_key,
+                        index_rows.as_deref(),
                     );
+                    if let Some(filter) =
+                        filter.filter(|_| predicate_index_ranges(filter, &schema).is_some())
+                    {
+                        let rows = storage.scan_table_filtered_limit(
+                            database,
+                            table,
+                            Some(filter),
+                            None,
+                        )?;
+                        add_record_locks(
+                            &mut requests,
+                            database,
+                            table,
+                            &schema,
+                            &rows,
+                            LockMode::Exclusive,
+                        );
+                    }
+                }
+                let indexed_columns = all_index_definitions(&schema)
+                    .into_iter()
+                    .flat_map(|(_, columns)| columns)
+                    .collect::<HashSet<_>>();
+                let assignments = match write {
+                    WriteCommand::Update { assignments, .. } => Some(assignments.as_slice()),
+                    WriteCommand::ExpressionUpdate { .. } => None,
+                    _ => unreachable!(),
+                };
+                if let Some(assignments) = assignments.filter(|assignments| {
+                    assignments
+                        .iter()
+                        .any(|(column, _)| indexed_columns.contains(column))
+                }) {
+                    let rows = storage.scan_table_filtered_limit(database, table, filter, None)?;
+                    for original in rows {
+                        let mut updated = original.clone();
+                        for (column, value) in assignments {
+                            match value {
+                                Some(value) => updated.set(column, value.clone()),
+                                None => updated.set_null(column),
+                            }
+                        }
+                        add_update_index_entry_locks(
+                            &mut requests,
+                            database,
+                            table,
+                            &schema,
+                            &original,
+                        );
+                        add_update_index_entry_locks(
+                            &mut requests,
+                            database,
+                            table,
+                            &schema,
+                            &updated,
+                        );
+                    }
+                }
+                if let WriteCommand::ExpressionUpdate { assignments, .. } = write {
+                    if assignments
+                        .iter()
+                        .any(|assignment| indexed_columns.contains(&assignment.target_column))
+                    {
+                        let rows =
+                            storage.scan_table_filtered_limit(database, table, filter, None)?;
+                        for original in rows {
+                            let mut updated = original.clone();
+                            if apply_expression_assignments(&mut updated, &schema, assignments)
+                                .is_ok()
+                            {
+                                add_update_index_entry_locks(
+                                    &mut requests,
+                                    database,
+                                    table,
+                                    &schema,
+                                    &original,
+                                );
+                                add_update_index_entry_locks(
+                                    &mut requests,
+                                    database,
+                                    table,
+                                    &schema,
+                                    &updated,
+                                );
+                            }
+                        }
+                    }
                 }
             }
             WriteCommand::Delete {
@@ -14679,7 +19540,38 @@ fn write_lock_requests_with_gap_locks(
                         LockMode::Exclusive,
                     );
                 } else {
-                    add_mutation_locks(&mut requests, database, table, &schema, filter, false);
+                    let index_rows = if gap_locks {
+                        Some(storage.scan_table(database, table)?)
+                    } else {
+                        None
+                    };
+                    add_mutation_locks(
+                        &mut requests,
+                        database,
+                        table,
+                        &schema,
+                        filter,
+                        false,
+                        index_rows.as_deref(),
+                    );
+                    if let Some(filter) =
+                        filter.filter(|_| predicate_index_ranges(filter, &schema).is_some())
+                    {
+                        let rows = storage.scan_table_filtered_limit(
+                            database,
+                            table,
+                            Some(filter),
+                            None,
+                        )?;
+                        add_record_locks(
+                            &mut requests,
+                            database,
+                            table,
+                            &schema,
+                            &rows,
+                            LockMode::Exclusive,
+                        );
+                    }
                 }
             }
             WriteCommand::CleanupOrphanStorage => {
@@ -14733,9 +19625,12 @@ fn write_lock_requests_with_gap_locks(
                     LockMode::IntentionExclusive,
                 );
             }
+            WriteCommand::XaCommitMarker { .. } => {}
             WriteCommand::ForeignKeyChecksDisabled => {}
         }
     }
+    add_foreign_key_parent_record_locks(storage, writes, &mut requests)?;
+    add_foreign_key_child_locks_for_parent_mutations(storage, writes, &mut requests)?;
     for (database, table) in storage.referential_tables_for_commands(writes)? {
         add_lock_request(
             &mut requests,
@@ -14745,15 +19640,302 @@ fn write_lock_requests_with_gap_locks(
         add_lock_request(
             &mut requests,
             format!("table:{database}.{table}"),
-            LockMode::Exclusive,
+            LockMode::IntentionExclusive,
         );
         add_lock_request(
             &mut requests,
             format!("mdl:{database}.{table}"),
-            LockMode::Exclusive,
+            LockMode::IntentionExclusive,
         );
     }
     Ok(sorted_lock_requests(requests))
+}
+
+fn add_foreign_key_parent_record_locks(
+    storage: &StorageEngineManager,
+    writes: &[WriteCommand],
+    requests: &mut HashMap<String, LockMode>,
+) -> anyhow::Result<()> {
+    for target in storage.foreign_key_parent_keys_for_commands(writes)? {
+        let Some(parent_schema) = storage
+            .get_database(&target.database)
+            .and_then(|database| database.get_table(&target.parent_table))
+        else {
+            continue;
+        };
+        let mut parent_row = Row::new();
+        for (column, value) in target.parent_columns.iter().zip(&target.values) {
+            parent_row.push(column, value.clone());
+        }
+        let Some(key) =
+            row_lock_key_for_schema(&parent_row, &target.parent_columns, &parent_schema)
+        else {
+            continue;
+        };
+        let Some((key_name, _)) = unique_key_columns(&parent_schema)
+            .into_iter()
+            .find(|(_, columns)| columns == &target.parent_columns)
+        else {
+            continue;
+        };
+        let prefix = if key_name == "PRIMARY" {
+            "row"
+        } else {
+            "unique"
+        };
+        add_lock_request(
+            requests,
+            format!(
+                "{prefix}:{}.{}:{key_name}:{key}",
+                target.database, target.parent_table
+            ),
+            LockMode::Shared,
+        );
+        let Some(child_schema) = storage
+            .get_database(&target.database)
+            .and_then(|database| database.get_table(&target.child_table))
+        else {
+            continue;
+        };
+        add_foreign_key_range_lock(
+            requests,
+            ForeignKeyRangeLock {
+                database: &target.database,
+                table: &target.child_table,
+                constraint_name: &target.constraint_name,
+                schema: &child_schema,
+                columns: &target.child_columns,
+                values: &target.values,
+                mode: LockMode::InsertIntention,
+            },
+        );
+    }
+    Ok(())
+}
+
+fn add_foreign_key_child_locks_for_parent_mutations(
+    storage: &StorageEngineManager,
+    writes: &[WriteCommand],
+    requests: &mut HashMap<String, LockMode>,
+) -> anyhow::Result<()> {
+    for write in writes {
+        let (database_name, parent_table, changes) = match write {
+            WriteCommand::Delete {
+                database,
+                table,
+                filter,
+            } => {
+                let old_rows =
+                    storage.scan_table_filtered_limit(database, table, filter.as_ref(), None)?;
+                (
+                    database,
+                    table,
+                    old_rows
+                        .into_iter()
+                        .map(|old| (old, None))
+                        .collect::<Vec<_>>(),
+                )
+            }
+            WriteCommand::Update {
+                database,
+                table,
+                filter,
+                assignments,
+            } => {
+                let mut changes = Vec::new();
+                for old in
+                    storage.scan_table_filtered_limit(database, table, filter.as_ref(), None)?
+                {
+                    let mut updated = old.clone();
+                    for (column, value) in assignments {
+                        match value {
+                            Some(value) => updated.set(column, value.clone()),
+                            None => updated.set_null(column),
+                        }
+                    }
+                    changes.push((old, Some(updated)));
+                }
+                (database, table, changes)
+            }
+            WriteCommand::ExpressionUpdate {
+                database,
+                table,
+                filter,
+                assignments,
+            } => {
+                let schema = storage
+                    .get_database(database)
+                    .and_then(|database| database.get_table(table));
+                let Some(schema) = schema else {
+                    continue;
+                };
+                let mut changes = Vec::new();
+                for old in
+                    storage.scan_table_filtered_limit(database, table, filter.as_ref(), None)?
+                {
+                    let mut updated = old.clone();
+                    apply_expression_assignments(&mut updated, &schema, assignments)?;
+                    changes.push((old, Some(updated)));
+                }
+                (database, table, changes)
+            }
+            WriteCommand::ReplaceRows {
+                database, table, ..
+            } => {
+                let old_rows = storage.scan_table(database, table)?;
+                (
+                    database,
+                    table,
+                    old_rows
+                        .into_iter()
+                        .map(|old| (old, None))
+                        .collect::<Vec<_>>(),
+                )
+            }
+            _ => continue,
+        };
+        if changes.is_empty() {
+            continue;
+        }
+        let foreign_keys: Vec<ForeignKeyDefinition> = storage
+            .foreign_key_definitions(database_name)?
+            .into_iter()
+            .filter(|foreign_key| foreign_key.parent_table.eq_ignore_ascii_case(parent_table))
+            .collect::<Vec<_>>();
+        if foreign_keys.is_empty() {
+            continue;
+        }
+        for foreign_key in foreign_keys {
+            let Some(child_schema) = storage
+                .get_database(database_name)
+                .and_then(|database| database.get_table(&foreign_key.child_table))
+            else {
+                continue;
+            };
+            let child_rows = storage.scan_table(database_name, &foreign_key.child_table)?;
+            for (old_parent, new_parent) in &changes {
+                let Some(old_values) =
+                    foreign_key_non_null_values(old_parent, &foreign_key.parent_columns)
+                else {
+                    continue;
+                };
+                let changed = new_parent.as_ref().is_none_or(|updated| {
+                    foreign_key_non_null_values(updated, &foreign_key.parent_columns).as_ref()
+                        != Some(&old_values)
+                });
+                if !changed {
+                    continue;
+                }
+                let delete_action = new_parent.is_none();
+                let exclusive_child_lock = if delete_action {
+                    foreign_key.on_delete_cascade || foreign_key.on_delete_set_null
+                } else {
+                    foreign_key.on_update_cascade || foreign_key.on_update_set_null
+                };
+                let matching = child_rows
+                    .iter()
+                    .filter(|child| {
+                        foreign_key_non_null_values(child, &foreign_key.child_columns)
+                            .is_some_and(|values| values == old_values)
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                add_record_locks(
+                    requests,
+                    database_name,
+                    &foreign_key.child_table,
+                    &child_schema,
+                    &matching,
+                    if exclusive_child_lock {
+                        LockMode::Exclusive
+                    } else {
+                        LockMode::Shared
+                    },
+                );
+                add_foreign_key_range_lock(
+                    requests,
+                    ForeignKeyRangeLock {
+                        database: database_name,
+                        table: &foreign_key.child_table,
+                        constraint_name: &foreign_key.name,
+                        schema: &child_schema,
+                        columns: &foreign_key.child_columns,
+                        values: &old_values,
+                        mode: LockMode::Exclusive,
+                    },
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn foreign_key_non_null_values(row: &Row, columns: &[String]) -> Option<Vec<Vec<u8>>> {
+    columns
+        .iter()
+        .map(|column| {
+            if row.is_null(column) {
+                None
+            } else {
+                row.get(column).map(|value| value.to_vec())
+            }
+        })
+        .collect()
+}
+
+struct ForeignKeyRangeLock<'a> {
+    database: &'a str,
+    table: &'a str,
+    constraint_name: &'a str,
+    schema: &'a TableSchema,
+    columns: &'a [String],
+    values: &'a [Vec<u8>],
+    mode: LockMode,
+}
+
+fn add_foreign_key_range_lock(
+    requests: &mut HashMap<String, LockMode>,
+    lock: ForeignKeyRangeLock<'_>,
+) {
+    let Some(key) = foreign_key_lock_key(lock.schema, lock.columns, lock.values) else {
+        return;
+    };
+    let point = KeyRange {
+        lower: Some(key.clone()),
+        lower_inclusive: true,
+        upper: Some(key),
+        upper_inclusive: true,
+    };
+    add_lock_request(
+        requests,
+        range_lock_resource(
+            lock.database,
+            lock.table,
+            &format!("__fk__{}", lock.constraint_name),
+            &point,
+        ),
+        lock.mode,
+    );
+}
+
+fn foreign_key_lock_key(
+    schema: &TableSchema,
+    columns: &[String],
+    values: &[Vec<u8>],
+) -> Option<Vec<u8>> {
+    if columns.is_empty() || columns.len() != values.len() {
+        return None;
+    }
+    let normalized = columns
+        .iter()
+        .zip(values)
+        .map(|(column, value)| normalize_index_value(schema, column, value))
+        .collect::<Vec<_>>();
+    Some(if normalized.len() == 1 {
+        normalized.into_iter().next().expect("one FK key value")
+    } else {
+        encode_composite_lock_key(&normalized)
+    })
 }
 
 fn add_table_ddl_locks(requests: &mut HashMap<String, LockMode>, database: &str, table: &str) {
@@ -14831,13 +20013,67 @@ fn add_record_locks(
         },
     );
     for row in rows {
-        if let Some(key) = row_lock_key(row, &primary_key) {
+        if let Some(key) = row_lock_key_for_schema(row, &primary_key, schema) {
             add_lock_request(
                 requests,
                 format!("row:{database}.{table}:PRIMARY:{key}"),
                 record,
             );
         }
+    }
+}
+
+fn add_update_index_entry_locks(
+    requests: &mut HashMap<String, LockMode>,
+    database: &str,
+    table: &str,
+    schema: &TableSchema,
+    row: &Row,
+) {
+    for (key_name, columns) in unique_key_columns(schema) {
+        if key_name == "PRIMARY" {
+            continue;
+        }
+        if let Some(key) = row_lock_key_for_schema(row, &columns, schema) {
+            add_lock_request(
+                requests,
+                format!("unique:{database}.{table}:{key_name}:{key}"),
+                LockMode::Exclusive,
+            );
+        }
+    }
+    for (index, column) in single_column_index_definitions(schema) {
+        let Some(value) = row.get(&column).filter(|_| !row.is_null(&column)) else {
+            continue;
+        };
+        let value = normalize_index_value(schema, &column, value);
+        let point = KeyRange {
+            lower: Some(value.clone()),
+            lower_inclusive: true,
+            upper: Some(value),
+            upper_inclusive: true,
+        };
+        add_lock_request(
+            requests,
+            range_lock_resource(database, table, &index, &point),
+            LockMode::Exclusive,
+        );
+    }
+    for (index, columns) in composite_index_definitions(schema) {
+        let Some(value) = composite_index_key_from_row(row, &columns, schema) else {
+            continue;
+        };
+        let point = KeyRange {
+            lower: Some(value.clone()),
+            lower_inclusive: true,
+            upper: Some(value),
+            upper_inclusive: true,
+        };
+        add_lock_request(
+            requests,
+            range_lock_resource(database, table, &index, &point),
+            LockMode::Exclusive,
+        );
     }
 }
 
@@ -14848,6 +20084,7 @@ fn add_mutation_locks(
     schema: &TableSchema,
     filter: Option<&RowPredicate>,
     changes_key: bool,
+    index_rows: Option<&[Row]>,
 ) {
     add_lock_request(
         requests,
@@ -14872,7 +20109,9 @@ fn add_mutation_locks(
                 LockMode::Exclusive,
             );
             if let Some(index_ranges) = predicate_index_ranges(filter, schema) {
-                for (index, ranges) in index_ranges {
+                for (index, ranges) in
+                    expand_next_key_index_ranges(index_ranges, schema, index_rows)
+                {
                     for range in ranges {
                         add_lock_request(
                             requests,
@@ -14896,7 +20135,7 @@ fn add_mutation_locks(
             format!("mdl:{database}.{table}"),
             LockMode::IntentionExclusive,
         );
-        for (index, ranges) in index_ranges {
+        for (index, ranges) in expand_next_key_index_ranges(index_ranges, schema, index_rows) {
             for range in ranges {
                 add_lock_request(
                     requests,
@@ -14928,6 +20167,8 @@ fn read_lock_requests(
     schema: &TableSchema,
     filter: Option<&RowPredicate>,
     for_update: bool,
+    locking_rows: Option<&[Row]>,
+    index_rows: Option<&[Row]>,
 ) -> Vec<LockRequest> {
     let mut requests = HashMap::new();
     let (intent, record) = if for_update {
@@ -14947,14 +20188,25 @@ fn read_lock_requests(
     );
     if let Some(index_ranges) = predicate_index_ranges(filter, schema) {
         add_lock_request(&mut requests, format!("table:{database}.{table}"), intent);
-        for (index, ranges) in index_ranges {
+        for (index, ranges) in expand_next_key_index_ranges(index_ranges, schema, index_rows) {
             for range in ranges {
                 add_lock_request(
                     &mut requests,
                     range_lock_resource(database, table, &index, &range),
-                    record,
+                    if for_update {
+                        record
+                    } else {
+                        LockMode::GapShared
+                    },
                 );
             }
+        }
+        for (index, key) in predicate_unique_keys(filter, schema) {
+            add_lock_request(
+                &mut requests,
+                format!("unique:{database}.{table}:{index}:{key}"),
+                record,
+            );
         }
         if let Some(key) = predicate_primary_key(filter, schema) {
             add_lock_request(
@@ -14963,10 +20215,158 @@ fn read_lock_requests(
                 record,
             );
         }
+        if let Some(rows) = locking_rows {
+            add_record_locks(&mut requests, database, table, schema, rows, record);
+        }
     } else {
-        add_lock_request(&mut requests, format!("table:{database}.{table}"), record);
+        if let Some(rows) = locking_rows {
+            add_record_locks(&mut requests, database, table, schema, rows, record);
+            if !table_primary_key_columns(schema).is_empty() {
+                let full_range = KeyRange {
+                    lower: None,
+                    lower_inclusive: false,
+                    upper: None,
+                    upper_inclusive: false,
+                };
+                add_lock_request(
+                    &mut requests,
+                    range_lock_resource(database, table, "PRIMARY", &full_range),
+                    if for_update {
+                        record
+                    } else {
+                        LockMode::GapShared
+                    },
+                );
+            }
+        } else {
+            add_lock_request(&mut requests, format!("table:{database}.{table}"), record);
+        }
     }
     sorted_lock_requests(requests)
+}
+
+fn expand_next_key_index_ranges(
+    index_ranges: Vec<(String, Vec<KeyRange>)>,
+    schema: &TableSchema,
+    index_rows: Option<&[Row]>,
+) -> Vec<(String, Vec<KeyRange>)> {
+    let Some(index_rows) = index_rows else {
+        return index_ranges;
+    };
+    index_ranges
+        .into_iter()
+        .map(|(index, ranges)| {
+            let Some(columns) = all_index_definitions(schema)
+                .into_iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(&index))
+                .map(|(_, columns)| columns)
+            else {
+                return (index, ranges);
+            };
+            if unique_key_columns(schema)
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case(&index))
+            {
+                return (index, ranges);
+            }
+            (
+                index,
+                ranges
+                    .into_iter()
+                    .map(|range| expand_next_key_range(range, &columns, schema, index_rows))
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+fn expand_next_key_range(
+    range: KeyRange,
+    columns: &[String],
+    schema: &TableSchema,
+    index_rows: &[Row],
+) -> KeyRange {
+    let Some(lower) = range.lower.as_ref() else {
+        return range;
+    };
+    if !range.lower_inclusive || range.upper.as_ref() != Some(lower) || !range.upper_inclusive {
+        return range;
+    }
+    let point = lower;
+    let mut predecessor = None;
+    let mut successor = None;
+    let mut found = false;
+    for row in index_rows {
+        let Some(key) = index_key_from_row(row, columns, schema) else {
+            continue;
+        };
+        match compare_lock_key_values(&key, point) {
+            std::cmp::Ordering::Less => {
+                if predecessor.as_ref().is_none_or(|candidate: &Vec<u8>| {
+                    compare_lock_key_values(candidate, &key) == std::cmp::Ordering::Less
+                }) {
+                    predecessor = Some(key);
+                }
+            }
+            std::cmp::Ordering::Equal => found = true,
+            std::cmp::Ordering::Greater => {
+                if successor.as_ref().is_none_or(|candidate: &Vec<u8>| {
+                    compare_lock_key_values(&key, candidate) == std::cmp::Ordering::Less
+                }) {
+                    successor = Some(key);
+                }
+            }
+        }
+    }
+    if found {
+        return KeyRange {
+            lower: predecessor,
+            lower_inclusive: false,
+            upper: Some(point.clone()),
+            upper_inclusive: true,
+        };
+    }
+    KeyRange {
+        lower: predecessor,
+        lower_inclusive: false,
+        upper: successor,
+        upper_inclusive: false,
+    }
+}
+
+fn index_key_from_row(row: &Row, columns: &[String], schema: &TableSchema) -> Option<Vec<u8>> {
+    if columns.len() == 1 {
+        let column = &columns[0];
+        return row
+            .get(column)
+            .filter(|_| !row.is_null(column))
+            .map(|value| normalize_index_value(schema, column, value));
+    }
+    composite_index_key_from_row(row, columns, schema)
+}
+
+fn predicate_unique_keys(
+    filter: Option<&RowPredicate>,
+    schema: &TableSchema,
+) -> Vec<(String, String)> {
+    let Some(filter) = filter else {
+        return Vec::new();
+    };
+    let mut equalities = HashMap::<String, Vec<u8>>::new();
+    if !collect_predicate_equalities(filter, &mut equalities) {
+        return Vec::new();
+    }
+    unique_key_columns(schema)
+        .into_iter()
+        .filter(|(name, _)| name != "PRIMARY")
+        .filter_map(|(name, columns)| {
+            let mut row = Row::new();
+            for column in &columns {
+                row.push(column, equalities.get(column)?.clone());
+            }
+            row_lock_key_for_schema(&row, &columns, schema).map(|key| (name, key))
+        })
+        .collect()
 }
 
 fn record_lock_requests(
@@ -14984,6 +20384,471 @@ fn record_lock_requests(
     };
     add_record_locks(&mut requests, database, table, schema, rows, record);
     sorted_lock_requests(requests)
+}
+
+fn locking_read_requests_for_rows(
+    database: &str,
+    table: &str,
+    schema: &TableSchema,
+    rows: &[Row],
+    for_update: bool,
+    index_rows: Option<&[Row]>,
+) -> Vec<LockRequest> {
+    let mut requests = HashMap::new();
+    add_record_locks(
+        &mut requests,
+        database,
+        table,
+        schema,
+        rows,
+        if for_update {
+            LockMode::Exclusive
+        } else {
+            LockMode::Shared
+        },
+    );
+    add_locking_read_index_points(
+        &mut requests,
+        database,
+        table,
+        schema,
+        rows,
+        for_update,
+        index_rows,
+    );
+    sorted_lock_requests(requests)
+}
+
+struct JoinRangeContext<'a> {
+    source_rows: &'a [Vec<Row>],
+    sources: &'a [JoinSource],
+    source_is_derived: &'a [bool],
+    for_update: bool,
+}
+
+fn add_locking_read_join_ranges(
+    requests: &mut HashMap<String, LockMode>,
+    selected_rows: &[Row],
+    predicates: &[Option<JoinPredicate>],
+    sources: &[JoinSource],
+    source_rows: &[Vec<Row>],
+    source_is_derived: &[bool],
+    for_update: bool,
+) {
+    let context = JoinRangeContext {
+        source_rows,
+        sources,
+        source_is_derived,
+        for_update,
+    };
+    for selected in selected_rows {
+        let combination = (0..sources.len())
+            .map(|source_index| join_row_marker(selected, source_index))
+            .collect::<Vec<_>>();
+        for (step_index, predicate) in predicates.iter().enumerate() {
+            let new_source = step_index + 1;
+            if source_is_derived.get(new_source).copied().unwrap_or(true) {
+                continue;
+            }
+            let Some(row_index) = combination.get(new_source).copied().flatten() else {
+                continue;
+            };
+            let Some(right_row) = source_rows[new_source].get(row_index) else {
+                continue;
+            };
+            let Some(predicate) = predicate else {
+                continue;
+            };
+            add_join_predicate_ranges(
+                requests,
+                predicate,
+                &combination,
+                new_source,
+                right_row,
+                &context,
+            );
+        }
+    }
+}
+
+fn join_index_rows_for_source<'a>(
+    source_index: usize,
+    schema: &TableSchema,
+    predicates: &[Option<JoinPredicate>],
+    rows: &'a [Row],
+) -> Option<&'a [Row]> {
+    if predicates.iter().flatten().any(|predicate| {
+        join_predicate_has_non_equality_index_predicate(predicate, source_index, schema)
+    }) {
+        None
+    } else {
+        Some(rows)
+    }
+}
+
+fn join_predicate_has_non_equality_index_predicate(
+    predicate: &JoinPredicate,
+    source_index: usize,
+    schema: &TableSchema,
+) -> bool {
+    match predicate {
+        JoinPredicate::Comparison(comparison) => {
+            let indexed_endpoint = |endpoint: &(usize, String)| {
+                endpoint.0 == source_index
+                    && single_column_index_definitions(schema)
+                        .iter()
+                        .any(|(_, column)| column.eq_ignore_ascii_case(&endpoint.1))
+            };
+            !matches!(
+                comparison.operator,
+                JoinOperator::Eq | JoinOperator::NullSafeEq
+            ) && (indexed_endpoint(&comparison.left) || indexed_endpoint(&comparison.right))
+        }
+        JoinPredicate::And(left, right) | JoinPredicate::Or(left, right) => {
+            join_predicate_has_non_equality_index_predicate(left, source_index, schema)
+                || join_predicate_has_non_equality_index_predicate(right, source_index, schema)
+        }
+        JoinPredicate::ScalarCondition(_) | JoinPredicate::Always => false,
+    }
+}
+
+fn add_join_predicate_ranges(
+    requests: &mut HashMap<String, LockMode>,
+    predicate: &JoinPredicate,
+    combination: &[Option<usize>],
+    new_source: usize,
+    right_row: &Row,
+    context: &JoinRangeContext<'_>,
+) {
+    match predicate {
+        JoinPredicate::Comparison(comparison) => {
+            if !join_predicate_matches(
+                predicate,
+                combination,
+                new_source,
+                right_row,
+                context.source_rows,
+                context.sources,
+            ) {
+                return;
+            }
+            let Some(left) = join_endpoint_value(
+                &comparison.left,
+                combination,
+                new_source,
+                right_row,
+                context.source_rows,
+            ) else {
+                return;
+            };
+            let Some(right) = join_endpoint_value(
+                &comparison.right,
+                combination,
+                new_source,
+                right_row,
+                context.source_rows,
+            ) else {
+                return;
+            };
+            add_join_endpoint_range(
+                requests,
+                &comparison.left,
+                right,
+                comparison.operator,
+                context,
+            );
+            add_join_endpoint_range(
+                requests,
+                &comparison.right,
+                left,
+                reverse_join_operator(comparison.operator),
+                context,
+            );
+        }
+        JoinPredicate::And(left, right) => {
+            add_join_predicate_ranges(requests, left, combination, new_source, right_row, context);
+            add_join_predicate_ranges(requests, right, combination, new_source, right_row, context);
+        }
+        JoinPredicate::Or(left, right) => {
+            if join_predicate_matches(
+                left,
+                combination,
+                new_source,
+                right_row,
+                context.source_rows,
+                context.sources,
+            ) {
+                add_join_predicate_ranges(
+                    requests,
+                    left,
+                    combination,
+                    new_source,
+                    right_row,
+                    context,
+                );
+            }
+            if join_predicate_matches(
+                right,
+                combination,
+                new_source,
+                right_row,
+                context.source_rows,
+                context.sources,
+            ) {
+                add_join_predicate_ranges(
+                    requests,
+                    right,
+                    combination,
+                    new_source,
+                    right_row,
+                    context,
+                );
+            }
+        }
+        JoinPredicate::ScalarCondition(_) => {
+            for (source_index, source) in context.sources.iter().enumerate() {
+                if context
+                    .source_is_derived
+                    .get(source_index)
+                    .copied()
+                    .unwrap_or(true)
+                {
+                    continue;
+                }
+                add_lock_request(
+                    requests,
+                    format!("table:{}:{}", source.database, source.table),
+                    if context.for_update {
+                        LockMode::Exclusive
+                    } else {
+                        LockMode::Shared
+                    },
+                );
+            }
+        }
+        JoinPredicate::Always => {}
+    }
+}
+
+fn add_join_endpoint_range(
+    requests: &mut HashMap<String, LockMode>,
+    endpoint: &(usize, String),
+    other_value: &[u8],
+    operator: JoinOperator,
+    context: &JoinRangeContext<'_>,
+) {
+    let source_index = endpoint.0;
+    if context
+        .source_is_derived
+        .get(source_index)
+        .copied()
+        .unwrap_or(true)
+    {
+        return;
+    }
+    let source = &context.sources[source_index];
+    let indexes = single_column_index_definitions(&source.schema)
+        .into_iter()
+        .filter(|(_, column)| column.eq_ignore_ascii_case(&endpoint.1))
+        .collect::<Vec<_>>();
+    let mode = if context.for_update {
+        LockMode::Exclusive
+    } else {
+        LockMode::GapShared
+    };
+    if indexes.is_empty() {
+        add_lock_request(
+            requests,
+            format!("table:{}:{}", source.database, source.table),
+            if context.for_update {
+                LockMode::Exclusive
+            } else {
+                LockMode::Shared
+            },
+        );
+        return;
+    }
+    let bound = normalize_index_value(&source.schema, &endpoint.1, other_value);
+    for (index, _) in indexes {
+        for range in join_operator_ranges(operator, &bound) {
+            add_lock_request(
+                requests,
+                range_lock_resource(&source.database, &source.table, &index, &range),
+                mode,
+            );
+        }
+    }
+}
+
+fn join_operator_ranges(operator: JoinOperator, bound: &[u8]) -> Vec<KeyRange> {
+    let point = || KeyRange {
+        lower: Some(bound.to_vec()),
+        lower_inclusive: true,
+        upper: Some(bound.to_vec()),
+        upper_inclusive: true,
+    };
+    match operator {
+        JoinOperator::Eq | JoinOperator::NullSafeEq => vec![point()],
+        JoinOperator::NotEq => vec![
+            KeyRange {
+                lower: None,
+                lower_inclusive: false,
+                upper: Some(bound.to_vec()),
+                upper_inclusive: false,
+            },
+            KeyRange {
+                lower: Some(bound.to_vec()),
+                lower_inclusive: false,
+                upper: None,
+                upper_inclusive: false,
+            },
+        ],
+        JoinOperator::Less => vec![KeyRange {
+            lower: None,
+            lower_inclusive: false,
+            upper: Some(bound.to_vec()),
+            upper_inclusive: false,
+        }],
+        JoinOperator::LessOrEq => vec![KeyRange {
+            lower: None,
+            lower_inclusive: false,
+            upper: Some(bound.to_vec()),
+            upper_inclusive: true,
+        }],
+        JoinOperator::Greater => vec![KeyRange {
+            lower: Some(bound.to_vec()),
+            lower_inclusive: false,
+            upper: None,
+            upper_inclusive: false,
+        }],
+        JoinOperator::GreaterOrEq => vec![KeyRange {
+            lower: Some(bound.to_vec()),
+            lower_inclusive: true,
+            upper: None,
+            upper_inclusive: false,
+        }],
+    }
+}
+
+fn reverse_join_operator(operator: JoinOperator) -> JoinOperator {
+    match operator {
+        JoinOperator::Eq => JoinOperator::Eq,
+        JoinOperator::NullSafeEq => JoinOperator::NullSafeEq,
+        JoinOperator::NotEq => JoinOperator::NotEq,
+        JoinOperator::Less => JoinOperator::Greater,
+        JoinOperator::LessOrEq => JoinOperator::GreaterOrEq,
+        JoinOperator::Greater => JoinOperator::Less,
+        JoinOperator::GreaterOrEq => JoinOperator::LessOrEq,
+    }
+}
+
+fn join_row_marker(row: &Row, source_index: usize) -> Option<usize> {
+    let marker = format!("__mydb_row_index_{source_index}");
+    row.get(&marker)
+        .and_then(|value| std::str::from_utf8(value).ok())
+        .and_then(|value| value.parse::<usize>().ok())
+}
+
+fn add_locking_read_index_points(
+    requests: &mut HashMap<String, LockMode>,
+    database: &str,
+    table: &str,
+    schema: &TableSchema,
+    rows: &[Row],
+    for_update: bool,
+    index_rows: Option<&[Row]>,
+) {
+    let mode = if for_update {
+        LockMode::Exclusive
+    } else {
+        LockMode::GapShared
+    };
+    for row in rows {
+        for (index, column) in single_column_index_definitions(schema) {
+            let Some(value) = row.get(&column).filter(|_| !row.is_null(&column)) else {
+                continue;
+            };
+            let value = normalize_index_value(schema, &column, value);
+            let point = KeyRange {
+                lower: Some(value.clone()),
+                lower_inclusive: true,
+                upper: Some(value),
+                upper_inclusive: true,
+            };
+            let point = index_rows
+                .and_then(|index_rows| {
+                    all_index_definitions(schema)
+                        .into_iter()
+                        .find(|(name, _)| name.eq_ignore_ascii_case(&index))
+                        .map(|(_, columns)| {
+                            if unique_key_columns(schema)
+                                .iter()
+                                .any(|(name, _)| name.eq_ignore_ascii_case(&index))
+                            {
+                                point.clone()
+                            } else {
+                                expand_next_key_range(point.clone(), &columns, schema, index_rows)
+                            }
+                        })
+                })
+                .unwrap_or(point);
+            add_lock_request(
+                requests,
+                range_lock_resource(database, table, &index, &point),
+                mode,
+            );
+        }
+        for (index, columns) in composite_index_definitions(schema) {
+            let Some(value) = composite_index_key_from_row(row, &columns, schema) else {
+                continue;
+            };
+            let point = KeyRange {
+                lower: Some(value.clone()),
+                lower_inclusive: true,
+                upper: Some(value),
+                upper_inclusive: true,
+            };
+            let point = index_rows
+                .and_then(|index_rows| {
+                    all_index_definitions(schema)
+                        .into_iter()
+                        .find(|(name, _)| name.eq_ignore_ascii_case(&index))
+                        .map(|(_, columns)| {
+                            if unique_key_columns(schema)
+                                .iter()
+                                .any(|(name, _)| name.eq_ignore_ascii_case(&index))
+                            {
+                                point.clone()
+                            } else {
+                                expand_next_key_range(point.clone(), &columns, schema, index_rows)
+                            }
+                        })
+                })
+                .unwrap_or(point);
+            add_lock_request(
+                requests,
+                range_lock_resource(database, table, &index, &point),
+                mode,
+            );
+        }
+        for (index, columns) in unique_key_columns(schema) {
+            if index == "PRIMARY" {
+                continue;
+            }
+            let Some(key) = row_lock_key_for_schema(row, &columns, schema) else {
+                continue;
+            };
+            add_lock_request(
+                requests,
+                format!("unique:{database}.{table}:{index}:{key}"),
+                if for_update {
+                    LockMode::Exclusive
+                } else {
+                    LockMode::Shared
+                },
+            );
+        }
+    }
 }
 
 fn range_lock_resource(database: &str, table: &str, index: &str, range: &KeyRange) -> String {
@@ -15014,9 +20879,9 @@ fn predicate_index_ranges(
         .into_iter()
         .filter_map(|(index, columns)| {
             let ranges = if columns.len() == 1 {
-                key_ranges_from_predicate(filter, &columns[0])
+                key_ranges_from_predicate(filter, &columns[0], schema)
             } else {
-                composite_index_range_from_predicate(filter, &columns)
+                composite_index_range_from_predicate(filter, &columns, schema)
             }?;
             Some((index, ranges))
         })
@@ -15035,7 +20900,7 @@ fn all_index_definitions(schema: &TableSchema) -> Vec<(String, Vec<String>)> {
         schema
             .indexes
             .iter()
-            .filter(|index| index.name != "PRIMARY")
+            .filter(|index| index.name != "PRIMARY" && index.kind == IndexKind::BTree)
             .map(|index| (index.name.clone(), index.columns.clone())),
     );
     definitions
@@ -15055,13 +20920,17 @@ fn composite_index_definitions(schema: &TableSchema) -> Vec<(String, Vec<String>
         .collect()
 }
 
-fn composite_index_key_from_row(row: &Row, columns: &[String]) -> Option<Vec<u8>> {
+fn composite_index_key_from_row(
+    row: &Row,
+    columns: &[String],
+    schema: &TableSchema,
+) -> Option<Vec<u8>> {
     let mut values = Vec::with_capacity(columns.len());
     for column in columns {
         if row.is_null(column) {
             return None;
         }
-        values.push(row.get(column)?.to_vec());
+        values.push(normalize_index_value(schema, column, row.get(column)?));
     }
     Some(encode_composite_lock_key(&values))
 }
@@ -15078,6 +20947,7 @@ fn encode_composite_lock_key(values: &[Vec<u8>]) -> Vec<u8> {
 fn composite_index_range_from_predicate(
     predicate: &RowPredicate,
     columns: &[String],
+    schema: &TableSchema,
 ) -> Option<Vec<KeyRange>> {
     let mut equalities = HashMap::new();
     if !collect_predicate_equalities(predicate, &mut equalities) {
@@ -15086,7 +20956,13 @@ fn composite_index_range_from_predicate(
     let values = columns
         .iter()
         .take_while(|column| equalities.contains_key(*column))
-        .map(|column| equalities.get(column).cloned().expect("checked above"))
+        .map(|column| {
+            normalize_index_value(
+                schema,
+                column,
+                equalities.get(column).expect("checked above"),
+            )
+        })
         .collect::<Vec<_>>();
     if values.is_empty() {
         return None;
@@ -15124,13 +21000,19 @@ fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
-fn key_ranges_from_predicate(predicate: &RowPredicate, column: &str) -> Option<Vec<KeyRange>> {
+fn key_ranges_from_predicate(
+    predicate: &RowPredicate,
+    column: &str,
+    schema: &TableSchema,
+) -> Option<Vec<KeyRange>> {
     match predicate {
-        RowPredicate::Eq(name, value) if name.eq_ignore_ascii_case(column) => {
+        RowPredicate::Eq(name, value) | RowPredicate::ExactEq(name, value)
+            if name.eq_ignore_ascii_case(column) =>
+        {
             Some(vec![KeyRange {
-                lower: Some(value.clone()),
+                lower: Some(normalize_index_value(schema, column, value)),
                 lower_inclusive: true,
-                upper: Some(value.clone()),
+                upper: Some(normalize_index_value(schema, column, value)),
                 upper_inclusive: true,
             }])
         }
@@ -15138,7 +21020,7 @@ fn key_ranges_from_predicate(predicate: &RowPredicate, column: &str) -> Option<V
             Some(vec![KeyRange {
                 lower: None,
                 lower_inclusive: false,
-                upper: Some(value.clone()),
+                upper: Some(normalize_index_value(schema, column, value)),
                 upper_inclusive: false,
             }])
         }
@@ -15146,13 +21028,13 @@ fn key_ranges_from_predicate(predicate: &RowPredicate, column: &str) -> Option<V
             Some(vec![KeyRange {
                 lower: None,
                 lower_inclusive: false,
-                upper: Some(value.clone()),
+                upper: Some(normalize_index_value(schema, column, value)),
                 upper_inclusive: true,
             }])
         }
         RowPredicate::Greater(name, value) if name.eq_ignore_ascii_case(column) => {
             Some(vec![KeyRange {
-                lower: Some(value.clone()),
+                lower: Some(normalize_index_value(schema, column, value)),
                 lower_inclusive: false,
                 upper: None,
                 upper_inclusive: false,
@@ -15160,7 +21042,7 @@ fn key_ranges_from_predicate(predicate: &RowPredicate, column: &str) -> Option<V
         }
         RowPredicate::GreaterOrEq(name, value) if name.eq_ignore_ascii_case(column) => {
             Some(vec![KeyRange {
-                lower: Some(value.clone()),
+                lower: Some(normalize_index_value(schema, column, value)),
                 lower_inclusive: true,
                 upper: None,
                 upper_inclusive: false,
@@ -15170,21 +21052,21 @@ fn key_ranges_from_predicate(predicate: &RowPredicate, column: &str) -> Option<V
             values
                 .iter()
                 .map(|value| KeyRange {
-                    lower: Some(value.clone()),
+                    lower: Some(normalize_index_value(schema, column, value)),
                     lower_inclusive: true,
-                    upper: Some(value.clone()),
+                    upper: Some(normalize_index_value(schema, column, value)),
                     upper_inclusive: true,
                 })
                 .collect(),
         ),
         RowPredicate::Like(name, pattern) if name.eq_ignore_ascii_case(column) => {
-            like_key_range(pattern)
+            like_key_range(&normalize_index_value(schema, column, pattern))
         }
         RowPredicate::Between(name, lower, upper) if name.eq_ignore_ascii_case(column) => {
             Some(vec![KeyRange {
-                lower: Some(lower.clone()),
+                lower: Some(normalize_index_value(schema, column, lower)),
                 lower_inclusive: true,
-                upper: Some(upper.clone()),
+                upper: Some(normalize_index_value(schema, column, upper)),
                 upper_inclusive: true,
             }])
         }
@@ -15198,8 +21080,8 @@ fn key_ranges_from_predicate(predicate: &RowPredicate, column: &str) -> Option<V
                 .iter()
                 .any(|name| name.eq_ignore_ascii_case(column));
             match (
-                key_ranges_from_predicate(left, column),
-                key_ranges_from_predicate(right, column),
+                key_ranges_from_predicate(left, column, schema),
+                key_ranges_from_predicate(right, column, schema),
             ) {
                 (Some(left), Some(right)) => intersect_key_ranges(&left, &right),
                 (Some(ranges), None) if !right_mentions => Some(ranges),
@@ -15326,6 +21208,23 @@ fn add_lock_request(requests: &mut HashMap<String, LockMode>, resource: String, 
         .or_insert(mode);
 }
 
+fn missing_lock_requests(planned: &[LockRequest], requested: &[LockRequest]) -> Vec<LockRequest> {
+    let mut planned_modes = HashMap::with_capacity(planned.len());
+    for request in planned {
+        add_lock_request(&mut planned_modes, request.resource.clone(), request.mode);
+    }
+    requested
+        .iter()
+        .filter(|request| {
+            planned_modes
+                .get(&request.resource)
+                .map(|held| merge_lock_modes(*held, request.mode) != *held)
+                .unwrap_or(true)
+        })
+        .cloned()
+        .collect()
+}
+
 fn sorted_lock_requests(requests: HashMap<String, LockMode>) -> Vec<LockRequest> {
     let mut requests = requests
         .into_iter()
@@ -15405,22 +21304,67 @@ fn primary_key_predicate(
         .ok_or_else(|| anyhow::anyhow!("Invalid primary key predicate"))
 }
 
-fn row_lock_key(row: &Row, columns: &[String]) -> Option<String> {
+fn row_lock_key_for_schema(row: &Row, columns: &[String], schema: &TableSchema) -> Option<String> {
     let mut hasher = Sha256::new();
     for column in columns {
         if row.is_null(column) {
             return None;
         }
-        let value = row.get(column)?;
+        let value = normalize_index_value(schema, column, row.get(column)?);
         hasher.update((column.len() as u32).to_le_bytes());
         hasher.update(column.as_bytes());
         hasher.update((value.len() as u32).to_le_bytes());
-        hasher.update(value);
+        hasher.update(&value);
     }
     Some(hex_bytes(&hasher.finalize()))
 }
 
+fn normalize_index_value(schema: &TableSchema, column: &str, value: &[u8]) -> Vec<u8> {
+    let normalized =
+        mysql_collation_key_bytes(value, column_collation_name(schema, column).as_deref());
+    let numeric = schema
+        .columns
+        .iter()
+        .find(|item| item.name.eq_ignore_ascii_case(column))
+        .is_some_and(|item| {
+            matches!(
+                item.data_type,
+                DataType::Int
+                    | DataType::BigInt
+                    | DataType::Float
+                    | DataType::Double
+                    | DataType::Boolean
+            )
+        });
+    let decimal = schema
+        .columns
+        .iter()
+        .find(|item| item.name.eq_ignore_ascii_case(column))
+        .is_some_and(|item| {
+            matches!(&item.data_type, DataType::Raw(raw) if {
+                let raw = raw.trim().to_ascii_uppercase();
+                raw.starts_with("DECIMAL") || raw.starts_with("NUMERIC")
+            })
+        });
+    let mut key = Vec::with_capacity(normalized.len() + 1);
+    key.push(if decimal {
+        b'D'
+    } else if numeric {
+        b'N'
+    } else {
+        b'S'
+    });
+    key.extend(normalized);
+    key
+}
+
 fn hidden_row_lock_key(row: &Row) -> String {
+    if row.row_id != 0 {
+        let mut hasher = Sha256::new();
+        hasher.update(b"mydb-hidden-row-id");
+        hasher.update(row.row_id.to_le_bytes());
+        return hex_bytes(&hasher.finalize());
+    }
     let mut columns = row
         .values
         .iter()
@@ -15446,6 +21390,9 @@ fn hidden_row_lock_key(row: &Row) -> String {
 }
 
 fn hidden_row_lock_key_with_ordinal(row: &Row, ordinal: usize) -> String {
+    if row.row_id != 0 {
+        return hidden_row_lock_key(row);
+    }
     let base = hidden_row_lock_key(row);
     let mut hasher = Sha256::new();
     hasher.update(base.as_bytes());
@@ -15466,7 +21413,7 @@ fn predicate_primary_key(filter: Option<&RowPredicate>, schema: &TableSchema) ->
     for column in &primary {
         row.push(column, equalities.get(column)?.clone());
     }
-    row_lock_key(&row, &primary)
+    row_lock_key_for_schema(&row, &primary, schema)
 }
 
 fn collect_predicate_equalities(
@@ -15474,7 +21421,7 @@ fn collect_predicate_equalities(
     equalities: &mut HashMap<String, Vec<u8>>,
 ) -> bool {
     match predicate {
-        RowPredicate::Eq(column, value) => {
+        RowPredicate::Eq(column, value) | RowPredicate::ExactEq(column, value) => {
             equalities.insert(column.clone(), value.clone());
             true
         }
@@ -15549,6 +21496,7 @@ enum CorrelatedSubqueryFilter {
 #[derive(Debug)]
 enum CorrelatedRowFilter {
     Predicate(RowPredicate),
+    Scalar(String),
     Subquery(CorrelatedSubqueryFilter),
     And(Box<CorrelatedRowFilter>, Box<CorrelatedRowFilter>),
     Or(Box<CorrelatedRowFilter>, Box<CorrelatedRowFilter>),
@@ -15573,18 +21521,19 @@ enum JoinOperator {
     GreaterOrEq,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct JoinComparison {
     left: (usize, String),
     right: (usize, String),
     operator: JoinOperator,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum JoinPredicate {
     Comparison(JoinComparison),
     And(Box<JoinPredicate>, Box<JoinPredicate>),
     Or(Box<JoinPredicate>, Box<JoinPredicate>),
+    ScalarCondition(String),
     Always,
 }
 
@@ -15826,6 +21775,13 @@ fn correlated_row_filter_clause(
     let Some(expression) = where_expression(sql) else {
         return Ok(None);
     };
+    correlated_filter_for_expression(expression, sources)
+}
+
+fn correlated_filter_for_expression(
+    expression: &str,
+    sources: &[JoinSource],
+) -> anyhow::Result<Option<CorrelatedRowFilter>> {
     let expression = trim_outer_parentheses(expression.trim());
     if !expression_has_correlated_subquery(expression, sources) {
         return Ok(None);
@@ -15876,10 +21832,21 @@ fn parse_correlated_row_filter_expression(
     if let Some(filter) = correlated_subquery_filter_expression(expression, sources) {
         return Ok((CorrelatedRowFilter::Subquery(filter), true));
     }
-    Ok((
-        CorrelatedRowFilter::Predicate(parse_predicate_expression(expression)?),
-        false,
-    ))
+    let scalar_comparison = ["<=>", ">=", "<=", "<>", "!=", ">", "<", "="]
+        .into_iter()
+        .any(|operator| {
+            find_top_level_operator(expression, operator)
+                .is_some_and(|position| !is_identifier_reference(expression[..position].trim()))
+        });
+    let filter = if expression.to_ascii_uppercase().contains("X'") || scalar_comparison {
+        CorrelatedRowFilter::Scalar(expression.to_string())
+    } else {
+        match parse_predicate_expression(expression) {
+            Ok(predicate) => CorrelatedRowFilter::Predicate(predicate),
+            Err(_) => CorrelatedRowFilter::Scalar(expression.to_string()),
+        }
+    };
+    Ok((filter, false))
 }
 
 fn find_top_level_boolean_and(expression: &str) -> Option<usize> {
@@ -15997,11 +21964,14 @@ fn outer_reference_names(sources: &[JoinSource]) -> HashSet<String> {
     names
 }
 
-fn correlated_outer_value<'a>(row: &'a Row, column: &str) -> anyhow::Result<Option<&'a [u8]>> {
-    if !row.contains(column) {
-        anyhow::bail!("Unknown or ambiguous correlated outer column '{}'", column);
+fn correlated_outer_value(row: &Row, expression: &str) -> anyhow::Result<Option<Vec<u8>>> {
+    if is_column_reference(expression) && !row.contains(expression) {
+        anyhow::bail!(
+            "Unknown or ambiguous correlated outer column '{}'",
+            expression
+        );
     }
-    Ok((!row.is_null(column)).then(|| row.get(column)).flatten())
+    evaluate_scalar_expression(expression, row)
 }
 
 fn sql_optional_comparison(
@@ -16212,27 +22182,72 @@ fn parse_with_clause(sql: &str) -> anyhow::Result<(bool, Vec<CteDefinition>, Str
 }
 
 fn recursive_cte_references_self(query: &str, name: &str) -> bool {
+    cte_query_reference_count(query, name) > 0
+}
+
+fn cte_query_reference_count(query: &str, name: &str) -> usize {
     let name = name.trim_matches('`').to_ascii_uppercase();
     let upper = query.to_ascii_uppercase();
-    [" FROM ", " JOIN "].into_iter().any(|keyword| {
-        let mut cursor = 0;
-        while let Some(position) = upper[cursor..].find(keyword) {
-            let start = cursor + position + keyword.len();
-            let rest = upper[start..].trim_start();
-            let reference = rest
-                .trim_start_matches('`')
-                .split(|character: char| {
-                    character.is_whitespace() || matches!(character, '`' | '(' | ')' | ',')
-                })
-                .next()
-                .unwrap_or("");
-            if reference == name {
-                return true;
+    [" FROM ", " JOIN "]
+        .into_iter()
+        .map(|keyword| {
+            let mut cursor = 0;
+            let mut count = 0;
+            while let Some(position) = upper[cursor..].find(keyword) {
+                let start = cursor + position + keyword.len();
+                let rest = upper[start..].trim_start();
+                let reference = rest
+                    .trim_start_matches('`')
+                    .split(|character: char| {
+                        character.is_whitespace() || matches!(character, '`' | '(' | ')' | ',')
+                    })
+                    .next()
+                    .unwrap_or("");
+                if reference == name {
+                    count += 1;
+                }
+                cursor = start;
             }
-            cursor = start;
+            count
+        })
+        .sum()
+}
+
+fn validate_recursive_cte_arm(arm: &str, name: &str) -> anyhow::Result<()> {
+    if cte_query_reference_count(arm, name) != 1 {
+        anyhow::bail!(
+            "Recursive CTE arm must reference '{}' exactly once in its FROM/JOIN clause",
+            name
+        );
+    }
+    for keyword in [" GROUP BY ", " ORDER BY "] {
+        if find_top_level_keyword(arm, keyword, 0).is_some() {
+            anyhow::bail!("Recursive CTE arm cannot contain {}", keyword.trim());
         }
-        false
-    })
+    }
+    if find_top_level_word(arm, "DISTINCT").is_some() {
+        anyhow::bail!("Recursive CTE arm cannot contain DISTINCT");
+    }
+    for function in [
+        "AVG(",
+        "BIT_AND(",
+        "BIT_OR(",
+        "BIT_XOR(",
+        "COUNT(",
+        "GROUP_CONCAT(",
+        "JSON_ARRAYAGG(",
+        "JSON_OBJECTAGG(",
+        "MAX(",
+        "MIN(",
+        "STDDEV(",
+        "SUM(",
+        "VARIANCE(",
+    ] {
+        if find_top_level_keyword(arm, function, 0).is_some() {
+            anyhow::bail!("Recursive CTE arm cannot contain aggregate functions");
+        }
+    }
+    Ok(())
 }
 
 fn skip_sql_whitespace(value: &str, cursor: &mut usize) {
@@ -16275,7 +22290,7 @@ fn virtual_table_schema(name: &str, columns: &[String]) -> TableSchema {
             .iter()
             .map(|column| Column {
                 name: column.clone(),
-                data_type: DataType::Blob,
+                data_type: virtual_table_column_data_type(name, column),
                 nullable: true,
                 default: None,
                 is_primary_key: false,
@@ -16289,6 +22304,37 @@ fn virtual_table_schema(name: &str, columns: &[String]) -> TableSchema {
         create_sql: None,
         engine: TableEngine::Neko233,
     }
+}
+
+fn virtual_table_column_data_type(_table: &str, column: &str) -> DataType {
+    if matches!(
+        column.to_ascii_uppercase().as_str(),
+        "TABLE_CATALOG"
+            | "TABLE_SCHEMA"
+            | "TABLE_NAME"
+            | "COLUMN_NAME"
+            | "TABLE_TYPE"
+            | "ENGINE"
+            | "ROW_FORMAT"
+            | "TABLE_COLLATION"
+            | "CREATE_OPTIONS"
+            | "TABLE_COMMENT"
+            | "COLUMN_DEFAULT"
+            | "IS_NULLABLE"
+            | "DATA_TYPE"
+            | "COLUMN_TYPE"
+            | "CHARACTER_SET_NAME"
+            | "COLLATION_NAME"
+            | "COLUMN_KEY"
+            | "EXTRA"
+            | "PRIVILEGES"
+            | "COLUMN_COMMENT"
+            | "GENERATION_EXPRESSION"
+            | "SRS_ID"
+    ) {
+        return DataType::Varchar(255);
+    }
+    DataType::Blob
 }
 
 const REPLICA_STATUS_COLUMNS: &[&str] = &[
@@ -16405,14 +22451,18 @@ fn information_schema_virtual_tables(
     storage: &StorageEngineManager,
     auth_catalog: &AuthCatalog,
     viewer: &str,
+    active_roles: &HashSet<String>,
 ) -> anyhow::Result<HashMap<String, VirtualTable>> {
     let mut schemata_rows = vec![
         information_schema_schemata_row("information_schema"),
         information_schema_schemata_row("mysql"),
+        information_schema_schemata_row("performance_schema"),
+        information_schema_schemata_row("sys"),
     ];
     let mut tables_rows = Vec::new();
     let mut columns_rows = Vec::new();
     let mut statistics_rows = Vec::new();
+    let mut partitions_rows = Vec::new();
     let mut table_constraints_rows = Vec::new();
     let mut key_column_usage_rows = Vec::new();
     let mut check_constraints_rows = Vec::new();
@@ -16422,8 +22472,17 @@ fn information_schema_virtual_tables(
     let mut routines_rows = Vec::new();
     let mut parameters_rows = Vec::new();
     let mut events_rows = Vec::new();
-    let (user_privileges_rows, schema_privileges_rows) =
-        information_schema_privilege_rows(auth_catalog, viewer);
+    let (
+        user_privileges_rows,
+        schema_privileges_rows,
+        table_privileges_rows,
+        column_privileges_rows,
+    ) = information_schema_privilege_rows(auth_catalog, viewer);
+    let applicable_roles_rows = information_schema_applicable_roles_rows(auth_catalog, viewer);
+    let enabled_roles_rows =
+        information_schema_enabled_roles_rows(auth_catalog, viewer, active_roles);
+    let (role_table_grants_rows, role_column_grants_rows, role_routine_grants_rows) =
+        information_schema_role_grant_rows(auth_catalog, viewer, active_roles);
     let mut databases = storage.list_databases();
     databases.sort();
     databases.dedup();
@@ -16496,7 +22555,7 @@ fn information_schema_virtual_tables(
                 .get_procedure_metadata(&procedure.name)
                 .unwrap_or_else(|| ProcedureMetadata::new(String::new()));
             for (index, parameter) in procedure.parameters.iter().enumerate() {
-                parameters_rows.push(vec![
+                let mut row = vec![
                     bytes("def"),
                     bytes(&database_name),
                     bytes(&procedure.name),
@@ -16507,17 +22566,10 @@ fn information_schema_virtual_tables(
                         ProcedureParameterMode::InOut => "INOUT",
                     }),
                     bytes(&parameter.name),
-                    bytes(
-                        parameter
-                            .data_type
-                            .split(['(', ' '])
-                            .next()
-                            .unwrap_or("")
-                            .to_ascii_lowercase()
-                            .as_str(),
-                    ),
-                    bytes(&parameter.data_type),
-                ]);
+                ];
+                row.extend(routine_parameter_metadata(&parameter.data_type));
+                row.push(bytes("PROCEDURE"));
+                parameters_rows.push(row);
             }
             routines_rows.push(vec![
                 bytes(&procedure.name),
@@ -16554,41 +22606,30 @@ fn information_schema_virtual_tables(
             let metadata = database
                 .get_function_metadata(&function.name)
                 .unwrap_or_else(|| ProcedureMetadata::new(String::new()));
-            let returns_data_type = function
-                .returns
-                .split(['(', ' '])
-                .next()
-                .unwrap_or("")
-                .to_ascii_lowercase();
-            parameters_rows.push(vec![
+            let mut return_row = vec![
                 bytes("def"),
                 bytes(&database_name),
                 bytes(&function.name),
                 bytes("0"),
                 None,
                 None,
-                bytes(&returns_data_type),
-                bytes(&function.returns),
-            ]);
+            ];
+            return_row.extend(routine_parameter_metadata(&function.returns));
+            return_row.push(bytes("FUNCTION"));
+            parameters_rows.push(return_row);
+            let returns_data_type = routine_parameter_type_name(&function.returns);
             for (index, parameter) in function.parameters.iter().enumerate() {
-                parameters_rows.push(vec![
+                let mut row = vec![
                     bytes("def"),
                     bytes(&database_name),
                     bytes(&function.name),
                     bytes(&(index + 1).to_string()),
                     bytes("IN"),
                     bytes(&parameter.name),
-                    bytes(
-                        parameter
-                            .data_type
-                            .split(['(', ' '])
-                            .next()
-                            .unwrap_or("")
-                            .to_ascii_lowercase()
-                            .as_str(),
-                    ),
-                    bytes(&parameter.data_type),
-                ]);
+                ];
+                row.extend(routine_parameter_metadata(&parameter.data_type));
+                row.push(bytes("FUNCTION"));
+                parameters_rows.push(row);
             }
             routines_rows.push(vec![
                 bytes(&function.name),
@@ -16636,8 +22677,16 @@ fn information_schema_virtual_tables(
                     bytes(&database_name),
                     bytes(&table_name),
                     bytes(definition),
-                    bytes("NONE"),
-                    bytes("NO"),
+                    bytes(view_check_option_name(view_check_option(&schema))),
+                    bytes(
+                        if simple_updatable_view_definition(storage, &database_name, &schema)?
+                            .is_some()
+                        {
+                            "YES"
+                        } else {
+                            "NO"
+                        },
+                    ),
                     bytes("root@%"),
                     bytes("DEFINER"),
                     bytes("utf8mb4"),
@@ -16723,8 +22772,49 @@ fn information_schema_virtual_tables(
                 (!view).then(|| b"utf8mb4_0900_ai_ci".to_vec()),
                 None,
                 Some(Vec::new()),
-                bytes(if view { "VIEW" } else { "Neko233 engine" }),
+                table_comment_from_schema(&schema)
+                    .map_or_else(|| Some(Vec::new()), |comment| Some(comment.into_bytes())),
             ]);
+
+            if !view {
+                if let Some(partition_info) = table_partition_info(&schema)? {
+                    partitions_rows.extend(partition_information_rows(
+                        &database_name,
+                        &table_name,
+                        &schema,
+                        &partition_info,
+                        &table_rows,
+                    )?);
+                } else {
+                    partitions_rows.push(vec![
+                        bytes("def"),
+                        bytes(&database_name),
+                        bytes(&table_name),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some(row_count.to_string().into_bytes()),
+                        Some(average_length.to_string().into_bytes()),
+                        Some(data_length.to_string().into_bytes()),
+                        None,
+                        Some(b"0".to_vec()),
+                        Some(b"0".to_vec()),
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some(Vec::new()),
+                        Some(b"DEFAULT".to_vec()),
+                        Some(b"DEFAULT".to_vec()),
+                    ]);
+                }
+            }
 
             let auto_increment_column = auto_increment_column_name(&schema);
             for (ordinal, column) in schema.columns.iter().enumerate() {
@@ -16738,7 +22828,37 @@ fn information_schema_virtual_tables(
                 let (numeric_precision, numeric_scale) =
                     information_schema_numeric_metadata(&column.data_type);
                 let datetime_precision = information_schema_datetime_precision(&column.data_type);
-                let character = matches!(column.data_type, DataType::Varchar(_) | DataType::Text);
+                let generated = generated_column_definition(&schema, &column.name);
+                let character = matches!(column.data_type, DataType::Varchar(_) | DataType::Text)
+                    || matches!(&column.data_type, DataType::Raw(value) if {
+                        let value = value.trim().to_ascii_uppercase();
+                        value.starts_with("CHAR(")
+                            || value.starts_with("VARCHAR(")
+                            || value.starts_with("ENUM(")
+                            || value.starts_with("SET(")
+                            || value.starts_with("TINYTEXT")
+                            || value.starts_with("TEXT")
+                            || value.starts_with("MEDIUMTEXT")
+                            || value.starts_with("LONGTEXT")
+                    });
+                let character_set_name = character.then(|| {
+                    column_collation_name(&schema, &column.name)
+                        .and_then(|value| mysql_collation_info(&value))
+                        .map(|value| value.character_set.to_string())
+                        .unwrap_or_else(|| "utf8mb4".to_string())
+                });
+                let character_octet_length = character_length.and_then(|length| {
+                    let maxlen = character_set_name
+                        .as_deref()
+                        .and_then(|charset| {
+                            MYSQL_CHARACTER_SETS
+                                .iter()
+                                .find(|info| info.name.eq_ignore_ascii_case(charset))
+                        })
+                        .map(|info| u64::from(info.maxlen))
+                        .unwrap_or(4);
+                    length.checked_mul(maxlen)
+                });
                 columns_rows.push(vec![
                     bytes("def"),
                     bytes(&database_name),
@@ -16752,24 +22872,46 @@ fn information_schema_virtual_tables(
                     bytes(if column.nullable { "YES" } else { "NO" }),
                     bytes(&data_type),
                     character_length.map(|value| value.to_string().into_bytes()),
-                    character_length.map(|value| value.saturating_mul(4).to_string().into_bytes()),
+                    character_octet_length.map(|value| value.to_string().into_bytes()),
                     numeric_precision.map(|value| value.to_string().into_bytes()),
                     numeric_scale.map(|value| value.to_string().into_bytes()),
                     datetime_precision.map(|value| value.to_string().into_bytes()),
-                    character.then(|| b"utf8mb4".to_vec()),
-                    character.then(|| b"utf8mb4_0900_ai_ci".to_vec()),
+                    character_set_name.map(String::into_bytes),
+                    character.then(|| {
+                        column_collation_name(&schema, &column.name)
+                            .unwrap_or_else(|| "utf8mb4_0900_ai_ci".into())
+                            .into_bytes()
+                    }),
                     bytes(&column_type),
                     bytes(&information_schema_column_key(&schema, &column.name)),
                     bytes(
-                        if auto_increment_column.as_deref() == Some(column.name.as_str()) {
-                            "auto_increment"
-                        } else {
-                            ""
-                        },
+                        generated
+                            .as_ref()
+                            .map(|(_, stored)| {
+                                if *stored {
+                                    "STORED GENERATED"
+                                } else {
+                                    "VIRTUAL GENERATED"
+                                }
+                            })
+                            .unwrap_or_else(|| {
+                                if auto_increment_column.as_deref() == Some(column.name.as_str()) {
+                                    "auto_increment"
+                                } else {
+                                    ""
+                                }
+                            }),
                     ),
                     bytes("select,insert,update,references"),
-                    Some(Vec::new()),
-                    Some(Vec::new()),
+                    column_comment_from_schema(&schema, &column.name)
+                        .map_or_else(|| Some(Vec::new()), |comment| Some(comment.into_bytes())),
+                    generated
+                        .as_ref()
+                        .map(|(expression, _)| {
+                            generated_expression_for_information_schema(expression, &schema)
+                                .into_bytes()
+                        })
+                        .or_else(|| Some(Vec::new())),
                     None,
                 ]);
             }
@@ -16783,6 +22925,7 @@ fn information_schema_virtual_tables(
                         name: "PRIMARY".into(),
                         columns: primary_key,
                         unique: true,
+                        kind: IndexKind::BTree,
                     },
                 );
             }
@@ -16793,6 +22936,11 @@ fn information_schema_virtual_tables(
                         .iter()
                         .find(|column| column.name.eq_ignore_ascii_case(column_name))
                         .is_some_and(|column| column.nullable);
+                    let (collation, sub_part, index_type) = match index.kind {
+                        IndexKind::BTree => (Some("A"), None, "BTREE"),
+                        IndexKind::FullText => (None, None, "FULLTEXT"),
+                        IndexKind::Spatial => (Some("A"), Some("32"), "SPATIAL"),
+                    };
                     statistics_rows.push(vec![
                         bytes("def"),
                         bytes(&database_name),
@@ -16802,12 +22950,12 @@ fn information_schema_virtual_tables(
                         bytes(&index.name),
                         bytes(&(position + 1).to_string()),
                         bytes(column_name),
-                        bytes("A"),
+                        collation.and_then(bytes),
                         bytes(&row_count.to_string()),
-                        None,
+                        sub_part.and_then(bytes),
                         None,
                         bytes(if nullable { "YES" } else { "" }),
-                        bytes("BTREE"),
+                        bytes(index_type),
                         Some(Vec::new()),
                         Some(Vec::new()),
                         bytes("YES"),
@@ -16902,7 +23050,7 @@ fn information_schema_virtual_tables(
     }
     schemata_rows.sort_by(|left, right| left[1].cmp(&right[1]));
     events_rows.sort_by(|left, right| left[1].cmp(&right[1]).then_with(|| left[2].cmp(&right[2])));
-    Ok(HashMap::from([
+    let mut virtual_tables = HashMap::from([
         (
             "schemata".into(),
             VirtualTable {
@@ -16949,7 +23097,7 @@ fn information_schema_virtual_tables(
                 .into_iter()
                 .map(str::to_string)
                 .collect(),
-                rows: tables_rows,
+                rows: Vec::new(),
             },
         ),
         (
@@ -16982,7 +23130,7 @@ fn information_schema_virtual_tables(
                 .into_iter()
                 .map(str::to_string)
                 .collect(),
-                rows: columns_rows,
+                rows: Vec::new(),
             },
         ),
         (
@@ -17012,6 +23160,42 @@ fn information_schema_virtual_tables(
                 .map(str::to_string)
                 .collect(),
                 rows: statistics_rows,
+            },
+        ),
+        (
+            "partitions".into(),
+            VirtualTable {
+                columns: [
+                    "TABLE_CATALOG",
+                    "TABLE_SCHEMA",
+                    "TABLE_NAME",
+                    "PARTITION_NAME",
+                    "SUBPARTITION_NAME",
+                    "PARTITION_ORDINAL_POSITION",
+                    "SUBPARTITION_ORDINAL_POSITION",
+                    "PARTITION_METHOD",
+                    "SUBPARTITION_METHOD",
+                    "PARTITION_EXPRESSION",
+                    "SUBPARTITION_EXPRESSION",
+                    "PARTITION_DESCRIPTION",
+                    "TABLE_ROWS",
+                    "AVG_ROW_LENGTH",
+                    "DATA_LENGTH",
+                    "MAX_DATA_LENGTH",
+                    "INDEX_LENGTH",
+                    "DATA_FREE",
+                    "CREATE_TIME",
+                    "UPDATE_TIME",
+                    "CHECK_TIME",
+                    "CHECKSUM",
+                    "PARTITION_COMMENT",
+                    "NODEGROUP",
+                    "TABLESPACE_NAME",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+                rows: partitions_rows,
             },
         ),
         (
@@ -17241,6 +23425,100 @@ fn information_schema_virtual_tables(
             },
         ),
         (
+            "enabled_roles".into(),
+            VirtualTable {
+                columns: ["ROLE_NAME", "ROLE_HOST", "IS_DEFAULT", "IS_MANDATORY"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+                rows: enabled_roles_rows,
+            },
+        ),
+        (
+            "role_table_grants".into(),
+            VirtualTable {
+                columns: [
+                    "GRANTOR",
+                    "GRANTOR_HOST",
+                    "GRANTEE",
+                    "GRANTEE_HOST",
+                    "TABLE_CATALOG",
+                    "TABLE_SCHEMA",
+                    "TABLE_NAME",
+                    "PRIVILEGE_TYPE",
+                    "IS_GRANTABLE",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+                rows: role_table_grants_rows,
+            },
+        ),
+        (
+            "role_column_grants".into(),
+            VirtualTable {
+                columns: [
+                    "GRANTOR",
+                    "GRANTOR_HOST",
+                    "GRANTEE",
+                    "GRANTEE_HOST",
+                    "TABLE_CATALOG",
+                    "TABLE_SCHEMA",
+                    "TABLE_NAME",
+                    "COLUMN_NAME",
+                    "PRIVILEGE_TYPE",
+                    "IS_GRANTABLE",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+                rows: role_column_grants_rows,
+            },
+        ),
+        (
+            "role_routine_grants".into(),
+            VirtualTable {
+                columns: [
+                    "GRANTOR",
+                    "GRANTOR_HOST",
+                    "GRANTEE",
+                    "GRANTEE_HOST",
+                    "SPECIFIC_CATALOG",
+                    "SPECIFIC_SCHEMA",
+                    "SPECIFIC_NAME",
+                    "ROUTINE_CATALOG",
+                    "ROUTINE_SCHEMA",
+                    "ROUTINE_NAME",
+                    "PRIVILEGE_TYPE",
+                    "IS_GRANTABLE",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+                rows: role_routine_grants_rows,
+            },
+        ),
+        (
+            "applicable_roles".into(),
+            VirtualTable {
+                columns: [
+                    "USER",
+                    "HOST",
+                    "GRANTEE",
+                    "GRANTEE_HOST",
+                    "ROLE_NAME",
+                    "ROLE_HOST",
+                    "IS_GRANTABLE",
+                    "IS_DEFAULT",
+                    "IS_MANDATORY",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+                rows: applicable_roles_rows,
+            },
+        ),
+        (
             "schema_privileges".into(),
             VirtualTable {
                 columns: [
@@ -17258,26 +23536,38 @@ fn information_schema_virtual_tables(
         ),
         (
             "table_privileges".into(),
-            empty_information_schema_table(&[
-                "GRANTEE",
-                "TABLE_CATALOG",
-                "TABLE_SCHEMA",
-                "TABLE_NAME",
-                "PRIVILEGE_TYPE",
-                "IS_GRANTABLE",
-            ]),
+            VirtualTable {
+                columns: [
+                    "GRANTEE",
+                    "TABLE_CATALOG",
+                    "TABLE_SCHEMA",
+                    "TABLE_NAME",
+                    "PRIVILEGE_TYPE",
+                    "IS_GRANTABLE",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+                rows: table_privileges_rows,
+            },
         ),
         (
             "column_privileges".into(),
-            empty_information_schema_table(&[
-                "GRANTEE",
-                "TABLE_CATALOG",
-                "TABLE_SCHEMA",
-                "TABLE_NAME",
-                "COLUMN_NAME",
-                "PRIVILEGE_TYPE",
-                "IS_GRANTABLE",
-            ]),
+            VirtualTable {
+                columns: [
+                    "GRANTEE",
+                    "TABLE_CATALOG",
+                    "TABLE_SCHEMA",
+                    "TABLE_NAME",
+                    "COLUMN_NAME",
+                    "PRIVILEGE_TYPE",
+                    "IS_GRANTABLE",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+                rows: column_privileges_rows,
+            },
         ),
         (
             "events".into(),
@@ -17325,7 +23615,15 @@ fn information_schema_virtual_tables(
                     "PARAMETER_MODE",
                     "PARAMETER_NAME",
                     "DATA_TYPE",
+                    "CHARACTER_MAXIMUM_LENGTH",
+                    "CHARACTER_OCTET_LENGTH",
+                    "NUMERIC_PRECISION",
+                    "NUMERIC_SCALE",
+                    "DATETIME_PRECISION",
+                    "CHARACTER_SET_NAME",
+                    "COLLATION_NAME",
                     "DTD_IDENTIFIER",
+                    "ROUTINE_TYPE",
                 ]
                 .into_iter()
                 .map(str::to_string)
@@ -17333,7 +23631,380 @@ fn information_schema_virtual_tables(
                 rows: parameters_rows,
             },
         ),
-    ]))
+    ]);
+    append_mysql_information_schema_compat_tables(&mut virtual_tables);
+    append_information_schema_virtual_metadata(
+        &mut tables_rows,
+        &mut columns_rows,
+        "information_schema",
+        &virtual_tables,
+    );
+    let mysql_tables = mysql_virtual_tables(auth_catalog, viewer);
+    append_information_schema_virtual_metadata(
+        &mut tables_rows,
+        &mut columns_rows,
+        "mysql",
+        &mysql_tables,
+    );
+    let performance_tables = performance_schema_virtual_tables(
+        &WireStats::default(),
+        viewer,
+        auth_catalog.has_privilege_with_roles(viewer, "", "PROCESS", active_roles),
+    );
+    append_information_schema_virtual_metadata(
+        &mut tables_rows,
+        &mut columns_rows,
+        "performance_schema",
+        &performance_tables,
+    );
+    let sys_tables = sys_virtual_tables(&WireStats::default());
+    append_information_schema_virtual_metadata(
+        &mut tables_rows,
+        &mut columns_rows,
+        "sys",
+        &sys_tables,
+    );
+    virtual_tables
+        .get_mut("tables")
+        .expect("information_schema.tables virtual table")
+        .rows = tables_rows;
+    virtual_tables
+        .get_mut("columns")
+        .expect("information_schema.columns virtual table")
+        .rows = columns_rows;
+    Ok(virtual_tables)
+}
+
+fn append_mysql_information_schema_compat_tables(
+    virtual_tables: &mut HashMap<String, VirtualTable>,
+) {
+    // MySQL 8.4 exposes these views even when the corresponding optional
+    // subsystem has no rows. Keep their schemas discoverable for JDBC and IDE
+    // metadata probes; populated core views above remain authoritative.
+    const MYSQL_84_COMPAT_VIEWS: &[(&str, &str)] = &[
+        (
+            "administrable_role_authorizations",
+            "USER,HOST,GRANTEE,GRANTEE_HOST,ROLE_NAME,ROLE_HOST,IS_GRANTABLE,IS_DEFAULT,IS_MANDATORY",
+        ),
+        (
+            "collation_character_set_applicability",
+            "COLLATION_NAME,CHARACTER_SET_NAME",
+        ),
+        (
+            "columns_extensions",
+            "TABLE_CATALOG,TABLE_SCHEMA,TABLE_NAME,COLUMN_NAME,ENGINE_ATTRIBUTE,SECONDARY_ENGINE_ATTRIBUTE",
+        ),
+        (
+            "column_statistics",
+            "SCHEMA_NAME,TABLE_NAME,COLUMN_NAME,HISTOGRAM",
+        ),
+        (
+            "files",
+            "FILE_ID,FILE_NAME,FILE_TYPE,TABLESPACE_NAME,TABLE_CATALOG,TABLE_SCHEMA,TABLE_NAME,LOGFILE_GROUP_NAME,LOGFILE_GROUP_NUMBER,ENGINE,FULLTEXT_KEYS,DELETED_ROWS,UPDATE_COUNT,FREE_EXTENTS,TOTAL_EXTENTS,EXTENT_SIZE,INITIAL_SIZE,MAXIMUM_SIZE,AUTOEXTEND_SIZE,CREATION_TIME,LAST_UPDATE_TIME,LAST_ACCESS_TIME,RECOVER_TIME,TRANSACTION_COUNTER,VERSION,ROW_FORMAT,TABLE_ROWS,AVG_ROW_LENGTH,DATA_LENGTH,MAX_DATA_LENGTH,INDEX_LENGTH,DATA_FREE,CREATE_TIME,UPDATE_TIME,CHECK_TIME,CHECKSUM,STATUS,EXTRA",
+        ),
+        ("global_status", "VARIABLE_NAME,VARIABLE_VALUE"),
+        ("global_variables", "VARIABLE_NAME,VARIABLE_VALUE"),
+        (
+            "innodb_buffer_page",
+            "POOL_ID,BLOCK_ID,SPACE,PAGE_NUMBER,PAGE_TYPE,FLUSH_TYPE,FIX_COUNT,IS_HASHED,NEWEST_MODIFICATION,OLDEST_MODIFICATION,ACCESS_TIME,TABLE_NAME,INDEX_NAME,NUMBER_RECORDS,DATA_SIZE,COMPRESSED_SIZE,PAGE_STATE,IO_FIX,IS_OLD,FREE_PAGE_CLOCK,IS_STALE",
+        ),
+        (
+            "innodb_buffer_page_lru",
+            "POOL_ID,LRU_POSITION,SPACE,PAGE_NUMBER,PAGE_TYPE,FLUSH_TYPE,FIX_COUNT,IS_HASHED,NEWEST_MODIFICATION,OLDEST_MODIFICATION,ACCESS_TIME,TABLE_NAME,INDEX_NAME,NUMBER_RECORDS,DATA_SIZE,COMPRESSED_SIZE,COMPRESSED,IO_FIX,IS_OLD,FREE_PAGE_CLOCK",
+        ),
+        (
+            "innodb_buffer_pool_stats",
+            "POOL_ID,POOL_SIZE,FREE_BUFFERS,DATABASE_PAGES,OLD_DATABASE_PAGES,MODIFIED_DATABASE_PAGES,PENDING_DECOMPRESS,PENDING_READS,PENDING_FLUSH_LRU,PENDING_FLUSH_LIST,PAGES_MADE_YOUNG,PAGES_NOT_MADE_YOUNG,PAGES_MADE_YOUNG_RATE,PAGES_MADE_NOT_YOUNG_RATE,NUMBER_PAGES_READ,NUMBER_PAGES_CREATED,NUMBER_PAGES_WRITTEN,PAGES_READ_RATE,PAGES_CREATE_RATE,PAGES_WRITTEN_RATE,NUMBER_PAGES_GET,HIT_RATE,YOUNG_MAKE_PER_THOUSAND_GETS,NOT_YOUNG_MAKE_PER_THOUSAND_GETS,NUMBER_PAGES_READ_AHEAD,NUMBER_READ_AHEAD_EVICTED,READ_AHEAD_RATE,READ_AHEAD_EVICTED_RATE,LRU_IO_TOTAL,LRU_IO_CURRENT,UNCOMPRESS_TOTAL,UNCOMPRESS_CURRENT",
+        ),
+        ("innodb_cached_indexes", "SPACE_ID,INDEX_ID,N_CACHED_PAGES"),
+        (
+            "innodb_cmp",
+            "PAGE_SIZE,COMPRESS_OPS,COMPRESS_OPS_OK,COMPRESS_TIME,UNCOMPRESS_OPS,UNCOMPRESS_TIME",
+        ),
+        (
+            "innodb_cmpmem",
+            "PAGE_SIZE,BUFFER_POOL_INSTANCE,PAGES_USED,PAGES_FREE,RELOCATION_OPS,RELOCATION_TIME",
+        ),
+        (
+            "innodb_cmpmem_reset",
+            "PAGE_SIZE,BUFFER_POOL_INSTANCE,PAGES_USED,PAGES_FREE,RELOCATION_OPS,RELOCATION_TIME",
+        ),
+        (
+            "innodb_cmp_per_index",
+            "DATABASE_NAME,TABLE_NAME,INDEX_NAME,COMPRESS_OPS,COMPRESS_OPS_OK,COMPRESS_TIME,UNCOMPRESS_OPS,UNCOMPRESS_TIME",
+        ),
+        (
+            "innodb_cmp_per_index_reset",
+            "DATABASE_NAME,TABLE_NAME,INDEX_NAME,COMPRESS_OPS,COMPRESS_OPS_OK,COMPRESS_TIME,UNCOMPRESS_OPS,UNCOMPRESS_TIME",
+        ),
+        (
+            "innodb_cmp_reset",
+            "PAGE_SIZE,COMPRESS_OPS,COMPRESS_OPS_OK,COMPRESS_TIME,UNCOMPRESS_OPS,UNCOMPRESS_TIME",
+        ),
+        (
+            "innodb_columns",
+            "TABLE_ID,NAME,POS,MTYPE,PRTYPE,LEN,HAS_DEFAULT,DEFAULT_VALUE",
+        ),
+        ("innodb_datafiles", "SPACE,PATH"),
+        ("innodb_fields", "INDEX_ID,NAME,POS"),
+        ("innodb_foreign", "ID,FOR_NAME,REF_NAME,N_COLS,TYPE"),
+        (
+            "innodb_foreign_cols",
+            "ID,FOR_COL_NAME,REF_COL_NAME,POS",
+        ),
+        ("innodb_ft_being_deleted", "DOC_ID"),
+        ("innodb_ft_config", "KEY,VALUE"),
+        ("innodb_ft_default_stopword", "VALUE"),
+        ("innodb_ft_deleted", "DOC_ID"),
+        (
+            "innodb_ft_index_cache",
+            "WORD,FIRST_DOC_ID,LAST_DOC_ID,DOC_COUNT,DOC_ID,POSITION",
+        ),
+        (
+            "innodb_ft_index_table",
+            "WORD,FIRST_DOC_ID,LAST_DOC_ID,DOC_COUNT,DOC_ID,POSITION",
+        ),
+        (
+            "innodb_indexes",
+            "INDEX_ID,NAME,TABLE_ID,TYPE,N_FIELDS,PAGE_NO,SPACE,MERGE_THRESHOLD",
+        ),
+        (
+            "innodb_locks",
+            "LOCK_ID,LOCK_TRX_ID,LOCK_MODE,LOCK_TYPE,LOCK_TABLE,LOCK_INDEX,LOCK_SPACE,LOCK_PAGE,LOCK_REC,LOCK_DATA",
+        ),
+        (
+            "innodb_lock_waits",
+            "REQUESTING_TRX_ID,REQUESTED_LOCK_ID,BLOCKING_TRX_ID,BLOCKING_LOCK_ID",
+        ),
+        (
+            "innodb_metrics",
+            "NAME,SUBSYSTEM,COUNT,MAX_COUNT,MIN_COUNT,AVG_COUNT,COUNT_RESET,MAX_COUNT_RESET,MIN_COUNT_RESET,AVG_COUNT_RESET,TIME_ENABLED,TIME_DISABLED,TIME_ELAPSED,TIME_RESET,STATUS,TYPE,COMMENT",
+        ),
+        (
+            "innodb_session_temp_tablespaces",
+            "ID,SPACE,PATH,SIZE,STATE,PURPOSE",
+        ),
+        (
+            "innodb_sys_columns",
+            "TABLE_ID,NAME,POS,MTYPE,PRTYPE,LEN",
+        ),
+        ("innodb_sys_datafiles", "SPACE,PATH"),
+        ("innodb_sys_fields", "INDEX_ID,NAME,POS"),
+        ("innodb_sys_foreign", "ID,FOR_NAME,REF_NAME,N_COLS,TYPE"),
+        (
+            "innodb_sys_foreign_cols",
+            "ID,FOR_COL_NAME,REF_COL_NAME,POS",
+        ),
+        (
+            "innodb_sys_indexes",
+            "INDEX_ID,NAME,TABLE_ID,TYPE,N_FIELDS,PAGE_NO,SPACE,MERGE_THRESHOLD",
+        ),
+        (
+            "innodb_sys_tables",
+            "TABLE_ID,NAME,FLAG,N_COLS,SPACE,FILE_FORMAT,ROW_FORMAT,ZIP_PAGE_SIZE,SPACE_TYPE",
+        ),
+        (
+            "innodb_sys_tablespaces",
+            "SPACE,NAME,FLAG,FILE_FORMAT,ROW_FORMAT,PAGE_SIZE,ZIP_PAGE_SIZE,SPACE_TYPE,FS_BLOCK_SIZE,FILE_SIZE,ALLOCATED_SIZE",
+        ),
+        (
+            "innodb_sys_tablestats",
+            "TABLE_ID,NAME,STATS_INITIALIZED,NUM_ROWS,CLUST_INDEX_SIZE,OTHER_INDEX_SIZE,MODIFIED_COUNTER,AUTOINC,REF_COUNT",
+        ),
+        ("innodb_sys_virtual", "TABLE_ID,POS,BASE_POS"),
+        (
+            "innodb_tables",
+            "TABLE_ID,NAME,FLAG,N_COLS,SPACE,ROW_FORMAT,ZIP_PAGE_SIZE,SPACE_TYPE,INSTANT_COLS,TOTAL_ROW_VERSIONS",
+        ),
+        (
+            "innodb_tablespaces",
+            "SPACE,NAME,FLAG,ROW_FORMAT,PAGE_SIZE,ZIP_PAGE_SIZE,SPACE_TYPE,FS_BLOCK_SIZE,FILE_SIZE,ALLOCATED_SIZE,AUTOEXTEND_SIZE,SERVER_VERSION,SPACE_VERSION,ENCRYPTION,STATE",
+        ),
+        (
+            "innodb_tablespaces_brief",
+            "SPACE,NAME,PATH,FLAG,SPACE_TYPE",
+        ),
+        (
+            "innodb_tablestats",
+            "TABLE_ID,NAME,STATS_INITIALIZED,NUM_ROWS,CLUST_INDEX_SIZE,OTHER_INDEX_SIZE,MODIFIED_COUNTER,AUTOINC,REF_COUNT",
+        ),
+        (
+            "innodb_temp_table_info",
+            "TABLE_ID,NAME,N_COLS,SPACE,PER_TABLE_TABLESPACE,IS_COMPRESSED",
+        ),
+        (
+            "innodb_trx",
+            "trx_id,trx_state,trx_started,trx_requested_lock_id,trx_wait_started,trx_weight,trx_mysql_thread_id,trx_query,trx_operation_state,trx_tables_in_use,trx_tables_locked,trx_lock_structs,trx_lock_memory_bytes,trx_rows_locked,trx_rows_modified,trx_concurrency_tickets,trx_isolation_level,trx_unique_checks,trx_foreign_key_checks,trx_last_foreign_key_error,trx_adaptive_hash_latched,trx_adaptive_hash_timeout,trx_is_read_only,trx_autocommit_non_locking,trx_schedule_weight",
+        ),
+        ("innodb_virtual", "TABLE_ID,POS,BASE_POS"),
+        (
+            "json_duality_views",
+            "TABLE_CATALOG,TABLE_SCHEMA,TABLE_NAME,DEFINER,SECURITY_TYPE,JSON_COLUMN_NAME,ROOT_TABLE_CATALOG,ROOT_TABLE_SCHEMA,ROOT_TABLE_NAME,ALLOW_INSERT,ALLOW_UPDATE,ALLOW_DELETE,READ_ONLY,STATUS",
+        ),
+        (
+            "json_duality_view_columns",
+            "TABLE_CATALOG,TABLE_SCHEMA,TABLE_NAME,REFERENCED_TABLE_CATALOG,REFERENCED_TABLE_SCHEMA,REFERENCED_TABLE_NAME,IS_ROOT_TABLE,REFERENCED_TABLE_ID,REFERENCED_COLUMN_NAME,JSON_KEY_NAME,ALLOW_INSERT,ALLOW_UPDATE,ALLOW_DELETE,READ_ONLY",
+        ),
+        (
+            "json_duality_view_links",
+            "TABLE_CATALOG,TABLE_SCHEMA,TABLE_NAME,PARENT_TABLE_CATALOG,PARENT_TABLE_SCHEMA,PARENT_TABLE_NAME,CHILD_TABLE_CATALOG,CHILD_TABLE_SCHEMA,CHILD_TABLE_NAME,PARENT_COLUMN_NAME,CHILD_COLUMN_NAME,JOIN_TYPE,JSON_KEY_NAME",
+        ),
+        (
+            "json_duality_view_tables",
+            "TABLE_CATALOG,TABLE_SCHEMA,TABLE_NAME,REFERENCED_TABLE_CATALOG,REFERENCED_TABLE_SCHEMA,REFERENCED_TABLE_NAME,WHERE_CLAUSE,ALLOW_INSERT,ALLOW_UPDATE,ALLOW_DELETE,READ_ONLY,IS_ROOT_TABLE,REFERENCED_TABLE_ID,REFERENCED_TABLE_PARENT_ID,REFERENCED_TABLE_PARENT_RELATIONSHIP",
+        ),
+        ("keywords", "WORD,RESERVED"),
+        (
+            "libraries",
+            "LIBRARY_CATALOG,LIBRARY_SCHEMA,LIBRARY_NAME,LIBRARY_DEFINITION,LANGUAGE,CREATED,LAST_ALTERED,SQL_MODE,LIBRARY_COMMENT,CREATOR",
+        ),
+        (
+            "optimizer_trace",
+            "QUERY,TRACE,MISSING_BYTES_BEYOND_MAX_MEM_SIZE,INSUFFICIENT_PRIVILEGES",
+        ),
+        (
+            "plugins",
+            "PLUGIN_NAME,PLUGIN_VERSION,PLUGIN_STATUS,PLUGIN_TYPE,PLUGIN_TYPE_VERSION,PLUGIN_LIBRARY,PLUGIN_LIBRARY_VERSION,PLUGIN_AUTHOR,PLUGIN_DESCRIPTION,PLUGIN_LICENSE,LOAD_OPTION",
+        ),
+        (
+            "processlist",
+            "ID,USER,HOST,DB,COMMAND,TIME,STATE,INFO",
+        ),
+        (
+            "profiling",
+            "QUERY_ID,SEQ,STATE,DURATION,CPU_USER,CPU_SYSTEM,CONTEXT_VOLUNTARY,CONTEXT_INVOLUNTARY,BLOCK_OPS_IN,BLOCK_OPS_OUT,MESSAGES_SENT,MESSAGES_RECEIVED,PAGE_FAULTS_MAJOR,PAGE_FAULTS_MINOR,SWAPS,SOURCE_FUNCTION,SOURCE_FILE,SOURCE_LINE",
+        ),
+        (
+            "resource_groups",
+            "RESOURCE_GROUP_NAME,RESOURCE_GROUP_TYPE,RESOURCE_GROUP_ENABLED,VCPU_IDS,THREAD_PRIORITY",
+        ),
+        (
+            "routine_libraries",
+            "ROUTINE_CATALOG,ROUTINE_SCHEMA,ROUTINE_NAME,ROUTINE_TYPE,LIBRARY_CATALOG,LIBRARY_SCHEMA,LIBRARY_NAME,LIBRARY_VERSION",
+        ),
+        (
+            "schemata_extensions",
+            "CATALOG_NAME,SCHEMA_NAME,OPTIONS",
+        ),
+        ("session_status", "VARIABLE_NAME,VARIABLE_VALUE"),
+        ("session_variables", "VARIABLE_NAME,VARIABLE_VALUE"),
+        (
+            "st_geometry_columns",
+            "TABLE_CATALOG,TABLE_SCHEMA,TABLE_NAME,COLUMN_NAME,SRS_NAME,SRS_ID,GEOMETRY_TYPE_NAME",
+        ),
+        (
+            "st_spatial_reference_systems",
+            "SRS_NAME,SRS_ID,ORGANIZATION,ORGANIZATION_COORDSYS_ID,DEFINITION,DESCRIPTION",
+        ),
+        (
+            "st_units_of_measure",
+            "UNIT_NAME,UNIT_TYPE,CONVERSION_FACTOR,DESCRIPTION",
+        ),
+        (
+            "tablespaces",
+            "TABLESPACE_NAME,ENGINE,TABLESPACE_TYPE,LOGFILE_GROUP_NAME,EXTENT_SIZE,AUTOEXTEND_SIZE,MAXIMUM_SIZE,NODEGROUP_ID,TABLESPACE_COMMENT",
+        ),
+        ("tablespaces_extensions", "TABLESPACE_NAME,ENGINE_ATTRIBUTE"),
+        (
+            "tables_extensions",
+            "TABLE_CATALOG,TABLE_SCHEMA,TABLE_NAME,ENGINE_ATTRIBUTE,SECONDARY_ENGINE_ATTRIBUTE",
+        ),
+        (
+            "table_constraints_extensions",
+            "CONSTRAINT_CATALOG,CONSTRAINT_SCHEMA,CONSTRAINT_NAME,TABLE_NAME,ENGINE_ATTRIBUTE,SECONDARY_ENGINE_ATTRIBUTE",
+        ),
+        ("user_attributes", "USER,HOST,ATTRIBUTE"),
+        (
+            "view_routine_usage",
+            "TABLE_CATALOG,TABLE_SCHEMA,TABLE_NAME,SPECIFIC_CATALOG,SPECIFIC_SCHEMA,SPECIFIC_NAME",
+        ),
+        (
+            "view_table_usage",
+            "VIEW_CATALOG,VIEW_SCHEMA,VIEW_NAME,TABLE_CATALOG,TABLE_SCHEMA,TABLE_NAME",
+        ),
+    ];
+
+    for &(name, columns) in MYSQL_84_COMPAT_VIEWS {
+        virtual_tables
+            .entry(name.to_string())
+            .or_insert_with(|| VirtualTable {
+                columns: if name == "innodb_trx" {
+                    columns.split(',').map(str::to_string).collect()
+                } else {
+                    columns.split(',').map(str::to_ascii_uppercase).collect()
+                },
+                rows: Vec::new(),
+            });
+    }
+}
+
+fn append_information_schema_virtual_metadata(
+    tables_rows: &mut Vec<Vec<Option<Vec<u8>>>>,
+    columns_rows: &mut Vec<Vec<Option<Vec<u8>>>>,
+    schema_name: &str,
+    virtual_tables: &HashMap<String, VirtualTable>,
+) {
+    let mut names = virtual_tables.keys().collect::<Vec<_>>();
+    names.sort_by_key(|name| name.to_ascii_lowercase());
+    for name in names {
+        let Some(table) = virtual_tables.get(name) else {
+            continue;
+        };
+        let exposed_name = if schema_name.eq_ignore_ascii_case("information_schema") {
+            name.to_ascii_uppercase()
+        } else {
+            name.to_string()
+        };
+        tables_rows.push(vec![
+            bytes("def"),
+            bytes(schema_name),
+            bytes(&exposed_name),
+            bytes("SYSTEM VIEW"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            bytes("utf8mb4_0900_ai_ci"),
+            None,
+            Some(Vec::new()),
+            Some(Vec::new()),
+        ]);
+        for (ordinal, column) in table.columns.iter().enumerate() {
+            columns_rows.push(vec![
+                bytes("def"),
+                bytes(schema_name),
+                bytes(&exposed_name),
+                bytes(column),
+                bytes(&(ordinal + 1).to_string()),
+                None,
+                bytes("YES"),
+                bytes("blob"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                bytes("blob"),
+                bytes(""),
+                bytes(""),
+                bytes("select,insert,update,references"),
+                Some(Vec::new()),
+                Some(Vec::new()),
+                None,
+            ]);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -17341,7 +24012,11 @@ struct AuthPrincipalMetadata {
     principal: String,
     global_privileges: HashSet<String>,
     database_privileges: HashMap<String, HashSet<String>>,
+    table_privileges: AuthTablePrivileges,
     roles: HashSet<String>,
+    column_privileges: AuthColumnPrivileges,
+    routine_privileges: AuthRoutinePrivileges,
+    plugin: String,
     is_role: bool,
 }
 
@@ -17436,7 +24111,11 @@ fn auth_catalog_metadata_principals(
             principal: principal.clone(),
             global_privileges: user.global_privileges.clone(),
             database_privileges: user.database_privileges.clone(),
+            table_privileges: user.table_privileges.clone(),
             roles: user.roles.clone(),
+            column_privileges: user.column_privileges.clone(),
+            routine_privileges: user.routine_privileges.clone(),
+            plugin: user.plugin.clone(),
             is_role: false,
         })
         .collect::<Vec<_>>();
@@ -17448,7 +24127,11 @@ fn auth_catalog_metadata_principals(
                     principal: principal.clone(),
                     global_privileges: role.global_privileges.clone(),
                     database_privileges: role.database_privileges.clone(),
+                    table_privileges: role.table_privileges.clone(),
                     roles: role.roles.clone(),
+                    column_privileges: role.column_privileges.clone(),
+                    routine_privileges: role.routine_privileges.clone(),
+                    plugin: default_authentication_plugin(),
                     is_role: true,
                 }),
         );
@@ -17506,13 +24189,78 @@ fn auth_grantable(privileges: &HashSet<String>) -> &'static str {
     }
 }
 
+fn partition_information_rows(
+    database: &str,
+    table: &str,
+    schema: &TableSchema,
+    info: &TablePartitionInfo,
+    rows: &[Row],
+) -> anyhow::Result<Vec<Vec<Option<Vec<u8>>>>> {
+    let mut partition_rows = vec![Vec::<Row>::new(); info.partitions.len()];
+    for row in rows {
+        let Some(index) = partition_for_row(row, schema)? else {
+            continue;
+        };
+        partition_rows[index].push(row.clone());
+    }
+    Ok(info
+        .partitions
+        .iter()
+        .enumerate()
+        .map(|(index, partition)| {
+            let rows = &partition_rows[index];
+            let row_count = rows.len() as u64;
+            let data_length = rows
+                .iter()
+                .flat_map(|row| row.values.iter())
+                .map(|(column, value)| column.len() as u64 + value.len() as u64)
+                .sum::<u64>();
+            let average_length = data_length.checked_div(row_count).unwrap_or(0);
+            vec![
+                bytes("def"),
+                bytes(database),
+                bytes(table),
+                bytes(&partition.name),
+                None,
+                bytes(&(index + 1).to_string()),
+                None,
+                bytes(&info.method),
+                None,
+                bytes(&info.expression),
+                None,
+                bytes(&partition.description),
+                Some(row_count.to_string().into_bytes()),
+                Some(average_length.to_string().into_bytes()),
+                Some(data_length.to_string().into_bytes()),
+                None,
+                Some(b"0".to_vec()),
+                Some(b"0".to_vec()),
+                None,
+                None,
+                None,
+                None,
+                Some(Vec::new()),
+                Some(b"DEFAULT".to_vec()),
+                Some(b"DEFAULT".to_vec()),
+            ]
+        })
+        .collect())
+}
+
 #[allow(clippy::type_complexity)]
 fn information_schema_privilege_rows(
     auth_catalog: &AuthCatalog,
     viewer: &str,
-) -> (Vec<Vec<Option<Vec<u8>>>>, Vec<Vec<Option<Vec<u8>>>>) {
+) -> (
+    Vec<Vec<Option<Vec<u8>>>>,
+    Vec<Vec<Option<Vec<u8>>>>,
+    Vec<Vec<Option<Vec<u8>>>>,
+    Vec<Vec<Option<Vec<u8>>>>,
+) {
     let mut user_rows = Vec::new();
     let mut schema_rows = Vec::new();
+    let mut table_rows = Vec::new();
+    let mut column_rows = Vec::new();
     for principal in auth_catalog_metadata_principals(auth_catalog, viewer) {
         let grantee = mysql_grantee(&principal.principal);
         let grantable = auth_grantable(&principal.global_privileges);
@@ -17541,19 +24289,281 @@ fn information_schema_privilege_rows(
                 ]);
             }
         }
+        for (schema, tables) in principal.column_privileges {
+            for (table, columns) in tables {
+                for (column, privileges) in columns {
+                    let grantable = auth_grantable(&privileges);
+                    for privilege in auth_privilege_set(&privileges) {
+                        column_rows.push(vec![
+                            bytes(&grantee),
+                            bytes("def"),
+                            bytes(&schema),
+                            bytes(&table),
+                            bytes(&column),
+                            bytes(&privilege),
+                            bytes(grantable),
+                        ]);
+                    }
+                }
+            }
+        }
+        // Table-level grants are kept separate from column grants, matching
+        // information_schema.TABLE_PRIVILEGES semantics.
+        for (schema, tables) in &principal.table_privileges {
+            for (table, privileges) in tables {
+                let grantable = auth_grantable(privileges);
+                for privilege in auth_privilege_set(privileges) {
+                    table_rows.push(vec![
+                        bytes(&grantee),
+                        bytes("def"),
+                        bytes(schema),
+                        bytes(table),
+                        bytes(&privilege),
+                        bytes(grantable),
+                    ]);
+                }
+            }
+        }
     }
-    (user_rows, schema_rows)
+    (user_rows, schema_rows, table_rows, column_rows)
+}
+
+fn information_schema_enabled_roles_rows(
+    auth_catalog: &AuthCatalog,
+    viewer: &str,
+    active_roles: &HashSet<String>,
+) -> Vec<Vec<Option<Vec<u8>>>> {
+    let default_roles = auth_catalog.default_roles(viewer);
+    let mut roles = auth_catalog
+        .expand_roles(active_roles)
+        .into_iter()
+        .collect::<Vec<_>>();
+    roles.sort();
+    roles
+        .into_iter()
+        .map(|role| {
+            let (role_name, role_host) = mysql_account_parts(&role);
+            vec![
+                bytes(&role_name),
+                bytes(&role_host),
+                bytes(if default_roles.contains(&role) {
+                    "YES"
+                } else {
+                    "NO"
+                }),
+                bytes("NO"),
+            ]
+        })
+        .collect()
+}
+
+#[allow(clippy::type_complexity)]
+fn information_schema_role_grant_rows(
+    auth_catalog: &AuthCatalog,
+    viewer: &str,
+    active_roles: &HashSet<String>,
+) -> (
+    Vec<Vec<Option<Vec<u8>>>>,
+    Vec<Vec<Option<Vec<u8>>>>,
+    Vec<Vec<Option<Vec<u8>>>>,
+) {
+    let data = auth_catalog.data.read();
+    let mut roles = expand_role_names(&data, active_roles)
+        .into_iter()
+        .collect::<Vec<_>>();
+    roles.sort();
+    let mut table_rows = Vec::new();
+    let mut column_rows = Vec::new();
+    let mut routine_rows = Vec::new();
+    let _ = viewer;
+    for role_name in roles {
+        let Some(role) = data.roles.get(&role_name) else {
+            continue;
+        };
+        let (grantee, grantee_host) = mysql_account_parts(&role_name);
+        for (database, tables) in &role.table_privileges {
+            for (table, privileges) in tables {
+                for privilege in auth_privilege_set(privileges) {
+                    table_rows.push(vec![
+                        bytes("root"),
+                        bytes("localhost"),
+                        bytes(&grantee),
+                        bytes(&grantee_host),
+                        bytes("def"),
+                        bytes(database),
+                        bytes(table),
+                        bytes(&privilege),
+                        bytes(auth_grantable(privileges)),
+                    ]);
+                }
+            }
+        }
+        for (database, tables) in &role.column_privileges {
+            for (table, columns) in tables {
+                for (column, privileges) in columns {
+                    for privilege in auth_privilege_set(privileges) {
+                        column_rows.push(vec![
+                            bytes("root"),
+                            bytes("localhost"),
+                            bytes(&grantee),
+                            bytes(&grantee_host),
+                            bytes("def"),
+                            bytes(database),
+                            bytes(table),
+                            bytes(column),
+                            bytes(&privilege),
+                            bytes(auth_grantable(privileges)),
+                        ]);
+                    }
+                }
+            }
+        }
+        for kind in [RoutineKind::Function, RoutineKind::Procedure] {
+            for (database, routines) in kind.grants(&role.routine_privileges) {
+                for (routine, privileges) in routines {
+                    for privilege in auth_privilege_set(privileges) {
+                        routine_rows.push(vec![
+                            bytes("root"),
+                            bytes("localhost"),
+                            bytes(&grantee),
+                            bytes(&grantee_host),
+                            bytes("def"),
+                            bytes(database),
+                            bytes(routine),
+                            bytes("def"),
+                            bytes(database),
+                            bytes(routine),
+                            bytes(&privilege),
+                            bytes(auth_grantable(privileges)),
+                        ]);
+                    }
+                }
+            }
+        }
+    }
+    table_rows.sort();
+    column_rows.sort();
+    routine_rows.sort();
+    (table_rows, column_rows, routine_rows)
+}
+
+fn mysql_default_roles_rows(auth_catalog: &AuthCatalog, viewer: &str) -> Vec<Vec<Option<Vec<u8>>>> {
+    let viewer = normalize_auth_name(viewer);
+    let can_inspect_all = auth_catalog.has_privilege(&viewer, "", "CREATE USER")
+        || auth_catalog.has_privilege(&viewer, "", "GRANT OPTION");
+    let data = auth_catalog.data.read();
+    let mut rows = Vec::new();
+    for (principal, account) in &data.users {
+        if !can_inspect_all && principal != &viewer {
+            continue;
+        }
+        let selected = if account.default_roles.all {
+            account.roles.iter().cloned().collect::<Vec<_>>()
+        } else {
+            account.default_roles.roles.iter().cloned().collect()
+        };
+        let (user, host) = mysql_account_parts(principal);
+        for role in selected {
+            if !data.roles.contains_key(&role) || !account.roles.contains(&role) {
+                continue;
+            }
+            let (role_user, role_host) = mysql_account_parts(&role);
+            rows.push(vec![
+                bytes(&host),
+                bytes(&user),
+                bytes(&role_host),
+                bytes(&role_user),
+            ]);
+        }
+    }
+    rows.sort();
+    rows
+}
+
+fn information_schema_applicable_roles_rows(
+    auth_catalog: &AuthCatalog,
+    viewer: &str,
+) -> Vec<Vec<Option<Vec<u8>>>> {
+    let viewer = normalize_auth_name(viewer);
+    let data = auth_catalog.data.read();
+    let Some(principal) = resolve_auth_user_key(&data.users, &viewer)
+        .or_else(|| data.roles.contains_key(&viewer).then_some(viewer.clone()))
+    else {
+        return Vec::new();
+    };
+    let (user, host) = mysql_account_parts(&principal);
+    let grantable = data
+        .users
+        .get(&principal)
+        .map(|account| auth_grantable(&account.global_privileges) == "YES")
+        .unwrap_or(false);
+    let default_roles = data
+        .users
+        .get(&principal)
+        .map(|account| {
+            if account.default_roles.all {
+                account.roles.clone()
+            } else {
+                account.default_roles.roles.clone()
+            }
+        })
+        .unwrap_or_default();
+    let mut pending = data
+        .users
+        .get(&principal)
+        .map(|account| account.roles.iter().cloned().collect::<Vec<_>>())
+        .or_else(|| {
+            data.roles
+                .get(&principal)
+                .map(|role| role.roles.iter().cloned().collect::<Vec<_>>())
+        })
+        .unwrap_or_default();
+    let mut visited = HashSet::new();
+    let mut rows = Vec::new();
+    while let Some(role_name) = pending.pop() {
+        let role_name = normalize_auth_name(&role_name);
+        if !visited.insert(role_name.clone()) {
+            continue;
+        }
+        let Some(role) = data.roles.get(&role_name) else {
+            continue;
+        };
+        let (role_user, role_host) = mysql_account_parts(&role_name);
+        rows.push(vec![
+            bytes(&user),
+            bytes(&host),
+            bytes(&user),
+            bytes(&host),
+            bytes(&role_user),
+            bytes(&role_host),
+            bytes(if grantable { "YES" } else { "NO" }),
+            bytes(if default_roles.contains(&role_name) {
+                "YES"
+            } else {
+                "NO"
+            }),
+            bytes("NO"),
+        ]);
+        pending.extend(role.roles.iter().cloned());
+    }
+    rows.sort();
+    rows
 }
 
 fn mysql_virtual_tables(auth_catalog: &AuthCatalog, viewer: &str) -> HashMap<String, VirtualTable> {
     let principals = auth_catalog_metadata_principals(auth_catalog, viewer);
     let mut user_rows = Vec::new();
     let mut db_rows = Vec::new();
+    let mut tables_priv_rows = Vec::new();
+    let mut columns_priv_rows = Vec::new();
+    let mut procs_priv_rows = Vec::new();
     // MySQL stores static privileges in mysql.user/mysql.db. This engine does
     // not implement dynamic global privileges, so mysql.global_grants is
     // intentionally empty rather than duplicating static grants.
     let global_grants_rows: Vec<Vec<Option<Vec<u8>>>> = Vec::new();
     let mut role_edges_rows = Vec::new();
+    let mut roles_mapping_rows = Vec::new();
+    let default_roles_rows = mysql_default_roles_rows(auth_catalog, viewer);
     for principal in &principals {
         let (user, host) = mysql_account_parts(&principal.principal);
         let mut row = vec![bytes(&host), bytes(&user)];
@@ -17575,7 +24585,7 @@ fn mysql_virtual_tables(auth_catalog: &AuthCatalog, viewer: &str) -> HashMap<Str
             bytes("0"),
             bytes("0"),
             bytes("0"),
-            bytes("mysql_native_password"),
+            bytes(&principal.plugin),
             None,
             bytes("N"),
             None,
@@ -17624,11 +24634,64 @@ fn mysql_virtual_tables(auth_catalog: &AuthCatalog, viewer: &str) -> HashMap<Str
                 bytes(&user),
                 bytes("N"),
             ]);
+            roles_mapping_rows.push(vec![
+                bytes(&host),
+                bytes(&user),
+                bytes(&from_user),
+                bytes("N"),
+            ]);
+        }
+        for (database, tables) in &principal.table_privileges {
+            for (table, privileges) in tables {
+                tables_priv_rows.push(vec![
+                    bytes(&host),
+                    bytes(database),
+                    bytes(&user),
+                    bytes(table),
+                    bytes("'root'@'localhost'"),
+                    None,
+                    bytes(&render_privileges(privileges)),
+                    bytes(""),
+                ]);
+            }
+        }
+        for (database, tables) in &principal.column_privileges {
+            for (table, columns) in tables {
+                for (column, privileges) in columns {
+                    columns_priv_rows.push(vec![
+                        bytes(&host),
+                        bytes(database),
+                        bytes(&user),
+                        bytes(table),
+                        bytes(column),
+                        None,
+                        bytes(&render_privileges(privileges)),
+                    ]);
+                }
+            }
+        }
+        for kind in [RoutineKind::Procedure, RoutineKind::Function] {
+            for (database, routines) in kind.grants(&principal.routine_privileges) {
+                for (routine, privileges) in routines {
+                    procs_priv_rows.push(vec![
+                        bytes(&host),
+                        bytes(database),
+                        bytes(&user),
+                        bytes(routine),
+                        bytes(kind.sql_name()),
+                        bytes("'root'@'localhost'"),
+                        bytes(&render_privileges(privileges)),
+                        None,
+                    ]);
+                }
+            }
         }
     }
     user_rows.sort_by(|left, right| left[1].cmp(&right[1]).then_with(|| left[0].cmp(&right[0])));
     db_rows.sort_by(|left, right| left[1].cmp(&right[1]).then_with(|| left[2].cmp(&right[2])));
     role_edges_rows.sort();
+    roles_mapping_rows.sort();
+    procs_priv_rows.sort();
 
     let mut user_columns = vec!["Host", "User"];
     user_columns.extend(
@@ -17702,51 +24765,80 @@ fn mysql_virtual_tables(auth_catalog: &AuthCatalog, viewer: &str) -> HashMap<Str
             },
         ),
         (
+            "roles_mapping".into(),
+            VirtualTable {
+                columns: ["Host", "User", "Role", "Admin_option"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+                rows: roles_mapping_rows,
+            },
+        ),
+        (
             "default_roles".into(),
-            empty_information_schema_table(&[
-                "HOST",
-                "USER",
-                "DEFAULT_ROLE_HOST",
-                "DEFAULT_ROLE_USER",
-            ]),
+            VirtualTable {
+                columns: ["HOST", "USER", "DEFAULT_ROLE_HOST", "DEFAULT_ROLE_USER"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+                rows: default_roles_rows,
+            },
         ),
         (
             "tables_priv".into(),
-            empty_information_schema_table(&[
-                "Host",
-                "Db",
-                "User",
-                "Table_name",
-                "Grantor",
-                "Timestamp",
-                "Table_priv",
-                "Column_priv",
-            ]),
+            VirtualTable {
+                columns: [
+                    "Host",
+                    "Db",
+                    "User",
+                    "Table_name",
+                    "Grantor",
+                    "Timestamp",
+                    "Table_priv",
+                    "Column_priv",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+                rows: tables_priv_rows,
+            },
         ),
         (
             "columns_priv".into(),
-            empty_information_schema_table(&[
-                "Host",
-                "Db",
-                "User",
-                "Table_name",
-                "Column_name",
-                "Timestamp",
-                "Column_priv",
-            ]),
+            VirtualTable {
+                columns: [
+                    "Host",
+                    "Db",
+                    "User",
+                    "Table_name",
+                    "Column_name",
+                    "Timestamp",
+                    "Column_priv",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+                rows: columns_priv_rows,
+            },
         ),
         (
             "procs_priv".into(),
-            empty_information_schema_table(&[
-                "Host",
-                "Db",
-                "User",
-                "Routine_name",
-                "Routine_type",
-                "Grantor",
-                "Proc_priv",
-                "Timestamp",
-            ]),
+            VirtualTable {
+                columns: [
+                    "Host",
+                    "Db",
+                    "User",
+                    "Routine_name",
+                    "Routine_type",
+                    "Grantor",
+                    "Proc_priv",
+                    "Timestamp",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+                rows: procs_priv_rows,
+            },
         ),
         (
             "func".into(),
@@ -17755,29 +24847,90 @@ fn mysql_virtual_tables(auth_catalog: &AuthCatalog, viewer: &str) -> HashMap<Str
     ])
 }
 
-fn performance_schema_virtual_tables() -> HashMap<String, VirtualTable> {
+fn performance_schema_virtual_tables(
+    stats: &WireStats,
+    viewer: &str,
+    can_view_all: bool,
+) -> HashMap<String, VirtualTable> {
     let mut map: HashMap<String, VirtualTable> = HashMap::new();
+    let snapshot = stats.snapshot();
+    let status_rows = vec![
+        vec![
+            bytes("Threads_connected"),
+            bytes(&snapshot.active_connections.to_string()),
+        ],
+        vec![
+            bytes("Connections"),
+            bytes(&snapshot.total_connections.to_string()),
+        ],
+        vec![bytes("Questions"), bytes(&snapshot.queries.to_string())],
+        vec![bytes("Queries"), bytes(&snapshot.queries.to_string())],
+        vec![
+            bytes("Slow_queries"),
+            bytes(&stats.slow_queries().len().to_string()),
+        ],
+        vec![
+            bytes("Innodb_row_lock_current_waits"),
+            bytes(&snapshot.lock_waits.to_string()),
+        ],
+        vec![
+            bytes("Innodb_row_lock_timeouts"),
+            bytes(&snapshot.lock_timeouts.to_string()),
+        ],
+        vec![
+            bytes("Innodb_deadlocks"),
+            bytes(&snapshot.deadlocks.to_string()),
+        ],
+    ];
+    let variable_rows = vec![
+        vec![bytes("version"), bytes(SERVER_VERSION)],
+        vec![
+            bytes("version_comment"),
+            bytes("MyDB Server (Neko233 engine)"),
+        ],
+        vec![bytes("port"), bytes("3306")],
+        vec![bytes("default_storage_engine"), bytes("InnoDB")],
+        vec![bytes("performance_schema"), bytes("1")],
+    ];
     map.insert(
         "GLOBAL_STATUS".into(),
-        empty_information_schema_table(&["VARIABLE_NAME", "VARIABLE_VALUE"]),
+        VirtualTable {
+            columns: vec!["VARIABLE_NAME".into(), "VARIABLE_VALUE".into()],
+            rows: status_rows.clone(),
+        },
     );
     map.insert(
         "SESSION_STATUS".into(),
-        empty_information_schema_table(&["VARIABLE_NAME", "VARIABLE_VALUE"]),
+        VirtualTable {
+            columns: vec!["VARIABLE_NAME".into(), "VARIABLE_VALUE".into()],
+            rows: status_rows,
+        },
     );
     map.insert(
         "GLOBAL_VARIABLES".into(),
-        empty_information_schema_table(&["VARIABLE_NAME", "VARIABLE_VALUE"]),
+        VirtualTable {
+            columns: vec!["VARIABLE_NAME".into(), "VARIABLE_VALUE".into()],
+            rows: variable_rows.clone(),
+        },
     );
     map.insert(
         "SESSION_VARIABLES".into(),
-        empty_information_schema_table(&["VARIABLE_NAME", "VARIABLE_VALUE"]),
+        VirtualTable {
+            columns: vec!["VARIABLE_NAME".into(), "VARIABLE_VALUE".into()],
+            rows: variable_rows,
+        },
     );
     map.insert(
         "PROCESSLIST".into(),
-        empty_information_schema_table(&[
-            "ID", "USER", "HOST", "DB", "COMMAND", "TIME", "STATE", "INFO",
-        ]),
+        VirtualTable {
+            columns: [
+                "ID", "USER", "HOST", "DB", "COMMAND", "TIME", "STATE", "INFO",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+            rows: stats.processlist_rows(viewer, can_view_all, true),
+        },
     );
     map.insert(
         "STATUS_BY_HOST".into(),
@@ -17827,7 +24980,7 @@ fn performance_schema_virtual_tables() -> HashMap<String, VirtualTable> {
     map
 }
 
-fn sys_virtual_tables() -> HashMap<String, VirtualTable> {
+fn sys_virtual_tables(stats: &WireStats) -> HashMap<String, VirtualTable> {
     let mut map: HashMap<String, VirtualTable> = HashMap::new();
     let processlist_cols = [
         "thd_id",
@@ -17848,11 +25001,23 @@ fn sys_virtual_tables() -> HashMap<String, VirtualTable> {
     ];
     map.insert(
         "processlist".into(),
-        empty_information_schema_table(&processlist_cols),
+        VirtualTable {
+            columns: processlist_cols
+                .iter()
+                .map(|column| (*column).to_string())
+                .collect(),
+            rows: stats.processlist_rows_for_sys(),
+        },
     );
     map.insert(
         "x$processlist".into(),
-        empty_information_schema_table(&processlist_cols),
+        VirtualTable {
+            columns: processlist_cols
+                .iter()
+                .map(|column| (*column).to_string())
+                .collect(),
+            rows: stats.processlist_rows_for_sys(),
+        },
     );
     let metrics_cols = ["Variable_name", "Variable_value", "Type", "Enabled"];
     map.insert(
@@ -17981,6 +25146,157 @@ fn bytes(value: &str) -> Option<Vec<u8>> {
     Some(value.as_bytes().to_vec())
 }
 
+fn column_collation_name(schema: &TableSchema, column: &str) -> Option<String> {
+    let column = schema
+        .columns
+        .iter()
+        .find(|item| item.name.eq_ignore_ascii_case(column))?;
+    if matches!(column.data_type, DataType::Blob)
+        || matches!(&column.data_type, DataType::Raw(value) if {
+            let value = value.to_ascii_uppercase();
+            value.contains("BINARY") || value.contains("BLOB")
+        })
+    {
+        return Some("binary".into());
+    }
+    if !matches!(column.data_type, DataType::Varchar(_) | DataType::Text)
+        && !matches!(&column.data_type, DataType::Raw(value) if {
+            let value = value.trim().to_ascii_uppercase();
+            value.starts_with("CHAR(")
+                || value.starts_with("VARCHAR(")
+                || value.starts_with("ENUM(")
+                || value.starts_with("SET(")
+                || value.starts_with("TINYTEXT")
+                || value.starts_with("TEXT")
+                || value.starts_with("MEDIUMTEXT")
+                || value.starts_with("LONGTEXT")
+        })
+    {
+        return None;
+    }
+    table_column_definition(schema, &column.name)
+        .and_then(|definition| parse_sql_collation(&definition))
+        .or_else(|| table_collation_option(schema))
+        .or_else(|| Some("utf8mb4_0900_ai_ci".into()))
+}
+
+fn table_collation_name(schema: &TableSchema) -> String {
+    table_collation_option(schema).unwrap_or_else(|| "utf8mb4_0900_ai_ci".into())
+}
+
+fn table_column_definition(schema: &TableSchema, column: &str) -> Option<String> {
+    let sql = schema.create_sql.as_deref()?;
+    let open = sql.find('(')?;
+    let close = sql.rfind(')')?;
+    split_sql_definitions(&sql[open + 1..close])
+        .into_iter()
+        .find(|definition| {
+            definition
+                .split_whitespace()
+                .next()
+                .map(|name| name.trim_matches('`').eq_ignore_ascii_case(column))
+                .unwrap_or(false)
+        })
+}
+
+fn sql_quoted_option_value(value: &str) -> Option<String> {
+    let value = value.trim_start();
+    let quote = *value
+        .as_bytes()
+        .first()
+        .filter(|byte| matches!(byte, b'\'' | b'"'))?;
+    let bytes = value.as_bytes();
+    let mut index = 1;
+    let mut output = Vec::new();
+    while index < bytes.len() {
+        if bytes[index] == b'\\' && index + 1 < bytes.len() {
+            output.push(bytes[index + 1]);
+            index += 2;
+        } else if bytes[index] == quote {
+            if bytes.get(index + 1) == Some(&quote) {
+                output.push(quote);
+                index += 2;
+            } else {
+                return String::from_utf8(output).ok();
+            }
+        } else {
+            output.push(bytes[index]);
+            index += 1;
+        }
+    }
+    None
+}
+
+fn sql_option_value(sql: &str, keyword: &str) -> Option<String> {
+    let upper = sql.to_ascii_uppercase();
+    let position = upper.rfind(keyword)? + keyword.len();
+    sql_quoted_option_value(sql[position..].trim_start_matches([' ', '=']))
+}
+
+fn table_comment_from_schema(schema: &TableSchema) -> Option<String> {
+    let sql = schema.create_sql.as_deref()?;
+    let options = sql.get(sql.rfind(')')?.saturating_add(1)..)?;
+    sql_option_value(options, "COMMENT")
+}
+
+fn column_comment_from_schema(schema: &TableSchema, column: &str) -> Option<String> {
+    let definition = table_column_definition(schema, column)?;
+    sql_option_value(&definition, "COMMENT")
+}
+
+fn split_sql_definitions(value: &str) -> Vec<String> {
+    let mut output = Vec::new();
+    let mut depth = 0i32;
+    let mut quote = None;
+    let mut escaped = false;
+    let mut start = 0;
+    for (index, character) in value.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if let Some(active) = quote {
+            if character == '\\' {
+                escaped = true;
+            } else if character == active {
+                quote = None;
+            }
+            continue;
+        }
+        match character {
+            '\'' | '"' | '`' => quote = Some(character),
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                output.push(value[start..index].trim().to_string());
+                start = index + character.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    output.push(value[start..].trim().to_string());
+    output
+}
+
+fn parse_sql_collation(definition: &str) -> Option<String> {
+    let upper = definition.to_ascii_uppercase();
+    let (position, length) = [" COLLATE=", " COLLATE "]
+        .into_iter()
+        .filter_map(|needle| upper.find(needle).map(|position| (position, needle.len())))
+        .min_by_key(|(position, _)| *position)?;
+    let value = definition[position + length..]
+        .split_whitespace()
+        .next()?
+        .trim_matches(['`', '\'', '"', ';']);
+    (!value.is_empty()).then(|| value.to_ascii_lowercase())
+}
+
+fn table_collation_option(schema: &TableSchema) -> Option<String> {
+    let sql = schema.create_sql.as_deref()?;
+    let options = sql.get(sql.rfind(')')?.saturating_add(1)..)?;
+    parse_sql_collation(options)
+}
+
 fn empty_information_schema_table(columns: &[&str]) -> VirtualTable {
     VirtualTable {
         columns: columns.iter().map(|column| (*column).to_string()).collect(),
@@ -17999,12 +25315,156 @@ fn information_schema_schemata_row(name: &str) -> Vec<Option<Vec<u8>>> {
     ]
 }
 
+fn routine_parameter_type_name(data_type: &str) -> String {
+    data_type
+        .trim()
+        .split(['(', ' ', '\t', '\r', '\n'])
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+}
+
+fn routine_parameter_metadata(data_type: &str) -> Vec<Option<Vec<u8>>> {
+    let type_name = routine_parameter_type_name(data_type);
+    let parsed = parse_data_type(data_type);
+    let is_character = matches!(
+        type_name.as_str(),
+        "char" | "varchar" | "text" | "tinytext" | "mediumtext" | "longtext" | "enum" | "set"
+    );
+    let character_length = if is_character {
+        match type_name.as_str() {
+            "text" => Some(65_535),
+            "tinytext" => Some(255),
+            "mediumtext" => Some(16_777_215),
+            "longtext" => Some(4_294_967_295),
+            _ => information_schema_character_length(&parsed),
+        }
+    } else {
+        None
+    };
+    let character_set = if is_character {
+        let explicit = find_top_level_keyword(data_type, " CHARACTER SET ", 0)
+            .and_then(|position| {
+                data_type[position + " CHARACTER SET ".len()..]
+                    .split_whitespace()
+                    .next()
+            })
+            .and_then(|value| normalize_mysql_charset(value.trim_matches('`')).ok());
+        Some(explicit.unwrap_or_else(|| "utf8mb4".into()))
+    } else {
+        None
+    };
+    let collation = if is_character {
+        let explicit =
+            parse_sql_collation(data_type).and_then(|value| normalize_mysql_collation(&value).ok());
+        explicit.or_else(|| {
+            character_set.as_deref().and_then(|charset| {
+                MYSQL_CHARACTER_SETS
+                    .iter()
+                    .find(|info| info.name.eq_ignore_ascii_case(charset))
+                    .map(|info| info.default_collation.to_string())
+            })
+        })
+    } else {
+        None
+    };
+    let character_octet_length = character_length.and_then(|length| {
+        let maxlen = character_set
+            .as_deref()
+            .and_then(|charset| {
+                MYSQL_CHARACTER_SETS
+                    .iter()
+                    .find(|info| info.name == charset)
+            })
+            .map(|info| u64::from(info.maxlen))
+            .unwrap_or(4);
+        length.checked_mul(maxlen)
+    });
+    let (numeric_precision, numeric_scale) = match type_name.as_str() {
+        "tinyint" => (Some(3), Some(0)),
+        "smallint" => (Some(5), Some(0)),
+        "mediumint" => (Some(7), Some(0)),
+        "int" | "integer" => (Some(10), Some(0)),
+        "bigint" => (Some(19), Some(0)),
+        "bool" | "boolean" => (Some(1), Some(0)),
+        _ => information_schema_numeric_metadata(&parsed),
+    };
+    let datetime_precision = information_schema_datetime_precision(&parsed);
+    vec![
+        bytes(&type_name),
+        character_length.map(|value| value.to_string().into_bytes()),
+        character_octet_length.map(|value| value.to_string().into_bytes()),
+        numeric_precision.map(|value| value.to_string().into_bytes()),
+        numeric_scale.map(|value| value.to_string().into_bytes()),
+        datetime_precision.map(|value| value.to_string().into_bytes()),
+        character_set.map(String::into_bytes),
+        collation.map(String::into_bytes),
+        bytes(data_type),
+    ]
+}
+
 fn information_schema_character_length(data_type: &DataType) -> Option<u64> {
     match data_type {
         DataType::Varchar(length) => Some(u64::from(*length)),
         DataType::Text => Some(65_535),
+        DataType::Raw(value) => raw_character_length(value),
         _ => None,
     }
+}
+
+fn raw_type_arguments(value: &str) -> Option<&str> {
+    let open = value.find('(')?;
+    let close = value[open + 1..].rfind(')')? + open + 1;
+    Some(&value[open + 1..close])
+}
+
+fn raw_enum_or_set_members(value: &str) -> Option<Vec<Vec<u8>>> {
+    let upper = value.trim().to_ascii_uppercase();
+    if !upper.starts_with("ENUM(") && !upper.starts_with("SET(") {
+        return None;
+    }
+    Some(
+        split_csv(raw_type_arguments(value)?)
+            .into_iter()
+            .map(|member| unescape_mysql_literal(member.trim()))
+            .collect(),
+    )
+}
+
+fn raw_character_length(value: &str) -> Option<u64> {
+    let upper = value.trim().to_ascii_uppercase();
+    if upper.starts_with("ENUM(") {
+        return raw_enum_or_set_members(value)?
+            .into_iter()
+            .map(|member| String::from_utf8_lossy(&member).chars().count() as u64)
+            .max();
+    }
+    if upper.starts_with("SET(") {
+        return raw_enum_or_set_members(value)?
+            .into_iter()
+            .try_fold(0_u64, |length, member| {
+                length
+                    .checked_add(String::from_utf8_lossy(&member).chars().count() as u64)
+                    .and_then(|length| length.checked_add(1))
+            })
+            .map(|length| length.saturating_sub(1));
+    }
+    if upper.starts_with("TINYTEXT") {
+        return Some(255);
+    }
+    if upper.starts_with("MEDIUMTEXT") {
+        return Some(16_777_215);
+    }
+    if upper.starts_with("LONGTEXT") {
+        return Some(4_294_967_295);
+    }
+    if upper.starts_with("TEXT") {
+        return Some(65_535);
+    }
+    if upper.starts_with("CHAR(") || upper.starts_with("VARCHAR(") {
+        return raw_type_arguments(value)?.trim().parse().ok();
+    }
+    None
 }
 
 fn information_schema_numeric_metadata(data_type: &DataType) -> (Option<u32>, Option<u32>) {
@@ -18028,6 +25488,13 @@ fn information_schema_numeric_metadata(data_type: &DataType) -> (Option<u32>, Op
                     })
                     .unwrap_or_default();
                 (values.first().copied(), values.get(1).copied().or(Some(0)))
+            } else if upper.starts_with("BIT(") {
+                (
+                    raw_type_arguments(value).and_then(|value| value.trim().parse().ok()),
+                    None,
+                )
+            } else if upper.starts_with("YEAR") {
+                (Some(4), Some(0))
             } else {
                 (None, None)
             }
@@ -18525,14 +25992,19 @@ fn parse_join_predicate(value: &str, sources: &[JoinSource]) -> anyhow::Result<J
         ("=", JoinOperator::Eq),
     ] {
         if let Some(position) = find_top_level_operator(value, operator) {
-            return Ok(JoinPredicate::Comparison(JoinComparison {
-                left: resolve_join_column(&value[..position], sources)?,
-                right: resolve_join_column(&value[position + operator.len()..], sources)?,
-                operator: kind,
-            }));
+            let left = resolve_join_column(&value[..position], sources);
+            let right = resolve_join_column(&value[position + operator.len()..], sources);
+            return match (left, right) {
+                (Ok(left), Ok(right)) => Ok(JoinPredicate::Comparison(JoinComparison {
+                    left,
+                    right,
+                    operator: kind,
+                })),
+                _ => Ok(JoinPredicate::ScalarCondition(value.to_string())),
+            };
         }
     }
-    anyhow::bail!("Unsupported JOIN ON predicate")
+    Ok(JoinPredicate::ScalarCondition(value.to_string()))
 }
 
 fn natural_join_predicate(
@@ -18620,7 +26092,75 @@ fn find_indexable_join_equality(
         }
         JoinPredicate::And(left, right) => find_indexable_join_equality(left, new_source)
             .or_else(|| find_indexable_join_equality(right, new_source)),
-        JoinPredicate::Comparison(_) | JoinPredicate::Or(_, _) | JoinPredicate::Always => None,
+        JoinPredicate::Comparison(_)
+        | JoinPredicate::Or(_, _)
+        | JoinPredicate::ScalarCondition(_)
+        | JoinPredicate::Always => None,
+    }
+}
+
+fn find_indexable_join_equalities(
+    predicate: &JoinPredicate,
+    new_source: usize,
+) -> Vec<((usize, String), (usize, String))> {
+    match predicate {
+        JoinPredicate::Comparison(comparison)
+            if comparison.operator == JoinOperator::Eq
+                && (comparison.left.0 == new_source) != (comparison.right.0 == new_source) =>
+        {
+            if comparison.left.0 == new_source {
+                vec![(comparison.right.clone(), comparison.left.clone())]
+            } else {
+                vec![(comparison.left.clone(), comparison.right.clone())]
+            }
+        }
+        JoinPredicate::And(left, right) => {
+            let mut equalities = find_indexable_join_equalities(left, new_source);
+            equalities.extend(find_indexable_join_equalities(right, new_source));
+            equalities
+        }
+        JoinPredicate::Comparison(_)
+        | JoinPredicate::Or(_, _)
+        | JoinPredicate::ScalarCondition(_)
+        | JoinPredicate::Always => Vec::new(),
+    }
+}
+
+fn row_filter_join_predicate(
+    predicate: &RowPredicate,
+    new_source: usize,
+    sources: &[JoinSource],
+) -> Option<JoinPredicate> {
+    match predicate {
+        RowPredicate::ColumnCompare(left, operator, right) => {
+            let left = resolve_join_column(left, sources).ok()?;
+            let right = resolve_join_column(right, sources).ok()?;
+            if (left.0 == new_source) == (right.0 == new_source) {
+                return None;
+            }
+            let operator = match operator {
+                RowPredicateColumnOperator::Eq => JoinOperator::Eq,
+                RowPredicateColumnOperator::NotEq => JoinOperator::NotEq,
+                RowPredicateColumnOperator::Less => JoinOperator::Less,
+                RowPredicateColumnOperator::LessOrEq => JoinOperator::LessOrEq,
+                RowPredicateColumnOperator::Greater => JoinOperator::Greater,
+                RowPredicateColumnOperator::GreaterOrEq => JoinOperator::GreaterOrEq,
+            };
+            Some(JoinPredicate::Comparison(JoinComparison {
+                left,
+                right,
+                operator,
+            }))
+        }
+        RowPredicate::And(left, right) => match (
+            row_filter_join_predicate(left, new_source, sources),
+            row_filter_join_predicate(right, new_source, sources),
+        ) {
+            (Some(left), Some(right)) => Some(JoinPredicate::And(Box::new(left), Box::new(right))),
+            (Some(predicate), None) | (None, Some(predicate)) => Some(predicate),
+            (None, None) => None,
+        },
+        _ => None,
     }
 }
 
@@ -18630,6 +26170,7 @@ fn join_predicate_matches(
     new_source: usize,
     right_row: &Row,
     source_rows: &[Vec<Row>],
+    sources: &[JoinSource],
 ) -> bool {
     match predicate {
         JoinPredicate::Comparison(comparison) => {
@@ -18653,7 +26194,8 @@ fn join_predicate_matches(
             let (Some(left), Some(right)) = (left, right) else {
                 return false;
             };
-            let ordering = compare_sql_bytes(left, right);
+            let collation = join_comparison_collation(comparison, sources);
+            let ordering = compare_sql_values(left, right, collation.as_deref());
             match comparison.operator {
                 JoinOperator::Eq => ordering.is_eq(),
                 JoinOperator::NullSafeEq => unreachable!(),
@@ -18665,15 +26207,97 @@ fn join_predicate_matches(
             }
         }
         JoinPredicate::And(left, right) => {
-            join_predicate_matches(left, combination, new_source, right_row, source_rows)
-                && join_predicate_matches(right, combination, new_source, right_row, source_rows)
+            join_predicate_matches(
+                left,
+                combination,
+                new_source,
+                right_row,
+                source_rows,
+                sources,
+            ) && join_predicate_matches(
+                right,
+                combination,
+                new_source,
+                right_row,
+                source_rows,
+                sources,
+            )
         }
         JoinPredicate::Or(left, right) => {
-            join_predicate_matches(left, combination, new_source, right_row, source_rows)
-                || join_predicate_matches(right, combination, new_source, right_row, source_rows)
+            join_predicate_matches(
+                left,
+                combination,
+                new_source,
+                right_row,
+                source_rows,
+                sources,
+            ) || join_predicate_matches(
+                right,
+                combination,
+                new_source,
+                right_row,
+                source_rows,
+                sources,
+            )
+        }
+        JoinPredicate::ScalarCondition(expression) => {
+            let row = join_expression_row(combination, new_source, right_row, source_rows, sources);
+            evaluate_scalar_condition(expression, &row).unwrap_or(false)
         }
         JoinPredicate::Always => true,
     }
+}
+
+fn join_comparison_collation(
+    comparison: &JoinComparison,
+    sources: &[JoinSource],
+) -> Option<String> {
+    column_collation_name(&sources[comparison.right.0].schema, &comparison.right.1)
+        .or_else(|| column_collation_name(&sources[comparison.left.0].schema, &comparison.left.1))
+}
+
+fn join_expression_row(
+    combination: &[Option<usize>],
+    new_source: usize,
+    right_row: &Row,
+    source_rows: &[Vec<Row>],
+    sources: &[JoinSource],
+) -> Row {
+    let unqualified = unambiguous_join_columns(sources, &[]);
+    let mut output = Row::new();
+    let mut inserted = HashSet::new();
+    for (source_index, source) in sources.iter().enumerate() {
+        let row = if source_index == new_source {
+            Some(right_row)
+        } else {
+            combination
+                .get(source_index)
+                .copied()
+                .flatten()
+                .and_then(|row_index| source_rows[source_index].get(row_index))
+        };
+        for column in &source.schema.columns {
+            let mut names = vec![
+                format!("{}.{}", source.alias, column.name),
+                format!("{}.{}", source.table, column.name),
+                format!("{}.{}.{}", source.database, source.table, column.name),
+            ];
+            if unqualified.contains(&column.name) {
+                names.push(column.name.clone());
+            }
+            for name in names {
+                if !inserted.insert(name.clone()) {
+                    continue;
+                }
+                if row.is_none_or(|row| row.is_null(&column.name)) {
+                    output.push_null(&name);
+                } else if let Some(value) = row.and_then(|row| row.get(&column.name)) {
+                    output.push(&name, value.to_vec());
+                }
+            }
+        }
+    }
+    output
 }
 
 fn join_endpoint_value<'a>(
@@ -18741,6 +26365,7 @@ fn join_aggregate_schema(sources: &[JoinSource], unqualified: &HashSet<String>) 
     schema.name = "<join>".into();
     schema.columns.clear();
     let mut inserted = HashSet::new();
+    let mut definitions = Vec::new();
     for source in sources {
         for column in &source.schema.columns {
             let mut names = vec![
@@ -18755,11 +26380,27 @@ fn join_aggregate_schema(sources: &[JoinSource], unqualified: &HashSet<String>) 
                 if inserted.insert(name.clone()) {
                     let mut qualified = column.clone();
                     qualified.name = name;
+                    if let Some(collation) = column_collation_name(&source.schema, &column.name) {
+                        if collation.eq_ignore_ascii_case("binary") {
+                            definitions.push(format!("`{}` BLOB", qualified.name));
+                        } else {
+                            definitions.push(format!(
+                                "`{}` VARCHAR(255) COLLATE {}",
+                                qualified.name, collation
+                            ));
+                        }
+                    }
                     schema.columns.push(qualified);
                 }
             }
         }
     }
+    schema.create_sql = (!definitions.is_empty()).then(|| {
+        format!(
+            "CREATE TABLE `<join>` ({}) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+            definitions.join(",")
+        )
+    });
     schema
 }
 
@@ -18894,6 +26535,29 @@ fn expand_join_projection(
         anyhow::bail!("Empty JOIN projection");
     }
     Ok(output)
+}
+
+fn single_source_wildcard_projection(
+    projection: &str,
+    source: &JoinSource,
+) -> anyhow::Result<bool> {
+    let items = split_csv(projection);
+    if items.len() != 1 {
+        return Ok(false);
+    }
+    let expression = projection_without_alias(&items[0]);
+    let Some(qualifier) = expression.strip_suffix(".*") else {
+        return Ok(false);
+    };
+    let qualifier = identifier(qualifier);
+    if qualifier.eq_ignore_ascii_case(&source.alias)
+        || qualifier.eq_ignore_ascii_case(&source.table)
+        || qualifier.eq_ignore_ascii_case(&format!("{}.{}", source.database, source.table))
+    {
+        Ok(true)
+    } else {
+        anyhow::bail!("Unknown table/alias '{}.*'", qualifier)
+    }
 }
 
 fn join_wildcard_projection(sources: &[JoinSource], steps: &[JoinStep]) -> Vec<JoinProjection> {
@@ -19142,9 +26806,9 @@ fn evaluate_window_projection(
                 .collect::<anyhow::Result<Vec<_>>>()
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
-    sort_projected_values(sql, &columns, &projection_items, &mut values);
+    sort_projected_values(sql, &columns, &projection_items, &mut values, Some(schema));
     if distinct {
-        deduplicate_projected_rows(&mut values);
+        deduplicate_projected_rows_with_schema(&mut values, &projection_items, Some(schema));
     }
     if let Some((offset, count)) = parse_limit_range(sql) {
         values = values.into_iter().skip(offset).take(count).collect();
@@ -19168,9 +26832,13 @@ fn evaluate_grouped_window_projection(
     let mut grouped_rows = Vec::with_capacity(groups.len());
     for (key, source_rows) in groups {
         let mut row = Row::new();
+        let representative = source_rows.first();
         for (column, value) in group_columns.iter().zip(key) {
+            let value = representative
+                .and_then(|row| evaluate_scalar_expression(column, row).ok().flatten())
+                .or_else(|| value.clone());
             if let Some(value) = value {
-                row.push(column, value.clone());
+                row.push(column, value);
             } else {
                 row.push_null(column);
             }
@@ -19230,8 +26898,10 @@ fn collect_innermost_aggregate_expressions(value: &str, output: &mut HashSet<Str
             cursor += character.len_utf8();
         }
         let function = value[start..cursor].to_ascii_uppercase();
-        if !matches!(function.as_str(), "COUNT" | "SUM" | "AVG" | "MIN" | "MAX")
-            || !value[cursor..].starts_with('(')
+        if !matches!(
+            function.as_str(),
+            "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "GROUP_CONCAT"
+        ) || !value[cursor..].starts_with('(')
         {
             continue;
         }
@@ -19964,6 +27634,31 @@ fn deduplicate_projected_rows(rows: &mut Vec<Vec<Option<Vec<u8>>>>) {
     rows.retain(|row| seen.insert(row.clone()));
 }
 
+fn deduplicate_projected_rows_with_schema(
+    rows: &mut Vec<Vec<Option<Vec<u8>>>>,
+    projection_items: &[String],
+    schema: Option<&TableSchema>,
+) {
+    let mut seen = HashSet::new();
+    rows.retain(|row| {
+        let key = row
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                let expression = projection_items
+                    .get(index)
+                    .map(String::as_str)
+                    .unwrap_or("");
+                value.clone().map(|value| {
+                    canonical_sql_value(Some(value), collation_for_expression(schema, expression))
+                        .unwrap_or_default()
+                })
+            })
+            .collect::<Vec<_>>();
+        seen.insert(key)
+    });
+}
+
 fn filter_projected_having(
     sql: &str,
     columns: &[String],
@@ -19986,8 +27681,11 @@ fn filter_projected_having(
 }
 
 fn projection_without_alias(value: &str) -> &str {
-    find_top_level_keyword(value, " AS ", 0)
-        .map(|position| value[..position].trim())
+    if let Some(position) = find_top_level_keyword(value, " AS ", 0) {
+        return value[..position].trim();
+    }
+    parse_implicit_alias_parts(value)
+        .map(|(expression, _)| expression)
         .unwrap_or_else(|| value.trim())
 }
 
@@ -19999,6 +27697,25 @@ fn last_insert_id_argument(value: &str) -> Option<&str> {
     }
     let argument = expression["LAST_INSERT_ID(".len()..expression.len() - 1].trim();
     (!argument.is_empty()).then_some(argument)
+}
+
+fn insert_last_insert_id_value(sql: &str) -> anyhow::Result<Option<u64>> {
+    let values_end =
+        find_top_level_keyword(sql, " ON DUPLICATE KEY UPDATE ", 0).unwrap_or(sql.len());
+    let values_sql = &sql[..values_end];
+    let upper = values_sql.to_ascii_uppercase();
+    let Some(function_start) = upper.find("LAST_INSERT_ID(") else {
+        return Ok(None);
+    };
+    let open = function_start + "LAST_INSERT_ID".len();
+    let close = matching_parenthesis(values_sql, open)
+        .ok_or_else(|| anyhow::anyhow!("LAST_INSERT_ID has an unterminated argument"))?;
+    let argument = &values_sql[open + 1..close];
+    let Some(value) = evaluate_scalar_expression(argument, &Row::new())? else {
+        return Ok(None);
+    };
+    let value = std::str::from_utf8(&value)?.trim().parse::<u64>()?;
+    Ok(Some(value))
 }
 
 fn parse_sleep_duration(value: &str) -> anyhow::Result<Option<Duration>> {
@@ -20620,14 +28337,22 @@ fn mysql_datetime_format_to_chrono(value: &str) -> String {
             output.push('%');
             break;
         };
-        output.push('%');
-        output.push(match specifier {
-            'i' => 'M',
-            'M' => 'B',
-            'W' => 'A',
-            's' | 'S' => 'S',
-            other => other,
-        });
+        match specifier {
+            'f' => {
+                if output.ends_with('.') {
+                    output.pop();
+                }
+                output.push_str("%.6f");
+            }
+            'i' => output.push_str("%M"),
+            'M' => output.push_str("%B"),
+            'W' => output.push_str("%A"),
+            's' | 'S' => output.push_str("%S"),
+            other => {
+                output.push('%');
+                output.push(other);
+            }
+        }
     }
     output
 }
@@ -20931,6 +28656,7 @@ fn execute_stored_function_nodes(
                                 );
                             }
                             let context = trigger_context_with_locals(Row::new(), locals);
+                            let expression = bind_trigger_local_references(&expression, locals);
                             let value = evaluate_scalar_expression(&expression, &context)?;
                             if !locals.set(&target, value)? {
                                 anyhow::bail!("Unknown local variable '{}'", target);
@@ -20949,7 +28675,8 @@ fn execute_stored_function_nodes(
                     continue;
                 }
                 if is_trigger_signal_statement(statement) {
-                    let condition = procedure_signal_condition(statement, &context)?;
+                    let statement = bind_trigger_local_references(statement, locals);
+                    let condition = procedure_signal_condition(&statement, &context)?;
                     if let Some(control) =
                         execute_stored_function_condition_handler(condition, locals, state)?
                     {
@@ -20958,7 +28685,8 @@ fn execute_stored_function_nodes(
                     continue;
                 }
                 if let Some(expression) = parse_stored_function_return_statement(statement)? {
-                    let value = evaluate_scalar_expression(expression, &context)?;
+                    let expression = bind_trigger_local_references(expression, locals);
+                    let value = evaluate_scalar_expression(&expression, &context)?;
                     return Ok(Some(StoredFunctionControl::Return(value)));
                 }
                 anyhow::bail!(
@@ -20972,7 +28700,7 @@ fn execute_stored_function_nodes(
                 let mut selected = otherwise.as_slice();
                 for (condition, statements) in branches {
                     let context = trigger_context_with_locals(Row::new(), locals);
-                    if evaluate_scalar_condition(condition, &context)? {
+                    if evaluate_scalar_condition_with_locals(condition, &context, locals)? {
                         selected = statements;
                         break;
                     }
@@ -20988,8 +28716,9 @@ fn execute_stored_function_nodes(
                 has_else,
             } => {
                 let context = trigger_context_with_locals(Row::new(), locals);
-                let selected =
-                    trigger_case_branch(selector, branches, otherwise, *has_else, &context)?;
+                let selected = trigger_case_branch(
+                    selector, branches, otherwise, *has_else, &context, locals,
+                )?;
                 if let Some(control) = execute_stored_function_nodes(selected, locals, state)? {
                     return Ok(Some(control));
                 }
@@ -20998,7 +28727,7 @@ fn execute_stored_function_nodes(
                 let mut finished = false;
                 for _ in 0..MAX_TRIGGER_LOOP_ITERATIONS {
                     let context = trigger_context_with_locals(Row::new(), locals);
-                    if matches!(kind, TriggerLoopKind::While(condition) if !evaluate_scalar_condition(condition, &context)?)
+                    if matches!(kind, TriggerLoopKind::While(condition) if !evaluate_scalar_condition_with_locals(condition, &context, locals)?)
                     {
                         finished = true;
                         break;
@@ -21026,7 +28755,7 @@ fn execute_stored_function_nodes(
                     }
                     if let TriggerLoopKind::RepeatUntil(condition) = kind {
                         let context = trigger_context_with_locals(Row::new(), locals);
-                        if evaluate_scalar_condition(condition, &context)? {
+                        if evaluate_scalar_condition_with_locals(condition, &context, locals)? {
                             finished = true;
                             break;
                         }
@@ -21214,11 +28943,182 @@ fn evaluate_stored_function_call(
     Ok(Some(result?))
 }
 
+fn split_scalar_collation(expression: &str) -> Option<(&str, String)> {
+    let position = find_top_level_keyword(expression, " COLLATE ", 0)?;
+    let inner = expression[..position].trim();
+    let collation = expression[position + " COLLATE ".len()..]
+        .trim()
+        .trim_matches('`');
+    if inner.is_empty() || collation.is_empty() || collation.contains(char::is_whitespace) {
+        return None;
+    }
+    Some((inner, collation.to_ascii_lowercase()))
+}
+
+fn convert_using_character_set(expression: &str) -> Option<(String, String)> {
+    let expression = expression.trim();
+    let upper = expression.to_ascii_uppercase();
+    if !upper.starts_with("CONVERT(") || !expression.ends_with(')') {
+        return None;
+    }
+    let inner = &expression[8..expression.len() - 1];
+    let position = find_top_level_keyword(inner, " USING ", 0)?;
+    let value = inner[..position].trim();
+    let character_set = inner[position + " USING ".len()..].trim();
+    if value.is_empty() || character_set.is_empty() || character_set.contains(char::is_whitespace) {
+        return None;
+    }
+    normalize_mysql_charset(character_set.trim_matches('`'))
+        .ok()
+        .map(|character_set| (value.to_string(), character_set))
+}
+
+fn cast_character_set_and_collation(data_type: &str) -> Option<(String, String)> {
+    let data_type = data_type.trim();
+    let upper = data_type.to_ascii_uppercase();
+    if !upper.starts_with("CHAR") && !upper.starts_with("NCHAR") {
+        return None;
+    }
+    let collation =
+        parse_sql_collation(data_type).and_then(|value| normalize_mysql_collation(&value).ok());
+    let character_set = find_top_level_keyword(data_type, " CHARACTER SET ", 0)
+        .and_then(|position| {
+            let remainder = &data_type[position + " CHARACTER SET ".len()..];
+            let end = find_top_level_keyword(remainder, " COLLATE ", 0).unwrap_or(remainder.len());
+            normalize_mysql_charset(remainder[..end].trim().trim_matches('`')).ok()
+        })
+        .or_else(|| {
+            collation
+                .as_deref()
+                .and_then(mysql_collation_info)
+                .map(|info| info.character_set.to_string())
+        })
+        .unwrap_or_else(|| "utf8mb4".to_string());
+    let collation = collation.or_else(|| {
+        MYSQL_CHARACTER_SETS
+            .iter()
+            .find(|info| info.name == character_set)
+            .map(|info| info.default_collation.to_string())
+    })?;
+    Some((character_set, collation))
+}
+
+fn scalar_expression_collation(expression: &str) -> Option<String> {
+    let expression = trim_outer_parentheses(expression.trim());
+    if let Some((_, collation)) = split_scalar_collation(expression) {
+        return normalize_mysql_collation(&collation).ok();
+    }
+    if let Some((_, character_set)) = convert_using_character_set(expression) {
+        return MYSQL_CHARACTER_SETS
+            .iter()
+            .find(|info| info.name == character_set)
+            .map(|info| info.default_collation.to_string());
+    }
+    if upper_starts_with_function(expression, "CAST") {
+        let inner = expression[5..expression.len().saturating_sub(1)].trim();
+        let position = find_top_level_keyword(inner, " AS ", 0)?;
+        return cast_character_set_and_collation(&inner[position + 4..])
+            .map(|(_, collation)| collation);
+    }
+    if matches!(expression.as_bytes().first(), Some(b'\'') | Some(b'"')) {
+        return Some("utf8mb4_0900_ai_ci".into());
+    }
+    None
+}
+
+fn scalar_expression_is_binary_literal(expression: &str) -> bool {
+    let expression = trim_outer_parentheses(expression.trim());
+    expression
+        .get(..2)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("X'"))
+        || expression.starts_with("0x")
+        || expression.starts_with("0X")
+        || expression
+            .get(..2)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("B'"))
+        || expression.starts_with("0b")
+        || expression.starts_with("0B")
+}
+
+fn scalar_expression_character_set(expression: &str) -> Option<String> {
+    let expression = trim_outer_parentheses(expression.trim());
+    if let Some((_, collation)) = split_scalar_collation(expression) {
+        return mysql_collation_info(&collation).map(|info| info.character_set.to_string());
+    }
+    if let Some((_, character_set)) = convert_using_character_set(expression) {
+        return Some(character_set);
+    }
+    if upper_starts_with_function(expression, "CAST") {
+        let inner = expression[5..expression.len().saturating_sub(1)].trim();
+        let position = find_top_level_keyword(inner, " AS ", 0)?;
+        return cast_character_set_and_collation(&inner[position + 4..])
+            .map(|(character_set, _)| character_set);
+    }
+    if expression
+        .get(..2)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("X'"))
+        || expression.starts_with("0x")
+        || expression.starts_with("0X")
+    {
+        return Some("binary".into());
+    }
+    if matches!(expression.as_bytes().first(), Some(b'\'') | Some(b'"')) {
+        return Some("utf8mb4".into());
+    }
+    None
+}
+
+fn upper_starts_with_function(expression: &str, function: &str) -> bool {
+    let upper = expression.to_ascii_uppercase();
+    upper.starts_with(&format!("{function}(")) && expression.ends_with(')')
+}
+
 fn evaluate_scalar_expression(value: &str, row: &Row) -> anyhow::Result<Option<Vec<u8>>> {
     let expression = trim_outer_parentheses(projection_without_alias(value).trim());
     let upper = expression.to_ascii_uppercase();
+    if upper == "TRUE" {
+        return Ok(Some(b"1".to_vec()));
+    }
+    if upper == "FALSE" {
+        return Ok(Some(b"0".to_vec()));
+    }
     if upper == "NULL" {
         return Ok(None);
+    }
+    if let Some((inner, _)) = split_scalar_collation(expression) {
+        return evaluate_scalar_expression(inner, row);
+    }
+    for function in ["COLLATION", "CHARSET"] {
+        let prefix = format!("{function}(");
+        if upper.starts_with(&prefix) && expression.ends_with(')') {
+            let argument = &expression[prefix.len()..expression.len() - 1];
+            if evaluate_scalar_expression(argument, row)?.is_none() {
+                return Ok(None);
+            }
+            let value = if function == "COLLATION" && scalar_expression_is_binary_literal(argument)
+            {
+                Some("binary".to_string())
+            } else if function == "COLLATION" {
+                scalar_expression_collation(argument)
+            } else {
+                scalar_expression_character_set(argument)
+            }
+            .unwrap_or_else(|| {
+                if function == "COLLATION" {
+                    "utf8mb4_0900_ai_ci".into()
+                } else {
+                    "utf8mb4".into()
+                }
+            });
+            return Ok(Some(value.into_bytes()));
+        }
+    }
+    if upper.starts_with("LAST_INSERT_ID(") && expression.ends_with(')') {
+        let argument = &expression["LAST_INSERT_ID(".len()..expression.len() - 1];
+        if argument.trim().is_empty() {
+            anyhow::bail!("LAST_INSERT_ID requires an argument in a row expression");
+        }
+        return evaluate_scalar_expression(argument, row);
     }
     if upper.starts_with("REGEXP_LIKE(") && expression.ends_with(')') {
         let arguments = split_csv(&expression[12..expression.len() - 1]);
@@ -21254,10 +29154,33 @@ fn evaluate_scalar_expression(value: &str, row: &Row) -> anyhow::Result<Option<V
             .to_vec(),
         ));
     }
-    if ["<=>", ">=", "<=", "<>", "!=", ">", "<", "="]
+    if let Some(value) = evaluate_fulltext_match(expression, row, None)? {
+        return Ok(Some(value));
+    }
+    if let Some(value) = evaluate_spatial_expression(expression, row)? {
+        return Ok(Some(value));
+    }
+    let is_condition = ["<=>", ">=", "<=", "<>", "!=", ">", "<", "="]
         .into_iter()
         .any(|operator| find_scalar_condition_operator(expression, operator).is_some())
-    {
+        || [
+            " BETWEEN ",
+            " NOT BETWEEN ",
+            " IN (",
+            " NOT IN (",
+            " LIKE ",
+            " NOT LIKE ",
+            " REGEXP ",
+            " RLIKE ",
+            " IS NULL",
+            " IS NOT NULL",
+        ]
+        .into_iter()
+        .any(|keyword| find_top_level_keyword(expression, keyword, 0).is_some())
+        || find_top_level_keyword(expression, " OR ", 0).is_some()
+        || find_top_level_boolean_and(expression).is_some()
+        || upper.starts_with("NOT ");
+    if is_condition {
         return Ok(Some(
             if evaluate_scalar_condition(expression, row)? {
                 b"1"
@@ -22225,8 +30148,20 @@ fn evaluate_scalar_expression(value: &str, row: &Row) -> anyhow::Result<Option<V
             if data_type.is_empty() {
                 anyhow::bail!("JSON_VALUE RETURNING requires a type");
             }
-            let literal = String::from_utf8(mysql_hex(&scalar))?;
-            return evaluate_cast_expression(&format!("X'{literal}'"), data_type, row);
+            let data_type_upper = data_type.trim().to_ascii_uppercase();
+            let literal = if data_type_upper.starts_with("SIGNED")
+                || data_type_upper.starts_with("UNSIGNED")
+                || data_type_upper.starts_with("DECIMAL")
+                || data_type_upper.starts_with("NUMERIC")
+                || data_type_upper.starts_with("FLOAT")
+                || data_type_upper.starts_with("DOUBLE")
+            {
+                String::from_utf8(scalar.clone())?
+            } else {
+                let literal = String::from_utf8(mysql_hex(&scalar))?;
+                format!("X'{literal}'")
+            };
+            return evaluate_cast_expression(&literal, data_type, row);
         }
         return Ok(Some(scalar));
     }
@@ -22259,7 +30194,7 @@ fn evaluate_scalar_expression(value: &str, row: &Row) -> anyhow::Result<Option<V
         } else {
             serde_json::Value::Array(matches)
         };
-        return Ok(Some(serde_json::to_vec(&value)?));
+        return Ok(Some(mysql_json_bytes(&value)?));
     }
     if upper.starts_with("JSON_OBJECT(") && expression.ends_with(')') {
         let arguments = split_csv(&expression[12..expression.len() - 1]);
@@ -22278,9 +30213,7 @@ fn evaluate_scalar_expression(value: &str, row: &Row) -> anyhow::Result<Option<V
                 .unwrap_or(serde_json::Value::Null);
             object.insert(key, value);
         }
-        return Ok(Some(serde_json::to_vec(&serde_json::Value::Object(
-            object,
-        ))?));
+        return Ok(Some(mysql_json_bytes(&serde_json::Value::Object(object))?));
     }
     if upper.starts_with("JSON_ARRAY(") && expression.ends_with(')') {
         let arguments = split_csv(&expression[11..expression.len() - 1]);
@@ -22292,7 +30225,7 @@ fn evaluate_scalar_expression(value: &str, row: &Row) -> anyhow::Result<Option<V
                     .unwrap_or(serde_json::Value::Null))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
-        return Ok(Some(serde_json::to_vec(&serde_json::Value::Array(values))?));
+        return Ok(Some(mysql_json_bytes(&serde_json::Value::Array(values))?));
     }
     if upper.starts_with("JSON_VALID(") && expression.ends_with(')') {
         let Some(value) = evaluate_scalar_expression(&expression[11..expression.len() - 1], row)?
@@ -22405,7 +30338,7 @@ fn evaluate_scalar_expression(value: &str, row: &Row) -> anyhow::Result<Option<V
                 .unwrap_or(serde_json::Value::Null);
             json_set_path(&mut document, &parse_json_path(&path)?, value)?;
         }
-        return Ok(Some(serde_json::to_vec(&document)?));
+        return Ok(Some(mysql_json_bytes(&document)?));
     }
     if upper.starts_with("JSON_REMOVE(") && expression.ends_with(')') {
         let arguments = split_csv(&expression[12..expression.len() - 1]);
@@ -22425,7 +30358,7 @@ fn evaluate_scalar_expression(value: &str, row: &Row) -> anyhow::Result<Option<V
                 .map_err(|_| anyhow::anyhow!("JSON path must be valid UTF-8"))?;
             json_remove_path(&mut document, &parse_json_path(&path)?)?;
         }
-        return Ok(Some(serde_json::to_vec(&document)?));
+        return Ok(Some(mysql_json_bytes(&document)?));
     }
     for function in ["IFNULL", "COALESCE"] {
         let prefix = format!("{function}(");
@@ -23024,6 +30957,7 @@ fn evaluate_scalar_expression(value: &str, row: &Row) -> anyhow::Result<Option<V
                 return Ok(None);
             };
             let mut value = parse_scalar_number(&value)?;
+            let mut round_scale = None;
             value = match function {
                 "ABS" => value.abs(),
                 "CEIL" | "CEILING" => value.ceil(),
@@ -23037,12 +30971,19 @@ fn evaluate_scalar_expression(value: &str, row: &Row) -> anyhow::Result<Option<V
                         .map(|value| parse_scalar_number(&value).map(|value| value as i32))
                         .transpose()?
                         .unwrap_or(0);
+                    if digits > 0 {
+                        round_scale = mysql_round_decimal_scale(&arguments[0])
+                            .map(|scale| scale.min(digits as usize));
+                    }
                     let factor = 10_f64.powi(digits);
                     (value * factor).round() / factor
                 }
                 _ => unreachable!(),
             };
-            return Ok(Some(format_mysql_number(value).into_bytes()));
+            let formatted = round_scale
+                .map(|scale| format_mysql_rounded_number(value, scale))
+                .unwrap_or_else(|| format_mysql_number(value));
+            return Ok(Some(formatted.into_bytes()));
         }
     }
     for function in [
@@ -23112,6 +31053,9 @@ fn evaluate_scalar_expression(value: &str, row: &Row) -> anyhow::Result<Option<V
         return evaluate_cast_expression(&inner[..position], &inner[position + 4..], row);
     }
     if upper.starts_with("CONVERT(") && expression.ends_with(')') {
+        if let Some((value_expression, _character_set)) = convert_using_character_set(expression) {
+            return evaluate_scalar_expression(&value_expression, row);
+        }
         let arguments = split_csv(&expression[8..expression.len() - 1]);
         if arguments.len() != 2 {
             anyhow::bail!("CONVERT requires an expression and type");
@@ -23394,14 +31338,16 @@ fn evaluate_scalar_expression(value: &str, row: &Row) -> anyhow::Result<Option<V
         }
     }
     if let Some((position, operator)) = find_scalar_arithmetic_operator(expression) {
+        let left_expression = &expression[..position];
+        let right_expression = &expression[position + 1..];
         let Some(left) = evaluate_scalar_expression(&expression[..position], row)? else {
             return Ok(None);
         };
         let Some(right) = evaluate_scalar_expression(&expression[position + 1..], row)? else {
             return Ok(None);
         };
-        let left = std::str::from_utf8(&left)?.parse::<f64>()?;
-        let right = std::str::from_utf8(&right)?.parse::<f64>()?;
+        let left = parse_scalar_number_for_expression(left_expression, &left)?;
+        let right = parse_scalar_number_for_expression(right_expression, &right)?;
         let value = match operator {
             '+' => left + right,
             '-' => left - right,
@@ -23428,6 +31374,9 @@ fn evaluate_scalar_expression(value: &str, row: &Row) -> anyhow::Result<Option<V
         return Ok((!row.is_null(unqualified))
             .then(|| row.get(unqualified).map(ToOwned::to_owned))
             .flatten());
+    }
+    if let Some((reference, _)) = parse_stored_function_call(expression) {
+        anyhow::bail!("FUNCTION {} does not exist", reference.trim_matches('`'));
     }
     if is_column_reference(expression) {
         anyhow::bail!("Unknown or ambiguous column '{}'", column);
@@ -23565,6 +31514,12 @@ fn cached_mysql_regex(pattern: &str, flags: &str) -> anyhow::Result<Regex> {
 
 fn evaluate_scalar_condition(value: &str, row: &Row) -> anyhow::Result<bool> {
     let value = trim_outer_parentheses(value.trim());
+    if value.eq_ignore_ascii_case("TRUE") || value == "1" {
+        return Ok(true);
+    }
+    if value.eq_ignore_ascii_case("FALSE") || value == "0" {
+        return Ok(false);
+    }
     if let Some(position) = find_top_level_keyword(value, " OR ", 0) {
         return Ok(evaluate_scalar_condition(&value[..position], row)?
             || evaluate_scalar_condition(&value[position + 4..], row)?);
@@ -23581,14 +31536,30 @@ fn evaluate_scalar_condition(value: &str, row: &Row) -> anyhow::Result<bool> {
             let candidate = evaluate_scalar_expression(&value[..position], row)?;
             let lower = evaluate_scalar_expression(&value[lower_start..separator], row)?;
             let upper = evaluate_scalar_expression(&value[separator + 5..], row)?;
-            let matched = candidate
-                .as_deref()
-                .zip(lower.as_deref())
-                .zip(upper.as_deref())
-                .is_some_and(|((candidate, lower), upper)| {
-                    compare_sql_bytes(candidate, lower).is_ge()
-                        && compare_sql_bytes(candidate, upper).is_le()
-                });
+            let collation = scalar_expression_collation(&value[..position])
+                .or_else(|| scalar_expression_collation(&value[lower_start..separator]))
+                .or_else(|| scalar_expression_collation(&value[separator + 5..]));
+            let matched = match (candidate.as_deref(), lower.as_deref(), upper.as_deref()) {
+                (Some(candidate), Some(lower), Some(upper)) => {
+                    compare_scalar_expressions(
+                        &value[..position],
+                        candidate,
+                        &value[lower_start..separator],
+                        lower,
+                        collation.as_deref(),
+                    )?
+                    .is_ge()
+                        && compare_scalar_expressions(
+                            &value[..position],
+                            candidate,
+                            &value[separator + 5..],
+                            upper,
+                            collation.as_deref(),
+                        )?
+                        .is_le()
+                }
+                _ => false,
+            };
             return Ok(matched ^ negate);
         }
     }
@@ -23601,13 +31572,22 @@ fn evaluate_scalar_condition(value: &str, row: &Row) -> anyhow::Result<bool> {
             let candidate = evaluate_scalar_expression(&value[..position], row)?;
             let mut matched = false;
             let mut contains_null = false;
-            for item in split_csv(&value[open + 1..value.len() - 1]) {
-                let item = evaluate_scalar_expression(&item, row)?;
+            let candidate_expression = &value[..position];
+            for item_expression in split_csv(&value[open + 1..value.len() - 1]) {
+                let item = evaluate_scalar_expression(&item_expression, row)?;
                 contains_null |= item.is_none();
-                matched |= candidate
-                    .as_deref()
-                    .zip(item.as_deref())
-                    .is_some_and(|(candidate, item)| compare_sql_bytes(candidate, item).is_eq());
+                let collation = scalar_expression_collation(candidate_expression)
+                    .or_else(|| scalar_expression_collation(&item_expression));
+                if let (Some(candidate), Some(item)) = (candidate.as_deref(), item.as_deref()) {
+                    matched |= compare_scalar_expressions(
+                        candidate_expression,
+                        candidate,
+                        &item_expression,
+                        item,
+                        collation.as_deref(),
+                    )?
+                    .is_eq();
+                }
             }
             return Ok(if negate {
                 !matched && candidate.is_some() && !contains_null
@@ -23620,11 +31600,22 @@ fn evaluate_scalar_condition(value: &str, row: &Row) -> anyhow::Result<bool> {
         if let Some(position) = find_top_level_keyword(value, keyword, 0) {
             let candidate = evaluate_scalar_expression(&value[..position], row)?;
             let pattern = evaluate_scalar_expression(&value[position + keyword.len()..], row)?;
-            let matched = candidate
-                .as_deref()
-                .zip(pattern.as_deref())
-                .is_some_and(|(candidate, pattern)| scalar_like_matches(candidate, pattern));
+            let collation = scalar_expression_collation(&value[..position])
+                .or_else(|| scalar_expression_collation(&value[position + keyword.len()..]));
+            let matched =
+                candidate
+                    .as_deref()
+                    .zip(pattern.as_deref())
+                    .is_some_and(|(candidate, pattern)| {
+                        scalar_like_matches_with_collation(candidate, pattern, collation.as_deref())
+                    });
             return Ok(matched ^ negate);
+        }
+    }
+    for (keyword, expected) in [(" IS NOT NULL", true), (" IS NULL", false)] {
+        if let Some(position) = find_top_level_keyword(value, keyword, 0) {
+            let present = evaluate_scalar_expression(&value[..position], row)?.is_some();
+            return Ok(present == expected);
         }
     }
     for (keyword, negate) in [
@@ -23656,7 +31647,16 @@ fn evaluate_scalar_condition(value: &str, row: &Row) -> anyhow::Result<bool> {
         let right = evaluate_scalar_expression(&value[position + 3..], row)?;
         return Ok(match (left.as_deref(), right.as_deref()) {
             (None, None) => true,
-            (Some(left), Some(right)) => compare_sql_bytes(left, right).is_eq(),
+            (Some(left), Some(right)) => compare_scalar_expressions(
+                &value[..position],
+                left,
+                &value[position + 3..],
+                right,
+                scalar_expression_collation(&value[..position])
+                    .or_else(|| scalar_expression_collation(&value[position + 3..]))
+                    .as_deref(),
+            )?
+            .is_eq(),
             _ => false,
         });
     }
@@ -23675,15 +31675,77 @@ fn evaluate_scalar_condition(value: &str, row: &Row) -> anyhow::Result<bool> {
         if let Some(position) = find_scalar_condition_operator(value, operator) {
             let left = evaluate_scalar_expression(&value[..position], row)?;
             let right = evaluate_scalar_expression(&value[position + operator.len()..], row)?;
-            return Ok(left
-                .as_deref()
-                .zip(right.as_deref())
-                .is_some_and(|(left, right)| predicate(compare_sql_bytes(left, right))));
+            let collation = scalar_expression_collation(&value[..position])
+                .or_else(|| scalar_expression_collation(&value[position + operator.len()..]));
+            return Ok(match (left.as_deref(), right.as_deref()) {
+                (Some(left), Some(right)) => predicate(compare_scalar_expressions(
+                    &value[..position],
+                    left,
+                    &value[position + operator.len()..],
+                    right,
+                    collation.as_deref(),
+                )?),
+                _ => false,
+            });
         }
     }
     Ok(evaluate_scalar_expression(value, row)?
         .as_deref()
         .is_some_and(sql_value_is_true))
+}
+
+fn evaluate_scalar_condition_with_locals(
+    value: &str,
+    row: &Row,
+    locals: &TriggerLocalScopes,
+) -> anyhow::Result<bool> {
+    let value = bind_trigger_local_references(value, locals);
+    evaluate_scalar_condition(&value, row)
+}
+
+fn evaluate_scalar_condition_with_schema(
+    value: &str,
+    row: &Row,
+    schema: &TableSchema,
+) -> anyhow::Result<bool> {
+    let value = trim_outer_parentheses(value.trim());
+    for (operator, predicate) in [
+        (
+            "<=>",
+            std::cmp::Ordering::is_eq as fn(std::cmp::Ordering) -> bool,
+        ),
+        (
+            ">=",
+            std::cmp::Ordering::is_ge as fn(std::cmp::Ordering) -> bool,
+        ),
+        ("<=", std::cmp::Ordering::is_le),
+        ("<>", std::cmp::Ordering::is_ne),
+        ("!=", std::cmp::Ordering::is_ne),
+        (">", std::cmp::Ordering::is_gt),
+        ("<", std::cmp::Ordering::is_lt),
+        ("=", std::cmp::Ordering::is_eq),
+    ] {
+        if let Some(position) = find_scalar_condition_operator(value, operator) {
+            let left_expression = &value[..position];
+            let right_expression = &value[position + operator.len()..];
+            let left = evaluate_scalar_expression(left_expression, row)?;
+            let right = evaluate_scalar_expression(right_expression, row)?;
+            return Ok(match (left.as_deref(), right.as_deref()) {
+                (None, None) if operator == "<=>" => true,
+                (Some(left), Some(right)) => predicate(compare_scalar_expressions(
+                    left_expression,
+                    left,
+                    right_expression,
+                    right,
+                    collation_for_expression(Some(schema), left_expression)
+                        .or_else(|| collation_for_expression(Some(schema), right_expression))
+                        .as_deref(),
+                )?),
+                _ => false,
+            });
+        }
+    }
+    evaluate_scalar_condition(value, row)
 }
 
 fn find_scalar_condition_operator(value: &str, operator: &str) -> Option<usize> {
@@ -23767,6 +31829,47 @@ fn scalar_like_matches(value: &[u8], pattern: &[u8]) -> bool {
     matches(value, pattern, 0, 0)
 }
 
+fn scalar_like_matches_ascii_ci(value: &[u8], pattern: &[u8]) -> bool {
+    fn matches(value: &[u8], pattern: &[u8], value_at: usize, pattern_at: usize) -> bool {
+        if pattern_at == pattern.len() {
+            return value_at == value.len();
+        }
+        match pattern[pattern_at] {
+            b'%' => {
+                matches(value, pattern, value_at, pattern_at + 1)
+                    || (value_at < value.len() && matches(value, pattern, value_at + 1, pattern_at))
+            }
+            b'_' => value_at < value.len() && matches(value, pattern, value_at + 1, pattern_at + 1),
+            b'\\' if pattern_at + 1 < pattern.len() => {
+                value_at < value.len()
+                    && value[value_at].eq_ignore_ascii_case(&pattern[pattern_at + 1])
+                    && matches(value, pattern, value_at + 1, pattern_at + 2)
+            }
+            byte => {
+                value_at < value.len()
+                    && value[value_at].eq_ignore_ascii_case(&byte)
+                    && matches(value, pattern, value_at + 1, pattern_at + 1)
+            }
+        }
+    }
+    matches(value, pattern, 0, 0)
+}
+
+fn scalar_like_matches_with_collation(
+    value: &[u8],
+    pattern: &[u8],
+    collation: Option<&str>,
+) -> bool {
+    match collation {
+        Some(collation) => {
+            let value = mysql_collation_key_bytes(value, Some(collation));
+            let pattern = mysql_collation_key_bytes(pattern, Some(collation));
+            scalar_like_matches(&value, &pattern)
+        }
+        None => scalar_like_matches(value, pattern),
+    }
+}
+
 fn sql_value_is_true(value: &[u8]) -> bool {
     std::str::from_utf8(value)
         .ok()
@@ -23774,8 +31877,445 @@ fn sql_value_is_true(value: &[u8]) -> bool {
         .is_some_and(|value| value != 0.0)
 }
 
+fn evaluate_scalar_expression_with_schema(
+    value: &str,
+    row: &Row,
+    schema: &TableSchema,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    let expression = trim_outer_parentheses(projection_without_alias(value).trim());
+    let upper = expression.to_ascii_uppercase();
+    if upper == "TRUE" {
+        return Ok(Some(b"1".to_vec()));
+    }
+    if upper == "FALSE" {
+        return Ok(Some(b"0".to_vec()));
+    }
+    for function in ["COLLATION", "CHARSET"] {
+        let prefix = format!("{function}(");
+        if upper.starts_with(&prefix) && expression.ends_with(')') {
+            let argument = expression[prefix.len()..expression.len() - 1].trim();
+            if is_identifier_reference(argument) {
+                let collation = collation_for_expression(Some(schema), argument);
+                let resolved = if function == "COLLATION" {
+                    collation
+                } else {
+                    collation
+                        .as_deref()
+                        .and_then(mysql_collation_info)
+                        .map(|info| info.character_set.to_string())
+                };
+                if let Some(resolved) = resolved {
+                    return Ok(Some(resolved.into_bytes()));
+                }
+            }
+        }
+    }
+    if upper.starts_with("HEX(") && expression.ends_with(')') {
+        let argument = expression[4..expression.len() - 1].trim();
+        let column = unqualified_column(argument);
+        let is_bit = is_identifier_reference(argument)
+            && schema.columns.iter().any(|item| {
+                item.name.eq_ignore_ascii_case(column)
+                    && matches!(&item.data_type, DataType::Raw(value) if value
+                        .trim()
+                        .to_ascii_uppercase()
+                        .starts_with("BIT"))
+            });
+        if is_bit {
+            let Some(value) = evaluate_scalar_expression(argument, row)? else {
+                return Ok(None);
+            };
+            return Ok(Some(
+                format!("{:X}", parse_binary_integer(&value)?).into_bytes(),
+            ));
+        }
+    }
+    if let Some(value) = evaluate_fulltext_match(expression, row, Some(schema))? {
+        return Ok(Some(value));
+    }
+    if let Some(value) = evaluate_spatial_expression(expression, row)? {
+        return Ok(Some(value));
+    }
+    let is_condition = ["<=>", ">=", "<=", "<>", "!=", ">", "<", "="]
+        .into_iter()
+        .any(|operator| find_scalar_condition_operator(expression, operator).is_some())
+        || [
+            " BETWEEN ",
+            " NOT BETWEEN ",
+            " IN (",
+            " NOT IN (",
+            " LIKE ",
+            " NOT LIKE ",
+            " REGEXP ",
+            " RLIKE ",
+            " IS NULL",
+            " IS NOT NULL",
+        ]
+        .into_iter()
+        .any(|keyword| find_top_level_keyword(expression, keyword, 0).is_some())
+        || find_top_level_keyword(expression, " OR ", 0).is_some()
+        || find_top_level_boolean_and(expression).is_some()
+        || upper.starts_with("NOT ");
+    if is_condition {
+        return Ok(Some(
+            if evaluate_scalar_condition_with_schema(expression, row, schema)? {
+                b"1"
+            } else {
+                b"0"
+            }
+            .to_vec(),
+        ));
+    }
+    if upper.starts_with("ROUND(") && expression.ends_with(')') {
+        let arguments = split_csv(&expression[6..expression.len() - 1]);
+        if matches!(arguments.len(), 1 | 2) && is_identifier_reference(&arguments[0]) {
+            let column = unqualified_column(&arguments[0]);
+            let Some(data_type) = schema
+                .columns
+                .iter()
+                .find(|item| item.name.eq_ignore_ascii_case(column))
+                .map(|item| &item.data_type)
+            else {
+                return evaluate_scalar_expression(value, row);
+            };
+            let Some(raw_value) = evaluate_scalar_expression(&arguments[0], row)? else {
+                return Ok(None);
+            };
+            let number = parse_scalar_number(&raw_value)?;
+            let digits = arguments
+                .get(1)
+                .map(|argument| evaluate_scalar_expression(argument, row))
+                .transpose()?
+                .flatten()
+                .map(|value| parse_scalar_number(&value).map(|value| value as i32))
+                .transpose()?
+                .unwrap_or(0);
+            let factor = 10_f64.powi(digits);
+            let approximate = matches!(data_type, DataType::Float | DataType::Double)
+                || matches!(data_type, DataType::Raw(value) if decimal_scale(value).is_none());
+            let rounded = if approximate {
+                round_mysql_approximate(number, digits)
+            } else {
+                (number * factor).round() / factor
+            };
+            if approximate || digits <= 0 {
+                return Ok(Some(format_mysql_number(rounded).into_bytes()));
+            }
+            let scale = match data_type {
+                DataType::Raw(value) => decimal_scale(value).unwrap_or(0),
+                _ => 0,
+            }
+            .min(digits as usize);
+            return Ok(Some(
+                format_mysql_rounded_number(rounded, scale).into_bytes(),
+            ));
+        }
+    }
+    if let Some((position, operator)) = find_scalar_arithmetic_operator(expression) {
+        let left_expression = &expression[..position];
+        let right_expression = &expression[position + 1..];
+        let Some(left) = evaluate_scalar_expression_with_schema(left_expression, row, schema)?
+        else {
+            return Ok(None);
+        };
+        let Some(right) = evaluate_scalar_expression_with_schema(right_expression, row, schema)?
+        else {
+            return Ok(None);
+        };
+        let left = parse_scalar_number_for_schema(left_expression, &left, schema)?;
+        let right = parse_scalar_number_for_schema(right_expression, &right, schema)?;
+        let result = match operator {
+            '+' => left + right,
+            '-' => left - right,
+            '*' => left * right,
+            '/' if right == 0.0 => return Ok(None),
+            '/' => left / right,
+            '%' if right == 0.0 => return Ok(None),
+            '%' => left % right,
+            _ => unreachable!(),
+        };
+        return Ok(Some(format_mysql_number(result).into_bytes()));
+    }
+    evaluate_scalar_expression(value, row)
+}
+
+fn evaluate_fulltext_match(
+    expression: &str,
+    row: &Row,
+    schema: Option<&TableSchema>,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    let Some(against_position) = find_top_level_keyword(expression, " AGAINST ", 0) else {
+        if expression.trim().to_ascii_uppercase().starts_with("MATCH(") {
+            anyhow::bail!("Incorrect arguments to MATCH");
+        }
+        return Ok(None);
+    };
+    let match_expression = expression[..against_position].trim();
+    let match_upper = match_expression.to_ascii_uppercase();
+    if !match_upper.starts_with("MATCH(") {
+        return Ok(None);
+    }
+    let match_open = match_expression
+        .find('(')
+        .ok_or_else(|| anyhow::anyhow!("Incorrect arguments to MATCH"))?;
+    if matching_parenthesis(match_expression, match_open) != Some(match_expression.len() - 1) {
+        anyhow::bail!("Incorrect arguments to MATCH");
+    }
+    let columns = split_csv(&match_expression[match_open + 1..match_expression.len() - 1])
+        .into_iter()
+        .map(|column| unqualified_column(column.trim()).to_string())
+        .filter(|column| !column.is_empty())
+        .collect::<Vec<_>>();
+    if columns.is_empty() {
+        anyhow::bail!("Incorrect arguments to MATCH");
+    }
+    if let Some(schema) = schema {
+        let indexed = schema.indexes.iter().any(|index| {
+            index.kind == IndexKind::FullText
+                && columns.iter().all(|column| {
+                    index
+                        .columns
+                        .iter()
+                        .any(|indexed_column| indexed_column.eq_ignore_ascii_case(column))
+                })
+        });
+        if !indexed {
+            anyhow::bail!("Can't find FULLTEXT index matching the column list");
+        }
+    }
+    let against = expression[against_position + " AGAINST ".len()..].trim();
+    let against_open = against
+        .find('(')
+        .ok_or_else(|| anyhow::anyhow!("Incorrect arguments to AGAINST"))?;
+    if matching_parenthesis(against, against_open).is_none() {
+        anyhow::bail!("Incorrect arguments to AGAINST");
+    }
+    let against_close = matching_parenthesis(against, against_open).unwrap();
+    if !against[against_close + 1..].trim().is_empty() {
+        return Ok(None);
+    }
+    let against_body = &against[against_open + 1..against_close];
+    let against_body_upper = against_body.to_ascii_uppercase();
+    let boolean_mode = against_body_upper.contains("IN BOOLEAN MODE");
+    let query_expression = [" IN BOOLEAN MODE", " IN NATURAL LANGUAGE MODE"]
+        .into_iter()
+        .filter_map(|keyword| {
+            against_body_upper
+                .find(keyword)
+                .map(|position| (position, keyword))
+        })
+        .min_by_key(|(position, _)| *position)
+        .map_or(against_body, |(position, _)| &against_body[..position]);
+    let query = evaluate_scalar_expression(query_expression.trim(), row)?;
+    let Some(query) = query else {
+        return Ok(None);
+    };
+    let query = String::from_utf8_lossy(&query);
+    let mut terms = Vec::new();
+    for raw in query.split_whitespace() {
+        let required = raw.starts_with('+');
+        let excluded = raw.starts_with('-');
+        let token = raw
+            .trim_start_matches(['+', '-', '~', '>', '<'])
+            .trim_matches('"')
+            .trim_end_matches('*')
+            .to_ascii_lowercase();
+        if !token.is_empty() {
+            terms.push((token, required, excluded));
+        }
+    }
+    if terms.is_empty() {
+        return Ok(Some(b"0".to_vec()));
+    }
+    let document = columns
+        .iter()
+        .filter_map(|column| row.get(column))
+        .map(|value| String::from_utf8_lossy(value).to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut matched = 0usize;
+    for (term, required, excluded) in &terms {
+        let count = fulltext_term_count(&document, term);
+        if *excluded && count > 0 {
+            return Ok(Some(b"0".to_vec()));
+        }
+        if *required && count == 0 {
+            return Ok(Some(b"0".to_vec()));
+        }
+        if count > 0 {
+            matched += 1;
+        }
+    }
+    if matched == 0 {
+        return Ok(Some(b"0".to_vec()));
+    }
+    let score = if boolean_mode {
+        1.0
+    } else {
+        matched as f64 / terms.len() as f64
+    };
+    Ok(Some(format_mysql_number(score).into_bytes()))
+}
+
+fn fulltext_term_count(document: &str, term: &str) -> usize {
+    document
+        .split(|character: char| !character.is_alphanumeric() && character != '_')
+        .filter(|word| *word == term)
+        .count()
+}
+
+fn evaluate_spatial_expression(expression: &str, row: &Row) -> anyhow::Result<Option<Vec<u8>>> {
+    let upper = expression.to_ascii_uppercase();
+    for (function, operation) in [
+        ("ST_GEOMFROMTEXT", "FROM_TEXT"),
+        ("GEOMFROMTEXT", "FROM_TEXT"),
+        ("ST_ASTEXT", "AS_TEXT"),
+        ("ASTEXT", "AS_TEXT"),
+        ("ST_X", "X"),
+        ("ST_Y", "Y"),
+        ("ST_ISVALID", "IS_VALID"),
+        ("ST_SRID", "SRID"),
+        ("ST_GEOMETRYTYPE", "GEOMETRY_TYPE"),
+        ("ST_DIMENSION", "DIMENSION"),
+    ] {
+        let prefix = format!("{function}(");
+        if !upper.starts_with(&prefix) || !expression.ends_with(')') {
+            continue;
+        }
+        let arguments = split_csv(&expression[prefix.len()..expression.len() - 1]);
+        if arguments.len() != 1 {
+            anyhow::bail!("{function} requires one argument");
+        }
+        let Some(value) = evaluate_scalar_expression(&arguments[0], row)? else {
+            return Ok(None);
+        };
+        let text = String::from_utf8_lossy(&value);
+        let text = text.trim();
+        if operation == "FROM_TEXT" {
+            if !text.to_ascii_uppercase().starts_with("POINT(")
+                && !text.to_ascii_uppercase().starts_with("LINESTRING(")
+                && !text.to_ascii_uppercase().starts_with("POLYGON(")
+            {
+                anyhow::bail!(
+                    "Cannot get geometry object from data you send to the GEOMETRY field"
+                );
+            }
+            return Ok(Some(text.as_bytes().to_vec()));
+        }
+        if operation == "AS_TEXT" {
+            return Ok(Some(text.as_bytes().to_vec()));
+        }
+        if operation == "IS_VALID" {
+            return Ok(Some(if text.contains('(') && text.ends_with(')') {
+                b"1".to_vec()
+            } else {
+                b"0".to_vec()
+            }));
+        }
+        if operation == "SRID" {
+            return Ok(Some(b"0".to_vec()));
+        }
+        if operation == "GEOMETRY_TYPE" {
+            let geometry = text.split('(').next().unwrap_or("").to_ascii_uppercase();
+            return Ok(Some(geometry.into_bytes()));
+        }
+        if operation == "DIMENSION" {
+            return Ok(Some(b"0".to_vec()));
+        }
+        let point = text
+            .strip_prefix("POINT(")
+            .or_else(|| text.strip_prefix("point("))
+            .and_then(|value| value.strip_suffix(')'))
+            .ok_or_else(|| anyhow::anyhow!("Argument is not a POINT geometry"))?;
+        let coordinates = point.split_whitespace().collect::<Vec<_>>();
+        if coordinates.len() != 2 {
+            anyhow::bail!("Invalid POINT geometry");
+        }
+        return Ok(Some(
+            if operation == "X" {
+                coordinates[0]
+            } else {
+                coordinates[1]
+            }
+            .as_bytes()
+            .to_vec(),
+        ));
+    }
+    Ok(None)
+}
+
 fn parse_scalar_number(value: &[u8]) -> anyhow::Result<f64> {
     Ok(std::str::from_utf8(value)?.trim().parse::<f64>()?)
+}
+
+fn parse_binary_integer(value: &[u8]) -> anyhow::Result<u128> {
+    if value.len() > 16 {
+        anyhow::bail!("binary integer is too large")
+    }
+    Ok(value.iter().fold(0_u128, |result, byte| {
+        result.saturating_mul(256) + u128::from(*byte)
+    }))
+}
+
+fn parse_scalar_number_for_expression(expression: &str, value: &[u8]) -> anyhow::Result<f64> {
+    if scalar_expression_is_binary_literal(expression) {
+        return Ok(parse_binary_integer(value)? as f64);
+    }
+    parse_scalar_number(value)
+}
+
+fn parse_scalar_number_for_schema(
+    expression: &str,
+    value: &[u8],
+    schema: &TableSchema,
+) -> anyhow::Result<f64> {
+    if scalar_expression_is_binary_literal(expression)
+        || (is_identifier_reference(expression)
+            && schema.columns.iter().any(|column| {
+                column
+                    .name
+                    .eq_ignore_ascii_case(unqualified_column(expression))
+                    && matches!(&column.data_type, DataType::Raw(value) if value
+                        .trim()
+                        .to_ascii_uppercase()
+                        .starts_with("BIT"))
+            }))
+    {
+        return Ok(parse_binary_integer(value)? as f64);
+    }
+    parse_scalar_number_for_expression(expression, value)
+}
+
+fn scalar_subquery_literal(value: &[u8]) -> String {
+    if std::str::from_utf8(value)
+        .ok()
+        .is_some_and(|value| value.trim().parse::<f64>().is_ok())
+    {
+        return String::from_utf8_lossy(value).trim().to_string();
+    }
+    hex_literal(value)
+}
+
+fn compare_scalar_expressions(
+    left_expression: &str,
+    left: &[u8],
+    right_expression: &str,
+    right: &[u8],
+    collation: Option<&str>,
+) -> anyhow::Result<std::cmp::Ordering> {
+    if collation.is_none()
+        && (scalar_expression_is_binary_literal(left_expression)
+            || scalar_expression_is_binary_literal(right_expression))
+    {
+        let left = parse_scalar_number_for_expression(left_expression, left);
+        let right = parse_scalar_number_for_expression(right_expression, right);
+        if let (Ok(left), Ok(right)) = (left, right) {
+            if let Some(ordering) = left.partial_cmp(&right) {
+                return Ok(ordering);
+            }
+        }
+    }
+    Ok(compare_sql_values(left, right, collation))
 }
 
 fn mysql_bit_mask(value: &[u8]) -> anyhow::Result<u64> {
@@ -24225,16 +32765,24 @@ fn evaluate_cast_expression(
     data_type: &str,
     row: &Row,
 ) -> anyhow::Result<Option<Vec<u8>>> {
-    let Some(value) = evaluate_scalar_expression(value, row)? else {
+    let expression = value;
+    let Some(value) = evaluate_scalar_expression(expression, row)? else {
         return Ok(None);
     };
     let data_type = data_type.trim().to_ascii_uppercase();
     if data_type.starts_with("CHAR") || data_type.starts_with("BINARY") {
         return Ok(Some(value));
     }
-    let number = parse_scalar_number(&value)?;
+    let number = if scalar_expression_is_binary_literal(expression) {
+        parse_binary_integer(&value)? as f64
+    } else {
+        parse_scalar_number(&value)?
+    };
     if data_type.starts_with("SIGNED") || data_type.starts_with("UNSIGNED") {
         return Ok(Some(format!("{:.0}", number.round()).into_bytes()));
+    }
+    if data_type.starts_with("FLOAT") || data_type.starts_with("DOUBLE") {
+        return Ok(Some(format_mysql_number(number).into_bytes()));
     }
     if data_type.starts_with("DECIMAL") {
         let scale = data_type
@@ -24393,6 +32941,38 @@ fn json_extract_path<'a>(
 fn sql_scalar_to_json(value: &[u8]) -> serde_json::Value {
     serde_json::from_slice(value)
         .unwrap_or_else(|_| serde_json::Value::String(String::from_utf8_lossy(value).into_owned()))
+}
+
+fn mysql_json_bytes(value: &serde_json::Value) -> anyhow::Result<Vec<u8>> {
+    let compact = serde_json::to_vec(value)?;
+    let mut output = Vec::with_capacity(compact.len().saturating_add(8));
+    let mut in_string = false;
+    let mut escaped = false;
+    for byte in compact {
+        if in_string {
+            output.push(byte);
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' => {
+                in_string = true;
+                output.push(byte);
+            }
+            b',' | b':' => {
+                output.push(byte);
+                output.push(b' ');
+            }
+            _ => output.push(byte),
+        }
+    }
+    Ok(output)
 }
 
 fn json_type_name(value: &serde_json::Value) -> &'static str {
@@ -24614,6 +33194,22 @@ fn evaluate_aggregate(
             }),
         _ => None,
     };
+    let sum_scale = match &aggregate {
+        AggregateExpression::Sum(column) => schema
+            .columns
+            .iter()
+            .find(|item| item.name == *column)
+            .or_else(|| {
+                let column = unqualified_column(column);
+                schema.columns.iter().find(|item| item.name == column)
+            })
+            .and_then(|item| match &item.data_type {
+                DataType::Int | DataType::BigInt | DataType::Boolean => Some(0),
+                DataType::Raw(value) => decimal_scale(value),
+                _ => None,
+            }),
+        _ => None,
+    };
     match aggregate {
         AggregateExpression::CountAll => Ok(Some(rows.len().to_string().into_bytes())),
         AggregateExpression::Count(expression) => {
@@ -24635,10 +33231,12 @@ fn evaluate_aggregate(
                 .iter()
                 .map(|row| aggregate_row_value(row, &expression))
                 .collect::<anyhow::Result<Vec<_>>>()?;
+            let collation = collation_for_expression(Some(schema), &expression);
             Ok(Some(
                 values
                     .into_iter()
                     .flatten()
+                    .map(|value| mysql_collation_key_bytes(&value, collation.as_deref()))
                     .collect::<HashSet<_>>()
                     .len()
                     .to_string()
@@ -24670,8 +33268,11 @@ fn evaluate_aggregate(
                         let right = evaluate_scalar_expression(&item.expression, right)
                             .ok()
                             .flatten();
-                        let mut ordering =
-                            compare_optional_sql_bytes(left.as_deref(), right.as_deref());
+                        let mut ordering = compare_optional_sql_values(
+                            left.as_deref(),
+                            right.as_deref(),
+                            collation_for_expression(Some(schema), &item.expression),
+                        );
                         if item.descending {
                             ordering = ordering.reverse();
                         }
@@ -24683,10 +33284,13 @@ fn evaluate_aggregate(
                 });
             }
             let mut seen = HashSet::new();
+            let collation = collation_for_expression(Some(schema), &expression);
             let values = values
                 .into_iter()
                 .map(|(_, value)| value)
-                .filter(|value| !distinct || seen.insert(value.clone()))
+                .filter(|value| {
+                    !distinct || seen.insert(mysql_collation_key_bytes(value, collation.as_deref()))
+                })
                 .collect::<Vec<_>>();
             if values.is_empty() {
                 return Ok(None);
@@ -24723,6 +33327,7 @@ fn evaluate_aggregate(
                 sum
             };
             let formatted = average_scale
+                .or(sum_scale)
                 .map(|scale| format!("{value:.scale$}"))
                 .unwrap_or_else(|| format_mysql_number(value));
             Ok(Some(formatted.into_bytes()))
@@ -24738,7 +33343,11 @@ fn evaluate_aggregate(
                 return Ok(None);
             };
             for value in values {
-                let ordering = compare_sql_bytes(&value, &selected);
+                let ordering = compare_sql_values(
+                    &value,
+                    &selected,
+                    collation_for_expression(Some(schema), &column).as_deref(),
+                );
                 if (maximum && ordering.is_gt()) || (!maximum && ordering.is_lt()) {
                     selected = value;
                 }
@@ -24752,21 +33361,84 @@ fn aggregate_row_value(row: &Row, expression: &str) -> anyhow::Result<Option<Vec
     evaluate_scalar_expression(expression, row)
 }
 
+fn aggregate_numeric_exactness(
+    aggregate: &AggregateExpression,
+    schema: &TableSchema,
+) -> Option<bool> {
+    match aggregate {
+        AggregateExpression::CountAll
+        | AggregateExpression::Count(_)
+        | AggregateExpression::CountDistinct(_) => Some(true),
+        AggregateExpression::Avg(argument) | AggregateExpression::Sum(argument) => {
+            if argument.trim().parse::<f64>().is_ok() {
+                return Some(true);
+            }
+            if argument.to_ascii_uppercase().contains("AS DECIMAL") {
+                return Some(true);
+            }
+            if !is_identifier_reference(argument) {
+                return Some(false);
+            }
+            let column = unqualified_column(argument);
+            schema
+                .columns
+                .iter()
+                .find(|item| item.name.eq_ignore_ascii_case(column))
+                .and_then(|item| match &item.data_type {
+                    DataType::Int | DataType::BigInt | DataType::Boolean => Some(true),
+                    DataType::Float | DataType::Double => Some(false),
+                    DataType::Raw(value) => decimal_scale(value).map(|_| true),
+                    _ => Some(false),
+                })
+                .or(Some(false))
+        }
+        AggregateExpression::Max(argument) | AggregateExpression::Min(argument) => {
+            if !is_identifier_reference(argument) {
+                return None;
+            }
+            let column = unqualified_column(argument);
+            schema
+                .columns
+                .iter()
+                .find(|item| item.name.eq_ignore_ascii_case(column))
+                .and_then(|item| match &item.data_type {
+                    DataType::Int | DataType::BigInt | DataType::Boolean => Some(true),
+                    DataType::Float | DataType::Double => Some(false),
+                    DataType::Raw(value) => decimal_scale(value).map(|_| true),
+                    _ => None,
+                })
+        }
+        AggregateExpression::GroupConcat { .. } => None,
+    }
+}
+
 fn evaluate_grouped_projection(
     item: &str,
     rows: &[Row],
     schema: &TableSchema,
     group_expressions: &[String],
     key: &[Option<Vec<u8>>],
+    allow_nondeterministic: bool,
 ) -> anyhow::Result<Option<Vec<u8>>> {
     if let Some(aggregate) = parse_aggregate_expression(item) {
         return evaluate_aggregate(aggregate, rows, schema);
     }
     if let Some(position) = grouped_projection_position(item, group_expressions) {
-        return Ok(key[position].clone());
+        return Ok(rows
+            .first()
+            .and_then(|row| evaluate_scalar_expression(&group_expressions[position], row).ok())
+            .flatten()
+            .or_else(|| key[position].clone()));
     }
     let expression = projection_without_alias(item).trim();
     let Some(materialized) = materialize_group_aggregates(expression, rows, schema)? else {
+        if allow_nondeterministic {
+            return evaluate_scalar_expression(
+                expression,
+                rows.first()
+                    .ok_or_else(|| anyhow::anyhow!("Aggregate group is empty"))?,
+            );
+        }
         anyhow::bail!("Nonaggregated column is not in GROUP BY");
     };
     evaluate_scalar_expression(
@@ -24787,24 +33459,233 @@ fn materialize_group_aggregates(
         return Ok(None);
     }
     let mut materialized = expression.to_string();
+    let round_context = expression.to_ascii_uppercase().contains("ROUND(");
     for aggregate_expression in aggregate_expressions {
         let aggregate = parse_aggregate_expression(&aggregate_expression)
             .ok_or_else(|| anyhow::anyhow!("Invalid aggregate expression"))?;
-        let replacement = evaluate_aggregate(aggregate, rows, schema)?
-            .map(|value| hex_literal(&value))
+        let replacement = evaluate_aggregate(aggregate.clone(), rows, schema)?
+            .map(|value| {
+                let literal = match &aggregate {
+                    AggregateExpression::CountAll
+                    | AggregateExpression::Count(_)
+                    | AggregateExpression::CountDistinct(_)
+                    | AggregateExpression::Sum(_)
+                    | AggregateExpression::Avg(_) => String::from_utf8_lossy(&value).into_owned(),
+                    _ => hex_literal(&value),
+                };
+                if round_context {
+                    match aggregate_numeric_exactness(&aggregate, schema) {
+                        Some(true) => format!("CAST({literal} AS DECIMAL(65,30))"),
+                        Some(false) => format!("CAST({literal} AS DOUBLE)"),
+                        None => literal,
+                    }
+                } else {
+                    literal
+                }
+            })
             .unwrap_or_else(|| "NULL".to_string());
         materialized = materialized.replace(&aggregate_expression, &replacement);
     }
     Ok(Some(materialized))
 }
 
-fn evaluate_regular_grouped_projection(
+fn validate_grouped_projection(
+    projection_items: &[String],
+    group_expressions: &[String],
+    schema: &TableSchema,
+) -> anyhow::Result<()> {
+    let grouped_columns = group_expressions
+        .iter()
+        .filter_map(|expression| {
+            let expression = projection_without_alias(expression).trim();
+            is_column_reference(expression).then(|| normalize_column_reference(expression))
+        })
+        .collect::<HashSet<_>>();
+    let functionally_dependent = grouped_columns_satisfy_unique_key(&grouped_columns, schema);
+
+    for (index, item) in projection_items.iter().enumerate() {
+        let expression = projection_without_alias(item).trim();
+        if group_expressions
+            .iter()
+            .any(|group| same_sql_expression(expression, group))
+        {
+            continue;
+        }
+        if expression == "*" {
+            if !functionally_dependent
+                && !schema
+                    .columns
+                    .iter()
+                    .all(|column| grouped_columns.contains(&column.name.to_ascii_lowercase()))
+            {
+                anyhow::bail!(
+                    "Expression #{} of SELECT list is not in GROUP BY clause and contains nonaggregated column '*'; this is incompatible with sql_mode=only_full_group_by",
+                    index + 1
+                );
+            }
+            continue;
+        }
+
+        let residual = expression_without_aggregate_expressions(expression);
+        let references = expression_column_references(&residual, schema);
+        let valid = references.iter().all(|reference| {
+            grouped_columns
+                .iter()
+                .any(|group| same_column_reference(group, reference))
+        }) || (functionally_dependent && !references.is_empty());
+        if !valid && !references.is_empty() {
+            let column = references.first().expect("non-empty references");
+            anyhow::bail!(
+                "Expression #{} of SELECT list is not in GROUP BY clause and contains nonaggregated column '{}'; this is incompatible with sql_mode=only_full_group_by",
+                index + 1,
+                column
+            );
+        }
+    }
+    Ok(())
+}
+
+fn grouped_columns_satisfy_unique_key(
+    grouped_columns: &HashSet<String>,
+    schema: &TableSchema,
+) -> bool {
+    unique_key_columns(schema).into_iter().any(|(_, columns)| {
+        !columns.is_empty()
+            && columns.iter().all(|column| {
+                schema
+                    .columns
+                    .iter()
+                    .find(|candidate| candidate.name.eq_ignore_ascii_case(column))
+                    .is_some_and(|candidate| {
+                        !candidate.nullable
+                            && grouped_columns
+                                .iter()
+                                .any(|group| same_column_reference(group, column))
+                    })
+            })
+    })
+}
+
+fn grouped_projection_allows_nondeterministic(
+    group_expressions: &[String],
+    schema: &TableSchema,
+) -> bool {
+    let grouped_columns = group_expressions
+        .iter()
+        .filter_map(|expression| {
+            let expression = projection_without_alias(expression).trim();
+            is_column_reference(expression).then(|| normalize_column_reference(expression))
+        })
+        .collect::<HashSet<_>>();
+    grouped_columns_satisfy_unique_key(&grouped_columns, schema)
+}
+
+fn same_column_reference(left: &str, right: &str) -> bool {
+    normalize_column_reference(left).eq_ignore_ascii_case(&normalize_column_reference(right))
+        || unqualified_column(left).eq_ignore_ascii_case(unqualified_column(right))
+}
+
+fn same_sql_expression(left: &str, right: &str) -> bool {
+    normalize_column_reference(left.trim().trim_matches('`'))
+        .eq_ignore_ascii_case(&normalize_column_reference(right.trim().trim_matches('`')))
+}
+
+fn expression_without_aggregate_expressions(expression: &str) -> String {
+    let mut output = expression.to_string();
+    let mut aggregates = HashSet::new();
+    collect_innermost_aggregate_expressions(expression, &mut aggregates);
+    for aggregate in aggregates {
+        output = output.replace(&aggregate, "0");
+    }
+    output
+}
+
+fn expression_column_references(expression: &str, schema: &TableSchema) -> Vec<String> {
+    const KEYWORDS: &[&str] = &[
+        "ALL", "AND", "AS", "ASC", "CASE", "DESC", "DISTINCT", "ELSE", "END", "FALSE", "FROM",
+        "GROUP", "HAVING", "IN", "IS", "LIKE", "LIMIT", "NOT", "NULL", "OR", "SELECT", "THEN",
+        "TRUE", "WHEN", "WHERE", "WITH",
+    ];
+    let mut references = Vec::new();
+    let mut cursor = 0;
+    while cursor < expression.len() {
+        let character = expression[cursor..]
+            .chars()
+            .next()
+            .expect("cursor remains within expression");
+        if matches!(character, '\'' | '"') {
+            cursor += character.len_utf8();
+            while cursor < expression.len() {
+                let next = expression[cursor..]
+                    .chars()
+                    .next()
+                    .expect("cursor remains within quoted expression");
+                cursor += next.len_utf8();
+                if next == character {
+                    if expression[cursor..].starts_with(character) {
+                        cursor += character.len_utf8();
+                    } else {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        if !(character.is_ascii_alphanumeric() || matches!(character, '_' | '$' | '.' | '`')) {
+            cursor += character.len_utf8();
+            continue;
+        }
+        let start = cursor;
+        cursor += character.len_utf8();
+        while cursor < expression.len() {
+            let next = expression[cursor..]
+                .chars()
+                .next()
+                .expect("cursor remains within expression");
+            if !(next.is_ascii_alphanumeric() || matches!(next, '_' | '$' | '.' | '`')) {
+                break;
+            }
+            cursor += next.len_utf8();
+        }
+        let token = expression[start..cursor].trim_matches('`');
+        if token.is_empty()
+            || token
+                .chars()
+                .next()
+                .is_some_and(|value| value.is_ascii_digit())
+            || KEYWORDS
+                .iter()
+                .any(|keyword| token.eq_ignore_ascii_case(keyword))
+            || expression[cursor..].trim_start().starts_with('(')
+            || token.starts_with('@')
+        {
+            continue;
+        }
+        let normalized = normalize_column_reference(token);
+        let unqualified = unqualified_column(&normalized);
+        if schema.columns.iter().any(|column| {
+            column.name.eq_ignore_ascii_case(&normalized)
+                || column.name.eq_ignore_ascii_case(unqualified)
+        }) {
+            references.push(normalized);
+        }
+    }
+    references.sort_unstable();
+    references.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+    references
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn evaluate_regular_grouped_projection(
+    backend: &mut Backend,
     sql: &str,
     projection_items: &[String],
     groups: std::collections::BTreeMap<Vec<Option<Vec<u8>>>, Vec<Row>>,
     group_expressions: &[String],
     schema: &TableSchema,
     distinct: bool,
+    allow_nondeterministic: bool,
+    sources: &[JoinSource],
 ) -> anyhow::Result<QueryOutcome> {
     let visible_columns = projection_items
         .iter()
@@ -24834,14 +33715,37 @@ fn evaluate_regular_grouped_projection(
         let projected = evaluation_items
             .iter()
             .map(|item| {
-                evaluate_grouped_projection(item, &group_rows, schema, group_expressions, &key)
+                evaluate_grouped_projection(
+                    item,
+                    &group_rows,
+                    schema,
+                    group_expressions,
+                    &key,
+                    allow_nondeterministic,
+                )
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
-        if evaluate_group_having(sql, &visible_columns, &projected, &group_rows, schema)? {
+        if evaluate_group_having_async(
+            backend,
+            sql,
+            &visible_columns,
+            &projected,
+            &group_rows,
+            schema,
+            sources,
+        )
+        .await?
+        {
             values.push(projected);
         }
     }
-    sort_projected_values(sql, &evaluation_columns, &evaluation_items, &mut values);
+    sort_projected_values(
+        sql,
+        &evaluation_columns,
+        &evaluation_items,
+        &mut values,
+        Some(schema),
+    );
     for row in &mut values {
         row.truncate(visible_columns.len());
     }
@@ -24881,6 +33785,39 @@ fn evaluate_group_having(
             Some(value) => row.set(column, value.clone()),
             None => row.set_null(column),
         }
+    }
+    evaluate_scalar_condition(&expression, &row)
+}
+
+async fn evaluate_group_having_async(
+    backend: &mut Backend,
+    sql: &str,
+    columns: &[String],
+    projected: &[Option<Vec<u8>>],
+    group_rows: &[Row],
+    schema: &TableSchema,
+    sources: &[JoinSource],
+) -> anyhow::Result<bool> {
+    let Some(expression) = having_expression(sql) else {
+        return Ok(true);
+    };
+    let expression = materialize_group_aggregates(expression, group_rows, schema)?
+        .unwrap_or_else(|| expression.to_string());
+    let mut row = group_rows
+        .first()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("Aggregate group is empty"))?;
+    for (column, value) in columns.iter().zip(projected) {
+        match value {
+            Some(value) => row.set(column, value.clone()),
+            None => row.set_null(column),
+        }
+    }
+    let correlated = correlated_filter_for_expression(&expression, sources)?;
+    if let Some(filter) = correlated {
+        return backend
+            .evaluate_correlated_row_filter(&filter, &row, sources)
+            .await;
     }
     evaluate_scalar_condition(&expression, &row)
 }
@@ -25026,12 +33963,234 @@ fn compare_optional_sql_bytes(left: Option<&[u8]>, right: Option<&[u8]>) -> std:
     }
 }
 
+fn compare_optional_sql_values(
+    left: Option<&[u8]>,
+    right: Option<&[u8]>,
+    collation: Option<String>,
+) -> std::cmp::Ordering {
+    match (left, right) {
+        (Some(left), Some(right)) => compare_sql_values(left, right, collation.as_deref()),
+        (None, Some(_)) => std::cmp::Ordering::Less,
+        (Some(_), None) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
+}
+
+fn compare_sql_values(left: &[u8], right: &[u8], collation: Option<&str>) -> std::cmp::Ordering {
+    if collation.is_none() {
+        if let (Ok(left), Ok(right)) = (std::str::from_utf8(left), std::str::from_utf8(right)) {
+            if let (Ok(left), Ok(right)) = (left.parse::<f64>(), right.parse::<f64>()) {
+                if let Some(ordering) = left.partial_cmp(&right) {
+                    return ordering;
+                }
+            }
+        }
+    }
+    let left = mysql_collation_key_bytes(left, collation);
+    let right = mysql_collation_key_bytes(right, collation);
+    left.cmp(&right)
+}
+
+fn mysql_collation_key_bytes(value: &[u8], collation: Option<&str>) -> Vec<u8> {
+    let collation_name = collation.unwrap_or("utf8mb4_0900_ai_ci");
+    if collation_name.eq_ignore_ascii_case("binary") {
+        return value.to_vec();
+    }
+    let pad_space = mysql_collation_info(collation_name)
+        .is_some_and(|info| info.pad_attribute.eq_ignore_ascii_case("PAD SPACE"));
+    if collation_name.to_ascii_lowercase().ends_with("_bin") {
+        return if pad_space {
+            trim_mysql_pad_space(value).to_vec()
+        } else {
+            value.to_vec()
+        };
+    }
+    let Ok(value) = std::str::from_utf8(value) else {
+        return value.to_vec();
+    };
+    let collation_name = collation_name.to_ascii_lowercase();
+    let case_insensitive = !collation_name.ends_with("_cs")
+        && !collation_name.contains("_as_cs")
+        && !collation_name.ends_with("_bin");
+    let accent_insensitive = !collation_name.contains("_as_")
+        && !collation_name.ends_with("_as_ci")
+        && (collation_name.contains("_ai_") || collation_name.ends_with("_ci"));
+    let mut folded = if case_insensitive {
+        value.to_uppercase()
+    } else {
+        value.to_string()
+    };
+    if accent_insensitive {
+        folded = strip_basic_diacritics(&folded);
+    }
+    if pad_space {
+        folded.truncate(folded.trim_end_matches(' ').len());
+    }
+    folded
+        .bytes()
+        .map(|byte| if byte == b'_' { 0x01 } else { byte })
+        .collect()
+}
+
+fn trim_mysql_pad_space(value: &[u8]) -> &[u8] {
+    let mut end = value.len();
+    while end > 0 && value[end - 1] == b' ' {
+        end -= 1;
+    }
+    &value[..end]
+}
+
+fn strip_basic_diacritics(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| match character {
+            'À' | 'Á' | 'Â' | 'Ã' | 'Ä' | 'Å' | 'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' => {
+                'a'
+            }
+            'Ç' | 'ç' => 'c',
+            'È' | 'É' | 'Ê' | 'Ë' | 'è' | 'é' | 'ê' | 'ë' => 'e',
+            'Ì' | 'Í' | 'Î' | 'Ï' | 'ì' | 'í' | 'î' | 'ï' => 'i',
+            'Ñ' | 'ñ' => 'n',
+            'Ò' | 'Ó' | 'Ô' | 'Õ' | 'Ö' | 'Ø' | 'ò' | 'ó' | 'ô' | 'õ' | 'ö' | 'ø' => {
+                'o'
+            }
+            'Ù' | 'Ú' | 'Û' | 'Ü' | 'ù' | 'ú' | 'û' | 'ü' => 'u',
+            'Ý' | 'Ÿ' | 'ý' | 'ÿ' => 'y',
+            'Æ' | 'æ' => 'a',
+            'Œ' | 'œ' => 'o',
+            'ß' => 's',
+            other => other,
+        })
+        .collect()
+}
+
+fn collation_for_expression(schema: Option<&TableSchema>, expression: &str) -> Option<String> {
+    let schema = schema?;
+    let expression = projection_without_alias(expression).trim();
+    let column = normalize_column_reference(expression);
+    let column = column.rsplit('.').next().unwrap_or(&column);
+    if schema.create_sql.is_none()
+        && schema
+            .columns
+            .iter()
+            .find(|item| item.name.eq_ignore_ascii_case(column))
+            .is_some_and(|item| matches!(item.data_type, DataType::Blob))
+    {
+        return None;
+    }
+    column_collation_name(schema, column)
+}
+
+fn canonical_sql_value(value: Option<Vec<u8>>, collation: Option<String>) -> Option<Vec<u8>> {
+    value.map(|value| mysql_collation_key_bytes(&value, collation.as_deref()))
+}
+
+fn group_rows_by_collation(
+    rows: Vec<Row>,
+    expressions: &[String],
+    schema: Option<&TableSchema>,
+) -> anyhow::Result<GroupRows> {
+    let mut groups = std::collections::BTreeMap::new();
+    for row in rows {
+        let key = expressions
+            .iter()
+            .map(|expression| {
+                evaluate_scalar_expression(expression, &row).map(|value| {
+                    canonical_sql_value(value, collation_for_expression(schema, expression))
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        groups.entry(key).or_insert_with(Vec::new).push(row);
+    }
+    Ok(groups)
+}
+
 fn format_mysql_number(value: f64) -> String {
     if value.fract() == 0.0 {
         format!("{value:.0}")
     } else {
         value.to_string()
     }
+}
+
+fn format_mysql_rounded_number(value: f64, scale: usize) -> String {
+    if scale == 0 {
+        return format_mysql_number(value);
+    }
+    let scale = scale.min(30);
+    format!("{value:.scale$}")
+}
+
+fn round_mysql_approximate(value: f64, digits: i32) -> f64 {
+    let factor = 10_f64.powi(digits);
+    if !factor.is_finite() || factor == 0.0 {
+        return 0.0;
+    }
+    let scaled = value * factor;
+    let lower = scaled.floor();
+    let fraction = scaled - lower;
+    let rounded = if (fraction - 0.5).abs() <= 1e-12 {
+        if lower.rem_euclid(2.0) == 0.0 {
+            lower
+        } else {
+            lower + 1.0
+        }
+    } else {
+        scaled.round()
+    };
+    rounded / factor
+}
+
+fn mysql_round_decimal_scale(expression: &str) -> Option<usize> {
+    let expression = trim_outer_parentheses(expression.trim());
+    if expression.parse::<f64>().is_ok() {
+        return mysql_numeric_literal_scale(expression);
+    }
+    if let Some(hex) = expression
+        .strip_prefix("X'")
+        .or_else(|| expression.strip_prefix("x'"))
+        .and_then(|value| value.strip_suffix('\''))
+    {
+        let value = hex_to_bytes(hex);
+        return std::str::from_utf8(&value)
+            .ok()
+            .filter(|value| value.parse::<f64>().is_ok())
+            .and_then(mysql_numeric_literal_scale);
+    }
+    let upper = expression.to_ascii_uppercase();
+    if upper.starts_with("CAST(") {
+        if let Some(start) = upper.find(" AS DECIMAL(") {
+            let start = start + " AS DECIMAL(".len();
+            return upper[start..]
+                .split_once(')')
+                .and_then(|(definition, _)| definition.split(',').nth(1))
+                .and_then(|scale| scale.trim().parse::<usize>().ok());
+        }
+        if upper.contains(" AS NUMERIC") {
+            return Some(0);
+        }
+        return None;
+    }
+    ["AVG(", "SUM("]
+        .iter()
+        .any(|prefix| upper.starts_with(prefix))
+        .then_some(30)
+}
+
+fn mysql_numeric_literal_scale(value: &str) -> Option<usize> {
+    let value = value.trim();
+    let (mantissa, exponent) = if let Some((mantissa, exponent)) =
+        value.split_once('e').or_else(|| value.split_once('E'))
+    {
+        (mantissa, exponent.parse::<i32>().ok()?)
+    } else {
+        (value, 0)
+    };
+    let fraction_scale = mantissa
+        .split_once('.')
+        .map(|(_, fraction)| fraction.len())
+        .unwrap_or(0) as i32;
+    Some((fraction_scale - exponent).max(0) as usize)
 }
 
 #[derive(Debug)]
@@ -25049,6 +34208,19 @@ enum QueryOutcome {
         out_parameters: Option<ProcedureResultSet>,
         affected_rows: u64,
     },
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AdminSqlResultSet {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<Option<String>>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AdminSqlResult {
+    pub result_sets: Vec<AdminSqlResultSet>,
+    pub affected_rows: u64,
+    pub last_insert_id: u64,
 }
 
 #[derive(Debug)]
@@ -25098,8 +34270,8 @@ impl ToMysqlValue for PreparedOutputValue {
         match self {
             Self::Null => unreachable!("NULL is encoded in the binary row bitmap"),
             Self::Bytes(value) => value.to_mysql_bin(writer, column),
-            Self::Int(value) => value.to_mysql_bin(writer, column),
-            Self::UInt(value) => value.to_mysql_bin(writer, column),
+            Self::Int(value) => write_prepared_signed_integer(writer, *value, column),
+            Self::UInt(value) => write_prepared_unsigned_integer(writer, *value, column),
             Self::Float(value) => value.to_mysql_bin(writer, column),
             Self::Double(value) => value.to_mysql_bin(writer, column),
             Self::Date(value) => value.to_mysql_bin(writer, column),
@@ -25132,6 +34304,63 @@ impl ToMysqlValue for PreparedOutputValue {
 
     fn is_null(&self) -> bool {
         matches!(self, Self::Null)
+    }
+}
+
+fn prepared_integer_error(value: impl std::fmt::Display, column: &MysqlColumn) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("cannot encode integer {value} as {:?}", column.coltype),
+    )
+}
+
+fn write_prepared_signed_integer<W: Write>(
+    writer: &mut W,
+    value: i64,
+    column: &MysqlColumn,
+) -> io::Result<()> {
+    if column.colflags.contains(ColumnFlags::UNSIGNED_FLAG) {
+        return u64::try_from(value)
+            .map_err(|_| prepared_integer_error(value, column))
+            .and_then(|value| write_prepared_unsigned_integer(writer, value, column));
+    }
+    match column.coltype {
+        ColumnType::MYSQL_TYPE_TINY => i8::try_from(value)
+            .map_err(|_| prepared_integer_error(value, column))
+            .and_then(|value| writer.write_i8(value)),
+        ColumnType::MYSQL_TYPE_SHORT | ColumnType::MYSQL_TYPE_YEAR => i16::try_from(value)
+            .map_err(|_| prepared_integer_error(value, column))
+            .and_then(|value| writer.write_i16::<LittleEndian>(value)),
+        ColumnType::MYSQL_TYPE_LONG | ColumnType::MYSQL_TYPE_INT24 => i32::try_from(value)
+            .map_err(|_| prepared_integer_error(value, column))
+            .and_then(|value| writer.write_i32::<LittleEndian>(value)),
+        ColumnType::MYSQL_TYPE_LONGLONG => writer.write_i64::<LittleEndian>(value),
+        _ => Err(prepared_integer_error(value, column)),
+    }
+}
+
+fn write_prepared_unsigned_integer<W: Write>(
+    writer: &mut W,
+    value: u64,
+    column: &MysqlColumn,
+) -> io::Result<()> {
+    if !column.colflags.contains(ColumnFlags::UNSIGNED_FLAG) {
+        return i64::try_from(value)
+            .map_err(|_| prepared_integer_error(value, column))
+            .and_then(|value| write_prepared_signed_integer(writer, value, column));
+    }
+    match column.coltype {
+        ColumnType::MYSQL_TYPE_TINY => u8::try_from(value)
+            .map_err(|_| prepared_integer_error(value, column))
+            .and_then(|value| writer.write_u8(value)),
+        ColumnType::MYSQL_TYPE_SHORT | ColumnType::MYSQL_TYPE_YEAR => u16::try_from(value)
+            .map_err(|_| prepared_integer_error(value, column))
+            .and_then(|value| writer.write_u16::<LittleEndian>(value)),
+        ColumnType::MYSQL_TYPE_LONG | ColumnType::MYSQL_TYPE_INT24 => u32::try_from(value)
+            .map_err(|_| prepared_integer_error(value, column))
+            .and_then(|value| writer.write_u32::<LittleEndian>(value)),
+        ColumnType::MYSQL_TYPE_LONGLONG => writer.write_u64::<LittleEndian>(value),
+        _ => Err(prepared_integer_error(value, column)),
     }
 }
 
@@ -25208,6 +34437,26 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for Backend {
         self.connection_id
     }
 
+    fn default_auth_plugin(&self) -> &str {
+        self.config.authentication.as_str()
+    }
+
+    async fn auth_plugin_for_username(&self, user: &[u8]) -> String {
+        let Ok(user) = std::str::from_utf8(user) else {
+            return self.config.authentication.clone();
+        };
+        self.config
+            .auth_catalog
+            .authentication_plugin(user, &self.client_address)
+    }
+
+    fn accepts_auth_plugin(&self, auth_plugin: &str) -> bool {
+        matches!(
+            auth_plugin,
+            "mysql_native_password" | "caching_sha2_password"
+        )
+    }
+
     fn salt(&self) -> [u8; 20] {
         self.salt
     }
@@ -25219,16 +34468,22 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for Backend {
         salt: &[u8],
         auth_data: &[u8],
     ) -> bool {
-        if auth_plugin != "mysql_native_password" {
+        if !matches!(
+            auth_plugin,
+            "mysql_native_password" | "caching_sha2_password"
+        ) {
             return false;
         }
         let Ok(username) = std::str::from_utf8(username) else {
             return false;
         };
-        let accepted =
-            self.config
-                .auth_catalog
-                .authenticate(&self.client_address, username, salt, auth_data);
+        let authenticated_user = self.config.auth_catalog.authenticate(
+            &self.client_address,
+            username,
+            auth_plugin,
+            salt,
+            auth_data,
+        );
         if self
             .config
             .audit_log
@@ -25236,16 +34491,23 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for Backend {
                 "authentication",
                 &normalize_auth_name(username),
                 "CONNECT",
-                if accepted { "ok" } else { "denied" },
+                if authenticated_user.is_some() {
+                    "ok"
+                } else {
+                    "denied"
+                },
             )
             .is_err()
         {
             return false;
         }
-        if !accepted {
+        let Some(authenticated_user) = authenticated_user else {
             return false;
-        }
-        *self.authenticated_user.lock() = Some(normalize_auth_name(username));
+        };
+        *self.authenticated_user.lock() = Some(authenticated_user);
+        *self.active_roles.lock() = None;
+        self.stats
+            .update_connection_identity(self.connection_id, &self.authenticated_username());
         true
     }
 
@@ -25269,16 +34531,9 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for Backend {
         let id = self.next_statement_id;
         self.next_statement_id += 1;
         self.prepared.insert(id, query.to_string());
-        let params: Vec<_> = (0..count_placeholders(query))
-            .map(|index| MysqlColumn {
-                table: String::new(),
-                column: format!("param{}", index + 1),
-                collen: 0,
-                coltype: ColumnType::MYSQL_TYPE_VAR_STRING,
-                colflags: ColumnFlags::empty(),
-            })
-            .collect();
-        info.reply(id, params.iter(), std::iter::empty()).await
+        let params = self.prepared_parameter_definitions(query);
+        let columns = self.prepared_result_definitions(query);
+        info.reply(id, params.iter(), columns.iter()).await
     }
 
     async fn on_execute<'a>(
@@ -25295,9 +34550,17 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for Backend {
                     .await
             }
         };
+        let expected_parameters = self.prepared_parameter_definitions(&query);
         let values: Vec<String> = params
             .into_iter()
-            .map(|param| mysql_value_to_literal(param.value.into_inner()))
+            .enumerate()
+            .map(|(index, param)| {
+                let column_type = expected_parameters
+                    .get(index)
+                    .map(|column| column.coltype)
+                    .unwrap_or(param.coltype);
+                mysql_parameter_to_literal(param.value.into_inner(), column_type)
+            })
             .collect();
         let sql = bind_parameters(&query, &values);
         if normalize_sql_whitespace(sql.trim().trim_end_matches(';').trim())
@@ -25429,6 +34692,104 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for Backend {
 }
 
 impl Backend {
+    fn query_source_schema(&self, query: &str) -> Option<TableSchema> {
+        let reference = query_source_table_reference(query)?;
+        self.table_schema(&reference).ok()
+    }
+
+    fn result_column_definitions(&self, query: &str, columns: &[String]) -> Vec<MysqlColumn> {
+        let schema = self.query_source_schema(query);
+        let projection_items = select_metadata_projection_items(query);
+        columns
+            .iter()
+            .enumerate()
+            .map(|(index, name)| {
+                let source_column = projection_items
+                    .as_ref()
+                    .and_then(|items| items.get(index))
+                    .and_then(|item| metadata_projection_column(item, &schema));
+                let source_column = source_column.or_else(|| {
+                    schema.as_ref().and_then(|schema| {
+                        schema
+                            .columns
+                            .iter()
+                            .find(|column| column.name.eq_ignore_ascii_case(name))
+                    })
+                });
+                let mut definition = source_column
+                    .map(|column| mysql_column_from_storage(column, schema.as_ref()))
+                    .or_else(|| {
+                        projection_items
+                            .as_ref()
+                            .and_then(|items| items.get(index))
+                            .map(|item| mysql_expression_column(name, item))
+                    })
+                    .unwrap_or_else(|| mysql_text_column(name));
+                definition.column = name.clone();
+                definition
+            })
+            .collect()
+    }
+
+    fn prepared_parameter_definitions(&self, query: &str) -> Vec<MysqlColumn> {
+        let names = prepared_parameter_column_names(query, self.query_source_schema(query));
+        let count = count_placeholders(query);
+        (0..count)
+            .map(|index| {
+                names
+                    .get(index)
+                    .and_then(|name| name.as_ref())
+                    .and_then(|name| {
+                        self.query_source_schema(query).and_then(|schema| {
+                            schema
+                                .columns
+                                .iter()
+                                .find(|column| column.name.eq_ignore_ascii_case(name))
+                                .map(|column| mysql_column_from_storage(column, Some(&schema)))
+                        })
+                    })
+                    .unwrap_or_else(|| mysql_text_column(&format!("param{}", index + 1)))
+            })
+            .collect()
+    }
+
+    fn prepared_result_definitions(&self, query: &str) -> Vec<MysqlColumn> {
+        if !query
+            .trim_start()
+            .get(.."SELECT".len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("SELECT"))
+            && !query
+                .trim_start()
+                .get(.."WITH".len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("WITH"))
+        {
+            return Vec::new();
+        }
+        let columns = select_metadata_projection_items(query)
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|item| {
+                        parse_alias(item).unwrap_or_else(|| {
+                            let expression = projection_without_alias(item).trim();
+                            if is_column_reference(expression) {
+                                expression
+                                    .rsplit('.')
+                                    .next()
+                                    .unwrap_or(expression)
+                                    .trim_matches('`')
+                                    .to_string()
+                            } else {
+                                expression.to_string()
+                            }
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        self.result_column_definitions(query, &columns)
+    }
+
     async fn execute_and_write<W: AsyncWrite + Send + Unpin>(
         &mut self,
         query: &str,
@@ -25493,19 +34854,36 @@ impl Backend {
                     .await
             }
             Ok(QueryOutcome::Rows { columns, rows }) => {
-                let definitions: Vec<_> = columns
-                    .iter()
-                    .map(|name| MysqlColumn {
-                        table: String::new(),
-                        column: name.clone(),
-                        collen: 0,
-                        coltype: ColumnType::MYSQL_TYPE_VAR_STRING,
-                        colflags: ColumnFlags::empty(),
-                    })
-                    .collect();
+                let definitions = self.result_column_definitions(query, &columns);
                 let mut writer = results.start(&definitions).await?;
                 for row in rows {
-                    writer.write_row(row).await?;
+                    let row = match row
+                        .into_iter()
+                        .zip(&definitions)
+                        .map(|(value, column)| {
+                            prepared_output_value_for_column(value, column).map_err(|error| {
+                                io::Error::new(
+                                    error.kind(),
+                                    format!("column '{}': {error}", column.column),
+                                )
+                            })
+                        })
+                        .collect::<io::Result<Vec<_>>>()
+                    {
+                        Ok(row) => row,
+                        Err(error) => {
+                            let message = error.to_string().into_bytes();
+                            return writer
+                                .finish_error(ErrorKind::ER_UNKNOWN_ERROR, &message)
+                                .await;
+                        }
+                    };
+                    if let Err(error) = writer.write_row(row).await {
+                        let message = error.to_string().into_bytes();
+                        return writer
+                            .finish_error(ErrorKind::ER_UNKNOWN_ERROR, &message)
+                            .await;
+                    }
                 }
                 writer.finish().await
             }
@@ -25516,19 +34894,7 @@ impl Backend {
             }) => {
                 let definitions = result_sets
                     .iter()
-                    .map(|result_set| {
-                        result_set
-                            .columns
-                            .iter()
-                            .map(|name| MysqlColumn {
-                                table: String::new(),
-                                column: name.clone(),
-                                collen: 0,
-                                coltype: ColumnType::MYSQL_TYPE_VAR_STRING,
-                                colflags: ColumnFlags::empty(),
-                            })
-                            .collect::<Vec<_>>()
-                    })
+                    .map(|result_set| self.result_column_definitions(query, &result_set.columns))
                     .collect::<Vec<_>>();
                 let out_definitions = out_parameters.as_ref().map(|result_set| {
                     let column_types = result_set
@@ -25546,7 +34912,33 @@ impl Backend {
                 for (index, result_set) in result_sets.into_iter().enumerate() {
                     let mut row_writer = result_writer.start(&definitions[index]).await?;
                     for row in result_set.rows {
-                        row_writer.write_row(row).await?;
+                        let row = match row
+                            .into_iter()
+                            .zip(&definitions[index])
+                            .map(|(value, column)| {
+                                prepared_output_value_for_column(value, column).map_err(|error| {
+                                    io::Error::new(
+                                        error.kind(),
+                                        format!("column '{}': {error}", column.column),
+                                    )
+                                })
+                            })
+                            .collect::<io::Result<Vec<_>>>()
+                        {
+                            Ok(row) => row,
+                            Err(error) => {
+                                let message = error.to_string().into_bytes();
+                                return row_writer
+                                    .finish_error(ErrorKind::ER_UNKNOWN_ERROR, &message)
+                                    .await;
+                            }
+                        };
+                        if let Err(error) = row_writer.write_row(row).await {
+                            let message = error.to_string().into_bytes();
+                            return row_writer
+                                .finish_error(ErrorKind::ER_UNKNOWN_ERROR, &message)
+                                .await;
+                        }
                     }
                     result_writer = row_writer.finish_one().await?;
                 }
@@ -25588,7 +34980,7 @@ impl Backend {
             Err(error) => {
                 self.stats.query_errors.fetch_add(1, Ordering::Relaxed);
                 debug!("query failed: {}", error);
-                let message = error.to_string();
+                let message = mysql_compat_error_message(error.to_string());
                 if let Some(condition) = error.downcast_ref::<ProcedureConditionError>() {
                     let sqlstate: [u8; 5] = condition
                         .0
@@ -25600,6 +34992,11 @@ impl Backend {
                         .error_with_code(condition.0.error_code, &sqlstate, message.as_bytes())
                         .await;
                 }
+                if message.starts_with("The value specified for generated column '") {
+                    return results
+                        .error_with_code(3105, b"HY000", message.as_bytes())
+                        .await;
+                }
                 let kind = error
                     .downcast_ref::<TriggerSignalError>()
                     .map(|signal| signal_error_kind(&signal.sqlstate))
@@ -25608,6 +35005,16 @@ impl Backend {
             }
         }
     }
+}
+
+fn mysql_compat_error_message(message: String) -> String {
+    if message.starts_with("Table '") && message.ends_with(" does not exist") {
+        return format!(
+            "{} doesn't exist",
+            message.trim_end_matches(" does not exist")
+        );
+    }
+    message
 }
 
 fn signal_error_kind(sqlstate: &str) -> ErrorKind {
@@ -25621,7 +35028,11 @@ fn signal_error_kind(sqlstate: &str) -> ErrorKind {
 }
 
 fn mysql_error_kind(message: &str) -> ErrorKind {
-    if message.starts_with("Row ") && message.ends_with("doesn't contain data for all columns") {
+    if message.starts_with("You have an error in your SQL syntax") {
+        ErrorKind::ER_PARSE_ERROR
+    } else if message.starts_with("Row ")
+        && message.ends_with("doesn't contain data for all columns")
+    {
         ErrorKind::ER_WARN_TOO_FEW_RECORDS
     } else if message.starts_with("Row ")
         && message.ends_with("contained more data than there were input columns")
@@ -25654,10 +35065,18 @@ fn mysql_error_kind(message: &str) -> ErrorKind {
         ErrorKind::ER_CHECK_CONSTRAINT_VIOLATED
     } else if message.starts_with("Duplicate entry for key '") {
         ErrorKind::ER_DUP_ENTRY
+    } else if message.starts_with("Data too long for column '") {
+        ErrorKind::ER_DATA_TOO_LONG
     } else if message.starts_with("Column '") && message.ends_with(" cannot be null") {
         ErrorKind::ER_BAD_NULL_ERROR
     } else if message.starts_with("Field '") && message.ends_with(" doesn't have a default value") {
         ErrorKind::ER_NO_DEFAULT_FOR_FIELD
+    } else if message == "Can't find FULLTEXT index matching the column list" {
+        ErrorKind::ER_FT_MATCHING_KEY_NOT_FOUND
+    } else if message == "All parts of a SPATIAL index must be NOT NULL" {
+        ErrorKind::ER_SPATIAL_CANT_HAVE_NULL
+    } else if message == "A SPATIAL index may only contain a geometrical type column" {
+        ErrorKind::ER_SPATIAL_MUST_HAVE_GEOM_COL
     } else if message.starts_with("Unknown storage engine '") && message.ends_with('\'') {
         ErrorKind::ER_UNKNOWN_STORAGE_ENGINE
     } else if message.starts_with("Unknown database '") {
@@ -25733,13 +35152,13 @@ pub async fn handle_connection(
         .map(|address| address.ip().to_string())
         .unwrap_or_else(|_| "unknown".to_string());
     let connection_id = stats.connected();
+    let _registration = ConnectionRegistration::new(stats.clone(), connection_id, &client_address);
     info!("MySQL connection {} opened", connection_id);
     let mut backend = Backend::new(storage, config.clone(), stats.clone(), connection_id);
     backend.client_address = client_address;
     if config.tls_config.is_none() {
         let (reader, writer) = stream.into_split();
         let result = AsyncMysqlIntermediary::run_on(backend, reader, writer).await;
-        stats.disconnected();
         info!("MySQL connection {} closed", connection_id);
         return result.map_err(Into::into);
     }
@@ -25759,9 +35178,82 @@ pub async fn handle_connection(
     } else {
         plain_run_with_options(backend, writer, options, init_params).await
     };
-    stats.disconnected();
     info!("MySQL connection {} closed", connection_id);
     result.map_err(Into::into)
+}
+
+/// Execute one statement for the built-in management SQL IDE.
+///
+/// It uses the same parser, privilege checks, transaction path, WAL and MVCC
+/// as a wire client. The short-lived backend is intentionally separate from
+/// the HTTP task so session variables and locks cannot leak between requests.
+pub async fn execute_admin_sql(
+    storage: Arc<StorageEngineManager>,
+    config: Arc<ProtocolConfig>,
+    stats: Arc<WireStats>,
+    username: &str,
+    database: Option<&str>,
+    sql: &str,
+) -> anyhow::Result<AdminSqlResult> {
+    let connection_id = stats.connected();
+    stats.register_connection(connection_id, "local");
+    let mut backend = Backend::new(storage, config, stats.clone(), connection_id);
+    if let Some(database) = database.filter(|database| !database.is_empty()) {
+        backend.database = database.to_string();
+    }
+    *backend.authenticated_user.lock() = Some(username.to_string());
+    let outcome = backend.execute(sql).await;
+    stats.unregister_connection(connection_id);
+    stats.disconnected();
+    let outcome = outcome?;
+    let result = match outcome {
+        QueryOutcome::Ok {
+            affected_rows,
+            last_insert_id,
+        } => AdminSqlResult {
+            result_sets: Vec::new(),
+            affected_rows,
+            last_insert_id,
+        },
+        QueryOutcome::Rows { columns, rows } => AdminSqlResult {
+            result_sets: vec![admin_result_set(columns, rows)],
+            affected_rows: 0,
+            last_insert_id: 0,
+        },
+        QueryOutcome::Multiple {
+            result_sets,
+            out_parameters,
+            affected_rows,
+        } => {
+            let mut sets = result_sets
+                .into_iter()
+                .map(|set| admin_result_set(set.columns, set.rows))
+                .collect::<Vec<_>>();
+            if let Some(set) = out_parameters {
+                sets.push(admin_result_set(set.columns, set.rows));
+            }
+            AdminSqlResult {
+                result_sets: sets,
+                affected_rows,
+                last_insert_id: 0,
+            }
+        }
+    };
+    Ok(result)
+}
+
+fn admin_result_set(columns: Vec<String>, rows: Vec<Vec<Option<Vec<u8>>>>) -> AdminSqlResultSet {
+    AdminSqlResultSet {
+        columns,
+        rows: rows
+            .into_iter()
+            .map(|row| {
+                row.into_iter()
+                    .map(|value| value.map(|value| String::from_utf8_lossy(&value).into_owned()))
+                    .collect()
+            })
+            .collect(),
+    }
 }
 
 #[cfg(test)]
@@ -25823,8 +35315,7 @@ fn create_table_like_sql(source: &TableSchema, destination: &str) -> anyhow::Res
     let open = original
         .find('(')
         .ok_or_else(|| anyhow::anyhow!("Source table has no column definition"))?;
-    let close = original
-        .rfind(')')
+    let close = matching_parenthesis(&original, open)
         .ok_or_else(|| anyhow::anyhow!("Source table has no closing column definition"))?;
     if close <= open {
         anyhow::bail!("Source table has an invalid column definition");
@@ -25893,7 +35384,24 @@ struct ViewDefinition {
     name: String,
     columns: Vec<String>,
     query: String,
+    check_option: ViewCheckOption,
     or_replace: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ViewCheckOption {
+    None,
+    Local,
+    Cascaded,
+}
+
+#[derive(Debug, Clone)]
+struct UpdatableView {
+    source_database: String,
+    source_table: String,
+    columns: Vec<(String, String)>,
+    check_option: ViewCheckOption,
+    view_predicate: Option<RowPredicate>,
 }
 
 struct CreateTableAsSelect {
@@ -27706,6 +37214,7 @@ async fn execute_scheduled_event(
                     &scheduled.database,
                     config.auth_catalog.clone(),
                     backend.authenticated_username(),
+                    backend.active_role_set(),
                 );
                 let result = STORED_FUNCTION_CATALOG
                     .scope(
@@ -28290,6 +37799,7 @@ fn procedure_parameter_column(name: &str, data_type: &str) -> MysqlColumn {
         "TIMESTAMP" => ColumnType::MYSQL_TYPE_TIMESTAMP,
         "TIME" => ColumnType::MYSQL_TYPE_TIME,
         "YEAR" => ColumnType::MYSQL_TYPE_YEAR,
+        "BIT" => ColumnType::MYSQL_TYPE_BIT,
         "JSON" => ColumnType::MYSQL_TYPE_JSON,
         "ENUM" => ColumnType::MYSQL_TYPE_ENUM,
         "SET" => ColumnType::MYSQL_TYPE_SET,
@@ -28299,6 +37809,7 @@ fn procedure_parameter_column(name: &str, data_type: &str) -> MysqlColumn {
         "LONGBLOB" => ColumnType::MYSQL_TYPE_LONG_BLOB,
         "BINARY" | "CHAR" => ColumnType::MYSQL_TYPE_STRING,
         "VARBINARY" | "VARCHAR" => ColumnType::MYSQL_TYPE_VAR_STRING,
+        "SIGNED" | "UNSIGNED" => ColumnType::MYSQL_TYPE_LONGLONG,
         _ => ColumnType::MYSQL_TYPE_VAR_STRING,
     };
     let mut colflags = ColumnFlags::empty();
@@ -29378,6 +38889,14 @@ fn procedure_condition_from_error(error: &anyhow::Error) -> ProcedureRaisedCondi
         };
     }
     let message = error.to_string();
+    if message.starts_with("The value specified for generated column '") {
+        return ProcedureRaisedCondition {
+            sqlstate: "HY000".into(),
+            error_code: 3105,
+            message,
+            information: HashMap::new(),
+        };
+    }
     let kind = mysql_error_kind(&message);
     ProcedureRaisedCondition {
         sqlstate: String::from_utf8_lossy(kind.sqlstate()).into_owned(),
@@ -30375,6 +39894,7 @@ fn collect_trigger_runtime_statements(
                             anyhow::bail!("Unknown local variable '{}'", target);
                         }
                         let evaluation = trigger_context_with_locals(context.clone(), locals);
+                        let expression = bind_trigger_local_references(&expression, locals);
                         let value = evaluate_scalar_expression(&expression, &evaluation)?;
                         locals.set(&target, value)?;
                     }
@@ -30410,8 +39930,14 @@ fn collect_trigger_runtime_statements(
                 has_else,
             } => {
                 let evaluation = trigger_context_with_locals(context.clone(), locals);
-                let selected =
-                    trigger_case_branch(selector, branches, otherwise, *has_else, &evaluation)?;
+                let selected = trigger_case_branch(
+                    selector,
+                    branches,
+                    otherwise,
+                    *has_else,
+                    &evaluation,
+                    locals,
+                )?;
                 if let Some(control) =
                     collect_trigger_runtime_statements(selected, context, locals, output)?
                 {
@@ -30503,20 +40029,33 @@ fn trigger_case_branch<'a>(
     otherwise: &'a [TriggerStatementNode],
     has_else: bool,
     context: &Row,
+    locals: &TriggerLocalScopes,
 ) -> anyhow::Result<&'a [TriggerStatementNode]> {
-    let selected_value = selector
+    let selected_expression = selector
+        .as_deref()
+        .map(|selector| bind_trigger_local_references(selector, locals));
+    let selected_collation = selected_expression
+        .as_deref()
+        .and_then(scalar_expression_collation);
+    let selected_value = selected_expression
         .as_deref()
         .map(|selector| evaluate_scalar_expression(selector, context))
         .transpose()?;
     for (condition, statements) in branches {
         let matched = if let Some(selected_value) = &selected_value {
-            let branch_value = evaluate_scalar_expression(condition, context)?;
+            let condition = bind_trigger_local_references(condition, locals);
+            let branch_value = evaluate_scalar_expression(&condition, context)?;
+            let collation =
+                scalar_expression_collation(&condition).or_else(|| selected_collation.clone());
             selected_value
                 .as_deref()
                 .zip(branch_value.as_deref())
-                .is_some_and(|(selected, branch)| compare_sql_bytes(selected, branch).is_eq())
+                .is_some_and(|(selected, branch)| {
+                    compare_sql_values(selected, branch, collation.as_deref()).is_eq()
+                })
         } else {
-            evaluate_scalar_condition(condition, context)?
+            let condition = bind_trigger_local_references(condition, locals);
+            evaluate_scalar_condition(&condition, context)?
         };
         if matched {
             return Ok(statements);
@@ -30579,6 +40118,90 @@ struct ParsedTriggerDeclaration {
     names: Vec<String>,
     data_type: String,
     default_expression: Option<String>,
+}
+
+fn trigger_local_character_set_collation(data_type: &str) -> Option<(String, String)> {
+    let upper = data_type.trim().to_ascii_uppercase();
+    let base = upper
+        .split(|character: char| character.is_whitespace() || character == '(')
+        .next()
+        .unwrap_or_default();
+    if !matches!(
+        base,
+        "CHAR"
+            | "NCHAR"
+            | "VARCHAR"
+            | "NVARCHAR"
+            | "TINYTEXT"
+            | "TEXT"
+            | "MEDIUMTEXT"
+            | "LONGTEXT"
+            | "ENUM"
+            | "SET"
+    ) {
+        return None;
+    }
+
+    let collation =
+        parse_sql_collation(data_type).and_then(|value| normalize_mysql_collation(&value).ok());
+    let character_set = find_top_level_keyword(data_type, " CHARACTER SET ", 0)
+        .and_then(|position| {
+            let remainder = &data_type[position + " CHARACTER SET ".len()..];
+            let end = find_top_level_keyword(remainder, " COLLATE ", 0).unwrap_or(remainder.len());
+            normalize_mysql_charset(remainder[..end].trim().trim_matches('`')).ok()
+        })
+        .or_else(|| {
+            collation
+                .as_deref()
+                .and_then(mysql_collation_info)
+                .map(|info| info.character_set.to_string())
+        });
+    let character_set = character_set?;
+    let collation = collation.or_else(|| {
+        MYSQL_CHARACTER_SETS
+            .iter()
+            .find(|info| info.name == character_set)
+            .map(|info| info.default_collation.to_string())
+    })?;
+    mysql_collation_info(&collation)
+        .filter(|info| info.character_set == character_set)
+        .map(|_| (character_set, collation))
+}
+
+fn trigger_numeric_data_type(data_type: &str) -> bool {
+    let upper = data_type.trim().to_ascii_uppercase();
+    let base = upper
+        .split(|character: char| character.is_whitespace() || character == '(')
+        .next()
+        .unwrap_or_default();
+    matches!(
+        base,
+        "TINYINT"
+            | "BOOL"
+            | "BOOLEAN"
+            | "SMALLINT"
+            | "MEDIUMINT"
+            | "INT"
+            | "INTEGER"
+            | "BIGINT"
+            | "DECIMAL"
+            | "NUMERIC"
+            | "FLOAT"
+            | "DOUBLE"
+            | "REAL"
+            | "YEAR"
+    )
+}
+
+fn trigger_value_literal(data_type: &str, value: &[u8]) -> String {
+    if trigger_numeric_data_type(data_type)
+        && std::str::from_utf8(value)
+            .ok()
+            .is_some_and(|value| value.trim().parse::<f64>().is_ok())
+    {
+        return String::from_utf8_lossy(value).trim().to_string();
+    }
+    hex_literal(value)
 }
 
 fn coerce_trigger_local_value(
@@ -31072,7 +40695,10 @@ fn execute_trigger_declaration(
     let value = declaration
         .default_expression
         .as_deref()
-        .map(|expression| evaluate_scalar_expression(expression, context))
+        .map(|expression| {
+            let expression = bind_trigger_local_references(expression, locals);
+            evaluate_scalar_expression(&expression, context)
+        })
         .transpose()?
         .flatten();
     for name in declaration.names {
@@ -31139,7 +40765,24 @@ fn bind_trigger_local_references(statement: &str, locals: &TriggerLocalScopes) -
                 if locals.is_null(identifier) {
                     output.push_str("NULL");
                 } else if let Some(value) = locals.get(identifier) {
-                    output.push_str(&hex_literal(value));
+                    if let Some(data_type) = locals.declared_type(identifier) {
+                        if let Some((character_set, collation)) =
+                            trigger_local_character_set_collation(data_type)
+                        {
+                            output.push_str("CONVERT(");
+                            output.push_str(&hex_literal(value));
+                            output.push_str(" USING ");
+                            output.push_str(&character_set);
+                            output.push_str(") COLLATE ");
+                            output.push_str(&collation);
+                        } else if trigger_numeric_data_type(data_type) {
+                            output.push_str(&trigger_value_literal(data_type, value));
+                        } else {
+                            output.push_str(&hex_literal(value));
+                        }
+                    } else {
+                        output.push_str(&hex_literal(value));
+                    }
                 }
             } else {
                 output.push_str(identifier);
@@ -31319,14 +40962,16 @@ fn bind_trigger_row_references(
                 .columns
                 .iter()
                 .find(|item| item.name.eq_ignore_ascii_case(&column))
-                .map(|item| item.name.as_str())
                 .ok_or_else(|| {
                     anyhow::anyhow!("Unknown trigger column '{}.{}'", qualifier, column)
                 })?;
-            if row.is_null(column) || !row.contains(column) {
+            if row.is_null(&column.name) || !row.contains(&column.name) {
                 output.push_str("NULL");
-            } else if let Some(value) = row.get(column) {
-                output.push_str(&hex_literal(value));
+            } else if let Some(value) = row.get(&column.name) {
+                output.push_str(&trigger_value_literal(
+                    &data_type_name(&column.data_type),
+                    value,
+                ));
             }
             cursor = end;
             continue;
@@ -31563,6 +41208,7 @@ fn parse_create_view(sql: &str) -> anyhow::Result<ViewDefinition> {
     let as_position = find_top_level_keyword(sql, " AS ", name_start)
         .ok_or_else(|| anyhow::anyhow!("CREATE VIEW requires AS SELECT"))?;
     let mut query = sql[as_position + 4..].trim().to_string();
+    let mut check_option = ViewCheckOption::None;
     for suffix in [
         " WITH CASCADED CHECK OPTION",
         " WITH LOCAL CHECK OPTION",
@@ -31571,6 +41217,13 @@ fn parse_create_view(sql: &str) -> anyhow::Result<ViewDefinition> {
         if query.to_ascii_uppercase().ends_with(suffix) {
             query.truncate(query.len() - suffix.len());
             query = query.trim().to_string();
+            check_option = if suffix.contains("CASCADED") {
+                ViewCheckOption::Cascaded
+            } else if suffix.contains("LOCAL") {
+                ViewCheckOption::Local
+            } else {
+                ViewCheckOption::Cascaded
+            };
             break;
         }
     }
@@ -31582,6 +41235,7 @@ fn parse_create_view(sql: &str) -> anyhow::Result<ViewDefinition> {
         name,
         columns,
         query,
+        check_option,
         or_replace: sql[..view].to_ascii_uppercase().contains("OR REPLACE"),
     })
 }
@@ -31592,16 +41246,280 @@ fn view_select_sql(schema: &TableSchema) -> Option<&str> {
         return None;
     }
     let position = find_top_level_keyword(sql, " AS ", 0)?;
-    Some(sql[position + 4..].trim())
+    let query = sql[position + 4..].trim();
+    for suffix in [
+        " WITH CASCADED CHECK OPTION",
+        " WITH LOCAL CHECK OPTION",
+        " WITH CHECK OPTION",
+    ] {
+        if query.to_ascii_uppercase().ends_with(suffix) {
+            return Some(query[..query.len() - suffix.len()].trim());
+        }
+    }
+    Some(query)
+}
+
+fn view_check_option(schema: &TableSchema) -> ViewCheckOption {
+    let Some(sql) = schema.create_sql.as_deref() else {
+        return ViewCheckOption::None;
+    };
+    let upper = sql.to_ascii_uppercase();
+    if upper.ends_with(" WITH CASCADED CHECK OPTION") {
+        ViewCheckOption::Cascaded
+    } else if upper.ends_with(" WITH LOCAL CHECK OPTION") {
+        ViewCheckOption::Local
+    } else if upper.ends_with(" WITH CHECK OPTION") {
+        ViewCheckOption::Cascaded
+    } else {
+        ViewCheckOption::None
+    }
+}
+
+fn view_check_option_name(option: ViewCheckOption) -> &'static str {
+    match option {
+        ViewCheckOption::None => "NONE",
+        ViewCheckOption::Local => "LOCAL",
+        ViewCheckOption::Cascaded => "CASCADED",
+    }
+}
+
+fn view_check_option_sql(option: ViewCheckOption) -> &'static str {
+    match option {
+        ViewCheckOption::None => "",
+        ViewCheckOption::Local => " WITH LOCAL CHECK OPTION",
+        ViewCheckOption::Cascaded => " WITH CASCADED CHECK OPTION",
+    }
+}
+
+fn map_view_predicate(
+    predicate: RowPredicate,
+    columns: &[(String, String)],
+) -> anyhow::Result<RowPredicate> {
+    let map_column = |column: String| {
+        columns
+            .iter()
+            .find(|(view, _)| view.eq_ignore_ascii_case(&column))
+            .map(|(_, base)| base.clone())
+            .ok_or_else(|| anyhow::anyhow!("Unknown column '{}' in view predicate", column))
+    };
+    Ok(match predicate {
+        RowPredicate::Eq(column, value) => RowPredicate::Eq(map_column(column)?, value),
+        RowPredicate::ExactEq(column, value) => RowPredicate::ExactEq(map_column(column)?, value),
+        RowPredicate::ColumnCompare(left, operator, right) => {
+            RowPredicate::ColumnCompare(map_column(left)?, operator, map_column(right)?)
+        }
+        RowPredicate::AlwaysTrue => RowPredicate::AlwaysTrue,
+        RowPredicate::AlwaysFalse => RowPredicate::AlwaysFalse,
+        RowPredicate::NotEq(column, value) => RowPredicate::NotEq(map_column(column)?, value),
+        RowPredicate::Less(column, value) => RowPredicate::Less(map_column(column)?, value),
+        RowPredicate::LessOrEq(column, value) => RowPredicate::LessOrEq(map_column(column)?, value),
+        RowPredicate::Greater(column, value) => RowPredicate::Greater(map_column(column)?, value),
+        RowPredicate::GreaterOrEq(column, value) => {
+            RowPredicate::GreaterOrEq(map_column(column)?, value)
+        }
+        RowPredicate::In(column, values) => RowPredicate::In(map_column(column)?, values),
+        RowPredicate::Between(column, lower, upper) => {
+            RowPredicate::Between(map_column(column)?, lower, upper)
+        }
+        RowPredicate::Like(column, value) => RowPredicate::Like(map_column(column)?, value),
+        RowPredicate::And(left, right) => RowPredicate::And(
+            Box::new(map_view_predicate(*left, columns)?),
+            Box::new(map_view_predicate(*right, columns)?),
+        ),
+        RowPredicate::Or(left, right) => RowPredicate::Or(
+            Box::new(map_view_predicate(*left, columns)?),
+            Box::new(map_view_predicate(*right, columns)?),
+        ),
+        RowPredicate::IsNull(column) => RowPredicate::IsNull(map_column(column)?),
+        RowPredicate::IsNotNull(column) => RowPredicate::IsNotNull(map_column(column)?),
+        RowPredicate::Never => RowPredicate::Never,
+    })
+}
+
+fn simple_updatable_view_definition(
+    storage: &StorageEngineManager,
+    database: &str,
+    schema: &TableSchema,
+) -> anyhow::Result<Option<UpdatableView>> {
+    let Some(query) = view_select_sql(schema) else {
+        return Ok(None);
+    };
+    let upper = query.to_ascii_uppercase();
+    if upper.starts_with("WITH ")
+        || !find_set_clauses(query).is_empty()
+        || [
+            " DISTINCT ",
+            " JOIN ",
+            " GROUP BY ",
+            " HAVING ",
+            " WINDOW ",
+            " UNION ",
+            " INTERSECT ",
+            " EXCEPT ",
+        ]
+        .into_iter()
+        .any(|keyword| find_top_level_keyword(query, keyword, 0).is_some())
+    {
+        return Ok(None);
+    }
+    let from = find_top_level_keyword(query, " FROM ", 0);
+    let Some(from) = from else {
+        return Ok(None);
+    };
+    let source_spec = query[from + 6..select_from_clause_end(query, from + 6)].trim();
+    let (source_reference, source_alias) = parse_join_source(source_spec)?;
+    let (source_database, source_table) = split_table_reference(&source_reference, database)?;
+    let source_schema = storage
+        .get_database(&source_database)
+        .and_then(|db| db.get_table(&source_table))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Table '{}.{}' does not exist",
+                source_database,
+                source_table
+            )
+        })?;
+    if view_select_sql(&source_schema).is_some() {
+        return Ok(None);
+    }
+    let (_, projection) = distinct_projection(query[6..from].trim());
+    let projection_items = split_csv(projection);
+    let columns = if projection.trim() == "*" {
+        if schema.columns.len() != source_schema.columns.len() {
+            return Ok(None);
+        }
+        schema
+            .columns
+            .iter()
+            .zip(&source_schema.columns)
+            .map(|(view, base)| (view.name.clone(), base.name.clone()))
+            .collect::<Vec<_>>()
+    } else {
+        if projection_items.len() != schema.columns.len() {
+            return Ok(None);
+        }
+        let mut columns = Vec::with_capacity(projection_items.len());
+        for (view_column, item) in schema.columns.iter().zip(projection_items) {
+            let expression = projection_without_alias(&item).trim();
+            if !is_column_reference(expression) {
+                return Ok(None);
+            }
+            let normalized = normalize_column_reference(expression);
+            let parts = normalized.split('.').collect::<Vec<_>>();
+            let base_name = match parts.as_slice() {
+                [column] => *column,
+                [qualifier, column]
+                    if qualifier.eq_ignore_ascii_case(&source_alias)
+                        || qualifier.eq_ignore_ascii_case(&source_table) =>
+                {
+                    *column
+                }
+                [qualifier, table, column]
+                    if qualifier.eq_ignore_ascii_case(&source_database)
+                        && table.eq_ignore_ascii_case(&source_table) =>
+                {
+                    *column
+                }
+                _ => return Ok(None),
+            };
+            let Some(base_column) = source_schema
+                .columns
+                .iter()
+                .find(|column| column.name.eq_ignore_ascii_case(base_name))
+            else {
+                return Ok(None);
+            };
+            columns.push((view_column.name.clone(), base_column.name.clone()));
+        }
+        columns
+    };
+    let primary_key = table_primary_key_columns(&source_schema);
+    if primary_key.iter().any(|key| {
+        !columns
+            .iter()
+            .any(|(_, base)| base.eq_ignore_ascii_case(key))
+    }) {
+        return Ok(None);
+    }
+    let view_predicate = match where_expression(query)
+        .map(parse_predicate_expression)
+        .transpose()?
+        .map(unqualify_row_predicate)
+    {
+        Some(predicate) => match map_view_predicate(predicate, &columns) {
+            Ok(predicate) => Some(predicate),
+            Err(_) => return Ok(None),
+        },
+        None => None,
+    };
+    Ok(Some(UpdatableView {
+        source_database,
+        source_table,
+        columns,
+        check_option: view_check_option(schema),
+        view_predicate,
+    }))
+}
+
+fn map_view_update_value(
+    value: UpdateValueExpression,
+    columns: &[(String, String)],
+) -> anyhow::Result<UpdateValueExpression> {
+    let map_column = |column: String| {
+        columns
+            .iter()
+            .find(|(view, _)| view.eq_ignore_ascii_case(&column))
+            .map(|(_, base)| base.clone())
+            .ok_or_else(|| anyhow::anyhow!("Unknown column '{}' in view", column))
+    };
+    Ok(match value {
+        UpdateValueExpression::Literal(value) => UpdateValueExpression::Literal(value),
+        UpdateValueExpression::Column(column) => UpdateValueExpression::Column(map_column(column)?),
+        UpdateValueExpression::Default(column) => {
+            UpdateValueExpression::Default(map_column(column)?)
+        }
+        UpdateValueExpression::Numeric {
+            source_column,
+            operator,
+            operand,
+        } => UpdateValueExpression::Numeric {
+            source_column: map_column(source_column)?,
+            operator,
+            operand,
+        },
+    })
+}
+
+fn map_view_assignments(
+    assignments: Vec<ExpressionAssignment>,
+    columns: &[(String, String)],
+) -> anyhow::Result<Vec<ExpressionAssignment>> {
+    assignments
+        .into_iter()
+        .map(|assignment| {
+            let target_column = columns
+                .iter()
+                .find(|(view, _)| view.eq_ignore_ascii_case(&assignment.target_column))
+                .map(|(_, base)| base.clone())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Column '{}' is not updatable through this view",
+                        assignment.target_column
+                    )
+                })?;
+            Ok(ExpressionAssignment {
+                target_column,
+                value: map_view_update_value(assignment.value, columns)?,
+            })
+        })
+        .collect()
 }
 
 fn parse_create_table(sql: &str) -> anyhow::Result<TableSchema> {
     let open = sql
         .find('(')
         .ok_or_else(|| anyhow::anyhow!("Missing column list"))?;
-    let close = sql
-        .rfind(')')
-        .ok_or_else(|| anyhow::anyhow!("Missing ')'"))?;
+    let close = matching_parenthesis(sql, open).ok_or_else(|| anyhow::anyhow!("Missing ')'"))?;
     let prefix = sql[..open].trim();
     let name = prefix
         .split_whitespace()
@@ -31625,7 +41543,7 @@ fn parse_create_table(sql: &str) -> anyhow::Result<TableSchema> {
             }
             continue;
         }
-        if upper.starts_with("FOREIGN ") || upper.contains(" FOREIGN KEY ") {
+        if upper.starts_with("FOREIGN ") || upper.contains("FOREIGN KEY") {
             continue;
         }
         if starts_with_sql_keyword(&upper, "CHECK")
@@ -31651,6 +41569,7 @@ fn parse_create_table(sql: &str) -> anyhow::Result<TableSchema> {
                 name: format!("{}_unique", column.name),
                 columns: vec![column.name.clone()],
                 unique: true,
+                kind: IndexKind::BTree,
             });
         }
         columns.push(column);
@@ -31665,7 +41584,7 @@ fn parse_create_table(sql: &str) -> anyhow::Result<TableSchema> {
             primary_key = Some(inline);
         }
     }
-    Ok(TableSchema {
+    let schema = TableSchema {
         name,
         columns,
         primary_key,
@@ -31675,7 +41594,9 @@ fn parse_create_table(sql: &str) -> anyhow::Result<TableSchema> {
         generation: 0,
         create_sql: Some(sql.trim().trim_end_matches(';').to_string()),
         engine: table_engine_from_sql(sql)?,
-    })
+    };
+    validate_table_partition_definition(&schema)?;
+    Ok(schema)
 }
 
 fn parse_index(definition: &str) -> Option<Index> {
@@ -31712,6 +41633,13 @@ fn parse_index(definition: &str) -> Option<Index> {
         name,
         columns,
         unique,
+        kind: if upper.starts_with("FULLTEXT") {
+            IndexKind::FullText
+        } else if upper.starts_with("SPATIAL") {
+            IndexKind::Spatial
+        } else {
+            IndexKind::BTree
+        },
     })
 }
 
@@ -31735,14 +41663,179 @@ fn parse_column(definition: &str) -> anyhow::Result<Column> {
     })
 }
 
+fn table_column_definitions(schema: &TableSchema) -> Option<Vec<String>> {
+    let sql = schema.create_sql.as_deref()?;
+    let open = sql.find('(')?;
+    let close = matching_parenthesis(sql, open)?;
+    Some(split_csv(&sql[open + 1..close]))
+}
+
+fn column_definition(schema: &TableSchema, column: &str) -> Option<String> {
+    table_column_definitions(schema)?
+        .into_iter()
+        .find(|definition| {
+            definition
+                .split_whitespace()
+                .next()
+                .is_some_and(|name| name.trim_matches('`').eq_ignore_ascii_case(column))
+        })
+}
+
+fn generated_column_definition(schema: &TableSchema, column: &str) -> Option<(String, bool)> {
+    let definition = column_definition(schema, column)?;
+    let upper = definition.to_ascii_uppercase();
+    let as_position = [" AS (", " AS("].into_iter().find_map(|marker| {
+        upper
+            .find(marker)
+            .map(|position| position + marker.len() - 1)
+    })?;
+    let close = matching_parenthesis(&definition, as_position)?;
+    let expression = definition[as_position + 1..close].trim().to_string();
+    let stored = upper[close + 1..].contains("STORED");
+    Some((expression, stored))
+}
+
+fn generated_column_names(schema: &TableSchema) -> Vec<String> {
+    schema
+        .columns
+        .iter()
+        .filter_map(|column| {
+            generated_column_definition(schema, &column.name).map(|_| column.name.clone())
+        })
+        .collect()
+}
+
+fn generated_column_write_error(schema: &TableSchema, column: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "The value specified for generated column '{}' in table '{}' is not allowed.",
+        column,
+        schema.name
+    )
+}
+
+fn reject_generated_insert_row(schema: &TableSchema, row: &Row) -> anyhow::Result<()> {
+    for column in generated_column_names(schema) {
+        if row.contains(&column) {
+            return Err(generated_column_write_error(schema, &column));
+        }
+    }
+    Ok(())
+}
+
+fn reject_generated_insert_columns(schema: &TableSchema, columns: &[String]) -> anyhow::Result<()> {
+    for column in columns {
+        if generated_column_definition(schema, column).is_some() {
+            return Err(generated_column_write_error(schema, column));
+        }
+    }
+    Ok(())
+}
+
+fn reject_generated_update_expression(
+    schema: &TableSchema,
+    column: &str,
+    expression: &str,
+) -> anyhow::Result<()> {
+    if generated_column_definition(schema, column).is_some()
+        && !expression.trim().eq_ignore_ascii_case("DEFAULT")
+    {
+        return Err(generated_column_write_error(schema, column));
+    }
+    Ok(())
+}
+
+fn reject_generated_update_assignments(
+    schema: &TableSchema,
+    assignments: &[ExpressionAssignment],
+) -> anyhow::Result<()> {
+    for assignment in assignments {
+        if generated_column_definition(schema, &assignment.target_column).is_some()
+            && !matches!(&assignment.value, UpdateValueExpression::Default(_))
+        {
+            return Err(generated_column_write_error(
+                schema,
+                &assignment.target_column,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn generated_expression_for_information_schema(expression: &str, schema: &TableSchema) -> String {
+    let mut output = format!("({expression})");
+    for column in &schema.columns {
+        let name = &column.name;
+        let mut replaced = String::with_capacity(output.len());
+        let mut cursor = 0;
+        while let Some(relative) = output[cursor..]
+            .to_ascii_lowercase()
+            .find(&name.to_ascii_lowercase())
+        {
+            let position = cursor + relative;
+            let end = position + name.len();
+            let boundary_before = position == 0
+                || !output.as_bytes()[position - 1].is_ascii_alphanumeric()
+                    && output.as_bytes()[position - 1] != b'_'
+                    && output.as_bytes()[position - 1] != b'`';
+            let boundary_after = end == output.len()
+                || !output.as_bytes()[end].is_ascii_alphanumeric()
+                    && output.as_bytes()[end] != b'_'
+                    && output.as_bytes()[end] != b'`';
+            if boundary_before && boundary_after && !output[position..end].starts_with('`') {
+                replaced.push_str(&output[cursor..position]);
+                replaced.push('`');
+                replaced.push_str(&output[position..end]);
+                replaced.push('`');
+                cursor = end;
+            } else {
+                replaced.push_str(&output[cursor..end]);
+                cursor = end;
+            }
+        }
+        replaced.push_str(&output[cursor..]);
+        output = replaced;
+    }
+    output
+}
+
+fn materialize_generated_columns(row: &mut Row, schema: &TableSchema) -> anyhow::Result<()> {
+    let generated = schema
+        .columns
+        .iter()
+        .filter_map(|column| {
+            generated_column_definition(schema, &column.name)
+                .map(|(expression, _)| (column.name.clone(), expression))
+        })
+        .collect::<Vec<_>>();
+    for _ in 0..=generated.len() {
+        let before = row.clone();
+        for (column, expression) in &generated {
+            match evaluate_scalar_expression_with_schema(expression, row, schema)? {
+                Some(value) => row.set(column, value),
+                None => row.set_null(column),
+            }
+        }
+        if *row == before {
+            return Ok(());
+        }
+    }
+    anyhow::bail!(
+        "Generated column dependency cycle in table '{}'",
+        schema.name
+    )
+}
+
 fn parse_data_type(value: &str) -> DataType {
     let upper = value.to_ascii_uppercase();
     if upper.starts_with("BIGINT") {
         DataType::BigInt
-    } else if upper.starts_with("INT")
-        || upper.starts_with("INTEGER")
-        || upper.starts_with("TINYINT")
-    {
+    } else if upper.starts_with("TINYINT") {
+        if upper.contains("(1)") {
+            DataType::Boolean
+        } else {
+            DataType::Int
+        }
+    } else if upper.starts_with("INT") || upper.starts_with("INTEGER") {
         DataType::Int
     } else if upper.starts_with("DOUBLE") {
         DataType::Double
@@ -31758,9 +41851,19 @@ fn parse_data_type(value: &str) -> DataType {
     } else if upper.starts_with("BLOB") || upper.contains("BINARY") {
         DataType::Blob
     } else if upper.starts_with("DATETIME") {
-        DataType::DateTime
+        if upper.contains('(') {
+            DataType::Raw(value.to_ascii_lowercase())
+        } else {
+            DataType::DateTime
+        }
     } else if upper.starts_with("TIMESTAMP") {
-        DataType::Timestamp
+        if upper.contains('(') {
+            DataType::Raw(value.to_ascii_lowercase())
+        } else {
+            DataType::Timestamp
+        }
+    } else if upper.starts_with("TIME") || upper.starts_with("BIT") {
+        DataType::Raw(value.to_ascii_lowercase())
     } else if upper.starts_with("DATE") {
         DataType::Date
     } else if upper.starts_with("BOOL") {
@@ -31820,11 +41923,11 @@ fn parse_alter_table_operation(
         return Ok(None);
     }
     let mut tokens = value.split_whitespace();
-    let action = tokens
+    let action_token = tokens
         .next()
-        .ok_or_else(|| anyhow::anyhow!("Empty ALTER TABLE operation"))?
-        .to_ascii_uppercase();
-    let remainder = value[action.len()..].trim();
+        .ok_or_else(|| anyhow::anyhow!("Empty ALTER TABLE operation"))?;
+    let action = action_token.to_ascii_uppercase();
+    let remainder = value[action_token.len()..].trim();
     let remainder_upper = remainder.to_ascii_uppercase();
     let operation = match action.as_str() {
         "ADD"
@@ -31852,7 +41955,11 @@ fn parse_alter_table_operation(
             if remainder_upper.starts_with("INDEX ")
                 || remainder_upper.starts_with("KEY ")
                 || remainder_upper.starts_with("UNIQUE INDEX ")
-                || remainder_upper.starts_with("UNIQUE KEY ") =>
+                || remainder_upper.starts_with("UNIQUE KEY ")
+                || remainder_upper.starts_with("FULLTEXT INDEX ")
+                || remainder_upper.starts_with("FULLTEXT KEY ")
+                || remainder_upper.starts_with("SPATIAL INDEX ")
+                || remainder_upper.starts_with("SPATIAL KEY ") =>
         {
             let (definition, if_not_exists) = strip_index_if_not_exists(remainder);
             let operation = AlterTableOperation::AddIndex(
@@ -32020,6 +42127,11 @@ fn parse_alter_table_operation(
             } else {
                 anyhow::bail!("Unsupported ALTER COLUMN operation");
             }
+        }
+        action if action.starts_with("COMMENT") => {
+            let comment = value["COMMENT".len()..].trim_start();
+            let comment = comment.strip_prefix('=').unwrap_or(comment).trim();
+            AlterTableOperation::SetTableComment(sql_quoted_option_value(comment))
         }
         _ => anyhow::bail!("Unsupported ALTER TABLE operation"),
     };
@@ -32252,6 +42364,19 @@ fn parse_create_index(sql: &str) -> anyhow::Result<(String, Index)> {
             unique: prefix
                 .iter()
                 .any(|token| token.eq_ignore_ascii_case("UNIQUE")),
+            kind: if prefix
+                .iter()
+                .any(|token| token.eq_ignore_ascii_case("FULLTEXT"))
+            {
+                IndexKind::FullText
+            } else if prefix
+                .iter()
+                .any(|token| token.eq_ignore_ascii_case("SPATIAL"))
+            {
+                IndexKind::Spatial
+            } else {
+                IndexKind::BTree
+            },
         },
     ))
 }
@@ -32300,7 +42425,11 @@ fn parse_insert(sql: &str, schema: &TableSchema) -> anyhow::Result<(String, Vec<
         for assignment in assignments {
             let (left, right) = split_equality(&assignment)?;
             let column = identifier(left);
-            if !schema.columns.iter().any(|item| item.name == column) {
+            if !schema
+                .columns
+                .iter()
+                .any(|item| item.name.eq_ignore_ascii_case(&column))
+            {
                 anyhow::bail!("Unknown column '{}'", column);
             }
             if !seen.insert(column.clone()) {
@@ -32315,6 +42444,7 @@ fn parse_insert(sql: &str, schema: &TableSchema) -> anyhow::Result<(String, Vec<
                 None => row.push_null(&column),
             }
         }
+        reject_generated_insert_row(schema, &row)?;
         return Ok((table, vec![row]));
     }
     let values_position = upper
@@ -32365,6 +42495,7 @@ fn parse_insert(sql: &str, schema: &TableSchema) -> anyhow::Result<(String, Vec<
                 None => row.push_null(column),
             }
         }
+        reject_generated_insert_row(schema, &row)?;
         rows.push(row);
     }
     Ok((table, rows))
@@ -32663,10 +42794,27 @@ fn parse_load_data(sql: &str, default_database: &str) -> anyhow::Result<LoadData
     let reference = sql[table_start..table_end].trim().trim_matches('`');
     let (database, table) = split_table_reference(reference, default_database)?;
     let tail = &sql[table_end..];
-    let tail_upper = tail.to_ascii_uppercase();
-    if tail_upper.contains(" PARTITION ") {
-        anyhow::bail!("LOAD DATA PARTITION is not supported yet");
-    }
+    let mut partition_end = None;
+    let partitions = find_top_level_keyword(tail, " PARTITION ", 0)
+        .map(|position| {
+            let open = tail[position + 11..]
+                .find('(')
+                .map(|offset| position + 11 + offset)
+                .ok_or_else(|| anyhow::anyhow!("LOAD DATA PARTITION requires a list"))?;
+            let close = matching_parenthesis(tail, open)
+                .ok_or_else(|| anyhow::anyhow!("Unclosed LOAD DATA PARTITION list"))?;
+            let names = split_csv(&tail[open + 1..close])
+                .into_iter()
+                .map(|name| identifier(&name))
+                .filter(|name| !name.is_empty())
+                .collect::<Vec<_>>();
+            if names.is_empty() {
+                anyhow::bail!("LOAD DATA PARTITION list cannot be empty");
+            }
+            partition_end = Some(close + 1);
+            Ok(names)
+        })
+        .transpose()?;
     let character_set = find_top_level_keyword(tail, " CHARACTER SET ", 0)
         .map(|position| {
             let value = tail[position + 15..].trim_start();
@@ -32759,7 +42907,8 @@ fn parse_load_data(sql: &str, default_database: &str) -> anyhow::Result<LoadData
         })
         .transpose()?
         .unwrap_or(0);
-    let binding_tail = &tail[..set_position.unwrap_or(tail.len())];
+    let binding_start = partition_end.unwrap_or(0);
+    let binding_tail = &tail[binding_start..set_position.unwrap_or(tail.len())];
     let columns = find_load_data_column_list(binding_tail)?;
     let set_assignments = set_position
         .map(|position| {
@@ -32790,6 +42939,7 @@ fn parse_load_data(sql: &str, default_database: &str) -> anyhow::Result<LoadData
         table,
         replace,
         ignore,
+        partitions,
         field_terminator,
         enclosed_by,
         optionally_enclosed,
@@ -32998,6 +43148,42 @@ fn decode_load_data_rows(
     Ok(DecodedLoadData { rows, warnings })
 }
 
+fn validate_load_data_partitions(
+    rows: Vec<Row>,
+    spec: &LoadDataSpec,
+    schema: &TableSchema,
+) -> anyhow::Result<Vec<Row>> {
+    let Some(requested) = &spec.partitions else {
+        return Ok(rows);
+    };
+    let Some(info) = table_partition_info(schema)? else {
+        anyhow::bail!("Table is not partitioned");
+    };
+    let requested = requested
+        .iter()
+        .map(|name| {
+            info.partitions
+                .iter()
+                .position(|partition| partition.name.eq_ignore_ascii_case(name))
+                .ok_or_else(|| anyhow::anyhow!("Unknown partition '{}'", name))
+        })
+        .collect::<anyhow::Result<HashSet<_>>>()?;
+    let mut selected = Vec::with_capacity(rows.len());
+    for row in rows {
+        let index = partition_for_row(&row, schema)?
+            .ok_or_else(|| anyhow::anyhow!("Table has no partition for row"))?;
+        if !requested.contains(&index) {
+            anyhow::bail!(
+                "Found a row not matching the given partition list for table '{}', partition '{}', row rejected",
+                schema.name,
+                info.partitions[index].name
+            );
+        }
+        selected.push(row);
+    }
+    Ok(selected)
+}
+
 fn load_data_binary_column(data_type: &DataType) -> bool {
     match data_type {
         DataType::Blob => true,
@@ -33183,6 +43369,46 @@ const MYSQL_COLLATIONS: &[MysqlCollationInfo] = &[
         pad_attribute: "NO PAD",
     },
     MysqlCollationInfo {
+        name: "utf8mb4_0900_as_ci",
+        character_set: "utf8mb4",
+        id: 305,
+        is_default: false,
+        sortlen: 0,
+        pad_attribute: "NO PAD",
+    },
+    MysqlCollationInfo {
+        name: "utf8mb4_0900_as_cs",
+        character_set: "utf8mb4",
+        id: 278,
+        is_default: false,
+        sortlen: 0,
+        pad_attribute: "NO PAD",
+    },
+    MysqlCollationInfo {
+        name: "utf8mb4_0900_bin",
+        character_set: "utf8mb4",
+        id: 309,
+        is_default: false,
+        sortlen: 1,
+        pad_attribute: "NO PAD",
+    },
+    MysqlCollationInfo {
+        name: "utf8mb4_cs_0900_ai_ci",
+        character_set: "utf8mb4",
+        id: 266,
+        is_default: false,
+        sortlen: 0,
+        pad_attribute: "NO PAD",
+    },
+    MysqlCollationInfo {
+        name: "utf8mb4_cs_0900_as_cs",
+        character_set: "utf8mb4",
+        id: 289,
+        is_default: false,
+        sortlen: 0,
+        pad_attribute: "NO PAD",
+    },
+    MysqlCollationInfo {
         name: "utf8mb4_general_ci",
         character_set: "utf8mb4",
         id: 45,
@@ -33219,6 +43445,14 @@ const MYSQL_COLLATIONS: &[MysqlCollationInfo] = &[
         character_set: "latin1",
         id: 8,
         is_default: true,
+        sortlen: 1,
+        pad_attribute: "PAD SPACE",
+    },
+    MysqlCollationInfo {
+        name: "latin1_bin",
+        character_set: "latin1",
+        id: 47,
+        is_default: false,
         sortlen: 1,
         pad_attribute: "PAD SPACE",
     },
@@ -33662,6 +43896,7 @@ fn parse_insert_conflict_action(
             .find(|item| item.name.eq_ignore_ascii_case(&requested))
             .map(|item| item.name.clone())
             .ok_or_else(|| anyhow::anyhow!("Unknown column '{}'", requested))?;
+        reject_generated_update_expression(schema, &column, right)?;
         let right = rewrite_insert_alias_references(right, insert_alias.as_ref());
         let value = expand_update_default_expression(&right, &column, schema)?;
         let value = parse_conflict_value_expression(&value)?;
@@ -33804,11 +44039,59 @@ fn rows_have_key_conflict(left: &Row, right: &Row, schema: &TableSchema) -> bool
         columns.iter().all(|column| {
             !left.is_null(column)
                 && !right.is_null(column)
-                && left
-                    .get(column)
-                    .is_some_and(|value| right.get(column) == Some(value))
+                && left.get(column).is_some_and(|left_value| {
+                    right.get(column).is_some_and(|right_value| {
+                        compare_sql_values(
+                            left_value,
+                            right_value,
+                            column_collation_name(schema, column).as_deref(),
+                        ) == std::cmp::Ordering::Equal
+                    })
+                })
         })
     })
+}
+
+fn coerce_insert_row_lengths(
+    row: &mut Row,
+    schema: &TableSchema,
+    row_number: usize,
+    strict: bool,
+    ignore: bool,
+    mut record_warning: impl FnMut(SqlWarning),
+) -> anyhow::Result<()> {
+    for column in &schema.columns {
+        let DataType::Varchar(limit) = column.data_type else {
+            continue;
+        };
+        let Some(value) = row.get(&column.name).map(ToOwned::to_owned) else {
+            continue;
+        };
+        if row.is_null(&column.name) {
+            continue;
+        }
+        let text = String::from_utf8_lossy(&value);
+        if text.chars().count() <= limit as usize {
+            continue;
+        }
+        if strict && !ignore {
+            anyhow::bail!(
+                "Data too long for column '{}' at row {}",
+                column.name,
+                row_number
+            );
+        }
+        let truncated = text.chars().take(limit as usize).collect::<String>();
+        row.set(&column.name, truncated.into_bytes());
+        record_warning(SqlWarning::warning(
+            1265,
+            format!(
+                "Data truncated for column '{}' at row {}",
+                column.name, row_number
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn row_optional_values(row: &Row, schema: &TableSchema) -> Vec<Option<Vec<u8>>> {
@@ -33898,7 +44181,7 @@ fn exact_row_predicate(schema: &TableSchema, row: &Row) -> RowPredicate {
             if row.is_null(&column.name) {
                 RowPredicate::IsNull(column.name.clone())
             } else {
-                RowPredicate::Eq(
+                RowPredicate::ExactEq(
                     column.name.clone(),
                     row.get(&column.name).unwrap_or_default().to_vec(),
                 )
@@ -34200,7 +44483,7 @@ fn parse_update(sql: &str) -> anyhow::Result<ParsedUpdate> {
     let set = upper
         .find(" SET ")
         .ok_or_else(|| anyhow::anyhow!("Missing SET"))?;
-    let table = sql[6..set].trim().trim_matches('`').to_string();
+    let table = parse_update_target_reference(&sql[6..set])?;
     let assignments_end = [" WHERE ", " ORDER BY ", " LIMIT "]
         .into_iter()
         .filter_map(|clause| upper[set + 5..].find(clause).map(|value| set + 5 + value))
@@ -34216,6 +44499,24 @@ fn parse_update(sql: &str) -> anyhow::Result<ParsedUpdate> {
         parse_where(sql)?.map(unqualify_row_predicate),
         parse_mutation_options(sql)?,
     ))
+}
+
+fn parse_update_target_reference(target: &str) -> anyhow::Result<String> {
+    let tokens = target.split_whitespace().collect::<Vec<_>>();
+    let table = match tokens.as_slice() {
+        [table] => *table,
+        [table, alias] if !alias.eq_ignore_ascii_case("AS") => *table,
+        [table, as_keyword, _alias] if as_keyword.eq_ignore_ascii_case("AS") => *table,
+        _ => anyhow::bail!(
+            "Invalid UPDATE target '{}'; expected table [AS] alias",
+            target.trim()
+        ),
+    };
+    let table = table.trim().trim_matches('`');
+    if table.is_empty() {
+        anyhow::bail!("Missing UPDATE target table");
+    }
+    Ok(table.to_string())
 }
 
 fn parse_delete(sql: &str) -> anyhow::Result<(String, Predicate, MutationOptions)> {
@@ -34296,6 +44597,11 @@ fn where_expression(sql: &str) -> Option<&str> {
 }
 
 fn having_expression(sql: &str) -> Option<&str> {
+    let (start, end) = having_expression_bounds(sql)?;
+    Some(sql[start..end].trim().trim_end_matches(';').trim())
+}
+
+fn having_expression_bounds(sql: &str) -> Option<(usize, usize)> {
     let position = find_top_level_keyword(sql, " HAVING ", 0)?;
     let start = position + 8;
     let end = [
@@ -34310,12 +44616,130 @@ fn having_expression(sql: &str) -> Option<&str> {
     .filter_map(|needle| find_top_level_keyword(sql, needle, start))
     .min()
     .unwrap_or(sql.len());
-    Some(sql[start..end].trim().trim_end_matches(';').trim())
+    Some((start, end))
+}
+
+fn scalar_subquery_ranges(value: &str) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let bytes = value.as_bytes();
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        if matches!(bytes[cursor], b'\'' | b'"' | b'`') {
+            let quote = bytes[cursor];
+            cursor += 1;
+            while cursor < bytes.len() {
+                if bytes[cursor] == b'\\' {
+                    cursor = cursor.saturating_add(2);
+                    continue;
+                }
+                if bytes[cursor] == quote {
+                    if cursor + 1 < bytes.len() && bytes[cursor + 1] == quote {
+                        cursor += 2;
+                    } else {
+                        cursor += 1;
+                        break;
+                    }
+                } else {
+                    cursor += 1;
+                }
+            }
+            continue;
+        }
+        if bytes[cursor] != b'(' {
+            cursor += 1;
+            continue;
+        }
+        let Some(close) = matching_parenthesis(value, cursor) else {
+            break;
+        };
+        let inner = value[cursor + 1..close].trim_start();
+        if inner.to_ascii_uppercase().starts_with("SELECT ")
+            || inner.to_ascii_uppercase().starts_with("WITH ")
+        {
+            ranges.push((cursor, close + 1));
+        }
+        cursor = close + 1;
+    }
+    ranges
+}
+
+fn query_source_aliases(sql: &str) -> HashSet<String> {
+    let Some(from) = find_top_level_keyword(sql, " FROM ", 0) else {
+        return HashSet::new();
+    };
+    let from_start = from + 6;
+    let from_end = select_from_clause_end(sql, from_start);
+    let clauses = find_join_clauses(sql, from_start, from_end);
+    let mut aliases = HashSet::new();
+    let mut segments = Vec::with_capacity(clauses.len() + 1);
+    if let Some(first) = clauses.first() {
+        segments.push(&sql[from_start..first.0]);
+    } else {
+        segments.push(&sql[from_start..from_end]);
+    }
+    for (index, clause) in clauses.iter().enumerate() {
+        let start = clause.0 + clause.1;
+        let end = clauses
+            .get(index + 1)
+            .map(|next| next.0)
+            .unwrap_or(from_end);
+        segments.push(&sql[start..end]);
+    }
+    for segment in segments {
+        let source = segment
+            .split_once(" ON ")
+            .or_else(|| segment.split_once(" USING "))
+            .map(|(source, _)| source)
+            .unwrap_or(segment)
+            .trim();
+        let words = source.split_whitespace().collect::<Vec<_>>();
+        let Some(table) = words.first() else {
+            continue;
+        };
+        let table = table.trim_matches('`').to_ascii_lowercase();
+        if !table.is_empty() && !table.starts_with('(') {
+            aliases.insert(table.clone());
+        }
+        let alias = if words
+            .get(1)
+            .is_some_and(|word| word.eq_ignore_ascii_case("AS"))
+        {
+            words.get(2)
+        } else {
+            words.get(1)
+        };
+        if let Some(alias) = alias {
+            let alias = alias.trim_matches('`').to_ascii_lowercase();
+            if !alias.is_empty() {
+                aliases.insert(alias);
+            }
+        }
+    }
+    aliases
+}
+
+fn subquery_has_outer_reference(subquery: &str, outer_aliases: &HashSet<String>) -> bool {
+    let local_aliases = query_source_aliases(subquery);
+    sql_identifier_token_ranges(subquery)
+        .iter()
+        .any(|(_, _, token)| {
+            let Some(qualifier) = token.split('.').next() else {
+                return false;
+            };
+            let qualifier = qualifier.to_ascii_lowercase();
+            outer_aliases.contains(&qualifier) && !local_aliases.contains(&qualifier)
+        })
 }
 
 fn parse_predicate_expression(expression: &str) -> anyhow::Result<RowPredicate> {
     let expression = trim_outer_parentheses(expression.trim());
     let expression_upper = expression.to_ascii_uppercase();
+    if matches!(expression_upper.as_str(), "TRUE" | "1") {
+        return Ok(RowPredicate::AlwaysTrue);
+    }
+    if matches!(expression_upper.as_str(), "FALSE" | "0") {
+        return Ok(RowPredicate::AlwaysFalse);
+    }
     if let Some(position) = find_top_level_keyword(expression, " OR ", 0) {
         return Ok(RowPredicate::Or(
             Box::new(parse_predicate_expression(&expression[..position])?),
@@ -34382,20 +44806,37 @@ fn parse_predicate_expression(expression: &str) -> anyhow::Result<RowPredicate> 
             parse_comparison_value(&expression[position + 6..])?,
         ));
     }
-    for (operator, constructor) in [
+    for (operator, constructor, column_operator) in [
         (
             ">=",
             RowPredicate::GreaterOrEq as fn(String, Vec<u8>) -> RowPredicate,
+            RowPredicateColumnOperator::GreaterOrEq,
         ),
-        ("<=", RowPredicate::LessOrEq),
-        ("<>", RowPredicate::NotEq),
-        ("!=", RowPredicate::NotEq),
-        (">", RowPredicate::Greater),
-        ("<", RowPredicate::Less),
-        ("=", RowPredicate::Eq),
+        (
+            "<=",
+            RowPredicate::LessOrEq,
+            RowPredicateColumnOperator::LessOrEq,
+        ),
+        ("<>", RowPredicate::NotEq, RowPredicateColumnOperator::NotEq),
+        ("!=", RowPredicate::NotEq, RowPredicateColumnOperator::NotEq),
+        (
+            ">",
+            RowPredicate::Greater,
+            RowPredicateColumnOperator::Greater,
+        ),
+        ("<", RowPredicate::Less, RowPredicateColumnOperator::Less),
+        ("=", RowPredicate::Eq, RowPredicateColumnOperator::Eq),
     ] {
         if let Some(position) = find_top_level_operator(expression, operator) {
-            let value = match parse_sql_value(expression[position + operator.len()..].trim())? {
+            let right = expression[position + operator.len()..].trim();
+            if !right.eq_ignore_ascii_case("NULL") && is_column_reference(right) {
+                return Ok(RowPredicate::ColumnCompare(
+                    identifier(&expression[..position]),
+                    column_operator,
+                    identifier(right),
+                ));
+            }
+            let value = match parse_sql_value(right)? {
                 SqlValue::Null => return Ok(RowPredicate::Never),
                 SqlValue::Bytes(value) => value,
             };
@@ -34462,6 +44903,7 @@ fn matching_parenthesis(value: &str, open: usize) -> Option<usize> {
 fn find_top_level_keyword(value: &str, keyword: &str, start: usize) -> Option<usize> {
     let upper = value.to_ascii_uppercase();
     let mut depth = 0_u32;
+    let mut case_depth = 0_u32;
     let mut quote = None;
     let mut escaped = false;
     for (index, ch) in value.char_indices() {
@@ -34481,7 +44923,34 @@ fn find_top_level_keyword(value: &str, keyword: &str, start: usize) -> Option<us
             '\'' | '"' => quote = Some(ch),
             '(' => depth += 1,
             ')' => depth = depth.saturating_sub(1),
-            _ if index >= start && depth == 0 && upper[index..].starts_with(keyword) => {
+            _ if ch.is_ascii_alphabetic() || ch == '_' => {
+                let word_end = value[index..]
+                    .char_indices()
+                    .find_map(|(offset, next)| {
+                        (offset > 0 && !next.is_ascii_alphanumeric() && next != '_')
+                            .then_some(index + offset)
+                    })
+                    .unwrap_or(value.len());
+                if depth == 0 {
+                    match &upper[index..word_end] {
+                        "CASE" => case_depth += 1,
+                        "END" => case_depth = case_depth.saturating_sub(1),
+                        _ => {}
+                    }
+                }
+                if index >= start
+                    && depth == 0
+                    && case_depth == 0
+                    && upper[index..].starts_with(keyword)
+                {
+                    return Some(index);
+                }
+            }
+            _ if index >= start
+                && depth == 0
+                && case_depth == 0
+                && upper[index..].starts_with(keyword) =>
+            {
                 return Some(index);
             }
             _ => {}
@@ -34532,7 +45001,7 @@ fn parse_assignment(value: &str) -> anyhow::Result<ExpressionAssignment> {
                     operand,
                 }
             } else {
-                parse_literal_update_value(value)?
+                anyhow::bail!("Update assignment requires scalar evaluation")
             }
         } else if is_identifier_reference(value) {
             UpdateValueExpression::Column(identifier(value))
@@ -34614,11 +45083,83 @@ fn unqualified_column(value: &str) -> &str {
     value.rsplit('.').next().unwrap_or(value)
 }
 
+fn predicate_source_index(column: &str, sources: &[JoinSource]) -> Option<usize> {
+    let parts = normalize_column_reference(column)
+        .split('.')
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let column_name = parts.last()?.as_str();
+    let matches = sources
+        .iter()
+        .enumerate()
+        .filter(|(_, source)| {
+            if !source
+                .schema
+                .columns
+                .iter()
+                .any(|item| item.name.eq_ignore_ascii_case(column_name))
+            {
+                return false;
+            }
+            if parts.len() == 1 {
+                return true;
+            }
+            let qualifier = parts[..parts.len() - 1].join(".");
+            qualifier.eq_ignore_ascii_case(&source.alias)
+                || qualifier.eq_ignore_ascii_case(&source.table)
+                || qualifier.eq_ignore_ascii_case(&format!("{}.{}", source.database, source.table))
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if matches.len() == 1 {
+        Some(matches[0])
+    } else {
+        None
+    }
+}
+
+fn predicate_for_source(
+    predicate: &RowPredicate,
+    source_index: usize,
+    sources: &[JoinSource],
+) -> Option<RowPredicate> {
+    let references_only_source = |predicate: &RowPredicate| {
+        predicate
+            .columns()
+            .into_iter()
+            .all(|column| predicate_source_index(column, sources) == Some(source_index))
+    };
+    match predicate {
+        RowPredicate::And(left, right) => {
+            let left = predicate_for_source(left, source_index, sources);
+            let right = predicate_for_source(right, source_index, sources);
+            match (left, right) {
+                (Some(left), Some(right)) => {
+                    Some(RowPredicate::And(Box::new(left), Box::new(right)))
+                }
+                (Some(predicate), None) | (None, Some(predicate)) => Some(predicate),
+                (None, None) => None,
+            }
+        }
+        RowPredicate::Or(_, _) if !references_only_source(predicate) => None,
+        _ if references_only_source(predicate) => Some(predicate.clone()),
+        _ => None,
+    }
+}
+
 fn unqualify_row_predicate(predicate: RowPredicate) -> RowPredicate {
     match predicate {
         RowPredicate::Eq(column, value) => {
             RowPredicate::Eq(unqualified_column(&column).to_string(), value)
         }
+        RowPredicate::ExactEq(column, value) => {
+            RowPredicate::ExactEq(unqualified_column(&column).to_string(), value)
+        }
+        RowPredicate::ColumnCompare(left, operator, right) => RowPredicate::ColumnCompare(
+            unqualified_column(&left).to_string(),
+            operator,
+            unqualified_column(&right).to_string(),
+        ),
         RowPredicate::NotEq(column, value) => {
             RowPredicate::NotEq(unqualified_column(&column).to_string(), value)
         }
@@ -34658,6 +45199,8 @@ fn unqualify_row_predicate(predicate: RowPredicate) -> RowPredicate {
             RowPredicate::IsNotNull(unqualified_column(&column).to_string())
         }
         RowPredicate::Never => RowPredicate::Never,
+        RowPredicate::AlwaysTrue => RowPredicate::AlwaysTrue,
+        RowPredicate::AlwaysFalse => RowPredicate::AlwaysFalse,
     }
 }
 
@@ -34686,6 +45229,7 @@ fn sort_projected_values(
     columns: &[String],
     projection_items: &[String],
     values: &mut [Vec<Option<Vec<u8>>>],
+    schema: Option<&TableSchema>,
 ) {
     let Some(order_items) = parse_order_by_items(sql) else {
         return;
@@ -34716,9 +45260,16 @@ fn sort_projected_values(
     if !resolved.is_empty() {
         values.sort_by(|left, right| {
             for (index, descending) in &resolved {
-                let mut ordering = compare_optional_sql_bytes(
+                let expression = projection_items
+                    .get(*index)
+                    .filter(|item| item.trim() != "*")
+                    .map(String::as_str)
+                    .or_else(|| columns.get(*index).map(String::as_str))
+                    .unwrap_or("");
+                let mut ordering = compare_optional_sql_values(
                     left.get(*index).and_then(Option::as_deref),
                     right.get(*index).and_then(Option::as_deref),
+                    collation_for_expression(schema, expression),
                 );
                 if *descending {
                     ordering = ordering.reverse();
@@ -34805,6 +45356,7 @@ fn resolve_row_order_expressions(
 fn sort_rows_by_expressions(
     rows: &mut Vec<Row>,
     order_items: &[OrderByExpression],
+    schema: Option<&TableSchema>,
 ) -> anyhow::Result<()> {
     if order_items.is_empty() {
         return Ok(());
@@ -34819,9 +45371,10 @@ fn sort_rows_by_expressions(
     }
     keyed.sort_by(|(_, left), (_, right)| {
         for (index, item) in order_items.iter().enumerate() {
-            let mut ordering = compare_optional_sql_bytes(
+            let mut ordering = compare_optional_sql_values(
                 left.get(index).and_then(Option::as_deref),
                 right.get(index).and_then(Option::as_deref),
+                collation_for_expression(schema, &item.expression),
             );
             if item.descending {
                 ordering = ordering.reverse();
@@ -35665,6 +46218,42 @@ fn parse_sql_value(value: &str) -> anyhow::Result<SqlValue> {
     if value.eq_ignore_ascii_case("NULL") {
         return Ok(SqlValue::Null);
     }
+    if value.len() >= 3
+        && (value.starts_with("B'") || value.starts_with("b'"))
+        && value.ends_with('\'')
+    {
+        let bits = &value[2..value.len() - 1];
+        if bits.is_empty() || !bits.bytes().all(|byte| matches!(byte, b'0' | b'1')) {
+            anyhow::bail!("Invalid bit literal '{}'; expected only 0 and 1", value);
+        }
+        let mut output = vec![0_u8; bits.len().div_ceil(8)];
+        for (index, bit) in bits.bytes().enumerate() {
+            if bit == b'1' {
+                let from_right = bits.len() - 1 - index;
+                let output_index = output.len() - 1 - from_right / 8;
+                output[output_index] |= 1 << (from_right % 8);
+            }
+        }
+        return Ok(SqlValue::Bytes(output));
+    }
+    if value.len() > 2
+        && (value.starts_with("0b") || value.starts_with("0B"))
+        && value[2..].bytes().all(|byte| matches!(byte, b'0' | b'1'))
+    {
+        let bits = &value[2..];
+        if bits.is_empty() {
+            anyhow::bail!("Invalid bit literal '{}'; expected at least one bit", value);
+        }
+        let mut output = vec![0_u8; bits.len().div_ceil(8)];
+        for (index, bit) in bits.bytes().enumerate() {
+            if bit == b'1' {
+                let from_right = bits.len() - 1 - index;
+                let output_index = output.len() - 1 - from_right / 8;
+                output[output_index] |= 1 << (from_right % 8);
+            }
+        }
+        return Ok(SqlValue::Bytes(output));
+    }
     if value.len() > 2
         && (value.starts_with("0x") || value.starts_with("0X"))
         && value[2..].bytes().all(|byte| byte.is_ascii_hexdigit())
@@ -35855,7 +46444,12 @@ fn render_create_table(schema: &TableSchema) -> String {
     definitions.extend(schema.indexes.iter().map(|index| {
         format!(
             "  {}KEY `{}` ({})",
-            if index.unique { "UNIQUE " } else { "" },
+            match index.kind {
+                IndexKind::FullText => "FULLTEXT ",
+                IndexKind::Spatial => "SPATIAL ",
+                IndexKind::BTree if index.unique => "UNIQUE ",
+                IndexKind::BTree => "",
+            },
             index.name,
             index
                 .columns
@@ -35878,8 +46472,97 @@ fn render_create_table(schema: &TableSchema) -> String {
 }
 
 fn parse_alias(value: &str) -> Option<String> {
-    find_top_level_keyword(value, " AS ", 0)
-        .map(|position| value[position + 4..].trim().trim_matches('`').to_string())
+    if let Some(position) = find_top_level_keyword(value, " AS ", 0) {
+        return Some(value[position + 4..].trim().trim_matches('`').to_string());
+    }
+    parse_implicit_alias_parts(value).map(|(_, alias)| alias.trim_matches('`').to_string())
+}
+
+fn parse_implicit_alias_parts(value: &str) -> Option<(&str, &str)> {
+    let value = value.trim();
+    let mut depth = 0_u32;
+    let mut quote = None;
+    let mut escaped = false;
+    let mut last_top_level_space = None;
+    for (index, character) in value.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if let Some(active) = quote {
+            if character == '\\' && active != '`' {
+                escaped = true;
+            } else if character == active {
+                quote = None;
+            }
+            continue;
+        }
+        match character {
+            '\'' | '"' | '`' => quote = Some(character),
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            character if depth == 0 && character.is_ascii_whitespace() => {
+                last_top_level_space = Some(index)
+            }
+            _ => {}
+        }
+    }
+    let split = last_top_level_space?;
+    let expression = value[..split].trim();
+    let alias = value[split..].trim();
+    if expression.is_empty()
+        || alias.contains('.')
+        || !is_identifier_reference(alias)
+        || matches!(
+            alias.trim_matches('`').to_ascii_uppercase().as_str(),
+            "AS" | "ASC"
+                | "DESC"
+                | "AND"
+                | "BETWEEN"
+                | "CASE"
+                | "ELSE"
+                | "END"
+                | "FROM"
+                | "WHERE"
+                | "GROUP"
+                | "HAVING"
+                | "IN"
+                | "IS"
+                | "LIKE"
+                | "ORDER"
+                | "LIMIT"
+                | "NOT"
+                | "OFFSET"
+                | "OR"
+                | "FOR"
+                | "REGEXP"
+                | "RLIKE"
+                | "THEN"
+                | "WITH"
+                | "WINDOW"
+                | "WHEN"
+                | "OVER"
+                | "NULL"
+                | "TRUE"
+                | "FALSE"
+        )
+    {
+        return None;
+    }
+    let tail = expression
+        .split_whitespace()
+        .next_back()
+        .unwrap_or_default();
+    if matches!(
+        tail,
+        "+" | "-" | "*" | "/" | "%" | "=" | "<" | ">" | "&" | "|" | "^"
+    ) || matches!(
+        tail.to_ascii_uppercase().as_str(),
+        "COLLATE" | "OVER" | "FILTER" | "WITHIN"
+    ) {
+        return None;
+    }
+    Some((expression, alias))
 }
 
 #[derive(Debug, Clone)]
@@ -36225,7 +46908,7 @@ fn apply_show_filter(
             ShowMetadataFilter::Like(pattern) => values
                 .get(like_column)
                 .and_then(Option::as_deref)
-                .is_some_and(|value| scalar_like_matches(value, pattern.as_bytes())),
+                .is_some_and(|value| scalar_like_matches_ascii_ci(value, pattern.as_bytes())),
             ShowMetadataFilter::Where(expression) => {
                 let mut row = Row::new();
                 for (column, value) in columns.iter().zip(&values) {
@@ -36411,9 +47094,121 @@ fn mysql_value_to_literal(value: ValueInner<'_>) -> String {
         ValueInner::Int(value) => value.to_string(),
         ValueInner::UInt(value) => value.to_string(),
         ValueInner::Double(value) => value.to_string(),
-        ValueInner::Date(value) | ValueInner::Time(value) | ValueInner::Datetime(value) => {
-            format!("'{}'", String::from_utf8_lossy(value))
+        ValueInner::Date(value) => mysql_binary_date_literal(value),
+        ValueInner::Datetime(value) => mysql_binary_datetime_literal(value),
+        ValueInner::Time(value) => mysql_binary_time_literal(value),
+    }
+}
+
+fn mysql_parameter_to_literal(value: ValueInner<'_>, column_type: ColumnType) -> String {
+    match (column_type, value) {
+        (ColumnType::MYSQL_TYPE_DATE, ValueInner::Date(value))
+        | (ColumnType::MYSQL_TYPE_DATE, ValueInner::Datetime(value)) => {
+            mysql_binary_date_literal(value)
         }
+        (ColumnType::MYSQL_TYPE_DATE, ValueInner::Bytes(value)) => {
+            mysql_text_date_or_binary_literal(value)
+        }
+        (
+            ColumnType::MYSQL_TYPE_DATETIME | ColumnType::MYSQL_TYPE_TIMESTAMP,
+            ValueInner::Datetime(value),
+        ) => mysql_binary_datetime_literal(value),
+        (
+            ColumnType::MYSQL_TYPE_DATETIME | ColumnType::MYSQL_TYPE_TIMESTAMP,
+            ValueInner::Bytes(value),
+        ) => mysql_text_datetime_or_binary_literal(value),
+        (ColumnType::MYSQL_TYPE_TIME, ValueInner::Time(value)) => mysql_binary_time_literal(value),
+        (ColumnType::MYSQL_TYPE_TIME, ValueInner::Bytes(value)) => {
+            mysql_text_time_or_binary_literal(value)
+        }
+        (_, value) => mysql_value_to_literal(value),
+    }
+}
+
+fn mysql_text_date_or_binary_literal(value: &[u8]) -> String {
+    if std::str::from_utf8(value)
+        .ok()
+        .is_some_and(|value| value.len() >= 8 && value.as_bytes().get(4) == Some(&b'-'))
+    {
+        return format!("'{}'", String::from_utf8_lossy(value));
+    }
+    mysql_binary_date_literal(value)
+}
+
+fn mysql_text_datetime_or_binary_literal(value: &[u8]) -> String {
+    if std::str::from_utf8(value)
+        .ok()
+        .is_some_and(|value| value.len() >= 10 && value.as_bytes().get(4) == Some(&b'-'))
+    {
+        return format!("'{}'", String::from_utf8_lossy(value));
+    }
+    if value.len() == 4 {
+        mysql_binary_date_literal(value)
+    } else {
+        mysql_binary_datetime_literal(value)
+    }
+}
+
+fn mysql_text_time_or_binary_literal(value: &[u8]) -> String {
+    if std::str::from_utf8(value)
+        .ok()
+        .is_some_and(|value| value.contains(':'))
+    {
+        return format!("'{}'", String::from_utf8_lossy(value));
+    }
+    mysql_binary_time_literal(value)
+}
+
+fn mysql_binary_date_literal(value: &[u8]) -> String {
+    let Some((&year_bytes, rest)) = value.split_first_chunk::<2>() else {
+        return hex_literal(value);
+    };
+    let [month, day, ..] = rest else {
+        return hex_literal(value);
+    };
+    let year = u16::from_le_bytes(year_bytes);
+    format!("'{year:04}-{month:02}-{day:02}'")
+}
+
+fn mysql_binary_datetime_literal(value: &[u8]) -> String {
+    let Some((&year_bytes, rest)) = value.split_first_chunk::<2>() else {
+        return hex_literal(value);
+    };
+    let [month, day, hour, minute, second, rest @ ..] = rest else {
+        return hex_literal(value);
+    };
+    let year = u16::from_le_bytes(year_bytes);
+    let micros = rest
+        .get(..4)
+        .map(|bytes| u32::from_le_bytes(bytes.try_into().expect("four-byte microseconds")));
+    match micros {
+        Some(micros) if micros != 0 => {
+            format!("'{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}.{micros:06}'")
+        }
+        _ => format!("'{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}'"),
+    }
+}
+
+fn mysql_binary_time_literal(value: &[u8]) -> String {
+    if value.len() < 8 {
+        return hex_literal(value);
+    }
+    let negative = value[0];
+    let days = u32::from_le_bytes(value[1..5].try_into().expect("four-byte time days"));
+    let hours = days.saturating_mul(24).saturating_add(u32::from(value[5]));
+    let micros = value
+        .get(8..)
+        .and_then(|rest| rest.get(..4))
+        .map(|bytes| u32::from_le_bytes(bytes.try_into().expect("four-byte microseconds")));
+    let sign = if negative == 0 { "" } else { "-" };
+    match micros {
+        Some(micros) if micros != 0 => {
+            format!(
+                "'{sign}{hours:03}:{}:{:02}.{:06}'",
+                value[6], value[7], micros
+            )
+        }
+        _ => format!("'{sign}{hours:03}:{}:{:02}'", value[6], value[7]),
     }
 }
 
@@ -36432,6 +47227,50 @@ fn hex_literal(value: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn update_target_accepts_mysql_table_aliases() {
+        for target in [
+            "BetFishRoomBattleRecordEntity record",
+            "BetFishRoomBattleRecordEntity AS record",
+        ] {
+            let sql = format!(
+                "UPDATE {target} SET resultReported = TRUE WHERE record.resultReported = FALSE"
+            );
+            let (table, _, filter, _) = parse_update(&sql).expect("parse aliased UPDATE");
+            assert_eq!(table, "BetFishRoomBattleRecordEntity");
+            assert!(filter.is_some());
+        }
+    }
+
+    #[test]
+    fn prepared_temporal_parameters_preserve_text_and_binary_forms() {
+        assert_eq!(
+            mysql_parameter_to_literal(
+                ValueInner::Bytes(b"2026-08-12"),
+                ColumnType::MYSQL_TYPE_DATE,
+            ),
+            "'2026-08-12'"
+        );
+        assert_eq!(
+            mysql_parameter_to_literal(
+                ValueInner::Date(&[0xEA, 0x07, 8, 12]),
+                ColumnType::MYSQL_TYPE_DATE,
+            ),
+            "'2026-08-12'"
+        );
+        assert_eq!(
+            mysql_parameter_to_literal(
+                ValueInner::Bytes(b"2026-08-12 01:02:03"),
+                ColumnType::MYSQL_TYPE_DATETIME,
+            ),
+            "'2026-08-12 01:02:03'"
+        );
+        assert_eq!(
+            mysql_parameter_to_literal(ValueInner::Bytes(b"12:34:56"), ColumnType::MYSQL_TYPE_TIME,),
+            "'12:34:56'"
+        );
+    }
 
     #[test]
     fn parse_named_lock_select_detects_calls() {
@@ -36554,6 +47393,56 @@ mod tests {
         (temp, storage, first, second)
     }
 
+    #[test]
+    fn gap_lock_conflicts_follow_innodb_directional_rules() {
+        assert!(lock_request_conflicts(
+            "range:any",
+            LockMode::InsertIntention,
+            LockMode::GapShared
+        ));
+        assert!(lock_request_conflicts(
+            "range:any",
+            LockMode::InsertIntention,
+            LockMode::Exclusive
+        ));
+        assert!(!lock_request_conflicts(
+            "range:any",
+            LockMode::GapShared,
+            LockMode::Exclusive
+        ));
+        assert!(!lock_request_conflicts(
+            "range:any",
+            LockMode::Exclusive,
+            LockMode::InsertIntention
+        ));
+    }
+
+    #[test]
+    fn numeric_lock_key_comparison_preserves_bigint_precision() {
+        assert_eq!(
+            compare_numeric_lock_values(b"9007199254740992", b"9007199254740993"),
+            Some(std::cmp::Ordering::Less)
+        );
+        assert_eq!(
+            compare_numeric_lock_values(b"9.007199254740993e15", b"9007199254740993"),
+            Some(std::cmp::Ordering::Equal)
+        );
+        assert_eq!(
+            compare_numeric_lock_values(b"-9007199254740993", b"-9007199254740992"),
+            Some(std::cmp::Ordering::Less)
+        );
+    }
+
+    #[test]
+    fn deadlock_tie_prefers_current_waiting_transaction() {
+        let stats = WireStats::default();
+        stats.waits_for.lock().insert(10, HashSet::from([20]));
+        let victim = stats
+            .detect_deadlock_victim(20, &HashSet::from([10]))
+            .expect("two-way deadlock");
+        assert_eq!(victim, 20);
+    }
+
     #[tokio::test]
     async fn metadata_shared_locks_block_ddl_but_allow_dml_intent() {
         let stats = Arc::new(WireStats::default());
@@ -36658,6 +47547,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mysql_jdbc_authentication_probe_variables_are_available() {
+        let (_temp, _storage, mut backend, _second) = transaction_backends().await;
+        assert_eq!(
+            query_rows(
+                &mut backend,
+                "SELECT @@GLOBAL.lower_case_table_names, @@authentication_policy, @@default_authentication_plugin, @@old_passwords, @@event_scheduler, @@performance_schema",
+            )
+            .await,
+            vec![vec![
+                Some(b"1".to_vec()),
+                Some(b"*,,".to_vec()),
+                Some(b"caching_sha2_password".to_vec()),
+                Some(b"0".to_vec()),
+                Some(b"ON".to_vec()),
+                Some(b"1".to_vec()),
+            ]]
+        );
+        assert_eq!(
+            second_value(
+                backend
+                    .execute("SHOW GLOBAL VARIABLES LIKE 'default_authentication_plugin'")
+                    .await
+                    .expect("default authentication plugin variable"),
+            ),
+            b"caching_sha2_password"
+        );
+    }
+
+    #[tokio::test]
+    async fn mysql84_cli_probe_select_dollar_dollar_is_parse_error() {
+        let (_temp, _storage, mut backend, _second) = transaction_backends().await;
+        let error = backend
+            .execute("SELECT $$")
+            .await
+            .expect_err("MySQL 8.4 client probe must be rejected as invalid SQL");
+        assert_eq!(
+            mysql_error_kind(&error.to_string()),
+            ErrorKind::ER_PARSE_ERROR
+        );
+    }
+
+    #[tokio::test]
     async fn primary_key_next_key_range_locks_block_matching_gap_inserts() {
         let (_temp, _storage, mut first, mut second) = transaction_backends().await;
         first
@@ -36711,6 +47642,147 @@ mod tests {
             .unwrap();
 
         first.execute("ROLLBACK").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_committed_insert_select_does_not_lock_source_rows() {
+        let (_temp, _storage, mut first, mut second) = transaction_backends().await;
+        first
+            .execute("CREATE TABLE insert_select_source (id BIGINT PRIMARY KEY, value BIGINT)")
+            .await
+            .expect("create INSERT SELECT source");
+        first
+            .execute("CREATE TABLE insert_select_target (id BIGINT PRIMARY KEY, value BIGINT)")
+            .await
+            .expect("create INSERT SELECT target");
+        first
+            .execute("INSERT INTO insert_select_source VALUES (1,10)")
+            .await
+            .expect("seed INSERT SELECT source");
+        first
+            .execute("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED")
+            .await
+            .expect("set READ COMMITTED");
+        first.execute("BEGIN").await.expect("begin source read");
+        first
+            .execute(
+                "INSERT INTO insert_select_target
+                 SELECT id,value FROM insert_select_source WHERE id=1",
+            )
+            .await
+            .expect("INSERT SELECT under READ COMMITTED");
+
+        second
+            .execute("UPDATE insert_select_source SET value=11 WHERE id=1")
+            .await
+            .expect("READ COMMITTED INSERT SELECT must not lock source rows");
+        first
+            .execute("ROLLBACK")
+            .await
+            .expect("rollback source read");
+    }
+
+    #[tokio::test]
+    async fn repeatable_read_insert_select_locks_source_rows() {
+        let (_temp, _storage, mut first, mut second) = transaction_backends().await;
+        first
+            .execute("CREATE TABLE insert_select_source (id BIGINT PRIMARY KEY, value BIGINT)")
+            .await
+            .expect("create INSERT SELECT source");
+        first
+            .execute("CREATE TABLE insert_select_target (id BIGINT PRIMARY KEY, value BIGINT)")
+            .await
+            .expect("create INSERT SELECT target");
+        first
+            .execute("INSERT INTO insert_select_source VALUES (1,10)")
+            .await
+            .expect("seed INSERT SELECT source");
+        first.execute("BEGIN").await.expect("begin source read");
+        first
+            .execute(
+                "INSERT INTO insert_select_target
+                 SELECT id,value FROM insert_select_source WHERE id=1",
+            )
+            .await
+            .expect("INSERT SELECT under REPEATABLE READ");
+
+        let error = second
+            .execute("UPDATE insert_select_source SET value=11 WHERE id=1")
+            .await
+            .expect_err("REPEATABLE READ INSERT SELECT must lock source rows");
+        assert!(error.to_string().contains("Lock wait timeout"), "{error}");
+        first
+            .execute("ROLLBACK")
+            .await
+            .expect("rollback source read");
+    }
+
+    #[tokio::test]
+    async fn autocommit_locking_read_releases_row_lock_after_statement() {
+        let (_temp, _storage, mut first, mut second) = transaction_backends().await;
+        first
+            .execute("SELECT id FROM actors WHERE id=1 FOR UPDATE")
+            .await
+            .unwrap();
+
+        second
+            .execute("UPDATE actors SET value=11 WHERE id=1")
+            .await
+            .expect("autocommit FOR UPDATE must release its lock at statement end");
+    }
+
+    #[tokio::test]
+    async fn autocommit_off_locking_read_holds_row_lock_until_commit() {
+        let (_temp, _storage, mut first, mut second) = transaction_backends().await;
+        first.execute("SET autocommit=0").await.unwrap();
+        first
+            .execute("SELECT id FROM actors WHERE id=1 FOR UPDATE")
+            .await
+            .unwrap();
+
+        let error = second
+            .execute("UPDATE actors SET value=11 WHERE id=1")
+            .await
+            .expect_err("autocommit=0 FOR UPDATE must retain its row lock");
+        assert!(error.to_string().contains("Lock wait timeout"), "{error}");
+
+        first.execute("COMMIT").await.unwrap();
+        second
+            .execute("UPDATE actors SET value=11 WHERE id=1")
+            .await
+            .expect("COMMIT must release the retained row lock");
+    }
+
+    #[tokio::test]
+    async fn serializable_plain_select_locks_rows_without_for_update() {
+        let (_temp, _storage, mut first, mut second) = transaction_backends().await;
+        first
+            .execute("SET SESSION TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+            .await
+            .expect("set serializable isolation");
+        first
+            .execute("SET autocommit=0")
+            .await
+            .expect("disable autocommit");
+        first
+            .execute("SELECT id FROM actors WHERE id=1")
+            .await
+            .expect("serializable plain select");
+
+        let error = second
+            .execute("UPDATE actors SET value=11 WHERE id=1")
+            .await
+            .expect_err("serializable plain select must hold a shared row lock");
+        assert!(error.to_string().contains("Lock wait timeout"), "{error}");
+
+        first
+            .execute("COMMIT")
+            .await
+            .expect("commit serializable read");
+        second
+            .execute("UPDATE actors SET value=11 WHERE id=1")
+            .await
+            .expect("commit must release serializable read lock");
     }
 
     #[tokio::test]
@@ -36805,6 +47877,431 @@ mod tests {
             .execute("INSERT INTO indexed_actors (id,value) VALUES (4,30)")
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn secondary_index_equality_locks_preceding_next_key_gap() {
+        let (_temp, _storage, mut first, mut second) = transaction_backends().await;
+        first
+            .execute(
+                "CREATE TABLE secondary_equality_gap_rows (
+                    id BIGINT PRIMARY KEY,
+                    value BIGINT,
+                    INDEX idx_value (value)
+                )",
+            )
+            .await
+            .expect("create secondary equality gap table");
+        first
+            .execute(
+                "INSERT INTO secondary_equality_gap_rows (id,value)
+                 VALUES (1,10),(2,20)",
+            )
+            .await
+            .expect("seed secondary equality gap table");
+        first.execute("BEGIN").await.expect("begin gap transaction");
+        first
+            .execute(
+                "SELECT id FROM secondary_equality_gap_rows
+                 WHERE value=10 FOR UPDATE",
+            )
+            .await
+            .expect("lock secondary equality row");
+
+        let error = second
+            .execute(
+                "INSERT INTO secondary_equality_gap_rows (id,value)
+                 VALUES (3,5)",
+            )
+            .await
+            .expect_err("next-key lock must block insertion into the preceding gap");
+        assert!(error.to_string().contains("Lock wait timeout"), "{error}");
+
+        second
+            .execute(
+                "INSERT INTO secondary_equality_gap_rows (id,value)
+                 VALUES (4,15)",
+            )
+            .await
+            .expect("next-key lock must not block the following gap");
+        first
+            .execute("ROLLBACK")
+            .await
+            .expect("rollback gap transaction");
+    }
+
+    #[tokio::test]
+    async fn secondary_index_equality_update_locks_preceding_next_key_gap() {
+        let (_temp, _storage, mut first, mut second) = transaction_backends().await;
+        first
+            .execute(
+                "CREATE TABLE secondary_update_gap_rows (
+                    id BIGINT PRIMARY KEY,
+                    value BIGINT,
+                    INDEX idx_value (value)
+                )",
+            )
+            .await
+            .expect("create secondary update gap table");
+        first
+            .execute(
+                "INSERT INTO secondary_update_gap_rows (id,value)
+                 VALUES (1,10),(2,20)",
+            )
+            .await
+            .expect("seed secondary update gap table");
+        first
+            .execute("BEGIN")
+            .await
+            .expect("begin update gap transaction");
+        first
+            .execute("UPDATE secondary_update_gap_rows SET value=11 WHERE value=10")
+            .await
+            .expect("update secondary equality row");
+
+        let error = second
+            .execute(
+                "INSERT INTO secondary_update_gap_rows (id,value)
+                 VALUES (3,5)",
+            )
+            .await
+            .expect_err("DML next-key lock must block insertion into the preceding gap");
+        assert!(error.to_string().contains("Lock wait timeout"), "{error}");
+
+        second
+            .execute(
+                "INSERT INTO secondary_update_gap_rows (id,value)
+                 VALUES (4,15)",
+            )
+            .await
+            .expect("DML next-key lock must not block the following gap");
+        first
+            .execute("ROLLBACK")
+            .await
+            .expect("rollback update gap transaction");
+    }
+
+    #[tokio::test]
+    async fn string_secondary_index_ranges_use_collation_order_not_numeric_order() {
+        let (_temp, _storage, mut first, mut second) = transaction_backends().await;
+        first
+            .execute(
+                "CREATE TABLE indexed_strings (id BIGINT PRIMARY KEY, value VARCHAR(32), INDEX idx_value (value))",
+            )
+            .await
+            .unwrap();
+        first
+            .execute("INSERT INTO indexed_strings (id,value) VALUES (1,'10'),(2,'20')")
+            .await
+            .unwrap();
+        first.execute("BEGIN").await.unwrap();
+        first
+            .execute("SELECT id FROM indexed_strings WHERE value > '2' FOR UPDATE")
+            .await
+            .unwrap();
+
+        second
+            .execute("INSERT INTO indexed_strings (id,value) VALUES (3,'15')")
+            .await
+            .expect("'15' is below the string range lower bound '2'");
+        let error = second
+            .execute("INSERT INTO indexed_strings (id,value) VALUES (4,'25')")
+            .await
+            .expect_err("'25' must be inside the locked string range")
+            .to_string();
+        assert!(error.contains("Lock wait timeout"), "{error}");
+
+        first.execute("ROLLBACK").await.unwrap();
+        second
+            .execute("INSERT INTO indexed_strings (id,value) VALUES (4,'25')")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn insert_and_upsert_lock_modes_follow_duplicate_index_semantics() {
+        let (_temp, storage, mut first, _second) = transaction_backends().await;
+        first
+            .execute(
+                "CREATE TABLE duplicate_lock_rows (
+                    id BIGINT PRIMARY KEY,
+                    value VARCHAR(32) UNIQUE,
+                    tag VARCHAR(32),
+                    INDEX idx_tag (tag)
+                )",
+            )
+            .await
+            .unwrap();
+        first
+            .execute("INSERT INTO duplicate_lock_rows VALUES (1,'same','tag')")
+            .await
+            .unwrap();
+        let schema = storage
+            .get_database("mydb")
+            .and_then(|database| database.get_table("duplicate_lock_rows"))
+            .expect("duplicate-lock schema");
+        let mut duplicate = Row::new();
+        duplicate.push("id", b"1".to_vec());
+        duplicate.push("value", b"new".to_vec());
+        let insert_locks = write_lock_requests(
+            &storage,
+            &[WriteCommand::Insert {
+                database: "mydb".into(),
+                table: "duplicate_lock_rows".into(),
+                row: duplicate.clone(),
+            }],
+        )
+        .expect("insert lock requests");
+        let primary =
+            row_lock_key_for_schema(&duplicate, &["id".into()], &schema).expect("primary lock key");
+        assert_eq!(
+            insert_locks
+                .iter()
+                .find(|request| request.resource
+                    == format!("row:mydb.duplicate_lock_rows:PRIMARY:{primary}"))
+                .map(|request| request.mode),
+            Some(LockMode::Shared)
+        );
+
+        let mut upsert = Row::new();
+        upsert.push("id", b"2".to_vec());
+        upsert.push("value", b"same".to_vec());
+        upsert.push("tag", b"tag-2".to_vec());
+        let upsert_locks = write_lock_requests(
+            &storage,
+            &[WriteCommand::Upsert {
+                database: "mydb".into(),
+                table: "duplicate_lock_rows".into(),
+                row: upsert,
+                update_columns: vec!["tag".into()],
+                ignore: false,
+            }],
+        )
+        .expect("upsert lock requests");
+        assert!(upsert_locks.iter().any(|request| {
+            request.resource.starts_with("range:") && request.mode == LockMode::Exclusive
+        }));
+        assert!(upsert_locks.iter().any(|request| {
+            request.resource.contains(&hex_bytes(b"idx_tag"))
+                && request.mode == LockMode::InsertIntention
+        }));
+
+        let mut fresh_upsert = Row::new();
+        fresh_upsert.push("id", b"3".to_vec());
+        fresh_upsert.push("value", b"fresh".to_vec());
+        fresh_upsert.push("tag", b"tag-3".to_vec());
+        let fresh_upsert_locks = write_lock_requests(
+            &storage,
+            &[WriteCommand::Upsert {
+                database: "mydb".into(),
+                table: "duplicate_lock_rows".into(),
+                row: fresh_upsert,
+                update_columns: vec!["tag".into()],
+                ignore: false,
+            }],
+        )
+        .expect("fresh upsert lock requests");
+        assert!(fresh_upsert_locks.iter().any(|request| {
+            request.resource.starts_with("range:")
+                && request.resource.contains(&hex_bytes(b"value_unique"))
+                && request.mode == LockMode::Exclusive
+        }));
+    }
+
+    #[tokio::test]
+    async fn secondary_index_locking_read_locks_clustered_primary_record() {
+        let (_temp, _storage, mut first, mut second) = transaction_backends().await;
+        first
+            .execute(
+                "CREATE TABLE secondary_lock_rows (
+                    id BIGINT PRIMARY KEY,
+                    value BIGINT,
+                    INDEX idx_value (value)
+                )",
+            )
+            .await
+            .unwrap();
+        first
+            .execute("INSERT INTO secondary_lock_rows (id,value) VALUES (1,10),(2,20)")
+            .await
+            .unwrap();
+        first.execute("BEGIN").await.unwrap();
+        first
+            .execute("SELECT id FROM secondary_lock_rows WHERE value=10 FOR UPDATE")
+            .await
+            .unwrap();
+
+        let error = second
+            .execute("UPDATE secondary_lock_rows SET value=11 WHERE id=1")
+            .await
+            .expect_err("secondary-index FOR UPDATE must lock the clustered record");
+        assert!(error.to_string().contains("Lock wait timeout"), "{error}");
+
+        second
+            .execute("UPDATE secondary_lock_rows SET value=21 WHERE id=2")
+            .await
+            .expect("a different clustered record must remain writable");
+        first.execute("ROLLBACK").await.unwrap();
+        second
+            .execute("UPDATE secondary_lock_rows SET value=11 WHERE id=1")
+            .await
+            .expect("rollback must release the clustered record lock");
+    }
+
+    #[tokio::test]
+    async fn secondary_index_mutation_locks_clustered_primary_record_before_materialization() {
+        let (_temp, _storage, mut first, mut second) = transaction_backends().await;
+        first
+            .execute(
+                "CREATE TABLE secondary_mutation_lock_rows (
+                    id BIGINT PRIMARY KEY,
+                    value BIGINT,
+                    INDEX idx_value (value)
+                )",
+            )
+            .await
+            .unwrap();
+        first
+            .execute("INSERT INTO secondary_mutation_lock_rows (id,value) VALUES (1,10),(2,20)")
+            .await
+            .unwrap();
+        first.execute("BEGIN").await.unwrap();
+        first
+            .execute("UPDATE secondary_mutation_lock_rows SET value=11 WHERE value=10")
+            .await
+            .unwrap();
+
+        let error = second
+            .execute("UPDATE secondary_mutation_lock_rows SET value=12 WHERE id=1")
+            .await
+            .expect_err(
+                "secondary-index UPDATE must lock the clustered record before materialization",
+            );
+        assert!(error.to_string().contains("Lock wait timeout"), "{error}");
+
+        first.execute("ROLLBACK").await.unwrap();
+        second
+            .execute("UPDATE secondary_mutation_lock_rows SET value=12 WHERE id=1")
+            .await
+            .expect("rollback must release the clustered record lock");
+    }
+
+    #[tokio::test]
+    async fn secondary_index_key_update_locks_new_index_entry_before_commit() {
+        let (_temp, _storage, mut first, mut second) = transaction_backends().await;
+        first
+            .execute(
+                "CREATE TABLE secondary_key_update_rows (
+                    id BIGINT PRIMARY KEY,
+                    value BIGINT,
+                    INDEX idx_value (value)
+                )",
+            )
+            .await
+            .unwrap();
+        first
+            .execute("INSERT INTO secondary_key_update_rows (id,value) VALUES (1,10)")
+            .await
+            .unwrap();
+        first.execute("BEGIN").await.unwrap();
+        first
+            .execute("UPDATE secondary_key_update_rows SET value=20 WHERE id=1")
+            .await
+            .unwrap();
+
+        let error = second
+            .execute("INSERT INTO secondary_key_update_rows (id,value) VALUES (2,20)")
+            .await
+            .expect_err("new secondary-index entry must be locked until update commit");
+        assert!(error.to_string().contains("Lock wait timeout"), "{error}");
+
+        first.execute("ROLLBACK").await.unwrap();
+        second
+            .execute("INSERT INTO secondary_key_update_rows (id,value) VALUES (2,20)")
+            .await
+            .expect("rollback must release secondary-index key locks");
+    }
+
+    #[tokio::test]
+    async fn secondary_index_share_gap_locks_block_insert_intention() {
+        let (_temp, _storage, mut first, mut second) = transaction_backends().await;
+        first
+            .execute(
+                "CREATE TABLE shared_index_rows (id BIGINT PRIMARY KEY, value BIGINT, INDEX idx_value (value))",
+            )
+            .await
+            .unwrap();
+        first
+            .execute("INSERT INTO shared_index_rows (id,value) VALUES (1,10),(2,20)")
+            .await
+            .unwrap();
+        first.execute("BEGIN").await.unwrap();
+        first
+            .execute("SELECT id FROM shared_index_rows WHERE value > 10 FOR SHARE")
+            .await
+            .unwrap();
+
+        let error = second
+            .execute("INSERT INTO shared_index_rows (id,value) VALUES (3,30)")
+            .await
+            .expect_err("a shared gap lock must block insert intention");
+        assert!(error.to_string().contains("Lock wait timeout"), "{error}");
+
+        first.execute("ROLLBACK").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unique_secondary_index_share_read_allows_duplicate_check() {
+        let (_temp, _storage, mut first, mut second) = transaction_backends().await;
+        first
+            .execute(
+                "CREATE TABLE unique_index_rows (
+                    id BIGINT PRIMARY KEY,
+                    email VARCHAR(64),
+                    UNIQUE KEY uq_email (email)
+                )",
+            )
+            .await
+            .unwrap();
+        first
+            .execute("INSERT INTO unique_index_rows (id,email) VALUES (1,'a@example.com')")
+            .await
+            .unwrap();
+        first.execute("BEGIN").await.unwrap();
+        first
+            .execute(
+                "SELECT id FROM unique_index_rows
+                 WHERE email='a@example.com' FOR SHARE",
+            )
+            .await
+            .unwrap();
+        let error = second
+            .execute(
+                "INSERT INTO unique_index_rows (id,email)
+                 VALUES (2,'a@example.com')",
+            )
+            .await
+            .expect_err("a duplicate unique secondary key must be rejected");
+        assert!(error.to_string().contains("Duplicate entry"), "{error}");
+        first.execute("ROLLBACK").await.unwrap();
+
+        first.execute("BEGIN").await.unwrap();
+        first
+            .execute(
+                "SELECT id FROM unique_index_rows
+                 WHERE email='a@example.com' FOR UPDATE",
+            )
+            .await
+            .unwrap();
+        let error = second
+            .execute(
+                "INSERT INTO unique_index_rows (id,email)
+                 VALUES (2,'a@example.com')",
+            )
+            .await
+            .expect_err("a unique secondary key update lock must block a conflicting insert");
+        assert!(error.to_string().contains("Lock wait timeout"), "{error}");
+        first.execute("ROLLBACK").await.unwrap();
     }
 
     #[tokio::test]
@@ -36939,6 +48436,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn decimal_secondary_index_range_locks_use_numeric_order() {
+        let (_temp, _storage, mut first, mut second) = transaction_backends().await;
+        first
+            .execute(
+                "CREATE TABLE decimal_index_rows (
+                    id BIGINT PRIMARY KEY,
+                    value DECIMAL(10,2),
+                    INDEX idx_value (value)
+                )",
+            )
+            .await
+            .expect("create decimal index table");
+        first
+            .execute("INSERT INTO decimal_index_rows VALUES (1,2.00),(2,10.00)")
+            .await
+            .expect("seed decimal index table");
+        first.execute("BEGIN").await.expect("begin decimal range");
+        first
+            .execute(
+                "SELECT id FROM decimal_index_rows
+                 WHERE value >= 2.00 AND value < 10.00 FOR UPDATE",
+            )
+            .await
+            .expect("lock decimal range");
+
+        let error = second
+            .execute("INSERT INTO decimal_index_rows VALUES (3,5.00)")
+            .await
+            .expect_err("numeric decimal range must block an insert inside the range");
+        assert!(error.to_string().contains("Lock wait timeout"), "{error}");
+        first
+            .execute("ROLLBACK")
+            .await
+            .expect("rollback decimal range");
+        second
+            .execute("INSERT INTO decimal_index_rows VALUES (3,5.00)")
+            .await
+            .expect("rollback must release decimal range lock");
+    }
+
+    #[tokio::test]
+    async fn bigint_secondary_index_range_locks_preserve_large_integer_order() {
+        let (_temp, _storage, mut first, mut second) = transaction_backends().await;
+        first
+            .execute(
+                "CREATE TABLE bigint_index_rows (
+                    id BIGINT PRIMARY KEY,
+                    value BIGINT,
+                    INDEX idx_value (value)
+                )",
+            )
+            .await
+            .expect("create bigint index table");
+        first
+            .execute(
+                "INSERT INTO bigint_index_rows VALUES
+                 (1,9007199254740992),(2,9007199254740994)",
+            )
+            .await
+            .expect("seed bigint index table");
+        first.execute("BEGIN").await.expect("begin bigint range");
+        first
+            .execute(
+                "SELECT id FROM bigint_index_rows
+                 WHERE value > 9007199254740992 AND value < 9007199254740994 FOR UPDATE",
+            )
+            .await
+            .expect("lock bigint range");
+
+        let error = second
+            .execute("INSERT INTO bigint_index_rows VALUES (3,9007199254740993)")
+            .await
+            .expect_err("a large integer inside the range must be blocked");
+        assert!(error.to_string().contains("Lock wait timeout"), "{error}");
+        first
+            .execute("ROLLBACK")
+            .await
+            .expect("rollback bigint range");
+        second
+            .execute("INSERT INTO bigint_index_rows VALUES (3,9007199254740993)")
+            .await
+            .expect("rollback must release bigint range lock");
+    }
+
+    #[tokio::test]
     async fn no_primary_key_skip_locked_uses_hidden_row_locks() {
         let (_temp, _storage, mut first, mut second) = transaction_backends().await;
         first
@@ -36991,12 +48573,48 @@ mod tests {
     }
 
     #[test]
+    fn mysql_auth_plugin_clauses_parse_and_reject_unknown_plugins() {
+        assert_eq!(
+            parse_user_identified_clause(
+                "'analyst'@'%' IDENTIFIED WITH caching_sha2_password BY 'secret'",
+                "CREATE USER"
+            )
+            .unwrap(),
+            (
+                "'analyst'@'%'".to_string(),
+                "secret".to_string(),
+                "caching_sha2_password".to_string()
+            )
+        );
+        assert_eq!(
+            parse_user_identified_clause("analyst IDENTIFIED BY 'secret'", "CREATE USER")
+                .unwrap()
+                .2,
+            "caching_sha2_password"
+        );
+        let error = parse_user_identified_clause(
+            "analyst IDENTIFIED WITH sha256_password BY 'secret'",
+            "CREATE USER",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("unsupported authentication plugin"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn auth_catalog_persists_users_roles_and_database_grants() {
         let directory = tempfile::tempdir().unwrap();
         let catalog = AuthCatalog::open(directory.path(), "root", "root-password").unwrap();
         catalog
             .create_users(
-                &[("game_writer".to_string(), "writer-password".to_string())],
+                &[(
+                    "game_writer".to_string(),
+                    "writer-password".to_string(),
+                    default_authentication_plugin(),
+                )],
                 false,
             )
             .unwrap();
@@ -37048,6 +48666,7 @@ mod tests {
       "database_privileges": {},
       "roles": []
     }
+
   },
   "roles": {}
 }"#,
@@ -37087,6 +48706,48 @@ mod tests {
             .any(|grant| {
                 grant.contains("ALTER ROUTINE, EXECUTE ON FUNCTION `mydb`.`increment`")
             }));
+    }
+
+    #[test]
+    fn auth_host_matching_prefers_exact_host_and_account_plugin() {
+        let catalog = AuthCatalog::in_memory("root", "root");
+        catalog
+            .create_users(
+                &[
+                    (
+                        "app@%".to_string(),
+                        "wild-password".to_string(),
+                        "caching_sha2_password".to_string(),
+                    ),
+                    (
+                        "app@192.168.1.20".to_string(),
+                        "exact-password".to_string(),
+                        "mysql_native_password".to_string(),
+                    ),
+                ],
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            catalog.authentication_plugin("app", "192.168.1.20"),
+            "mysql_native_password"
+        );
+        assert_eq!(
+            catalog.verify_password("app@192.168.1.20", "exact-password"),
+            Some("app@192.168.1.20".to_string())
+        );
+        assert_eq!(
+            catalog.verify_password("app@192.168.1.21", "wild-password"),
+            Some("app@%".to_string())
+        );
+        assert!(mysql_host_matches(
+            "192.168.1.0/255.255.255.0",
+            "192.168.1.21"
+        ));
+        assert!(!mysql_host_matches(
+            "192.168.1.0/255.255.255.0",
+            "192.168.2.21"
+        ));
     }
 
     #[test]
@@ -37149,6 +48810,7 @@ mod tests {
             Arc::new(WireStats::default()),
             1,
         );
+        backend.stats.register_connection(1, "local");
         backend
             .execute("CREATE USER 'writer' IDENTIFIED BY 'writer-password'")
             .await
@@ -37201,6 +48863,124 @@ mod tests {
             _ => panic!("expected grants rows"),
         };
         assert!(!rendered.iter().any(|grant| grant.contains("analyst")));
+    }
+
+    #[tokio::test]
+    async fn mysql_role_activation_default_roles_and_enabled_metadata_follow_session() {
+        let (_temp, _storage, mut backend, _second) = transaction_backends().await;
+        backend
+            .execute("CREATE TABLE mydb.role_data (id BIGINT PRIMARY KEY)")
+            .await
+            .unwrap();
+        backend
+            .execute("INSERT INTO mydb.role_data VALUES (1)")
+            .await
+            .unwrap();
+        backend
+            .execute("CREATE USER 'role_session' IDENTIFIED BY 'role-password'")
+            .await
+            .unwrap();
+        backend
+            .execute("CREATE ROLE role_reader, role_writer")
+            .await
+            .unwrap();
+        backend
+            .execute("GRANT SELECT ON mydb.role_data TO role_reader")
+            .await
+            .unwrap();
+        backend
+            .execute("GRANT INSERT ON mydb.role_data TO role_writer")
+            .await
+            .unwrap();
+        backend
+            .execute("GRANT role_reader, role_writer TO role_session")
+            .await
+            .unwrap();
+        backend
+            .execute("SET DEFAULT ROLE role_reader TO role_session")
+            .await
+            .unwrap();
+
+        *backend.authenticated_user.lock() = Some("role_session".into());
+        *backend.active_roles.lock() = None;
+        backend.database = "mydb".into();
+        assert!(backend
+            .execute("SELECT id FROM mydb.role_data")
+            .await
+            .is_ok());
+        assert!(backend
+            .execute("INSERT INTO mydb.role_data VALUES (2)")
+            .await
+            .is_err());
+        assert!(
+            single_value(backend.execute("SELECT CURRENT_ROLE()").await.unwrap())
+                .windows(b"role_reader".len())
+                .any(|part| part == b"role_reader")
+        );
+
+        backend.execute("SET ROLE NONE").await.unwrap();
+        assert!(backend
+            .execute("SELECT id FROM mydb.role_data")
+            .await
+            .is_err());
+        backend.execute("SET ROLE role_writer").await.unwrap();
+        assert!(backend
+            .execute("INSERT INTO mydb.role_data VALUES (2)")
+            .await
+            .is_ok());
+        assert!(backend
+            .execute("SELECT id FROM mydb.role_data")
+            .await
+            .is_err());
+        backend.execute("SET ROLE DEFAULT").await.unwrap();
+        assert!(backend
+            .execute("SELECT id FROM mydb.role_data")
+            .await
+            .is_ok());
+
+        let enabled = query_rows(
+            &mut backend,
+            "SELECT ROLE_NAME,ROLE_HOST,IS_DEFAULT,IS_MANDATORY \
+             FROM information_schema.enabled_roles",
+        )
+        .await;
+        assert_eq!(
+            enabled,
+            vec![vec![
+                bytes("role_reader"),
+                bytes("%"),
+                bytes("YES"),
+                bytes("NO"),
+            ]]
+        );
+        let role_grants = query_rows(
+            &mut backend,
+            "SELECT GRANTEE,GRANTEE_HOST,TABLE_SCHEMA,TABLE_NAME,PRIVILEGE_TYPE \
+             FROM information_schema.role_table_grants",
+        )
+        .await;
+        assert!(role_grants.iter().any(|row| {
+            row == &vec![
+                bytes("role_reader"),
+                bytes("%"),
+                bytes("mydb"),
+                bytes("role_data"),
+                bytes("SELECT"),
+            ]
+        }));
+
+        backend
+            .execute("SET ROLE ALL EXCEPT role_reader")
+            .await
+            .unwrap();
+        assert!(backend
+            .execute("INSERT INTO mydb.role_data VALUES (3)")
+            .await
+            .is_ok());
+        assert!(backend
+            .execute("SELECT id FROM mydb.role_data")
+            .await
+            .is_err());
     }
 
     #[tokio::test]
@@ -37261,6 +49041,419 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn column_grants_are_persisted_displayed_and_enforced() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = Arc::new(StorageEngineManager::new(
+            temp.path().to_path_buf(),
+            16384,
+            "4M",
+        ));
+        storage.init().await.unwrap();
+        storage.create_database("mydb").await.unwrap();
+        let mut backend = Backend::new(
+            storage,
+            Arc::new(ProtocolConfig::default()),
+            Arc::new(WireStats::default()),
+            1,
+        );
+        backend
+            .execute(
+                "CREATE TABLE mydb.allowed \
+                 (id BIGINT PRIMARY KEY, value BIGINT, secret BIGINT)",
+            )
+            .await
+            .unwrap();
+        backend
+            .execute("INSERT INTO mydb.allowed VALUES (1, 10, 99)")
+            .await
+            .unwrap();
+        backend
+            .execute("CREATE USER 'column_reader' IDENTIFIED BY 'column-password'")
+            .await
+            .unwrap();
+        backend
+            .execute("GRANT SELECT (id), UPDATE (value) ON mydb.allowed TO 'column_reader'")
+            .await
+            .unwrap();
+        backend.execute("CREATE ROLE column_role").await.unwrap();
+        backend
+            .execute("GRANT SELECT (value) ON mydb.allowed TO column_role")
+            .await
+            .unwrap();
+        backend
+            .execute("GRANT column_role TO column_reader")
+            .await
+            .unwrap();
+        backend
+            .authenticated_user
+            .lock()
+            .replace("column_reader".to_string());
+        backend.execute("SET ROLE column_role").await.unwrap();
+        backend.database = "mydb".to_string();
+
+        assert!(matches!(
+            backend
+                .execute("SELECT id FROM mydb.allowed")
+                .await
+                .unwrap(),
+            QueryOutcome::Rows { .. }
+        ));
+        assert!(matches!(
+            backend
+                .execute("SELECT value FROM mydb.allowed")
+                .await
+                .unwrap(),
+            QueryOutcome::Rows { .. }
+        ));
+        let error = backend
+            .execute("SELECT id, secret FROM mydb.allowed")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("lacks SELECT privilege"), "{error}");
+        backend
+            .execute("UPDATE mydb.allowed SET value = 20")
+            .await
+            .unwrap();
+        let error = backend
+            .execute("UPDATE mydb.allowed SET id = 2")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("lacks UPDATE privilege"), "{error}");
+
+        let grants = query_rows(
+            &mut backend,
+            "SHOW GRANTS FOR column_reader USING column_role",
+        )
+        .await
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|value| String::from_utf8(value).unwrap())
+        .collect::<Vec<_>>();
+        assert!(grants.iter().any(
+            |grant| grant.contains("GRANT SELECT (\x60id\x60) ON \x60mydb\x60.\x60allowed\x60")
+        ));
+        assert!(grants
+            .iter()
+            .any(|grant| grant
+                .contains("GRANT SELECT (\x60value\x60) ON \x60mydb\x60.\x60allowed\x60")));
+
+        backend
+            .authenticated_user
+            .lock()
+            .replace("root".to_string());
+        let columns = query_rows(
+            &mut backend,
+            "SELECT COLUMN_NAME, PRIVILEGE_TYPE \
+             FROM information_schema.COLUMN_PRIVILEGES \
+             WHERE TABLE_SCHEMA='mydb' AND TABLE_NAME='allowed'",
+        )
+        .await;
+        assert!(columns
+            .iter()
+            .flatten()
+            .flatten()
+            .any(|value| value == b"id"));
+        assert!(columns
+            .iter()
+            .flatten()
+            .flatten()
+            .any(|value| value == b"value"));
+        let mysql_columns = query_rows(
+            &mut backend,
+            "SELECT Column_name, Column_priv FROM mysql.columns_priv \
+             WHERE Db='mydb' AND Table_name='allowed'",
+        )
+        .await;
+        assert_eq!(mysql_columns.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn column_grants_cover_join_predicates_and_projection_columns() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = Arc::new(StorageEngineManager::new(
+            temp.path().join("data"),
+            16384,
+            "4M",
+        ));
+        storage.init().await.unwrap();
+        storage.create_database("mydb").await.unwrap();
+        let auth = Arc::new(AuthCatalog::in_memory("root", "root"));
+        auth.create_users(
+            &[(
+                "join_reader".to_string(),
+                "secret".to_string(),
+                default_authentication_plugin(),
+            )],
+            false,
+        )
+        .unwrap();
+        let config = Arc::new(ProtocolConfig {
+            auth_catalog: auth.clone(),
+            ..ProtocolConfig::default()
+        });
+        let stats = Arc::new(WireStats::default());
+        let mut owner = Backend::new(storage.clone(), config.clone(), stats.clone(), 1);
+        owner
+            .execute(
+                "CREATE TABLE join_grant_left (id BIGINT PRIMARY KEY, value BIGINT, hidden BIGINT)",
+            )
+            .await
+            .unwrap();
+        owner
+            .execute(
+                "CREATE TABLE join_grant_right (id BIGINT PRIMARY KEY, value BIGINT, hidden BIGINT)",
+            )
+            .await
+            .unwrap();
+        owner
+            .execute("INSERT INTO join_grant_left VALUES (1,10,100)")
+            .await
+            .unwrap();
+        owner
+            .execute("INSERT INTO join_grant_right VALUES (2,10,200)")
+            .await
+            .unwrap();
+        auth.grant_column_privileges(
+            &["join_reader".to_string()],
+            "mydb",
+            "join_grant_left",
+            &HashMap::from([
+                ("id".to_string(), HashSet::from(["SELECT".to_string()])),
+                ("value".to_string(), HashSet::from(["SELECT".to_string()])),
+            ]),
+        )
+        .unwrap();
+        auth.grant_column_privileges(
+            &["join_reader".to_string()],
+            "mydb",
+            "join_grant_right",
+            &HashMap::from([
+                ("id".to_string(), HashSet::from(["SELECT".to_string()])),
+                ("value".to_string(), HashSet::from(["SELECT".to_string()])),
+            ]),
+        )
+        .unwrap();
+        let mut reader = Backend::new(storage, config, stats, 2);
+        *reader.authenticated_user.lock() = Some("join_reader".to_string());
+        assert_eq!(
+            query_rows(
+                &mut reader,
+                "SELECT l.id,r.id FROM join_grant_left l
+                 JOIN join_grant_right r ON l.value=r.value
+                 WHERE l.value=10 ORDER BY l.id",
+            )
+            .await,
+            vec![vec![Some(b"1".to_vec()), Some(b"2".to_vec())]]
+        );
+        let error = reader
+            .execute(
+                "SELECT l.hidden FROM join_grant_left l
+                 JOIN join_grant_right r ON l.value=r.value",
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("SELECT") && error.contains("join_grant_left"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn column_grants_cover_complex_dml_sources_and_targets() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let storage = Arc::new(StorageEngineManager::new(
+            temp.path().join("data"),
+            16384,
+            "4M",
+        ));
+        storage.init().await.expect("initialize storage");
+        storage
+            .create_database("mydb")
+            .await
+            .expect("create database");
+        let auth = Arc::new(AuthCatalog::in_memory("root", "root"));
+        auth.create_users(
+            &[(
+                "dml_reader".to_string(),
+                "secret".to_string(),
+                default_authentication_plugin(),
+            )],
+            false,
+        )
+        .expect("create restricted user");
+        let config = Arc::new(ProtocolConfig {
+            auth_catalog: auth.clone(),
+            ..ProtocolConfig::default()
+        });
+        let stats = Arc::new(WireStats::default());
+        let mut owner = Backend::new(storage.clone(), config.clone(), stats.clone(), 1);
+        owner
+            .execute("CREATE TABLE dml_target (id BIGINT PRIMARY KEY, value BIGINT, hidden BIGINT)")
+            .await
+            .expect("create target table");
+        owner
+            .execute("CREATE TABLE dml_source (id BIGINT PRIMARY KEY, value BIGINT, hidden BIGINT)")
+            .await
+            .expect("create source table");
+        owner
+            .execute("INSERT INTO dml_target VALUES (1,10,100)")
+            .await
+            .expect("insert target row");
+        owner
+            .execute("INSERT INTO dml_source VALUES (1,20,200),(2,30,300)")
+            .await
+            .expect("insert source row");
+
+        auth.grant_column_privileges(
+            &["dml_reader".to_string()],
+            "mydb",
+            "dml_target",
+            &HashMap::from([
+                ("id".to_string(), HashSet::from(["SELECT".to_string()])),
+                (
+                    "value".to_string(),
+                    HashSet::from(["SELECT".to_string(), "UPDATE".to_string()]),
+                ),
+            ]),
+        )
+        .expect("grant target columns");
+        auth.grant_column_privileges(
+            &["dml_reader".to_string()],
+            "mydb",
+            "dml_source",
+            &HashMap::from([
+                ("id".to_string(), HashSet::from(["SELECT".to_string()])),
+                ("value".to_string(), HashSet::from(["SELECT".to_string()])),
+            ]),
+        )
+        .expect("grant source columns");
+        auth.grant_table_privileges(
+            &["dml_reader".to_string()],
+            "mydb",
+            "dml_target",
+            HashSet::from(["DELETE".to_string()]),
+        )
+        .expect("grant delete privilege");
+        auth.grant_column_privileges(
+            &["dml_reader".to_string()],
+            "mydb",
+            "dml_target",
+            &HashMap::from([
+                ("id".to_string(), HashSet::from(["INSERT".to_string()])),
+                ("value".to_string(), HashSet::from(["INSERT".to_string()])),
+            ]),
+        )
+        .expect("grant insert column");
+
+        let mut reader = Backend::new(storage, config, stats, 2);
+        *reader.authenticated_user.lock() = Some("dml_reader".to_string());
+        reader
+            .execute(
+                "UPDATE dml_target t JOIN dml_source s ON t.id=s.id \
+                 SET t.value=s.value WHERE s.value > 0",
+            )
+            .await
+            .expect("column grants allow join update");
+
+        let error = reader
+            .execute(
+                "UPDATE dml_target t JOIN dml_source s ON t.id=s.id \
+                 SET t.value=s.hidden",
+            )
+            .await
+            .expect_err("hidden source column must be denied");
+        assert!(error.to_string().contains("SELECT"), "{error:#}");
+
+        reader
+            .execute(
+                "INSERT INTO dml_target (id,value) \
+                 SELECT s.id,s.value FROM dml_source s WHERE s.id=2",
+            )
+            .await
+            .expect("column grants allow insert select");
+
+        reader
+            .execute(
+                "DELETE t FROM dml_target t JOIN dml_source s ON t.id=s.id \
+                 WHERE s.value > 0",
+            )
+            .await
+            .expect("table delete plus source select allow join delete");
+
+        auth.create_users(
+            &[(
+                "dml_upserter".to_string(),
+                "secret".to_string(),
+                default_authentication_plugin(),
+            )],
+            false,
+        )
+        .expect("create upsert user");
+        auth.grant_column_privileges(
+            &["dml_upserter".to_string()],
+            "mydb",
+            "dml_target",
+            &HashMap::from([
+                ("id".to_string(), HashSet::from(["INSERT".to_string()])),
+                (
+                    "value".to_string(),
+                    HashSet::from(["INSERT".to_string(), "UPDATE".to_string()]),
+                ),
+            ]),
+        )
+        .expect("grant upsert columns");
+        *reader.authenticated_user.lock() = Some("dml_upserter".to_string());
+        reader
+            .execute(
+                "INSERT INTO dml_target (id,value) VALUES (1,99) \
+                 ON DUPLICATE KEY UPDATE value=VALUES(value)",
+            )
+            .await
+            .expect("incoming upsert values do not require SELECT");
+        let error = reader
+            .execute(
+                "INSERT INTO dml_target (id,value) VALUES (1,100) \
+                 ON DUPLICATE KEY UPDATE value=value+1",
+            )
+            .await
+            .expect_err("existing-row expression must require SELECT");
+        assert!(error.to_string().contains("SELECT"), "{error:#}");
+        auth.grant_column_privileges(
+            &["dml_upserter".to_string()],
+            "mydb",
+            "dml_target",
+            &HashMap::from([("value".to_string(), HashSet::from(["SELECT".to_string()]))]),
+        )
+        .expect("grant upsert read column");
+        reader
+            .execute(
+                "INSERT INTO dml_target (id,value) VALUES (1,100) \
+                 ON DUPLICATE KEY UPDATE value=value+1",
+            )
+            .await
+            .expect("existing-row expression has SELECT");
+        auth.revoke_column_privileges(
+            &["dml_upserter".to_string()],
+            "mydb",
+            "dml_target",
+            &HashMap::from([("value".to_string(), HashSet::from(["UPDATE".to_string()]))]),
+        )
+        .expect("revoke upsert update column");
+        let error = reader
+            .execute(
+                "INSERT INTO dml_target (id,value) VALUES (1,101) \
+                 ON DUPLICATE KEY UPDATE value=value+1",
+            )
+            .await
+            .expect_err("upsert target expression must require UPDATE");
+        assert!(error.to_string().contains("UPDATE"), "{error:#}");
+    }
+
+    #[tokio::test]
     async fn single_node_compat_surface_statements() {
         let temp = tempfile::tempdir().unwrap();
         let storage = Arc::new(StorageEngineManager::new(
@@ -37276,6 +49469,7 @@ mod tests {
             Arc::new(WireStats::default()),
             1,
         );
+        backend.stats.register_connection(1, "local");
         backend
             .execute("CREATE TABLE compat.t (id BIGINT PRIMARY KEY, v VARCHAR(64))")
             .await
@@ -37387,6 +49581,19 @@ mod tests {
                 .unwrap(),
             QueryOutcome::Rows { .. }
         ));
+        let status = query_rows(
+            &mut backend,
+            "SELECT * FROM performance_schema.GLOBAL_STATUS",
+        )
+        .await;
+        assert!(status
+            .iter()
+            .any(|row| row.first() == Some(&bytes("Questions"))));
+        let processlist = backend.execute("SHOW PROCESSLIST").await.unwrap();
+        let QueryOutcome::Rows { rows, .. } = processlist else {
+            panic!("expected SHOW PROCESSLIST rows");
+        };
+        assert!(rows.iter().any(|row| row.first() == Some(&bytes("1"))));
     }
 
     #[tokio::test]
@@ -37587,6 +49794,8 @@ mod tests {
             .await
             .unwrap();
         *user.authenticated_user.lock() = Some("inherited_user".into());
+        *user.active_roles.lock() = None;
+        user.execute("SET ROLE routine_parent").await.unwrap();
         assert_eq!(
             single_value(
                 user.execute("SELECT mydb.routine_increment(4)")
@@ -37733,6 +49942,75 @@ mod tests {
             .execute("GRANT catalog_role TO 'catalog_reader'")
             .await
             .unwrap();
+        backend
+            .execute("CREATE PROCEDURE mydb.catalog_proc() SELECT 1")
+            .await
+            .unwrap();
+        backend
+            .execute("GRANT EXECUTE ON PROCEDURE mydb.catalog_proc TO 'catalog_reader'")
+            .await
+            .unwrap();
+        *backend.authenticated_user.lock() = Some("catalog_reader".into());
+        assert_eq!(
+            query_rows(
+                &mut backend,
+                "SELECT USER,HOST,GRANTEE,GRANTEE_HOST,ROLE_NAME,ROLE_HOST,IS_GRANTABLE,IS_DEFAULT,IS_MANDATORY \
+                 FROM information_schema.applicable_roles",
+            )
+            .await,
+            vec![vec![
+                bytes("catalog_reader"),
+                bytes("%"),
+                bytes("catalog_reader"),
+                bytes("%"),
+                bytes("catalog_role"),
+                bytes("%"),
+                bytes("NO"),
+                bytes("NO"),
+                bytes("NO"),
+            ]]
+        );
+        *backend.authenticated_user.lock() = Some("root".into());
+        assert_eq!(
+            query_rows(
+                &mut backend,
+                "SELECT TABLE_NAME FROM information_schema.tables \\
+                 WHERE TABLE_SCHEMA='information_schema' AND TABLE_NAME='applicable_roles'",
+            )
+            .await,
+            vec![vec![bytes("APPLICABLE_ROLES")]]
+        );
+        assert_eq!(
+            query_rows(
+                &mut backend,
+                "SELECT COLUMN_NAME FROM information_schema.columns WHERE TABLE_SCHEMA='information_schema' AND TABLE_NAME='applicable_roles' ORDER BY ORDINAL_POSITION",
+            )
+            .await,
+            vec![
+                vec![bytes("USER")],
+                vec![bytes("HOST")],
+                vec![bytes("GRANTEE")],
+                vec![bytes("GRANTEE_HOST")],
+                vec![bytes("ROLE_NAME")],
+                vec![bytes("ROLE_HOST")],
+                vec![bytes("IS_GRANTABLE")],
+                vec![bytes("IS_DEFAULT")],
+                vec![bytes("IS_MANDATORY")],
+            ]
+        );
+        assert_eq!(
+            query_rows(
+                &mut backend,
+                "SELECT SCHEMA_NAME FROM information_schema.schemata WHERE SCHEMA_NAME='information_schema' OR SCHEMA_NAME='mysql' OR SCHEMA_NAME='performance_schema' OR SCHEMA_NAME='sys' ORDER BY SCHEMA_NAME",
+            )
+            .await,
+            vec![
+                vec![bytes("information_schema")],
+                vec![bytes("mysql")],
+                vec![bytes("performance_schema")],
+                vec![bytes("sys")],
+            ]
+        );
 
         assert_eq!(
             query_rows(
@@ -37779,6 +50057,36 @@ mod tests {
             )
             .await,
             vec![vec![bytes("catalog_role"), bytes("catalog_reader")]]
+        );
+        assert_eq!(
+            query_rows(
+                &mut backend,
+                "SELECT Host,User,Routine_name,Proc_priv,Routine_type = 'PROCEDURE' as is_proc \
+                 FROM mysql.procs_priv WHERE Db='mydb' AND User='catalog_reader'",
+            )
+            .await,
+            vec![vec![
+                bytes("%"),
+                bytes("catalog_reader"),
+                bytes("catalog_proc"),
+                bytes("EXECUTE"),
+                bytes("1"),
+            ]]
+        );
+        assert_eq!(
+            query_rows(
+                &mut backend,
+                "SELECT null from_host, Role from_user, Host to_host, User to_user, Admin_option with_admin_option \
+                 FROM mysql.roles_mapping WHERE User='catalog_reader' ORDER BY to_user,to_host",
+            )
+            .await,
+            vec![vec![
+                None,
+                bytes("catalog_role"),
+                bytes("%"),
+                bytes("catalog_reader"),
+                bytes("N"),
+            ]]
         );
         assert_eq!(
             single_value(backend.execute("SELECT 'mysql.user'").await.unwrap()),
@@ -37921,7 +50229,7 @@ mod tests {
             .iter()
             .all(|row| row.len() == db_table.columns.len()));
         assert!(tables.get("global_grants").unwrap().rows.is_empty());
-        let (_, schema_privileges) =
+        let (_, schema_privileges, _, _) =
             information_schema_privilege_rows(&backend.config.auth_catalog, "root");
         assert!(schema_privileges.iter().all(|row| {
             row.get(3).and_then(Option::as_deref) != Some(b"GRANT OPTION".as_slice())
@@ -38639,6 +50947,28 @@ mod tests {
     }
 
     #[test]
+    fn caching_sha2_password_roundtrip() {
+        let salt = b"12345678901234567890";
+        let stage1 = Sha256::digest(b"root");
+        let stage2 = Sha256::digest(stage1);
+        let mut mask = Sha256::new();
+        mask.update(stage2);
+        mask.update(salt);
+        let response: Vec<u8> = stage1
+            .iter()
+            .zip(mask.finalize())
+            .map(|(left, right)| left ^ right)
+            .collect();
+        let hash = password_sha256_hex("root");
+        assert!(verify_caching_sha2_password_sha256(&hash, salt, &response));
+        assert!(!verify_caching_sha2_password_sha256(
+            &password_sha256_hex("wrong"),
+            salt,
+            &response
+        ));
+    }
+
+    #[test]
     fn authentication_salt_is_ascii_compatible_with_jdbc_clients() {
         let salt = generate_auth_salt();
         assert!(salt.iter().all(|byte| byte.is_ascii_alphanumeric()));
@@ -39137,6 +51467,32 @@ mod tests {
             .await,
             vec![vec![Some(b"IN".to_vec()), Some(b"input".to_vec())]]
         );
+        backend
+            .execute(
+                "CREATE FUNCTION latin_parameter(input VARCHAR(20) CHARACTER SET latin1 COLLATE latin1_swedish_ci)
+                 RETURNS BIGINT DETERMINISTIC RETURN CHAR_LENGTH(input)",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            query_rows(
+                &mut backend,
+                "SELECT DATA_TYPE,CHARACTER_MAXIMUM_LENGTH,CHARACTER_OCTET_LENGTH,
+                        CHARACTER_SET_NAME,COLLATION_NAME,DTD_IDENTIFIER,ROUTINE_TYPE
+                 FROM information_schema.parameters
+                 WHERE SPECIFIC_NAME='latin_parameter' AND ORDINAL_POSITION=1",
+            )
+            .await,
+            vec![vec![
+                Some(b"varchar".to_vec()),
+                Some(b"20".to_vec()),
+                Some(b"20".to_vec()),
+                Some(b"latin1".to_vec()),
+                Some(b"latin1_swedish_ci".to_vec()),
+                Some(b"VARCHAR(20) CHARACTER SET latin1 COLLATE latin1_swedish_ci".to_vec()),
+                Some(b"FUNCTION".to_vec()),
+            ]]
+        );
         let status = query_rows(&mut backend, "SHOW FUNCTION STATUS").await;
         assert!(status
             .iter()
@@ -39247,6 +51603,38 @@ mod tests {
             .execute("SHOW CREATE FUNCTION add_one")
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn routine_local_character_set_and_collation_are_preserved() {
+        let (_temp, _storage, mut backend, _second) = transaction_backends().await;
+        backend
+            .execute(
+                "CREATE PROCEDURE routine_local_collation() \
+                 BEGIN \
+                   DECLARE value VARCHAR(10) CHARACTER SET latin1 COLLATE latin1_bin DEFAULT 'A'; \
+                   SELECT value = 'a', value = 'A', COLLATION(value), CHARSET(value), value; \
+                 END",
+            )
+            .await
+            .expect("create routine with local character metadata");
+        let QueryOutcome::Multiple { result_sets, .. } = backend
+            .execute("CALL routine_local_collation()")
+            .await
+            .expect("call routine")
+        else {
+            panic!("expected routine result set");
+        };
+        assert_eq!(
+            result_sets[0].rows,
+            vec![vec![
+                Some(b"0".to_vec()),
+                Some(b"1".to_vec()),
+                Some(b"latin1_bin".to_vec()),
+                Some(b"latin1".to_vec()),
+                Some(b"A".to_vec()),
+            ]]
+        );
     }
 
     #[tokio::test]
@@ -40370,15 +52758,26 @@ mod tests {
         );
         assert_eq!(
             query_rows(&mut backend, "SHOW COLLATION LIKE 'latin1%'").await,
-            vec![vec![
-                Some(b"latin1_swedish_ci".to_vec()),
-                Some(b"latin1".to_vec()),
-                Some(b"8".to_vec()),
-                Some(b"Yes".to_vec()),
-                Some(b"Yes".to_vec()),
-                Some(b"1".to_vec()),
-                Some(b"PAD SPACE".to_vec()),
-            ]]
+            vec![
+                vec![
+                    Some(b"latin1_swedish_ci".to_vec()),
+                    Some(b"latin1".to_vec()),
+                    Some(b"8".to_vec()),
+                    Some(b"Yes".to_vec()),
+                    Some(b"Yes".to_vec()),
+                    Some(b"1".to_vec()),
+                    Some(b"PAD SPACE".to_vec()),
+                ],
+                vec![
+                    Some(b"latin1_bin".to_vec()),
+                    Some(b"latin1".to_vec()),
+                    Some(b"47".to_vec()),
+                    Some(b"".to_vec()),
+                    Some(b"Yes".to_vec()),
+                    Some(b"1".to_vec()),
+                    Some(b"PAD SPACE".to_vec()),
+                ],
+            ]
         );
         backend
             .execute("SET NAMES latin1 COLLATE latin1_swedish_ci")
@@ -40494,6 +52893,275 @@ mod tests {
         assert!(privileges
             .iter()
             .any(|row| { row.first().and_then(Option::as_deref) == Some(b"Select".as_slice()) }));
+
+        backend
+            .execute(
+                "CREATE TABLE collation_binary (
+                    name VARCHAR(32) COLLATE utf8mb4_bin,
+                    UNIQUE KEY uq_name (name)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+            )
+            .await
+            .unwrap();
+        backend
+            .execute("INSERT INTO collation_binary VALUES ('Alice'), ('alice')")
+            .await
+            .unwrap();
+        assert_eq!(
+            query_rows(
+                &mut backend,
+                "SELECT name FROM collation_binary WHERE name='ALICE' OR name LIKE 'A%'",
+            )
+            .await,
+            vec![vec![Some(b"Alice".to_vec())]]
+        );
+        assert_eq!(
+            query_rows(&mut backend, "SHOW FULL COLUMNS FROM collation_binary").await[0][2],
+            Some(b"utf8mb4_bin".to_vec())
+        );
+        assert_eq!(
+            query_rows(
+                &mut backend,
+                "SELECT CHARACTER_SET_NAME,COLLATION_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA='mydb' AND TABLE_NAME='collation_binary' AND COLUMN_NAME='name'",
+            )
+            .await,
+            vec![vec![
+                Some(b"utf8mb4".to_vec()),
+                Some(b"utf8mb4_bin".to_vec()),
+            ]]
+        );
+        assert_eq!(
+            query_rows(
+                &mut backend,
+                "SELECT TABLE_COLLATION FROM information_schema.TABLES WHERE TABLE_SCHEMA='mydb' AND TABLE_NAME='collation_binary'",
+            )
+            .await,
+            vec![vec![Some(b"utf8mb4_0900_ai_ci".to_vec())]]
+        );
+
+        backend
+            .execute(
+                "CREATE TABLE collation_latin1_expression (
+                    name VARCHAR(32) CHARACTER SET latin1 COLLATE latin1_bin
+                ) ENGINE=InnoDB",
+            )
+            .await
+            .unwrap();
+        backend
+            .execute("INSERT INTO collation_latin1_expression VALUES ('A')")
+            .await
+            .unwrap();
+        assert_eq!(
+            query_rows(
+                &mut backend,
+                "SELECT name='a', COLLATION(name), CHARSET(name) FROM collation_latin1_expression",
+            )
+            .await,
+            vec![vec![
+                Some(b"0".to_vec()),
+                Some(b"latin1_bin".to_vec()),
+                Some(b"latin1".to_vec()),
+            ]]
+        );
+
+        backend
+            .execute(
+                "CREATE TABLE collation_ai (
+                    name VARCHAR(32),
+                    UNIQUE KEY uq_name (name)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+            )
+            .await
+            .unwrap();
+        backend
+            .execute("INSERT INTO collation_ai VALUES ('Alice'), ('Álice')")
+            .await
+            .unwrap_err();
+        backend
+            .execute("INSERT INTO collation_ai VALUES ('Alice')")
+            .await
+            .unwrap();
+        backend
+            .execute("INSERT INTO collation_ai VALUES ('Álice')")
+            .await
+            .unwrap_err();
+
+        backend
+            .execute(
+                "CREATE TABLE collation_upsert (
+                    name VARCHAR(32),
+                    value BIGINT,
+                    UNIQUE KEY uq_name (name)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+            )
+            .await
+            .unwrap();
+        backend
+            .execute("INSERT INTO collation_upsert VALUES ('Alice',1)")
+            .await
+            .unwrap();
+        backend
+            .execute("INSERT INTO collation_upsert VALUES ('alice',2) ON DUPLICATE KEY UPDATE value=VALUES(value)")
+            .await
+            .unwrap();
+        assert_eq!(
+            query_rows(&mut backend, "SELECT name,value FROM collation_upsert").await,
+            vec![vec![Some(b"Alice".to_vec()), Some(b"2".to_vec())]]
+        );
+
+        backend
+            .execute(
+                "CREATE TABLE collation_pad_general (
+                    name VARCHAR(32) COLLATE utf8mb4_general_ci,
+                    UNIQUE KEY uq_name (name)
+                ) ENGINE=InnoDB",
+            )
+            .await
+            .unwrap();
+        backend
+            .execute("INSERT INTO collation_pad_general VALUES ('a')")
+            .await
+            .unwrap();
+        assert!(backend
+            .execute("INSERT INTO collation_pad_general VALUES ('a ')")
+            .await
+            .is_err());
+        backend
+            .execute("REPLACE INTO collation_pad_general VALUES ('a ')")
+            .await
+            .unwrap();
+        assert_eq!(
+            query_rows(&mut backend, "SELECT name FROM collation_pad_general").await,
+            vec![vec![Some(b"a ".to_vec())]]
+        );
+
+        backend
+            .execute(
+                "CREATE TABLE collation_no_pad (
+                    name VARCHAR(32),
+                    UNIQUE KEY uq_name (name)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+            )
+            .await
+            .unwrap();
+        backend
+            .execute("INSERT INTO collation_no_pad VALUES ('a'), ('a ')")
+            .await
+            .unwrap();
+        assert_eq!(
+            query_rows(
+                &mut backend,
+                "SELECT COUNT(*) FROM collation_no_pad WHERE name='a'",
+            )
+            .await,
+            vec![vec![Some(b"1".to_vec())]]
+        );
+
+        let sorted = query_rows(
+            &mut backend,
+            "SELECT name FROM collation_binary ORDER BY name",
+        )
+        .await;
+        assert_eq!(
+            sorted,
+            vec![vec![Some(b"Alice".to_vec())], vec![Some(b"alice".to_vec())]]
+        );
+
+        let grouped = query_rows(
+            &mut backend,
+            "SELECT name,COUNT(*) FROM collation_binary GROUP BY name ORDER BY name",
+        )
+        .await;
+        assert_eq!(
+            grouped,
+            vec![
+                vec![Some(b"Alice".to_vec()), Some(b"1".to_vec())],
+                vec![Some(b"alice".to_vec()), Some(b"1".to_vec())],
+            ]
+        );
+
+        backend
+            .execute("CREATE TABLE collation_join_left (name VARCHAR(32) COLLATE utf8mb4_bin)")
+            .await
+            .unwrap();
+        backend
+            .execute("INSERT INTO collation_join_left VALUES ('Alice')")
+            .await
+            .unwrap();
+        backend
+            .execute("CREATE TABLE collation_join_right (name VARCHAR(32) COLLATE utf8mb4_bin)")
+            .await
+            .unwrap();
+        backend
+            .execute("INSERT INTO collation_join_right VALUES ('alice'),('Alice')")
+            .await
+            .unwrap();
+        assert_eq!(
+            query_rows(
+                &mut backend,
+                "SELECT r.name FROM collation_join_left l JOIN collation_join_right r ON l.name=r.name",
+            )
+            .await,
+            vec![vec![Some(b"Alice".to_vec())]]
+        );
+    }
+
+    #[tokio::test]
+    async fn common_utf8mb4_0900_collations_preserve_case_and_accent_rules() {
+        let (_temp, _storage, mut backend, _second) = transaction_backends().await;
+        backend
+            .execute("SET NAMES utf8mb4 COLLATE utf8mb4_0900_as_cs")
+            .await
+            .expect("utf8mb4_0900_as_cs must be accepted");
+        backend
+            .execute(
+                "CREATE TABLE collation_as_cs (
+                    value VARCHAR(32) COLLATE utf8mb4_0900_as_cs,
+                    UNIQUE KEY uq_value (value)
+                )",
+            )
+            .await
+            .expect("create accent-sensitive table");
+        assert_eq!(
+            query_rows(
+                &mut backend,
+                "SELECT COLLATION_NAME FROM information_schema.COLUMNS \
+                 WHERE TABLE_SCHEMA='mydb' AND TABLE_NAME='collation_as_cs' \
+                 AND COLUMN_NAME='value'",
+            )
+            .await,
+            vec![vec![Some(b"utf8mb4_0900_as_cs".to_vec())]]
+        );
+        backend
+            .execute("INSERT INTO collation_as_cs VALUES ('a'),('A'),('á')")
+            .await
+            .expect("case and accent variants must remain distinct");
+        assert_eq!(
+            query_rows(&mut backend, "SELECT COUNT(*) FROM collation_as_cs").await,
+            vec![vec![Some(b"3".to_vec())]]
+        );
+
+        backend
+            .execute(
+                "CREATE TABLE collation_as_ci (
+                    value VARCHAR(32) COLLATE utf8mb4_0900_as_ci,
+                    UNIQUE KEY uq_value (value)
+                )",
+            )
+            .await
+            .expect("create case-insensitive accent-sensitive table");
+        backend
+            .execute("INSERT INTO collation_as_ci VALUES ('a')")
+            .await
+            .expect("insert base character");
+        assert!(backend
+            .execute("INSERT INTO collation_as_ci VALUES ('A')")
+            .await
+            .is_err());
+        backend
+            .execute("INSERT INTO collation_as_ci VALUES ('á')")
+            .await
+            .expect("accent-sensitive collation must distinguish accented character");
     }
 
     #[test]
@@ -40703,6 +53371,21 @@ mod tests {
         .await;
         assert_eq!(status.len(), 1);
         assert_eq!(status[0][0], bytes("Threads_connected"));
+
+        assert_eq!(
+            query_rows(&mut backend, "SHOW SESSION STATUS LIKE 'ssl_version'",).await,
+            vec![vec![bytes("Ssl_version"), bytes("")]]
+        );
+
+        backend.database.clear();
+        let QueryOutcome::Rows { rows, .. } = backend
+            .execute("SELECT DATABASE()")
+            .await
+            .expect("DATABASE() without an initial schema")
+        else {
+            panic!("expected DATABASE() result");
+        };
+        assert_eq!(rows, vec![vec![None]]);
     }
 
     #[tokio::test]
@@ -41013,6 +53696,91 @@ mod tests {
             query_rows(&mut backend, "EXECUTE status_stmt").await,
             vec![vec![Some(b"0".to_vec()), Some(b"0".to_vec())]]
         );
+    }
+
+    #[tokio::test]
+    async fn mysql_last_insert_id_upsert_counter_matches_go_driver() {
+        let (_temp, _storage, mut backend, _second) = transaction_backends().await;
+        backend
+            .execute(
+                "CREATE TABLE id_generator (
+                    name VARCHAR(64) NOT NULL PRIMARY KEY,
+                    next_id BIGINT NOT NULL
+                ) ENGINE=InnoDB",
+            )
+            .await
+            .expect("create id generator");
+        let statement = "INSERT INTO id_generator (name, next_id)
+                         VALUES ('counter', LAST_INSERT_ID(1))
+                         ON DUPLICATE KEY UPDATE next_id = LAST_INSERT_ID(next_id + 1)";
+        backend.execute(statement).await.expect("insert counter");
+        assert_eq!(
+            query_rows(
+                &mut backend,
+                "SELECT LAST_INSERT_ID(), next_id FROM id_generator WHERE name='counter'",
+            )
+            .await,
+            vec![vec![Some(b"1".to_vec()), Some(b"1".to_vec())]]
+        );
+        backend.execute(statement).await.expect("increment counter");
+        assert_eq!(
+            query_rows(
+                &mut backend,
+                "SELECT LAST_INSERT_ID(), next_id FROM id_generator WHERE name='counter'",
+            )
+            .await,
+            vec![vec![Some(b"2".to_vec()), Some(b"2".to_vec())]]
+        );
+    }
+
+    #[tokio::test]
+    async fn mysql_last_insert_id_upsert_counter_serializes_concurrent_clients() {
+        let (_temp, storage, mut first, second) = transaction_backends().await;
+        first
+            .execute(
+                "CREATE TABLE id_generator (
+                    name VARCHAR(64) NOT NULL PRIMARY KEY,
+                    next_id BIGINT NOT NULL
+                ) ENGINE=InnoDB",
+            )
+            .await
+            .expect("create concurrent id generator");
+        let config = first.config.clone();
+        let stats = first.stats.clone();
+        let statement = "INSERT INTO id_generator (name, next_id)
+                         VALUES ('counter', LAST_INSERT_ID(1))
+                         ON DUPLICATE KEY UPDATE next_id = LAST_INSERT_ID(next_id + 1)";
+        let mut tasks = Vec::new();
+        for connection_id in 3..35 {
+            let mut backend = Backend::new(
+                storage.clone(),
+                config.clone(),
+                stats.clone(),
+                connection_id,
+            );
+            backend.lock_wait_timeout = Duration::from_secs(10);
+            tasks.push(tokio::spawn(
+                async move { backend.execute(statement).await },
+            ));
+        }
+        let mut errors = Vec::new();
+        for task in tasks {
+            match task.await.expect("concurrent counter task") {
+                Ok(_) => {}
+                Err(error) => errors.push(error.to_string()),
+            }
+        }
+        assert!(
+            errors.is_empty(),
+            "concurrent counter errors={errors:?} snapshot={:?}",
+            stats.snapshot()
+        );
+        let value = first
+            .execute("SELECT next_id FROM id_generator WHERE name='counter'")
+            .await
+            .expect("read concurrent counter");
+        assert_eq!(single_value(value), b"32");
+        drop(second);
     }
 
     #[tokio::test]
@@ -41480,7 +54248,7 @@ mod tests {
                 "CREATE TABLE metadata_child (
                     id BIGINT AUTO_INCREMENT PRIMARY KEY,
                     parent_id BIGINT,
-                    code VARCHAR(16) NOT NULL,
+                    code VARCHAR(16) NOT NULL COMMENT 'business code',
                     score DECIMAL(10,2),
                     UNIQUE KEY uk_metadata_code (code),
                     KEY idx_metadata_parent (parent_id,code),
@@ -41488,7 +54256,7 @@ mod tests {
                         REFERENCES metadata_parent (id)
                         ON DELETE CASCADE ON UPDATE RESTRICT,
                     CONSTRAINT chk_metadata_score CHECK (score >= 0)
-                ) ENGINE=InnoDB",
+                ) ENGINE=InnoDB COMMENT='metadata table'",
             )
             .await
             .unwrap();
@@ -41497,6 +54265,10 @@ mod tests {
                 "INSERT INTO metadata_child(parent_id,code,score)
                  VALUES (NULL,'a',1.25),(NULL,'b',2.50)",
             )
+            .await
+            .unwrap();
+        backend
+            .execute("ALTER TABLE metadata_child COMMENT='metadata table v2'")
             .await
             .unwrap();
         backend
@@ -41545,6 +54317,8 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0][0].as_deref(), Some(&b"id"[..]));
         assert_eq!(rows[1][0].as_deref(), Some(&b"code"[..]));
+        assert_eq!(rows[0][8].as_deref(), Some(&b""[..]));
+        assert_eq!(rows[1][8].as_deref(), Some(&b"business code"[..]));
         assert_eq!(
             query_rows(
                 &mut backend,
@@ -41585,6 +54359,39 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0][0].as_deref(), Some(&b"metadata_child"[..]));
         assert_eq!(rows[1][0].as_deref(), Some(&b"metadata_parent"[..]));
+        assert_eq!(
+            single_value(
+                backend
+                    .execute(
+                        "SELECT TABLE_COMMENT FROM information_schema.tables
+                         WHERE table_schema='mydb' AND table_name='metadata_child'",
+                    )
+                    .await
+                    .unwrap()
+            ),
+            b"metadata table v2"
+        );
+        let QueryOutcome::Rows { rows, .. } = backend
+            .execute("SHOW CREATE TABLE metadata_child")
+            .await
+            .unwrap()
+        else {
+            panic!("expected SHOW CREATE TABLE rows")
+        };
+        let create_sql = String::from_utf8_lossy(rows[0][1].as_ref().unwrap());
+        assert!(create_sql.contains("COMMENT='metadata table v2'"));
+        assert!(create_sql.contains("COMMENT 'business code'"));
+
+        assert_eq!(
+            query_rows(
+                &mut backend,
+                "SELECT COLUMN_COMMENT FROM information_schema.columns
+                 WHERE table_schema='mydb' AND table_name='metadata_child'
+                   AND column_name='code'",
+            )
+            .await,
+            vec![vec![Some(b"business code".to_vec())]]
+        );
 
         assert_eq!(
             query_rows(
@@ -41602,6 +54409,26 @@ mod tests {
                 vec![Some(b"metadata_view".to_vec()), Some(b"UNKNOWN".to_vec()),],
             ]
         );
+        let QueryOutcome::Rows { columns, rows } = backend
+            .execute(
+                "SELECT TABLE_SCHEMA,TABLE_NAME,PARTITION_NAME,
+                        PARTITION_METHOD,TABLE_ROWS,TABLESPACE_NAME
+                 FROM information_schema.partitions
+                 WHERE table_schema='mydb' AND table_name='metadata_child'",
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected information_schema.PARTITIONS rows")
+        };
+        assert_eq!(columns.len(), 6);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0].as_deref(), Some(&b"mydb"[..]));
+        assert_eq!(rows[0][1].as_deref(), Some(&b"metadata_child"[..]));
+        assert_eq!(rows[0][2], None);
+        assert_eq!(rows[0][3], None);
+        assert_eq!(rows[0][4].as_deref(), Some(&b"2"[..]));
+        assert_eq!(rows[0][5].as_deref(), Some(&b"DEFAULT"[..]));
         assert_eq!(
             single_value(
                 backend
@@ -41839,7 +54666,7 @@ mod tests {
                 Some(b"metadata_view".to_vec()),
                 Some(b"SELECT id,code FROM metadata_child".to_vec()),
                 Some(b"NONE".to_vec()),
-                Some(b"NO".to_vec()),
+                Some(b"YES".to_vec()),
                 Some(b"DEFINER".to_vec()),
             ]]
         );
@@ -41869,6 +54696,412 @@ mod tests {
                     Some(b"utf8mb4".to_vec()),
                 ],
                 vec![Some(b"mydb".to_vec()), Some(b"utf8mb4".to_vec())],
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn logical_table_partitions_route_rows_and_expose_metadata() {
+        let (_temp, _storage, mut backend, _second) = transaction_backends().await;
+        backend
+            .execute(
+                "CREATE TABLE partitioned_range (
+                    id BIGINT NOT NULL PRIMARY KEY,
+                    label VARCHAR(16)
+                ) ENGINE=InnoDB
+                PARTITION BY RANGE (id) (
+                    PARTITION p0 VALUES LESS THAN (10),
+                    PARTITION p1 VALUES LESS THAN (20),
+                    PARTITION pmax VALUES LESS THAN MAXVALUE
+                )",
+            )
+            .await
+            .unwrap();
+        backend
+            .execute("INSERT INTO partitioned_range VALUES (1,'low'),(15,'mid'),(99,'high')")
+            .await
+            .unwrap();
+        assert_eq!(
+            query_rows(
+                &mut backend,
+                "SELECT id,label FROM partitioned_range ORDER BY id",
+            )
+            .await,
+            vec![
+                vec![Some(b"1".to_vec()), Some(b"low".to_vec())],
+                vec![Some(b"15".to_vec()), Some(b"mid".to_vec())],
+                vec![Some(b"99".to_vec()), Some(b"high".to_vec())],
+            ]
+        );
+        let QueryOutcome::Rows { rows, .. } = backend
+            .execute(
+                "SELECT PARTITION_NAME,PARTITION_METHOD,PARTITION_EXPRESSION,
+                        PARTITION_DESCRIPTION,TABLE_ROWS
+                 FROM information_schema.PARTITIONS
+                 WHERE TABLE_SCHEMA='mydb' AND TABLE_NAME='partitioned_range'
+                 ORDER BY PARTITION_ORDINAL_POSITION",
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected partition metadata rows")
+        };
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0][0].as_deref(), Some(&b"p0"[..]));
+        assert_eq!(rows[0][1].as_deref(), Some(&b"RANGE"[..]));
+        assert_eq!(rows[0][2].as_deref(), Some(&b"id"[..]));
+        assert_eq!(rows[0][3].as_deref(), Some(&b"(10)"[..]));
+        assert_eq!(rows[0][4].as_deref(), Some(&b"1"[..]));
+        assert_eq!(rows[1][4].as_deref(), Some(&b"1"[..]));
+        assert_eq!(rows[2][0].as_deref(), Some(&b"pmax"[..]));
+        assert_eq!(rows[2][3].as_deref(), Some(&b"MAXVALUE"[..]));
+        backend
+            .execute("CREATE TABLE partitioned_range_copy LIKE partitioned_range")
+            .await
+            .unwrap();
+        backend
+            .execute("INSERT INTO partitioned_range_copy VALUES (2,'copy')")
+            .await
+            .unwrap();
+        assert_eq!(
+            single_value(
+                backend
+                    .execute(
+                        "SELECT COUNT(*) FROM information_schema.PARTITIONS
+                         WHERE TABLE_SCHEMA='mydb' AND TABLE_NAME='partitioned_range_copy'",
+                    )
+                    .await
+                    .unwrap()
+            ),
+            b"3"
+        );
+        backend
+            .execute("UPDATE partitioned_range SET id=16 WHERE id=15")
+            .await
+            .unwrap();
+        assert_eq!(
+            single_value(
+                backend
+                    .execute("SELECT label FROM partitioned_range WHERE id=16")
+                    .await
+                    .unwrap()
+            ),
+            b"mid"
+        );
+        backend
+            .execute(
+                "CREATE TABLE partitioned_list (id BIGINT PRIMARY KEY)
+                 PARTITION BY LIST (id) (
+                    PARTITION p1 VALUES IN (1,2),
+                    PARTITION p3 VALUES IN (3)
+                 )",
+            )
+            .await
+            .unwrap();
+        backend
+            .execute("INSERT INTO partitioned_list VALUES (1),(3)")
+            .await
+            .unwrap();
+        assert!(backend
+            .execute("INSERT INTO partitioned_list VALUES (4)")
+            .await
+            .is_err());
+        backend
+            .execute(
+                "CREATE TABLE partitioned_hash (id BIGINT PRIMARY KEY)
+                 PARTITION BY HASH (id) PARTITIONS 4",
+            )
+            .await
+            .unwrap();
+        backend
+            .execute("INSERT INTO partitioned_hash VALUES (1),(2)")
+            .await
+            .unwrap();
+        assert_eq!(
+            single_value(
+                backend
+                    .execute(
+                        "SELECT COUNT(*) FROM information_schema.PARTITIONS
+                         WHERE TABLE_SCHEMA='mydb' AND TABLE_NAME='partitioned_hash'",
+                    )
+                    .await
+                    .unwrap()
+            ),
+            b"4"
+        );
+        backend
+            .execute(
+                "CREATE TABLE partitioned_key (
+                    id BIGINT PRIMARY KEY,
+                    bucket BIGINT NOT NULL
+                 ) PARTITION BY KEY (bucket) PARTITIONS 2",
+            )
+            .await
+            .unwrap();
+        backend
+            .execute("INSERT INTO partitioned_key VALUES (1,10),(2,20)")
+            .await
+            .unwrap();
+        assert_eq!(
+            single_value(
+                backend
+                    .execute(
+                        "SELECT COUNT(*) FROM information_schema.PARTITIONS
+                         WHERE TABLE_SCHEMA='mydb' AND TABLE_NAME='partitioned_key'",
+                    )
+                    .await
+                    .unwrap()
+            ),
+            b"2"
+        );
+        backend
+            .execute(
+                "CREATE TABLE partitioned_columns (
+                    year_value BIGINT NOT NULL,
+                    month_value BIGINT NOT NULL,
+                    PRIMARY KEY (year_value,month_value)
+                 ) PARTITION BY RANGE COLUMNS (year_value,month_value) (
+                    PARTITION p2025 VALUES LESS THAN (2026,1),
+                    PARTITION pmax VALUES LESS THAN MAXVALUE
+                 )",
+            )
+            .await
+            .unwrap();
+        backend
+            .execute("INSERT INTO partitioned_columns VALUES (2025,12),(2026,1)")
+            .await
+            .unwrap();
+        backend
+            .execute("INSERT INTO partitioned_columns VALUES (2027,1)")
+            .await
+            .unwrap();
+        backend
+            .execute(
+                "CREATE TABLE partitioned_range_without_max (id BIGINT PRIMARY KEY)
+                 PARTITION BY RANGE (id) (
+                    PARTITION p0 VALUES LESS THAN (10)
+                 )",
+            )
+            .await
+            .unwrap();
+        assert!(backend
+            .execute("INSERT INTO partitioned_range_without_max VALUES (10)")
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn expression_partitions_route_temporal_rows() {
+        let (_temp, _storage, mut backend, _second) = transaction_backends().await;
+        backend
+            .execute(
+                "CREATE TABLE expression_partitions (
+                    id BIGINT NOT NULL PRIMARY KEY,
+                    event_date DATE NOT NULL
+                 ) PARTITION BY RANGE (YEAR(event_date)) (
+                    PARTITION p2025 VALUES LESS THAN (2026),
+                    PARTITION pmax VALUES LESS THAN MAXVALUE
+                 )",
+            )
+            .await
+            .expect("create expression partition table");
+        backend
+            .execute(
+                "INSERT INTO expression_partitions VALUES
+                 (1,'2025-12-31'),(2,'2026-01-01')",
+            )
+            .await
+            .expect("insert rows into expression partition table");
+        assert_eq!(
+            query_rows(
+                &mut backend,
+                "SELECT PARTITION_NAME,TABLE_ROWS
+                 FROM information_schema.PARTITIONS
+                 WHERE TABLE_SCHEMA='mydb' AND TABLE_NAME='expression_partitions'
+                 ORDER BY PARTITION_ORDINAL_POSITION",
+            )
+            .await,
+            vec![
+                vec![Some(b"p2025".to_vec()), Some(b"1".to_vec())],
+                vec![Some(b"pmax".to_vec()), Some(b"1".to_vec())],
+            ]
+        );
+        backend
+            .execute("INSERT INTO expression_partitions VALUES (3,'2024-01-01')")
+            .await
+            .expect("insert earlier expression partition row");
+        assert_eq!(
+            single_value(
+                backend
+                    .execute(
+                        "SELECT COUNT(*) FROM expression_partitions
+                         WHERE event_date < '2026-01-01'",
+                    )
+                    .await
+                    .expect("count expression partition rows")
+            ),
+            b"2"
+        );
+    }
+
+    #[tokio::test]
+    async fn logical_table_partitions_survive_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = Arc::new(StorageEngineManager::new(
+            temp.path().to_path_buf(),
+            16384,
+            "4M",
+        ));
+        storage.init().await.unwrap();
+        storage.create_database("mydb").await.unwrap();
+        let config = Arc::new(ProtocolConfig::default());
+        let stats = Arc::new(WireStats::default());
+        let mut backend = Backend::new(storage.clone(), config, stats, 1);
+        backend
+            .execute(
+                "CREATE TABLE persisted_partitions (id BIGINT PRIMARY KEY)
+                 PARTITION BY RANGE (id) (
+                    PARTITION p0 VALUES LESS THAN (10),
+                    PARTITION pmax VALUES LESS THAN MAXVALUE
+                 )",
+            )
+            .await
+            .unwrap();
+        backend
+            .execute("INSERT INTO persisted_partitions VALUES (1),(20)")
+            .await
+            .unwrap();
+        storage.flush_consistent().await.unwrap();
+        drop(backend);
+        drop(storage);
+
+        let restarted = Arc::new(StorageEngineManager::new(
+            temp.path().to_path_buf(),
+            16384,
+            "4M",
+        ));
+        restarted.init().await.unwrap();
+        let config = Arc::new(ProtocolConfig::default());
+        let stats = Arc::new(WireStats::default());
+        let mut backend = Backend::new(restarted, config, stats, 1);
+        assert_eq!(
+            query_rows(
+                &mut backend,
+                "SELECT id FROM persisted_partitions ORDER BY id",
+            )
+            .await,
+            vec![vec![Some(b"1".to_vec())], vec![Some(b"20".to_vec())],]
+        );
+        assert!(backend
+            .execute("INSERT INTO persisted_partitions VALUES (100)")
+            .await
+            .is_ok());
+        assert!(backend
+            .execute(
+                "SELECT PARTITION_NAME FROM information_schema.PARTITIONS
+                 WHERE TABLE_SCHEMA='mydb' AND TABLE_NAME='persisted_partitions'
+                 ORDER BY PARTITION_ORDINAL_POSITION",
+            )
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn simple_updatable_views_route_dml_and_enforce_check_option() {
+        let (_temp, _storage, mut backend, _second) = transaction_backends().await;
+        backend
+            .execute(
+                "CREATE TABLE view_accounts (
+                    id BIGINT PRIMARY KEY,
+                    name VARCHAR(32) NOT NULL,
+                    active BIGINT NOT NULL DEFAULT 1
+                )",
+            )
+            .await
+            .unwrap();
+        backend
+            .execute("INSERT INTO view_accounts VALUES (1,'one',1),(2,'two',1)")
+            .await
+            .unwrap();
+        backend
+            .execute(
+                "CREATE VIEW active_accounts(id,name,active) AS
+                 SELECT id,name,active FROM view_accounts WHERE active=1
+                 WITH LOCAL CHECK OPTION",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            query_rows(
+                &mut backend,
+                "SELECT TABLE_NAME,CHECK_OPTION,IS_UPDATABLE
+                 FROM information_schema.views
+                 WHERE table_schema='mydb' AND table_name='active_accounts'",
+            )
+            .await,
+            vec![vec![
+                Some(b"active_accounts".to_vec()),
+                Some(b"LOCAL".to_vec()),
+                Some(b"YES".to_vec()),
+            ]]
+        );
+        let QueryOutcome::Rows { rows, .. } = backend
+            .execute("SHOW CREATE VIEW active_accounts")
+            .await
+            .unwrap()
+        else {
+            panic!("expected SHOW CREATE VIEW rows")
+        };
+        assert!(String::from_utf8_lossy(rows[0][1].as_ref().unwrap())
+            .contains("WITH LOCAL CHECK OPTION"));
+
+        backend
+            .execute("INSERT INTO active_accounts VALUES (3,'three',1)")
+            .await
+            .unwrap();
+        assert!(backend
+            .execute("INSERT INTO active_accounts VALUES (4,'hidden',0)")
+            .await
+            .is_err());
+        backend
+            .execute("UPDATE active_accounts SET name='ONE' WHERE id=1")
+            .await
+            .unwrap();
+        assert!(backend
+            .execute("UPDATE active_accounts SET active=0 WHERE id=1")
+            .await
+            .is_err());
+        backend
+            .execute("DELETE FROM active_accounts WHERE id=2")
+            .await
+            .unwrap();
+        assert_eq!(
+            single_value(
+                backend
+                    .execute("SELECT COUNT(*) FROM view_accounts")
+                    .await
+                    .unwrap()
+            ),
+            b"2"
+        );
+        assert_eq!(
+            query_rows(
+                &mut backend,
+                "SELECT id,name,active FROM view_accounts ORDER BY id"
+            )
+            .await,
+            vec![
+                vec![
+                    Some(b"1".to_vec()),
+                    Some(b"ONE".to_vec()),
+                    Some(b"1".to_vec())
+                ],
+                vec![
+                    Some(b"3".to_vec()),
+                    Some(b"three".to_vec()),
+                    Some(b"1".to_vec())
+                ],
             ]
         );
     }
@@ -46979,11 +60212,13 @@ mod tests {
                     .unwrap(),
                 Some(0)
             );
-            assert!(connection
+            let reset_error = connection
                 .query_drop("SELECT * FROM reset_wire_temp")
                 .unwrap_err()
-                .to_string()
-                .contains("does not exist"));
+                .to_string();
+            assert!(
+                reset_error.contains("does not exist") || reset_error.contains("doesn't exist")
+            );
             assert_eq!(
                 connection
                     .query_first::<u8, _>("SELECT @@autocommit")
@@ -47179,6 +60414,326 @@ mod tests {
         );
         assert!(sets[2].0.is_empty());
         assert!(sets[2].1.is_empty());
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mysql_client_receives_storage_column_metadata_for_prepared_crud() {
+        use mysql::consts::{ColumnFlags as ClientColumnFlags, ColumnType as ClientColumnType};
+        use mysql::prelude::Queryable;
+
+        let temp = tempfile::tempdir().unwrap();
+        let storage = Arc::new(StorageEngineManager::new(
+            temp.path().to_path_buf(),
+            16384,
+            "4M",
+        ));
+        storage.init().await.unwrap();
+        storage.create_database("mydb").await.unwrap();
+        let config = Arc::new(ProtocolConfig::default());
+        let stats = Arc::new(WireStats::default());
+        let mut setup = Backend::new(storage.clone(), config.clone(), stats.clone(), 1);
+        setup
+            .execute(
+                "CREATE TABLE jdbc_metadata (id BIGINT UNSIGNED NOT NULL PRIMARY KEY, amount INT, label VARCHAR(32), created DATE, payload BLOB)",
+            )
+            .await
+            .unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_connection(stream, storage, config, stats)
+                .await
+                .unwrap();
+        });
+
+        let metadata = tokio::task::spawn_blocking(move || {
+            let options = mysql::OptsBuilder::default()
+                .ip_or_hostname(Some("127.0.0.1"))
+                .tcp_port(port)
+                .user(Some("root"))
+                .pass(Some("root"))
+                .db_name(Some("mydb"))
+                .prefer_socket(false);
+            let mut connection = mysql::Conn::new(options).unwrap();
+            let statement = connection
+                .prep("INSERT INTO jdbc_metadata (id,amount,label,created,payload) VALUES (?,?,?,?,?)")
+                .unwrap();
+            let params = statement.params().to_vec();
+            connection
+                .exec_drop(
+                    &statement,
+                    mysql::Params::Positional(vec![
+                        mysql::Value::UInt(1),
+                        mysql::Value::Int(7),
+                        mysql::Value::Bytes(b"hello".to_vec()),
+                        mysql::Value::Date(2026, 8, 12, 0, 0, 0, 0),
+                        mysql::Value::Bytes(vec![0, 255]),
+                    ]),
+                )
+                .unwrap();
+            let query = connection
+                .prep("SELECT id,amount,label,created,payload FROM jdbc_metadata WHERE id=?")
+                .unwrap();
+            let result_columns = query.columns().to_vec();
+            let result = connection
+                .exec_first::<(u64, i32, String, mysql::Value, Vec<u8>), _, _>(
+                    &query,
+                    (1_u64,),
+                )
+                .unwrap();
+            (params, result_columns, result)
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(metadata.0.len(), 5);
+        assert_eq!(
+            metadata.0[0].column_type(),
+            ClientColumnType::MYSQL_TYPE_LONGLONG
+        );
+        assert!(metadata.0[0]
+            .flags()
+            .contains(ClientColumnFlags::UNSIGNED_FLAG));
+        assert_eq!(
+            metadata.1[0].column_type(),
+            ClientColumnType::MYSQL_TYPE_LONGLONG
+        );
+        assert!(metadata.1[0]
+            .flags()
+            .contains(ClientColumnFlags::UNSIGNED_FLAG));
+        assert_eq!(
+            metadata.1[1].column_type(),
+            ClientColumnType::MYSQL_TYPE_LONG
+        );
+        assert_eq!(
+            metadata.1[2].column_type(),
+            ClientColumnType::MYSQL_TYPE_VAR_STRING
+        );
+        assert_eq!(
+            metadata.1[3].column_type(),
+            ClientColumnType::MYSQL_TYPE_DATE
+        );
+        assert_eq!(
+            metadata.1[4].column_type(),
+            ClientColumnType::MYSQL_TYPE_BLOB
+        );
+        assert_eq!(
+            metadata.2,
+            Some((
+                1,
+                7,
+                "hello".to_string(),
+                mysql::Value::Date(2026, 8, 12, 0, 0, 0, 0),
+                vec![0, 255],
+            ))
+        );
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mysql_client_decodes_projection_predicates_and_decimal_window() {
+        use mysql::prelude::Queryable;
+
+        let temp = tempfile::tempdir().unwrap();
+        let storage = Arc::new(StorageEngineManager::new(
+            temp.path().to_path_buf(),
+            16384,
+            "4M",
+        ));
+        storage.init().await.unwrap();
+        storage.create_database("mydb").await.unwrap();
+        let config = Arc::new(ProtocolConfig::default());
+        let stats = Arc::new(WireStats::default());
+        let mut setup = Backend::new(storage.clone(), config.clone(), stats.clone(), 1);
+        setup
+            .execute(
+                "CREATE TABLE wire_window_decimal (
+                    id INT PRIMARY KEY,
+                    amount DECIMAL(10,2)
+                )",
+            )
+            .await
+            .unwrap();
+        setup
+            .execute("INSERT INTO wire_window_decimal VALUES (1,12.50),(2,0.00)")
+            .await
+            .unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_connection(stream, storage, config, stats)
+                .await
+                .unwrap();
+        });
+
+        tokio::task::spawn_blocking(move || {
+            let options = mysql::OptsBuilder::default()
+                .ip_or_hostname(Some("127.0.0.1"))
+                .tcp_port(port)
+                .user(Some("root"))
+                .pass(Some("root"))
+                .db_name(Some("mydb"))
+                .prefer_socket(false);
+            let mut connection = mysql::Conn::new(options).unwrap();
+            let predicates: Option<(u8, u8, u8, u8)> = connection
+                .query_first("SELECT 3 BETWEEN 1 AND 4,'abc' LIKE 'a%',2 IN (1,2),NOT (1=0)")
+                .unwrap();
+            assert_eq!(predicates, Some((1, 1, 1, 1)));
+            let rows: Vec<(i32, String, String)> = connection
+                .query(
+                    "SELECT id,amount,SUM(amount) OVER
+                     (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+                     FROM wire_window_decimal ORDER BY id",
+                )
+                .unwrap();
+            assert_eq!(
+                rows,
+                vec![
+                    (1, "12.50".to_string(), "12.50".to_string()),
+                    (2, "0.00".to_string(), "12.50".to_string()),
+                ]
+            );
+            assert_eq!(
+                connection.query_first::<u8, _>("SELECT 1").unwrap(),
+                Some(1)
+            );
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mysql_client_exposes_fulltext_spatial_and_unknown_function_semantics() {
+        use mysql::prelude::Queryable;
+
+        let temp = tempfile::tempdir().unwrap();
+        let storage = Arc::new(StorageEngineManager::new(
+            temp.path().to_path_buf(),
+            16384,
+            "4M",
+        ));
+        storage.init().await.unwrap();
+        storage.create_database("mydb").await.unwrap();
+        let config = Arc::new(ProtocolConfig::default());
+        let stats = Arc::new(WireStats::default());
+        let mut setup = Backend::new(storage.clone(), config.clone(), stats.clone(), 1);
+        setup
+            .execute(
+                "CREATE TABLE wire_fulltext (
+                    id INT PRIMARY KEY,
+                    title VARCHAR(255),
+                    body TEXT,
+                    FULLTEXT KEY ft_title_body (title, body)
+                )",
+            )
+            .await
+            .unwrap();
+        setup
+            .execute(
+                "CREATE TABLE wire_spatial (
+                    id INT PRIMARY KEY,
+                    point_value POINT NOT NULL,
+                    SPATIAL INDEX sp_point (point_value)
+                )",
+            )
+            .await
+            .unwrap();
+        setup
+            .execute(
+                "INSERT INTO wire_fulltext VALUES
+                 (1,'Rust database','MySQL compatible database'),
+                 (2,'Other','unrelated text')",
+            )
+            .await
+            .unwrap();
+        setup
+            .execute(
+                "INSERT INTO wire_spatial VALUES
+                 (1,ST_GeomFromText('POINT(1 2)'))",
+            )
+            .await
+            .unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_connection(stream, storage, config, stats)
+                .await
+                .unwrap();
+        });
+
+        tokio::task::spawn_blocking(move || {
+            let options = mysql::OptsBuilder::default()
+                .ip_or_hostname(Some("127.0.0.1"))
+                .tcp_port(port)
+                .user(Some("root"))
+                .pass(Some("root"))
+                .db_name(Some("mydb"))
+                .prefer_socket(false);
+            let mut connection = mysql::Conn::new(options).unwrap();
+            let scores: Vec<(f64,)> = connection
+                .query(
+                    "SELECT MATCH(title,body) AGAINST ('database')
+                     FROM wire_fulltext ORDER BY id",
+                )
+                .unwrap();
+            assert_eq!(scores.len(), 2);
+            assert!(scores[0].0 > 0.0);
+            assert_eq!(scores[1].0, 0.0);
+            let spatial: Option<(String, String, String, String)> = connection
+                .query_first(
+                    "SELECT ST_AsText(point_value),ST_X(point_value),
+                            ST_Y(point_value),ST_GeometryType(point_value)
+                     FROM wire_spatial",
+                )
+                .unwrap();
+            assert_eq!(
+                spatial,
+                Some((
+                    "POINT(1 2)".to_string(),
+                    "1".to_string(),
+                    "2".to_string(),
+                    "POINT".to_string(),
+                ))
+            );
+            let index_types: Vec<(String, String)> = connection
+                .query(
+                    "SELECT INDEX_NAME,INDEX_TYPE
+                     FROM information_schema.STATISTICS
+                     WHERE TABLE_SCHEMA='mydb'
+                       AND TABLE_NAME IN ('wire_fulltext','wire_spatial')
+                     ORDER BY INDEX_NAME",
+                )
+                .unwrap();
+            assert!(index_types
+                .iter()
+                .any(|(name, kind)| name == "ft_title_body" && kind == "FULLTEXT"));
+            assert!(index_types
+                .iter()
+                .any(|(name, kind)| name == "sp_point" && kind == "SPATIAL"));
+            let error = connection
+                .query_first::<String, _>("SELECT no_such_function(1)")
+                .unwrap_err();
+            assert!(error.to_string().contains("1305"));
+        })
+        .await
+        .unwrap();
         tokio::time::timeout(Duration::from_secs(5), server)
             .await
             .unwrap()
@@ -47903,6 +61458,212 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn xa_prepare_recover_commit_is_cross_connection_and_holds_locks() {
+        let (_temp, _storage, mut first, mut second) = transaction_backends().await;
+        first
+            .execute("XA START 'gtrid','bqual',42")
+            .await
+            .expect("start XA branch");
+        first
+            .execute("INSERT INTO actors VALUES (2,20)")
+            .await
+            .expect("stage XA write");
+        first
+            .execute("XA END 'gtrid','bqual',42")
+            .await
+            .expect("end XA branch");
+        first
+            .execute("XA PREPARE 'gtrid','bqual',42")
+            .await
+            .expect("prepare XA branch");
+
+        assert_eq!(
+            single_value(
+                second
+                    .execute("SELECT COUNT(*) FROM actors")
+                    .await
+                    .expect("prepared write stays invisible")
+            ),
+            b"1"
+        );
+        let recovered = second
+            .execute("XA RECOVER")
+            .await
+            .expect("recover prepared XA branch");
+        let QueryOutcome::Rows { rows, .. } = recovered else {
+            panic!("XA RECOVER must return rows");
+        };
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0].as_deref(), Some(b"42".as_slice()));
+        assert_eq!(rows[0][1].as_deref(), Some(b"5".as_slice()));
+        assert_eq!(rows[0][2].as_deref(), Some(b"5".as_slice()));
+        assert_eq!(rows[0][3].as_deref(), Some(b"gtridbqual".as_slice()));
+
+        let error = second
+            .execute("UPDATE actors SET value=21 WHERE id=2")
+            .await
+            .expect_err("prepared XA branch must retain row locks");
+        assert!(error.to_string().contains("Lock wait timeout"), "{error}");
+
+        second
+            .execute("XA COMMIT 'gtrid','bqual',42")
+            .await
+            .expect("commit prepared XA branch from another connection");
+        assert_eq!(
+            single_value(
+                second
+                    .execute("SELECT COUNT(*) FROM actors")
+                    .await
+                    .expect("committed XA row visible")
+            ),
+            b"2"
+        );
+        let recovered = second
+            .execute("XA RECOVER")
+            .await
+            .expect("recover after XA commit");
+        let QueryOutcome::Rows { rows, .. } = recovered else {
+            panic!("XA RECOVER must return rows");
+        };
+        assert!(rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn xa_prepared_catalog_reloads_and_reacquires_locks() {
+        let temp = tempfile::tempdir().expect("create XA catalog directory");
+        let storage = StorageEngineManager::new(temp.path().join("data"), 16384, "4M");
+        storage.init().await.expect("initialize storage");
+        storage
+            .create_database("mydb")
+            .await
+            .expect("create database");
+        let config = Arc::new(ProtocolConfig::default());
+        let mut backend =
+            Backend::new(Arc::new(storage), config, Arc::new(WireStats::default()), 1);
+        backend
+            .execute("CREATE TABLE xa_catalog_rows (id BIGINT PRIMARY KEY, value BIGINT)")
+            .await
+            .expect("create XA table");
+        let storage = backend.storage.clone();
+        let catalog = temp.path().join("xa");
+        let first_stats = Arc::new(WireStats::default());
+        first_stats
+            .initialize_xa_catalog(catalog.clone(), storage.as_ref())
+            .expect("initialize empty XA catalog");
+        let mut row = Row::new();
+        row.push("id", b"1".to_vec());
+        row.push("value", b"10".to_vec());
+        first_stats
+            .prepare_xa_transaction(PreparedXaTransaction {
+                identifier: XaIdentifier {
+                    key: "7:67:62".to_string(),
+                    format_id: 7,
+                    gtrid: b"g".to_vec(),
+                    bqual: b"b".to_vec(),
+                },
+                commands: vec![WriteCommand::Insert {
+                    database: "mydb".to_string(),
+                    table: "xa_catalog_rows".to_string(),
+                    row,
+                }],
+                lock_owner: first_stats.internal_connection_id(),
+                committing: false,
+            })
+            .expect("persist prepared XA catalog");
+        drop(first_stats);
+
+        let restarted_stats = WireStats::default();
+        restarted_stats
+            .initialize_xa_catalog(catalog, storage.as_ref())
+            .expect("reload prepared XA catalog");
+        assert_eq!(restarted_stats.prepared_xa_rows().len(), 1);
+        let requests = write_lock_requests(
+            storage.as_ref(),
+            &[WriteCommand::Update {
+                database: "mydb".to_string(),
+                table: "xa_catalog_rows".to_string(),
+                filter: Some(RowPredicate::Eq("id".to_string(), b"1".to_vec())),
+                assignments: vec![("value".to_string(), Some(b"11".to_vec()))],
+            }],
+        )
+        .expect("build conflicting lock request");
+        assert!(!restarted_stats.try_acquire_locks(&requests, 99));
+    }
+
+    #[tokio::test]
+    async fn xa_committing_catalog_skips_replay_after_durable_marker() {
+        let temp = tempfile::tempdir().expect("create XA marker directory");
+        let storage = StorageEngineManager::new(temp.path().join("data"), 16384, "4M");
+        storage.init().await.expect("initialize storage");
+        storage
+            .create_database("mydb")
+            .await
+            .expect("create database");
+        let config = Arc::new(ProtocolConfig::default());
+        let mut backend =
+            Backend::new(Arc::new(storage), config, Arc::new(WireStats::default()), 1);
+        backend
+            .execute("CREATE TABLE xa_marker_rows (id BIGINT PRIMARY KEY, value BIGINT)")
+            .await
+            .expect("create XA marker table");
+        let storage = backend.storage.clone();
+        let catalog = temp.path().join("xa");
+        let first_stats = Arc::new(WireStats::default());
+        first_stats
+            .initialize_xa_catalog(catalog.clone(), storage.as_ref())
+            .expect("initialize empty XA marker catalog");
+        let key = "8:67:62";
+        let mut row = Row::new();
+        row.push("id", b"1".to_vec());
+        row.push("value", b"10".to_vec());
+        first_stats
+            .prepare_xa_transaction(PreparedXaTransaction {
+                identifier: XaIdentifier {
+                    key: key.to_string(),
+                    format_id: 8,
+                    gtrid: b"g".to_vec(),
+                    bqual: b"b".to_vec(),
+                },
+                commands: vec![WriteCommand::Insert {
+                    database: "mydb".to_string(),
+                    table: "xa_marker_rows".to_string(),
+                    row,
+                }],
+                lock_owner: first_stats.internal_connection_id(),
+                committing: false,
+            })
+            .expect("persist XA marker transaction");
+        first_stats
+            .mark_prepared_xa_committing(key)
+            .expect("persist XA committing state");
+        let transaction = first_stats
+            .prepared_xa(key)
+            .expect("read XA committing state");
+        let mut commands = transaction.commands;
+        commands.push(WriteCommand::XaCommitMarker {
+            key: key.to_string(),
+        });
+        storage
+            .execute_prepared_batch(commands)
+            .await
+            .expect("durably apply XA batch and marker");
+        drop(first_stats);
+
+        let restarted_stats = WireStats::default();
+        restarted_stats
+            .initialize_xa_catalog(catalog, storage.as_ref())
+            .expect("recover XA catalog after commit marker");
+        assert!(restarted_stats.prepared_xa_rows().is_empty());
+        assert_eq!(
+            storage.scan_table("mydb", "xa_marker_rows").unwrap().len(),
+            1
+        );
+        storage
+            .clear_xa_commit_marker(key)
+            .expect("remove XA marker after recovery");
+    }
+
+    #[tokio::test]
     async fn transaction_preparation_returns_auto_id_and_rollback_keeps_mysql_gap() {
         let (_temp, _storage, mut backend, _second) = transaction_backends().await;
         backend
@@ -47947,6 +61708,136 @@ mod tests {
             single_value(backend.execute("SELECT id FROM tx_ids").await.unwrap()),
             b"2"
         );
+    }
+
+    #[tokio::test]
+    async fn foreign_key_insert_locks_only_the_referenced_parent_record() {
+        let (_temp, _storage, mut first, mut second) = transaction_backends().await;
+        first
+            .execute("CREATE TABLE fk_lock_parent (id BIGINT PRIMARY KEY, value BIGINT)")
+            .await
+            .expect("create FK parent");
+        first
+            .execute(
+                "CREATE TABLE fk_lock_child (
+                    id BIGINT PRIMARY KEY,
+                    parent_id BIGINT,
+                    FOREIGN KEY (parent_id) REFERENCES fk_lock_parent(id)
+                )",
+            )
+            .await
+            .expect("create FK child");
+        first
+            .execute("INSERT INTO fk_lock_parent VALUES (1,10),(2,20)")
+            .await
+            .expect("seed FK parents");
+        first.execute("BEGIN").await.expect("begin FK insert");
+        first
+            .execute("INSERT INTO fk_lock_child VALUES (1,1)")
+            .await
+            .expect("insert child row");
+
+        second
+            .execute("UPDATE fk_lock_parent SET value=21 WHERE id=2")
+            .await
+            .expect("unrelated parent row must remain writable");
+        let error = second
+            .execute("UPDATE fk_lock_parent SET value=11 WHERE id=1")
+            .await
+            .expect_err("referenced parent row must be protected by FK check");
+        assert!(error.to_string().contains("Lock wait timeout"), "{error}");
+        first.execute("ROLLBACK").await.expect("rollback FK insert");
+    }
+
+    #[tokio::test]
+    async fn foreign_key_update_locks_the_new_parent_record() {
+        let (_temp, _storage, mut first, mut second) = transaction_backends().await;
+        first
+            .execute("CREATE TABLE fk_update_parent (id BIGINT PRIMARY KEY, value BIGINT)")
+            .await
+            .expect("create FK parent");
+        first
+            .execute(
+                "CREATE TABLE fk_update_child (
+                    id BIGINT PRIMARY KEY,
+                    parent_id BIGINT,
+                    FOREIGN KEY (parent_id) REFERENCES fk_update_parent(id)
+                )",
+            )
+            .await
+            .expect("create FK child");
+        first
+            .execute("INSERT INTO fk_update_parent VALUES (1,10),(2,20)")
+            .await
+            .expect("seed FK parents");
+        first
+            .execute("INSERT INTO fk_update_child VALUES (1,1)")
+            .await
+            .expect("seed FK child");
+        first.execute("BEGIN").await.expect("begin FK update");
+        first
+            .execute("UPDATE fk_update_child SET parent_id=2 WHERE id=1")
+            .await
+            .expect("update child reference");
+
+        second
+            .execute("UPDATE fk_update_parent SET value=11 WHERE id=1")
+            .await
+            .expect("old parent row must remain writable");
+        let error = second
+            .execute("UPDATE fk_update_parent SET value=21 WHERE id=2")
+            .await
+            .expect_err("new parent row must be protected by FK check");
+        assert!(error.to_string().contains("Lock wait timeout"), "{error}");
+        first.execute("ROLLBACK").await.expect("rollback FK update");
+    }
+
+    #[tokio::test]
+    async fn foreign_key_parent_update_locks_matching_child_rows() {
+        let (_temp, _storage, mut first, mut second) = transaction_backends().await;
+        first
+            .execute("CREATE TABLE fk_parent_update_lock (id BIGINT PRIMARY KEY)")
+            .await
+            .expect("create FK parent");
+        first
+            .execute(
+                "CREATE TABLE fk_child_update_lock (
+                    id BIGINT PRIMARY KEY,
+                    parent_id BIGINT,
+                    value BIGINT,
+                    FOREIGN KEY (parent_id) REFERENCES fk_parent_update_lock(id)
+                        ON UPDATE CASCADE
+                )",
+            )
+            .await
+            .expect("create FK child");
+        first
+            .execute("INSERT INTO fk_parent_update_lock VALUES (1),(2)")
+            .await
+            .expect("seed FK parents");
+        first
+            .execute("INSERT INTO fk_child_update_lock VALUES (10,1,10),(20,2,20)")
+            .await
+            .expect("seed FK children");
+        first.execute("BEGIN").await.expect("begin parent update");
+        first
+            .execute("UPDATE fk_parent_update_lock SET id=3 WHERE id=1")
+            .await
+            .expect("update parent with cascade");
+
+        second
+            .execute("UPDATE fk_child_update_lock SET value=21 WHERE id=20")
+            .await
+            .expect("unrelated child row must remain writable");
+        let error = second
+            .execute("UPDATE fk_child_update_lock SET parent_id=2 WHERE id=10")
+            .await
+            .expect_err("matching child row must be protected by parent update");
+        assert!(error.to_string().contains("Lock wait timeout"), "{error}");
+        first
+            .execute("ROLLBACK")
+            .await
+            .expect("rollback parent update");
     }
 
     #[tokio::test]
@@ -48913,6 +62804,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rollback_to_savepoint_retains_existing_row_locks() {
+        let (_temp, _storage, mut first, mut second) = transaction_backends().await;
+        first
+            .execute("INSERT INTO actors (id,value) VALUES (2,20)")
+            .await
+            .unwrap();
+        first.execute("BEGIN").await.unwrap();
+        first
+            .execute("SELECT value FROM actors WHERE id=1 FOR UPDATE")
+            .await
+            .unwrap();
+        first.execute("SAVEPOINT before_second_lock").await.unwrap();
+        first
+            .execute("SELECT value FROM actors WHERE id=2 FOR UPDATE")
+            .await
+            .unwrap();
+
+        assert!(second
+            .execute("SELECT value FROM actors WHERE id=2 FOR UPDATE NOWAIT")
+            .await
+            .is_err());
+        assert!(second
+            .execute("SELECT value FROM actors WHERE id=1 FOR UPDATE NOWAIT")
+            .await
+            .is_err());
+
+        first
+            .execute("ROLLBACK TO SAVEPOINT before_second_lock")
+            .await
+            .unwrap();
+        assert!(second
+            .execute("SELECT value FROM actors WHERE id=2 FOR UPDATE NOWAIT")
+            .await
+            .is_err());
+        assert!(second
+            .execute("SELECT value FROM actors WHERE id=1 FOR UPDATE NOWAIT")
+            .await
+            .is_err());
+        first.execute("ROLLBACK").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rollback_to_savepoint_releases_inserted_primary_row_locks() {
+        let (_temp, _storage, mut first, mut second) = transaction_backends().await;
+        first.execute("BEGIN").await.unwrap();
+        first
+            .execute("SELECT value FROM actors WHERE id=1 FOR UPDATE")
+            .await
+            .unwrap();
+        first
+            .execute("INSERT INTO actors (id,value) VALUES (2,20)")
+            .await
+            .unwrap();
+        first.execute("SAVEPOINT before_insert").await.unwrap();
+        first
+            .execute("INSERT INTO actors (id,value) VALUES (3,30)")
+            .await
+            .unwrap();
+
+        assert!(second
+            .execute("SELECT value FROM actors WHERE id=3 FOR UPDATE NOWAIT")
+            .await
+            .is_err());
+        assert!(second
+            .execute("SELECT value FROM actors WHERE id=1 FOR UPDATE NOWAIT")
+            .await
+            .is_err());
+
+        first
+            .execute("ROLLBACK TO SAVEPOINT before_insert")
+            .await
+            .unwrap();
+        let QueryOutcome::Rows { rows, .. } = second
+            .execute("SELECT value FROM actors WHERE id=3 FOR UPDATE NOWAIT")
+            .await
+            .unwrap()
+        else {
+            panic!("expected rows")
+        };
+        assert!(rows.is_empty());
+        assert!(second
+            .execute("SELECT value FROM actors WHERE id=1 FOR UPDATE NOWAIT")
+            .await
+            .is_err());
+        first.execute("ROLLBACK").await.unwrap();
+    }
+
+    #[tokio::test]
     async fn common_case_string_numeric_and_cast_expressions_match_mysql() {
         let (_temp, _storage, mut backend, _second) = transaction_backends().await;
         backend
@@ -48925,6 +62904,12 @@ mod tests {
             .execute("INSERT INTO expression_rows VALUES (1,10,'héllo',NULL),(2,20,'world','mage')")
             .await
             .unwrap();
+        let mut scalar_row = Row::new();
+        scalar_row.push("value", b"10".to_vec());
+        assert_eq!(
+            evaluate_scalar_expression("NULLIF(value,10) IS NULL", &scalar_row).unwrap(),
+            Some(b"1".to_vec())
+        );
         let QueryOutcome::Rows { columns, rows } = backend
             .execute("EXPLAIN SELECT id FROM expression_rows WHERE id=1")
             .await
@@ -49181,6 +63166,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn string_expression_metadata_does_not_force_numeric_wire_conversion() {
+        assert_eq!(
+            mysql_expression_column(
+                "label",
+                "CASE WHEN score>=20 THEN CONCAT(UPPER(name),'-',CAST(score AS CHAR)) ELSE CONCAT_WS(':',name,NULL,'rookie') END"
+            )
+            .coltype,
+            ColumnType::MYSQL_TYPE_VAR_STRING
+        );
+        assert_eq!(
+            mysql_expression_column("label", "CONCAT(name,'-suffix')").coltype,
+            ColumnType::MYSQL_TYPE_VAR_STRING
+        );
+        assert_eq!(
+            mysql_expression_column("formatted", "DATE_FORMAT(dt,'%Y-%m-%d')").coltype,
+            ColumnType::MYSQL_TYPE_VAR_STRING
+        );
+    }
+
     #[tokio::test]
     async fn common_math_and_text_functions_work_in_queries_and_mutations() {
         let (_temp, _storage, mut backend, _second) = transaction_backends().await;
@@ -49215,6 +63220,21 @@ mod tests {
                 Some(b"Axyx".to_vec()),
                 Some("猫cba".as_bytes().to_vec()),
                 Some(b"gogogo".to_vec())
+            ]]
+        );
+        let QueryOutcome::Rows { rows, .. } = backend
+            .execute("SELECT ROUND(15,2), ROUND(15.125,2), ROUND(15,-1)")
+            .await
+            .unwrap()
+        else {
+            panic!("expected ROUND rows")
+        };
+        assert_eq!(
+            rows,
+            vec![vec![
+                Some(b"15".to_vec()),
+                Some(b"15.13".to_vec()),
+                Some(b"20".to_vec())
             ]]
         );
 
@@ -49303,6 +63323,39 @@ mod tests {
                     Some(b"players=2".to_vec())
                 ]
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn round_uses_mysql_exact_and_approximate_numeric_rules() {
+        let (_temp, _storage, mut backend, _second) = transaction_backends().await;
+        backend
+            .execute(
+                "CREATE TABLE round_types (
+                    id BIGINT PRIMARY KEY,
+                    exact_value DECIMAL(10,2),
+                    approximate_value DOUBLE,
+                    integer_value INT
+                )",
+            )
+            .await
+            .unwrap();
+        backend
+            .execute("INSERT INTO round_types VALUES (1,-1.25,-1.25,10)")
+            .await
+            .unwrap();
+        assert_eq!(
+            query_rows(
+                &mut backend,
+                "SELECT ROUND(exact_value,1),ROUND(approximate_value,1),ROUND(integer_value,2)
+                 FROM round_types",
+            )
+            .await,
+            vec![vec![
+                Some(b"-1.3".to_vec()),
+                Some(b"-1.2".to_vec()),
+                Some(b"10".to_vec()),
+            ]]
         );
     }
 
@@ -49950,6 +64003,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mysql_binary_literals_keep_mysql_numeric_and_bit_semantics() {
+        let (_temp, _storage, mut backend, _second) = transaction_backends().await;
+        assert_eq!(
+            query_rows(
+                &mut backend,
+                "SELECT X'35'+4, X'35'>=10, CAST(X'35' AS UNSIGNED),
+                        X'0A'+1, B'1010'+1, HEX(B'1010'), HEX(X'0A'), HEX(X'35')",
+            )
+            .await,
+            vec![vec![
+                Some(b"57".to_vec()),
+                Some(b"1".to_vec()),
+                Some(b"53".to_vec()),
+                Some(b"11".to_vec()),
+                Some(b"11".to_vec()),
+                Some(b"0A".to_vec()),
+                Some(b"0A".to_vec()),
+                Some(b"35".to_vec()),
+            ]]
+        );
+    }
+
+    #[tokio::test]
     async fn mysql_calendar_functions_cover_leap_years_billing_and_transactions() {
         let (_temp, _storage, mut backend, _second) = transaction_backends().await;
         assert_eq!(
@@ -50394,6 +64470,51 @@ mod tests {
                 Some(b"0".to_vec()),
                 Some(b"0".to_vec()),
             ]]
+        );
+    }
+
+    #[tokio::test]
+    async fn date_format_reads_datetime_columns_and_uses_mysql_microseconds() {
+        let (_temp, _storage, mut backend, _second) = transaction_backends().await;
+        backend
+            .execute(
+                "CREATE TABLE date_format_rows (
+                    id BIGINT PRIMARY KEY,
+                    dt DATETIME(6),
+                    d DATE
+                )",
+            )
+            .await
+            .unwrap();
+        backend
+            .execute(
+                "INSERT INTO date_format_rows VALUES
+                    (1,'2026-02-28 12:34:56.123456','2026-02-28'),
+                    (2,'2024-02-29 00:00:00.000001','2024-02-29')",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            query_rows(
+                &mut backend,
+                "SELECT DATE_FORMAT(dt,'%Y-%m-%d'),
+                        DATE_FORMAT(dt,'%Y-%m-%d %H:%i:%s.%f'),
+                        DATE_FORMAT(d,'%Y-%m-%d')
+                 FROM date_format_rows ORDER BY id",
+            )
+            .await,
+            vec![
+                vec![
+                    Some(b"2026-02-28".to_vec()),
+                    Some(b"2026-02-28 12:34:56.123456".to_vec()),
+                    Some(b"2026-02-28".to_vec()),
+                ],
+                vec![
+                    Some(b"2024-02-29".to_vec()),
+                    Some(b"2024-02-29 00:00:00.000001".to_vec()),
+                    Some(b"2024-02-29".to_vec()),
+                ],
+            ]
         );
     }
 
@@ -53825,6 +67946,418 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn joined_for_update_locks_only_final_matching_rows() {
+        let (_temp, _storage, mut first, mut second) = transaction_backends().await;
+        second
+            .execute("INSERT INTO actors (id,value) VALUES (2,20)")
+            .await
+            .unwrap();
+        first.execute("BEGIN").await.unwrap();
+        first
+            .execute(
+                "SELECT a.id FROM actors a JOIN actors b ON b.id=a.id \
+                 WHERE a.id=1 FOR UPDATE",
+            )
+            .await
+            .unwrap();
+
+        second.execute("BEGIN").await.unwrap();
+        assert_eq!(
+            single_value(
+                second
+                    .execute("SELECT id FROM actors WHERE id=2 FOR UPDATE NOWAIT")
+                    .await
+                    .unwrap()
+            ),
+            b"2"
+        );
+        let error = second
+            .execute("SELECT id FROM actors WHERE id=1 FOR UPDATE NOWAIT")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(mysql_error_kind(&error), ErrorKind::ER_LOCK_NOWAIT);
+
+        second.execute("ROLLBACK").await.unwrap();
+        first.execute("COMMIT").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn joined_locking_reads_acquire_base_rows_in_global_order() {
+        let (_temp, _storage, mut first, mut second) = transaction_backends().await;
+        first
+            .execute("CREATE TABLE join_lock_left (id BIGINT PRIMARY KEY, value BIGINT)")
+            .await
+            .unwrap();
+        first
+            .execute("CREATE TABLE join_lock_right (id BIGINT PRIMARY KEY, value BIGINT)")
+            .await
+            .unwrap();
+        first
+            .execute("INSERT INTO join_lock_left VALUES (1,10)")
+            .await
+            .unwrap();
+        first
+            .execute("INSERT INTO join_lock_right VALUES (1,20)")
+            .await
+            .unwrap();
+        first.execute("BEGIN").await.unwrap();
+        first
+            .execute(
+                "SELECT l.id FROM join_lock_left l
+                 JOIN join_lock_right r ON r.id=l.id FOR UPDATE",
+            )
+            .await
+            .unwrap();
+        second.execute("BEGIN").await.unwrap();
+        second
+            .execute(
+                "SELECT r.id FROM join_lock_right r
+                 JOIN join_lock_left l ON l.id=r.id FOR UPDATE NOWAIT",
+            )
+            .await
+            .expect_err("the same joined rows must conflict regardless of JOIN order");
+
+        second.execute("ROLLBACK").await.unwrap();
+        first.execute("ROLLBACK").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn joined_locking_read_locks_secondary_index_point_and_clustered_row() {
+        let (_temp, _storage, mut first, mut second) = transaction_backends().await;
+        first
+            .execute(
+                "CREATE TABLE join_secondary_left (
+                    id BIGINT PRIMARY KEY,
+                    value BIGINT
+                )",
+            )
+            .await
+            .unwrap();
+        first
+            .execute(
+                "CREATE TABLE join_secondary_right (
+                    id BIGINT PRIMARY KEY,
+                    value BIGINT,
+                    INDEX idx_value (value)
+                )",
+            )
+            .await
+            .unwrap();
+        first
+            .execute("INSERT INTO join_secondary_left VALUES (1,10)")
+            .await
+            .unwrap();
+        first
+            .execute("INSERT INTO join_secondary_right VALUES (1,10)")
+            .await
+            .unwrap();
+        first.execute("BEGIN").await.unwrap();
+        first
+            .execute(
+                "SELECT l.id FROM join_secondary_left l
+                 JOIN join_secondary_right r ON r.value=l.value
+                 FOR UPDATE",
+            )
+            .await
+            .unwrap();
+
+        let error = second
+            .execute("UPDATE join_secondary_right SET value=11 WHERE id=1")
+            .await
+            .expect_err("joined FOR UPDATE must lock the clustered row");
+        assert!(error.to_string().contains("Lock wait timeout"), "{error}");
+        let error = second
+            .execute("INSERT INTO join_secondary_right VALUES (2,10)")
+            .await
+            .expect_err("joined FOR UPDATE must lock the matching secondary index point");
+        assert!(error.to_string().contains("Lock wait timeout"), "{error}");
+
+        second
+            .execute("INSERT INTO join_secondary_right VALUES (3,20)")
+            .await
+            .expect("an unrelated secondary index point must remain writable");
+        first.execute("ROLLBACK").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn joined_locking_read_locks_secondary_equality_next_key_gap() {
+        let (_temp, _storage, mut first, mut second) = transaction_backends().await;
+        first
+            .execute("CREATE TABLE join_equality_left (id BIGINT PRIMARY KEY)")
+            .await
+            .expect("create join equality left");
+        first
+            .execute(
+                "CREATE TABLE join_equality_right (
+                    id BIGINT PRIMARY KEY,
+                    value BIGINT,
+                    INDEX idx_value (value)
+                )",
+            )
+            .await
+            .expect("create join equality right");
+        first
+            .execute("INSERT INTO join_equality_left VALUES (1)")
+            .await
+            .expect("seed join equality left");
+        first
+            .execute("INSERT INTO join_equality_right VALUES (1,10),(2,20)")
+            .await
+            .expect("seed join equality right");
+        first
+            .execute("BEGIN")
+            .await
+            .expect("begin join equality transaction");
+        first
+            .execute(
+                "SELECT l.id FROM join_equality_left l
+                 JOIN join_equality_right r ON r.id=l.id
+                 WHERE r.value=10 FOR UPDATE",
+            )
+            .await
+            .expect("lock joined secondary equality");
+
+        let error = second
+            .execute("INSERT INTO join_equality_right VALUES (3,5)")
+            .await
+            .expect_err("joined equality must lock the preceding secondary gap");
+        assert!(error.to_string().contains("Lock wait timeout"), "{error}");
+        second
+            .execute("INSERT INTO join_equality_right VALUES (4,15)")
+            .await
+            .expect("joined equality must not lock the following gap");
+        first
+            .execute("ROLLBACK")
+            .await
+            .expect("rollback join equality transaction");
+    }
+
+    #[tokio::test]
+    async fn joined_locking_read_locks_matching_join_range_gap() {
+        let (_temp, _storage, mut first, mut second) = transaction_backends().await;
+        first
+            .execute("CREATE TABLE join_range_left (id BIGINT PRIMARY KEY, value BIGINT)")
+            .await
+            .unwrap();
+        first
+            .execute(
+                "CREATE TABLE join_range_right (
+                    id BIGINT PRIMARY KEY,
+                    value BIGINT,
+                    INDEX idx_value (value)
+                )",
+            )
+            .await
+            .unwrap();
+        first
+            .execute("INSERT INTO join_range_left VALUES (1,5)")
+            .await
+            .unwrap();
+        first
+            .execute("INSERT INTO join_range_right VALUES (1,10)")
+            .await
+            .unwrap();
+        first.execute("BEGIN").await.unwrap();
+        first
+            .execute(
+                "SELECT l.id FROM join_range_left l
+                 JOIN join_range_right r ON r.value > l.value
+                 WHERE l.id=1 FOR UPDATE",
+            )
+            .await
+            .unwrap();
+
+        let error = second
+            .execute("INSERT INTO join_range_right VALUES (2,7)")
+            .await
+            .expect_err("joined FOR UPDATE must lock the matching secondary range");
+        assert!(error.to_string().contains("Lock wait timeout"), "{error}");
+        second
+            .execute("INSERT INTO join_range_right VALUES (3,3)")
+            .await
+            .expect("a non-matching join range must remain writable");
+        first.execute("ROLLBACK").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn join_on_constants_and_scalar_expressions_match_mysql() {
+        let (_temp, _storage, mut backend, _second) = transaction_backends().await;
+        backend
+            .execute("CREATE TABLE join_expression_left (id BIGINT PRIMARY KEY, value BIGINT)")
+            .await
+            .unwrap();
+        backend
+            .execute("CREATE TABLE join_expression_right (id BIGINT PRIMARY KEY, value BIGINT)")
+            .await
+            .unwrap();
+        backend
+            .execute("INSERT INTO join_expression_left VALUES (1,10),(2,20)")
+            .await
+            .unwrap();
+        backend
+            .execute("INSERT INTO join_expression_right VALUES (1,9),(2,19),(3,20)")
+            .await
+            .unwrap();
+
+        let arithmetic = backend
+            .execute(
+                "SELECT l.id, r.id FROM join_expression_left l
+                 JOIN join_expression_right r ON l.value = r.value + 1
+                 ORDER BY l.id",
+            )
+            .await
+            .unwrap();
+        let QueryOutcome::Rows { rows, .. } = arithmetic else {
+            panic!("expected rows")
+        };
+        assert_eq!(
+            rows,
+            vec![
+                vec![Some(b"1".to_vec()), Some(b"1".to_vec())],
+                vec![Some(b"2".to_vec()), Some(b"2".to_vec())],
+            ]
+        );
+
+        let function = backend
+            .execute(
+                "SELECT l.id, r.id FROM join_expression_left l
+                 JOIN join_expression_right r ON ABS(r.value) = l.value - 1
+                 ORDER BY l.id",
+            )
+            .await
+            .unwrap();
+        let QueryOutcome::Rows { rows, .. } = function else {
+            panic!("expected rows")
+        };
+        assert_eq!(
+            rows,
+            vec![
+                vec![Some(b"1".to_vec()), Some(b"1".to_vec())],
+                vec![Some(b"2".to_vec()), Some(b"2".to_vec())],
+            ]
+        );
+
+        let constant = backend
+            .execute(
+                "SELECT COUNT(*) FROM join_expression_left l
+                 JOIN join_expression_right r ON 1=1",
+            )
+            .await
+            .unwrap();
+        assert_eq!(single_value(constant), b"6");
+    }
+
+    #[tokio::test]
+    async fn grouped_having_supports_uncorrelated_scalar_subqueries() {
+        let (_temp, _storage, mut backend, _second) = transaction_backends().await;
+        backend
+            .execute("CREATE TABLE having_items (bucket VARCHAR(16), value BIGINT)")
+            .await
+            .unwrap();
+        backend
+            .execute("CREATE TABLE having_threshold (value BIGINT)")
+            .await
+            .unwrap();
+        backend
+            .execute("INSERT INTO having_items VALUES ('a',1),('a',2),('b',3)")
+            .await
+            .unwrap();
+        backend
+            .execute("INSERT INTO having_threshold VALUES (1)")
+            .await
+            .unwrap();
+        let outcome = backend
+            .execute(
+                "SELECT bucket, COUNT(*) AS n FROM having_items
+                 GROUP BY bucket
+                 HAVING COUNT(*) > (SELECT value FROM having_threshold)
+                 ORDER BY bucket",
+            )
+            .await
+            .unwrap();
+        let QueryOutcome::Rows { columns, rows } = outcome else {
+            panic!("expected grouped rows")
+        };
+        assert_eq!(columns, vec!["bucket", "n"]);
+        assert_eq!(rows, vec![vec![Some(b"a".to_vec()), Some(b"2".to_vec())]]);
+
+        backend
+            .execute("INSERT INTO having_threshold VALUES (2)")
+            .await
+            .unwrap();
+        let outcome = backend
+            .execute(
+                "SELECT bucket FROM having_items
+                 GROUP BY bucket
+                 HAVING COUNT(*) IN (SELECT value FROM having_threshold)
+                 ORDER BY bucket",
+            )
+            .await
+            .unwrap();
+        let QueryOutcome::Rows { rows, .. } = outcome else {
+            panic!("expected grouped rows")
+        };
+        assert_eq!(
+            rows,
+            vec![vec![Some(b"a".to_vec())], vec![Some(b"b".to_vec())]]
+        );
+    }
+
+    #[tokio::test]
+    async fn grouped_having_supports_correlated_scalar_subqueries() {
+        let (_temp, _storage, mut backend, _second) = transaction_backends().await;
+        backend
+            .execute("CREATE TABLE correlated_having_items (bucket VARCHAR(16), value BIGINT)")
+            .await
+            .unwrap();
+        backend
+            .execute("CREATE TABLE correlated_having_threshold (bucket VARCHAR(16), value BIGINT)")
+            .await
+            .unwrap();
+        backend
+            .execute("INSERT INTO correlated_having_items VALUES ('a',1),('a',2),('b',3)")
+            .await
+            .unwrap();
+        backend
+            .execute("INSERT INTO correlated_having_threshold VALUES ('a',1),('b',2)")
+            .await
+            .unwrap();
+
+        let outcome = backend
+            .execute(
+                "SELECT i.bucket, COUNT(*) AS n FROM correlated_having_items i
+                 GROUP BY i.bucket
+                 HAVING COUNT(*) > (SELECT t.value FROM correlated_having_threshold t
+                                    WHERE t.bucket = i.bucket)
+                 ORDER BY i.bucket",
+            )
+            .await
+            .unwrap();
+        let QueryOutcome::Rows { columns, rows } = outcome else {
+            panic!("expected correlated grouped rows")
+        };
+        assert_eq!(columns, vec!["i.bucket", "n"]);
+        assert_eq!(rows, vec![vec![Some(b"a".to_vec()), Some(b"2".to_vec())]]);
+
+        let outcome = backend
+            .execute(
+                "SELECT i.bucket, COUNT(*) AS n FROM correlated_having_items i
+                 GROUP BY i.bucket
+                 HAVING COUNT(*) > 1
+                    AND EXISTS (SELECT 1 FROM correlated_having_threshold t
+                                WHERE t.bucket = i.bucket AND t.value < COUNT(*))
+                 ORDER BY i.bucket",
+            )
+            .await
+            .unwrap();
+        let QueryOutcome::Rows { rows, .. } = outcome else {
+            panic!("expected compound correlated grouped rows")
+        };
+        assert_eq!(rows, vec![vec![Some(b"a".to_vec()), Some(b"2".to_vec())]]);
+    }
+
+    #[tokio::test]
     async fn for_share_and_nowait_match_mysql_lock_compatibility() {
         let (_temp, _storage, mut first, mut second) = transaction_backends().await;
         second
@@ -53941,6 +68474,111 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn join_skip_locked_filters_locked_base_rows_before_joining() {
+        let (_temp, _storage, mut first, mut second) = transaction_backends().await;
+        second
+            .execute("INSERT INTO actors (id,value) VALUES (2,20)")
+            .await
+            .unwrap();
+        first.execute("BEGIN").await.unwrap();
+        first
+            .execute("SELECT id FROM actors WHERE id=1 FOR UPDATE")
+            .await
+            .unwrap();
+
+        second.execute("BEGIN").await.unwrap();
+        let QueryOutcome::Rows { rows, .. } = tokio::time::timeout(
+            Duration::from_millis(50),
+            second.execute(
+                &("SELECT a.id FROM actors a JOIN actors b ON b.id=a.id ".to_string()
+                    + "ORDER BY a.id LIMIT 1 FOR UPDATE SKIP LOCKED"),
+            ),
+        )
+        .await
+        .expect("JOIN SKIP LOCKED must not wait")
+        .unwrap() else {
+            panic!("expected joined rows")
+        };
+        assert_eq!(rows, vec![vec![Some(b"2".to_vec())]]);
+
+        first.execute("COMMIT").await.unwrap();
+        second.execute("COMMIT").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn join_skip_locked_does_not_lock_rows_removed_by_final_join_filter() {
+        let (_temp, storage, mut first, mut second) = transaction_backends().await;
+        first
+            .execute("CREATE TABLE join_left (id BIGINT PRIMARY KEY, value BIGINT)")
+            .await
+            .unwrap();
+        first
+            .execute("CREATE TABLE join_right (id BIGINT PRIMARY KEY, value BIGINT)")
+            .await
+            .unwrap();
+        first
+            .execute("INSERT INTO join_left VALUES (1,10),(2,20)")
+            .await
+            .unwrap();
+        first
+            .execute("INSERT INTO join_right VALUES (1,100),(2,200)")
+            .await
+            .unwrap();
+        second.execute("BEGIN").await.unwrap();
+        let QueryOutcome::Rows { rows, .. } = second
+            .execute(
+                "SELECT a.id FROM join_left a
+                 JOIN join_right b ON a.id=b.id
+                 WHERE a.id=2
+                 FOR UPDATE SKIP LOCKED",
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected joined rows")
+        };
+        assert_eq!(rows, vec![vec![Some(b"2".to_vec())]]);
+
+        let mut third = Backend::new(storage, second.config.clone(), second.stats.clone(), 3);
+        third.execute("BEGIN").await.unwrap();
+        third
+            .execute("UPDATE join_left SET value=11 WHERE id=1")
+            .await
+            .unwrap();
+        third.execute("ROLLBACK").await.unwrap();
+        second.execute("ROLLBACK").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn join_locking_read_locks_only_finally_matched_base_rows() {
+        let (_temp, _storage, mut first, mut second) = transaction_backends().await;
+        second
+            .execute("INSERT INTO actors (id,value) VALUES (2,20)")
+            .await
+            .unwrap();
+        first.execute("BEGIN").await.unwrap();
+        first
+            .execute(
+                "SELECT a.id FROM actors a JOIN actors b ON b.id=a.id
+                 WHERE a.id=1 FOR UPDATE",
+            )
+            .await
+            .unwrap();
+
+        second
+            .execute("UPDATE actors SET value=21 WHERE id=2")
+            .await
+            .expect("JOIN FOR UPDATE must not lock rows removed by its final predicate");
+        let error = second
+            .execute("UPDATE actors SET value=11 WHERE id=1")
+            .await
+            .expect_err("JOIN FOR UPDATE must retain the matched base row lock");
+        assert!(error.to_string().contains("Lock wait timeout"), "{error}");
+
+        first.execute("ROLLBACK").await.unwrap();
+    }
+
+    #[tokio::test]
     async fn deadlock_detection_rolls_back_victim_and_unblocks_survivor() {
         let (_temp, _storage, mut first, mut second) = transaction_backends().await;
         second
@@ -53952,6 +68590,10 @@ mod tests {
         second.execute("BEGIN").await.unwrap();
         first
             .execute("UPDATE actors SET value=value+10 WHERE id=1")
+            .await
+            .unwrap();
+        first
+            .execute("UPDATE actors SET value=value+1 WHERE id=1")
             .await
             .unwrap();
         second
@@ -53991,7 +68633,7 @@ mod tests {
         assert_eq!(
             rows,
             vec![
-                vec![Some(b"1".to_vec()), Some(b"20".to_vec())],
+                vec![Some(b"1".to_vec()), Some(b"21".to_vec())],
                 vec![Some(b"2".to_vec()), Some(b"12".to_vec())],
             ]
         );
@@ -54310,6 +68952,161 @@ mod tests {
         assert!(error
             .to_string()
             .contains("Unknown or ambiguous column 'id'"));
+    }
+
+    #[tokio::test]
+    async fn information_schema_preserves_boolean_tinyint_width() {
+        let (_temp, _storage, mut backend, _second) = transaction_backends().await;
+        backend
+            .execute(
+                "CREATE TABLE boolean_metadata (flag BOOLEAN, small_flag TINYINT(2)) ENGINE=InnoDB",
+            )
+            .await
+            .expect("create boolean metadata table");
+        let QueryOutcome::Rows { rows, .. } = backend
+            .execute(
+                "SELECT COLUMN_NAME, DATA_TYPE, COLUMN_TYPE
+                 FROM information_schema.columns
+                 WHERE table_schema='mydb' AND table_name='boolean_metadata'
+                 ORDER BY ORDINAL_POSITION",
+            )
+            .await
+            .expect("read boolean column metadata")
+        else {
+            panic!("expected boolean column metadata rows")
+        };
+        assert_eq!(
+            rows,
+            vec![
+                vec![
+                    Some(b"flag".to_vec()),
+                    Some(b"tinyint".to_vec()),
+                    Some(b"tinyint(1)".to_vec()),
+                ],
+                vec![
+                    Some(b"small_flag".to_vec()),
+                    Some(b"int".to_vec()),
+                    Some(b"int".to_vec()),
+                ],
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn comma_joins_and_boolean_predicates_match_mysql() {
+        let (_temp, _storage, mut backend, _second) = transaction_backends().await;
+        backend
+            .execute("CREATE TABLE comma_a (id BIGINT PRIMARY KEY, value VARCHAR(8))")
+            .await
+            .expect("create comma_a");
+        backend
+            .execute("CREATE TABLE comma_b (id BIGINT PRIMARY KEY, value VARCHAR(8))")
+            .await
+            .expect("create comma_b");
+        backend
+            .execute("INSERT INTO comma_a VALUES (1,'a'),(2,'b')")
+            .await
+            .expect("insert comma_a");
+        backend
+            .execute("INSERT INTO comma_b VALUES (2,'B'),(3,'C')")
+            .await
+            .expect("insert comma_b");
+
+        let joined = backend
+            .execute(
+                "SELECT a.id,b.value FROM comma_a a, comma_b b WHERE a.id=b.id AND TRUE ORDER BY a.id",
+            )
+            .await
+            .expect("execute comma join");
+        let QueryOutcome::Rows { rows, .. } = joined else {
+            panic!("expected comma join rows");
+        };
+        assert_eq!(rows, vec![vec![Some(b"2".to_vec()), Some(b"B".to_vec())]]);
+
+        let empty = backend
+            .execute("SELECT COUNT(*) FROM comma_a a, comma_b b WHERE FALSE")
+            .await
+            .expect("execute false predicate");
+        assert_eq!(single_value(empty), b"0");
+    }
+
+    #[tokio::test]
+    async fn information_schema_qualified_boolean_predicates_match_datagrip() {
+        let (_temp, _storage, mut backend, _second) = transaction_backends().await;
+        let booleans = backend
+            .execute("SELECT TRUE, FALSE, TRUE AND FALSE, TRUE OR FALSE")
+            .await
+            .expect("MySQL boolean literals and conjunctions");
+        let QueryOutcome::Rows { rows, .. } = booleans else {
+            panic!("expected boolean literal rows");
+        };
+        assert_eq!(
+            rows,
+            vec![vec![
+                Some(b"1".to_vec()),
+                Some(b"0".to_vec()),
+                Some(b"0".to_vec()),
+                Some(b"1".to_vec()),
+            ]]
+        );
+        let result = backend
+            .execute(
+                "SELECT T.table_name, V.table_name\n                 FROM information_schema.tables T LEFT JOIN information_schema.views V ON T.table_schema = V.table_schema AND T.table_name = V.table_name\n                 WHERE T.table_schema = 'mydb' AND TRUE",
+            )
+            .await
+            .expect("DataGrip information_schema table/view introspection");
+        assert!(matches!(result, QueryOutcome::Rows { .. }));
+
+        let empty = backend
+            .execute(
+                "SELECT COUNT(*)\n                 FROM information_schema.tables T LEFT JOIN information_schema.views V ON T.table_schema = V.table_schema AND T.table_name = V.table_name\n                 WHERE T.table_schema = 'mydb' AND FALSE",
+            )
+            .await
+            .expect("DataGrip information_schema false predicate");
+        assert_eq!(single_value(empty), b"0");
+    }
+
+    #[tokio::test]
+    async fn information_schema_exposes_mysql84_optional_metadata_views() {
+        let (_temp, _storage, mut backend, _second) = transaction_backends().await;
+        let views = query_rows(
+            &mut backend,
+            "SELECT COUNT(*)
+             FROM information_schema.tables
+             WHERE table_schema='information_schema'
+               AND table_name IN ('column_statistics','innodb_trx','tablespaces','json_duality_views','view_table_usage')",
+        )
+        .await;
+        assert_eq!(views, vec![vec![Some(b"5".to_vec())]]);
+
+        let trx_columns = query_rows(
+            &mut backend,
+            "SELECT column_name
+             FROM information_schema.columns
+             WHERE table_schema='information_schema' AND table_name='innodb_trx'
+             ORDER BY ordinal_position",
+        )
+        .await;
+        assert_eq!(trx_columns.len(), 25);
+        assert_eq!(trx_columns[0], vec![Some(b"trx_id".to_vec())]);
+        assert_eq!(
+            trx_columns.last(),
+            Some(&vec![Some(b"trx_schedule_weight".to_vec())])
+        );
+    }
+
+    #[tokio::test]
+    async fn qualified_wildcard_projection_matches_mysql() {
+        let (_temp, _storage, mut backend, _second) = transaction_backends().await;
+        let QueryOutcome::Rows { columns, rows } = backend
+            .execute("SELECT t.* FROM actors AS t WHERE t.id=1 LIMIT 1")
+            .await
+            .expect("qualified wildcard projection")
+        else {
+            panic!("expected qualified wildcard rows")
+        };
+        assert_eq!(columns, vec!["id", "value"]);
+        assert_eq!(rows, vec![vec![Some(b"1".to_vec()), Some(b"10".to_vec())]]);
     }
 
     #[tokio::test]
@@ -54840,6 +69637,38 @@ mod tests {
             .unwrap();
         assert_eq!(single_value(nested), b"2");
 
+        backend
+            .execute("SET SESSION sql_mode='ONLY_FULL_GROUP_BY'")
+            .await
+            .unwrap();
+        backend
+            .execute("CREATE TABLE strict_group_rows (category VARCHAR(16), value BIGINT)")
+            .await
+            .unwrap();
+        backend
+            .execute("INSERT INTO strict_group_rows VALUES ('a',1),('a',2)")
+            .await
+            .unwrap();
+        let strict_error = backend
+            .execute("SELECT category,value FROM strict_group_rows GROUP BY category")
+            .await
+            .unwrap_err();
+        assert!(strict_error.to_string().contains("only_full_group_by"));
+        let strict_primary_key = backend
+            .execute("SELECT category,MAX(value) FROM strict_group_rows GROUP BY category")
+            .await
+            .unwrap();
+        assert!(matches!(strict_primary_key, QueryOutcome::Rows { .. }));
+        let strict_functional_dependency = backend
+            .execute("SELECT id,value FROM actors GROUP BY id")
+            .await;
+        assert!(
+            strict_functional_dependency.is_ok(),
+            "functional dependency query failed: {:?}",
+            strict_functional_dependency
+        );
+        backend.execute("SET SESSION sql_mode=''").await.unwrap();
+
         let correlated = backend
             .execute(
                 "SELECT d.id FROM (SELECT id,value FROM actors) d WHERE EXISTS (SELECT 1 FROM guilds g WHERE g.id=d.id)",
@@ -55078,7 +69907,7 @@ mod tests {
 
     #[tokio::test]
     async fn recursive_cte_and_scalar_arithmetic_match_mysql() {
-        let (_temp, _storage, mut backend, _second) = transaction_backends().await;
+        let (_temp, storage, mut backend, _second) = transaction_backends().await;
         let sequence = backend
             .execute(
                 "WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<5) SELECT n,n*2 AS doubled FROM seq ORDER BY n",
@@ -55099,6 +69928,74 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
         );
+
+        backend
+            .execute("SET SESSION cte_max_recursion_depth=2")
+            .await
+            .expect("set CTE recursion depth");
+        let depth_error = backend
+            .execute(
+                "WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<5) SELECT n FROM seq",
+            )
+            .await
+            .expect_err("CTE recursion depth must stop runaway recursion");
+        assert!(depth_error
+            .to_string()
+            .contains("Recursive query aborted after 3 iterations"));
+        backend
+            .execute("SET SESSION cte_max_recursion_depth=1000")
+            .await
+            .expect("restore CTE recursion depth");
+        backend
+            .execute("SET GLOBAL cte_max_recursion_depth=2")
+            .await
+            .expect("set global CTE recursion depth");
+        assert_eq!(
+            query_rows(
+                &mut backend,
+                "SELECT @@global.cte_max_recursion_depth,@@session.cte_max_recursion_depth"
+            )
+            .await,
+            vec![vec![Some(b"2".to_vec()), Some(b"1000".to_vec())]]
+        );
+        let mut new_connection = Backend::new(
+            storage.clone(),
+            backend.config.clone(),
+            backend.stats.clone(),
+            3,
+        );
+        assert_eq!(
+            query_rows(
+                &mut new_connection,
+                "SELECT @@session.cte_max_recursion_depth"
+            )
+            .await,
+            vec![vec![Some(b"2".to_vec())]]
+        );
+        backend
+            .execute("SET GLOBAL cte_max_recursion_depth=1000")
+            .await
+            .expect("restore global CTE recursion depth");
+
+        let forward_error = backend
+            .execute(
+                "WITH RECURSIVE first_cte AS (SELECT value FROM second_cte), second_cte AS (SELECT 1 AS value) SELECT * FROM first_cte",
+            )
+            .await
+            .expect_err("MySQL rejects forward CTE references");
+        assert!(forward_error
+            .to_string()
+            .contains("cannot reference later CTE"));
+
+        let aggregate_error = backend
+            .execute(
+                "WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT MAX(n)+1 FROM seq WHERE n<5) SELECT n FROM seq",
+            )
+            .await
+            .expect_err("MySQL rejects aggregate recursive members");
+        assert!(aggregate_error
+            .to_string()
+            .contains("cannot contain aggregate functions"));
 
         let multiple_anchors = backend
             .execute(
@@ -55666,6 +70563,61 @@ mod tests {
                     Some(b"escaped\tvalue".to_vec()),
                 ],
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn load_data_partition_list_routes_and_rejects_rows_from_other_partitions() {
+        let (_temp, _storage, mut backend, _second) = transaction_backends().await;
+        backend
+            .execute(
+                "CREATE TABLE load_partition_rows (
+                    id BIGINT PRIMARY KEY,
+                    label VARCHAR(16)
+                ) PARTITION BY RANGE (id) (
+                    PARTITION p0 VALUES LESS THAN (10),
+                    PARTITION p1 VALUES LESS THAN (MAXVALUE)
+                )",
+            )
+            .await
+            .unwrap();
+        let p0 = parse_load_data(
+            "LOAD DATA LOCAL INFILE 'rows.csv' INTO TABLE load_partition_rows PARTITION (p0) FIELDS TERMINATED BY ','",
+            "mydb",
+        )
+        .unwrap();
+        backend
+            .submit_load_data(p0, b"1,low\n2,low2\n")
+            .await
+            .unwrap();
+        assert_eq!(
+            single_value(
+                backend
+                    .execute("SELECT COUNT(*) FROM load_partition_rows WHERE id < 10")
+                    .await
+                    .unwrap()
+            ),
+            b"2"
+        );
+
+        let invalid = parse_load_data(
+            "LOAD DATA LOCAL INFILE 'rows.csv' INTO TABLE load_partition_rows PARTITION (p0) FIELDS TERMINATED BY ','",
+            "mydb",
+        )
+        .unwrap();
+        let error = backend
+            .submit_load_data(invalid, b"3,ok\n11,wrong-partition\n")
+            .await
+            .expect_err("LOAD DATA PARTITION must reject rows outside the selected partition");
+        assert!(error.to_string().contains("row rejected"), "{error}");
+        assert_eq!(
+            single_value(
+                backend
+                    .execute("SELECT COUNT(*) FROM load_partition_rows")
+                    .await
+                    .unwrap()
+            ),
+            b"2"
         );
     }
 
@@ -57032,5 +71984,77 @@ mod tests {
         assert!(rendered.contains("DECIMAL(20,6)"));
         assert!(rendered.contains("attrs JSON"));
         assert!(rendered.contains("ENUM('new','used')"));
+    }
+
+    #[tokio::test]
+    async fn generated_columns_reject_explicit_writes_and_allow_default() {
+        let (_temp, _storage, mut backend, _second) = transaction_backends().await;
+        backend
+            .execute(
+                "CREATE TABLE generated_values (
+                    id BIGINT PRIMARY KEY,
+                    base BIGINT,
+                    stored_value BIGINT AS (base + 1) STORED,
+                    virtual_value BIGINT AS (stored_value + 1) VIRTUAL
+                )",
+            )
+            .await
+            .expect("create generated column table");
+        backend
+            .execute("INSERT INTO generated_values (id,base) VALUES (1,10)")
+            .await
+            .expect("insert generated column base values");
+        let QueryOutcome::Rows { rows, .. } = backend
+            .execute("SELECT id,base,stored_value,virtual_value FROM generated_values WHERE id=1")
+            .await
+            .expect("read generated column values")
+        else {
+            panic!("expected generated column rows");
+        };
+        assert_eq!(
+            rows,
+            vec![vec![
+                Some(b"1".to_vec()),
+                Some(b"10".to_vec()),
+                Some(b"11".to_vec()),
+                Some(b"12".to_vec())
+            ]]
+        );
+
+        let insert_error = backend
+            .execute("INSERT INTO generated_values (id,base,stored_value) VALUES (2,20,99)")
+            .await
+            .expect_err("explicit generated INSERT must fail");
+        assert!(insert_error
+            .to_string()
+            .contains("The value specified for generated column 'stored_value'"));
+
+        let update_error = backend
+            .execute("UPDATE generated_values SET stored_value=99 WHERE id=1")
+            .await
+            .expect_err("explicit generated UPDATE must fail");
+        assert!(update_error
+            .to_string()
+            .contains("The value specified for generated column 'stored_value'"));
+
+        backend
+            .execute("UPDATE generated_values SET base=20,stored_value=DEFAULT WHERE id=1")
+            .await
+            .expect("DEFAULT generated UPDATE is allowed");
+        let QueryOutcome::Rows { rows, .. } = backend
+            .execute("SELECT base,stored_value,virtual_value FROM generated_values WHERE id=1")
+            .await
+            .expect("read recomputed generated values")
+        else {
+            panic!("expected recomputed generated rows");
+        };
+        assert_eq!(
+            rows,
+            vec![vec![
+                Some(b"20".to_vec()),
+                Some(b"21".to_vec()),
+                Some(b"22".to_vec())
+            ]]
+        );
     }
 }

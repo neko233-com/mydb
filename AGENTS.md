@@ -29,6 +29,21 @@ WAL 写入是每个提交的关键路径，任何修改必须遵守以下约束�
 - WAL v2 magic: `b"MDG1"` / `b"EVT4"` (bincode_compat/varint)，解码时必须做 fallback 兼容
 - 新增 WAL 版本必须 bump magic number 并保留旧格式解码路径
 
+## 并发与多核架构
+
+- **禁止 Actor 模型**：存储引擎不使用任何 actor / 专用写线程 / mpsc channel。提交采用 **Leader/Follower 组提交**，运行于调用方（连接）任务之上：首个发现 `commit_state.active == false` 的写者成为 leader，串行 drain 队列、每组一次 WAL `fsync`，队列空才释放 leadership，严格 FIFO。无专用写线程、无 actor 邮箱。
+- **多核吞吐**：组提交必须在多核上可并行受益于核心数。当单 leader 的 `fsync` 吞吐上限（≈ 1 / 单次 `fsync` 耗时）低于目标时，按表命名空间分片为多个独立的 Leader/Follower 组（`CommitShard`），每组持有独立 WAL 文件、独立 `fsync`，从而多核并行提交。路由规则：单表 DML/DDL 按 `hash(table_namespace) % shard_count` 固定路由到同一分片，保证单表写入顺序与 DDL-before-DML 顺序；跨表事务路由到其写入集中首个表所属分片（罕见路径，允许在该分片串行）。
+- **取消安全（Cancellation Safety）**：leader 运行在调用方任务上，连接断开 / 任务取消必须自恢复。通过 `LeaderGuard`（`Drop`）在取消时重置 `active = false` 并将 in-flight 批次重新入队（`generation` 单调号防止陈旧 leader 误抢 leadership），避免管道永久卡死。任何改 `active` 的路径都必须保证异常 / 取消后能由新 leader 接管。
+
+## 系统性能影响规避
+
+数据库热路径不得受运行平台 / OS 的隐含性能陷阱影响。已确认并必须规避的项：
+
+1. **Windows 定时器分辨率**：`tokio::time::timeout` / `sleep` 受 OS 定时器分辨率约束（Windows 默认 ~15.6ms），会使配置的 250µs 窗口实际等待 ~12ms。组提交窗口等待必须使用 `std::time::Instant`（QPC，sub-µs 精度）+ `tokio::task::yield_now()` 轮询实现，禁止依赖 OS 定时器粒度实现亚毫秒等待。
+2. **WAL fsync 成本**：`WalWriter::sync()` 只调一次 `sync_data()`（见性能优先规则第 1 条）；WAL 文件应以写透 / 无缓冲方式打开（`FILE_FLAG_WRITE_THROUGH`，Windows）以让 `FlushFileBuffers` 仅刷已写范围而非整文件脏页，避免 4.4ms 级的隐式刷盘。禁止为降低延迟而关闭持久化（`sync_data`）。
+3. **禁止在调用方热路径做阻塞 / 重系统调用**：序列化、堆分配、`clear()` / `rebuild_all_indexes()` 等重操作不得在 WAL 锁持有期间或 leader 关键路径执行；锁必须在任何 `await` 之前释放。
+4. **性能对比必须同机、实际运行、相同持久化设置**（见性能优先规则第 8 条）；禁止用历史比值或关闭持久化来“赢”。
+
 ## 代码风格
 
 - 不要添加无关注释，代码应自文档化

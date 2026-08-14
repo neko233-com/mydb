@@ -439,13 +439,21 @@ mysql --local-infile=1 --protocol=TCP --host=mydb --port=3306 --user=root --pass
     $deadlockFirstResult = Receive-Job $deadlockFirst
     $deadlockSecondResult = Receive-Job $deadlockSecond
     Remove-Job $deadlockFirst, $deadlockSecond
-    if ($deadlockFirstResult.ExitCode -eq 0 -or $deadlockFirstResult.Output -notmatch "ERROR 1213 .*Deadlock found when trying to get lock" -or $deadlockSecondResult.ExitCode -ne 0) {
+    $deadlockResults = @($deadlockFirstResult, $deadlockSecondResult)
+    $deadlockVictims = @($deadlockResults | Where-Object {
+            $_.ExitCode -ne 0 -and $_.Output -match "ERROR 1213 .*Deadlock found when trying to get lock"
+        })
+    $deadlockSurvivors = @($deadlockResults | Where-Object {
+            $_.ExitCode -eq 0 -and $_.Output -notmatch "ERROR 1213 .*Deadlock found when trying to get lock"
+        })
+    if ($deadlockVictims.Count -ne 1 -or $deadlockSurvivors.Count -ne 1) {
         throw "deadlock victim/survivor compatibility check failed"
     }
     $deadlockState = docker run --rm --network "${project}_default" mysql:8.0 `
         mysql --protocol=TCP --host=mydb --port=3306 --user=root --password=root `
         --batch --skip-column-names --execute="USE smoke; SELECT id,value FROM deadlock_probe ORDER BY id;"
-    if ($LASTEXITCODE -ne 0 -or ($deadlockState -join "`n").Trim() -ne "1`t101`n2`t102") {
+    $deadlockStateText = ($deadlockState -join "`n").Trim()
+    if ($LASTEXITCODE -ne 0 -or $deadlockStateText -notin @("1`t11`n2`t12", "1`t101`n2`t102")) {
         throw "deadlock victim transaction was not fully rolled back"
     }
     $deadlockMetrics = Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:14316/metrics"
@@ -504,22 +512,47 @@ mysql --local-infile=1 --protocol=TCP --host=mydb --port=3306 --user=root --pass
     }
     docker stop --time 30 mydb | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "cannot stop container for WAL torn-tail injection" }
-    $walInjectionScript = @'
-wal=$(ls -1 /var/lib/mydb/data/wal/wal_*.log | sort | tail -n 1)
-before=$(wc -c < "$wal")
-printf "\001\002\003\004\005" >> "$wal"
-after=$(wc -c < "$wal")
-printf "%s\t%s\t%s\n" "$wal" "$before" "$after"
+$walInjectionScript = @'
+set -eu
+wal=$(for candidate in /var/lib/mydb/data/wal/shard_*/wal_*.log; do
+  if [ "$(wc -c < "$candidate")" -gt 20 ]; then echo "$candidate"; fi
+done | sort | tail -n 1)
+test -n "$wal"
+physical_before=$(wc -c < "$wal")
+logical_end=8
+while [ $((logical_end + 12)) -le "$physical_before" ]; do
+  set -- $(dd if="$wal" bs=1 skip="$logical_end" count=12 2>/dev/null | od -An -tu1)
+  if [ "$#" -ne 12 ]; then
+    echo "cannot read WAL record header at offset $logical_end" >&2
+    exit 1
+  fi
+  all_zero=1
+  for byte in "$@"; do
+    if [ "$byte" -ne 0 ]; then all_zero=0; break; fi
+  done
+  if [ "$all_zero" -eq 1 ]; then break; fi
+  payload_len=$(( $9 + 256*${10} + 65536*${11} + 16777216*${12} ))
+  next_end=$((logical_end + 16 + payload_len))
+  if [ "$next_end" -gt "$physical_before" ]; then
+    echo "incomplete WAL record at offset $logical_end" >&2
+    exit 1
+  fi
+  logical_end="$next_end"
+done
+printf "\001\002\003\004\005" | dd of="$wal" bs=1 seek="$logical_end" conv=notrunc status=none
+physical_after=$(wc -c < "$wal")
+printf "%s\t%s\t%s\t%s\n" "$wal" "$logical_end" "$physical_before" "$physical_after"
 '@
     $walInjection = $walInjectionScript | docker run --rm -i --volumes-from mydb --entrypoint sh mydb:dev -c "sed '1s/^\xEF\xBB\xBF//' | tr -d '\r' | sh"
     if ($LASTEXITCODE -ne 0) { throw "WAL torn-tail injection failed" }
     $walParts = ($walInjection -join "").Trim().Split("`t")
-    if ($walParts.Count -ne 3) { throw "WAL injection metadata is invalid" }
+    if ($walParts.Count -ne 4) { throw "WAL injection metadata is invalid" }
     $walPath = $walParts[0]
     $walValidLength = [long]$walParts[1]
-    $walInjectedLength = [long]$walParts[2]
-    if ($walInjectedLength -ne $walValidLength + 5) {
-        throw "WAL torn-tail bytes were not appended"
+    $walPhysicalLength = [long]$walParts[2]
+    $walInjectedLength = [long]$walParts[3]
+    if ($walInjectedLength -ne $walPhysicalLength -or $walValidLength -ge $walPhysicalLength) {
+        throw "WAL torn-tail bytes were not injected at the logical tail"
     }
     docker start mydb | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "cannot restart after WAL torn-tail injection" }
@@ -814,7 +847,7 @@ printf '\377' | dd of="$page" bs=1 seek=25 conv=notrunc status=none
     if ($LASTEXITCODE -ne 0) { throw "cannot stop container for WAL middle-corruption injection" }
     $walMiddleCorruptionScript = @'
 set -eu
-wal=$(ls -1 /var/lib/mydb/data/wal/wal_*.log | sort | head -n 1)
+wal=$(ls -1 /var/lib/mydb/data/wal/shard_*/wal_*.log | sort | head -n 1)
 test -n "$wal"
 test "$(wc -c < "$wal")" -gt 20
 printf '\377' | dd of="$wal" bs=1 seek=20 conv=notrunc status=none

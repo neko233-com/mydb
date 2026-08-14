@@ -1441,21 +1441,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mydb-router"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "serde",
- "serde_yaml",
- "tempfile",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "windows-service",
-]
-
-[[package]]
 name = "mydb-server"
 version = "0.1.0"
 dependencies = [

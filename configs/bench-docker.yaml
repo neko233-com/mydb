@@ -1,10 +1,13 @@
+# MyDB benchmark configuration (Docker-controlled comparison).
+# Used by the Docker benchmark compose so MyDB and MySQL run under identical
+# CPU/memory limits. thread_count 0 = auto-detect allocated CPUs (Docker sets
+# the container's visible parallelism), which also drives the shard count so
+# commits fsync in parallel across the allocated cores.
 server:
   host: "0.0.0.0"
   port: 3306
-  max_connections: 256
-  # Docker resource limits can expose host CPU count. Keep runtime aligned with
-  # compose/benchmark's one CPU allocation unless deployment overrides config.
-  thread_count: 1
+  max_connections: 1000
+  thread_count: 0
   connect_timeout: 10
   interactive_timeout: 28800
 
@@ -18,13 +21,13 @@ http:
 storage:
   data_dir: "/var/lib/mydb/data"
   engine: "neko233"
-  buffer_pool_size: "256M"
-  log_file_size: "64M"
+  buffer_pool_size: "320M"
+  log_file_size: "256M"
   page_size: 16384
   group_commit_window_us: 250
 
 memory:
-  max_memory: "384M"
+  max_memory: "768M"
   query_cache_size: "32M"
   sort_buffer_size: "2M"
 

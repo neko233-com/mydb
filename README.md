@@ -43,7 +43,6 @@ mydb/
 │   ├── mydb-server/       # 服务端主体
 │   ├── mydb-cli/          # 命令行客户端（兼容 mysql 命令）
 │   ├── mydb-wire/         # MySQL 协议兼容层
-│   ├── mydb-router/       # 透明 MySQL TCP 路由/故障切换入口
 │   ├── mydb-parser/       # SQL 解析器
 │   ├── mydb-storage/      # Neko233 存储引擎（InnoDB 仅为外部兼容别名）
 │   ├── mydb-transaction/  # 事务管理与锁
@@ -69,7 +68,7 @@ mydb/
 - **CRC 校验**：WAL 和数据页均带 CRC，检测损坏并安全拒绝启动
 - **提交热路径**：一次 `sync_data()` 顺序 fsync = 持久性保证，锁内仅 write+fsync，无额外 syscall
 - **MVCC 基础**：持久化 row-id、事务 commit 序号、RR/SERIALIZABLE 读视图、RC 语句视图、历史版本链与旧版本清理基础已接入；事务读不再复制整库快照
-- **索引锁基础**：主键/二级索引的 record、next-key、gap、insert-intention 锁，复合索引左前缀与单列索引 `LIKE` 前缀范围锁，以及 statement-duration 基础 MDL 已覆盖已验收路径；复杂 JOIN 逐行锁、完整 InnoDB 边界仍按验收清单推进
+- **索引锁基础**：主键/二级索引的 record、next-key、gap、insert-intention 锁；二级索引锁定读会同步锁定命中的聚簇记录；复合索引左前缀与单列索引 `LIKE` 前缀范围锁，以及 statement-duration 基础 MDL 已覆盖已验收路径；JOIN 锁定读已覆盖最终命中基表聚簇记录、二级索引点锁、列对列比较范围锁和基础 `SKIP LOCKED` 行过滤，完整隐式锁与 InnoDB 边界仍按验收清单推进
 - **InnoDB 名称兼容**：`ENGINE=InnoDB` 在 SQL/协议层映射至 Neko233；项目不加载或复用 MySQL InnoDB 源码，`MEMORY` 保持独立语义
 
 ---
@@ -134,6 +133,9 @@ irm https://raw.githubusercontent.com/neko233-com/mydb/main/scripts/install.ps1 
 # 本地发布包升级（不重复发布版本）
 .\scripts\install.ps1 -PackagePath .\mydb-windows-x86_64.zip
 
+# 静默安装/升级：不弹 PowerShell 窗口；首次提权仍可能显示 UAC 同意框
+cscript //nologo .\scripts\install-silent.vbs -PackagePath .\mydb-windows-x86_64.zip
+
 # 卸载 MySQL/MariaDB；先完成迁移和备份，再按需加 -PurgeData
 .\scripts\uninstall-mysql.ps1
 ```
@@ -152,10 +154,14 @@ cd mydb
 # 编译（Release 模式）
 cargo build --release
 
+# 正式包只包含 server/cli/migrate/dump、配置、安装脚本和文档；
+# mydb-bench、测试结果与 target/bench 不进入发布包
+.\scripts\build-release.ps1 -Version "0.1.0"
+# 发布包同时生成同名 `.sha256` 校验文件；发布前先校验压缩包完整性。
+
 # 安装到系统
 cargo install --path crates/mydb-server
 cargo install --path crates/mydb-cli
-cargo install --path crates/mydb-router
 cargo install --path crates/mydb-migrate
 cargo install --path crates/mydb-dump
 ```
@@ -186,7 +192,7 @@ storage:
   group_commit_window_us: 250   # 吞吐默认；0 = 低延迟自然批量
 
 security:
-  authentication: "mysql_native_password"
+  authentication: "caching_sha2_password" # MySQL 8.4 默认
   require_secure_transport: true  # 生产环境强制 TLS
   tls_cert: "/etc/mydb/tls/server.crt"
   tls_key: "/etc/mydb/tls/server.key"
@@ -253,32 +259,6 @@ const db = await mysql.createConnection({
 
 远程客户端将 Host 改为服务器 IP；安装脚本默认监听全部网卡并创建 TCP 3306 入站规则。
 生产环境应改为强密码、TLS 或明确的来源 IP 白名单。
-
-### mydb-router：所有客户端的统一入口
-
-需要独立入口、后端故障切换或多套 MyDB 实例时，启动透明 TCP 路由器：
-
-```bash
-cargo run --release -p mydb-router -- --config configs/router.yaml
-# 客户端统一连接 127.0.0.1:13306；单条 TCP 连接固定到一个 MyDB 后端
-```
-
-`mydb-router` 不改写 MySQL 握手、TLS、预编译协议或 SQL，因此 JDBC、Go `database/sql`、
-`mysql2`、DataGrip、VS Code、dbx 等客户端无需专用适配器。多后端配置只适合后端本身已有
-复制/一致性策略；事务不会在多个后端之间拆分。
-
-Windows 安装包的 `-Component all` 会同时安装 `MyDBRouter` 自动服务，并开放 TCP 13306；
-单独部署 router 时可执行：
-
-```powershell
-.\mydb-router.exe --service install --config C:\Server\mydb\mydb-server\router.yaml
-sc.exe start MyDBRouter
-```
-
-router 只在建立连接时选择后端，之后整条 TCP 会话固定到该后端，保证事务、prepared
-statement、临时表和连接级变量不会被拆到不同实例。后端不可用时会在建立连接阶段按权重顺序回退。
-
----
 
 ## 🔒 生产部署最佳实践
 
@@ -360,6 +340,29 @@ mydb-cli --admin-password <admin-password> agent slow
 mydb-cli --admin-password <admin-password> agent ask "最近有哪些慢 SQL？"
 ```
 
+### 内置 Web SQL IDE
+
+打开 `http://127.0.0.1:4306/`；使用 `http.admin_username` / `http.admin_password` 登录；完整使用文档：
+`http://127.0.0.1:4306/admin/doc`。
+登录后可直接执行 SQL、查看结果集、切换数据库、格式化查询和退出会话；执行入口复用
+MyDB 的同一套 SQL parser、权限、事务、WAL 与 MVCC，不是旁路模拟器。接口为：
+
+Web 后台默认自动识别浏览器中英文；右上角可手动切换 `Auto`、`中文`、`English`，选择保存在当前浏览器。
+登录既支持 HTTP 管理账号，也支持真实 MySQL 用户；后者按该用户的 SQL 权限执行查询。
+
+```bash
+# 登录，返回短期 Bearer session token
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"username":"root","password":"root"}' \
+  http://127.0.0.1:4306/api/v1/auth/login
+
+# Web SQL IDE 使用的统一执行入口
+curl -X POST -H "Authorization: Bearer <session-token>" \
+  -H "Content-Type: application/json" \
+  -d '{"sql":"SELECT 1 AS ok","database":null}' \
+  http://127.0.0.1:4306/api/v1/sql/query
+```
+
 ---
 
 ## 💾 备份与恢复
@@ -427,7 +430,7 @@ curl -X POST -H "Authorization: Bearer <admin-password>" \
 ```bash
 mydb-migrate \
   --source 'mysql://root:password@127.0.0.1:3306' \
-  --target 'mysql://root:root@127.0.0.1:13306' \
+  --target 'mysql://root:root@127.0.0.1:3306' \
   --database game \
   --batch-size 500 \
   --report migration-report.json
@@ -456,15 +459,18 @@ mysql -h 127.0.0.1 -P 3306 game < game.sql
 
 - `CREATE DATABASE`/`DROP DATABASE`
 - `CREATE TABLE`（含列定义、主键、索引、外键、CHECK 约束）
+- `FULLTEXT`/`SPATIAL` 索引：类型持久化、CREATE/ALTER、SHOW INDEX、`information_schema.STATISTICS`，以及基础全文布尔检索和 POINT 空间函数；完整倒排索引/相关性评分与 GIS 类型仍按兼容矩阵推进
 - `CREATE TABLE ... LIKE ...`（跨 schema 复制结构）
 - `CREATE TABLE ... AS SELECT ...`（快照建表）
 - `ALTER TABLE`（ADD/DROP/MODIFY/CHANGE COLUMN、ADD/DROP INDEX/PRIMARY KEY/FOREIGN KEY/CHECK）
 - `CREATE INDEX`/`DROP INDEX`
-- `CREATE VIEW`/`DROP VIEW`（只读视图）
+- 表级逻辑分区：`PARTITION BY RANGE/LIST/HASH/KEY`，含复合 `RANGE COLUMNS`、常用表达式分区函数（`YEAR`/`MONTH`/`DAY`/`QUARTER`/`TO_DAYS`/`TO_SECONDS`/`UNIX_TIMESTAMP`/`ABS`/`MOD`）的写入校验、重启恢复和 `information_schema.PARTITIONS` 元数据；数据保持单表物理布局，子分区/在线重组/物理裁剪仍按兼容矩阵推进
+- `CREATE VIEW`/`DROP VIEW`；复杂 JOIN/聚合/表达式视图只读，单基表直接列投影支持 DML 与 `WITH CHECK OPTION`
 - `CREATE TEMPORARY TABLE`（连接级临时表）
 - `CREATE TRIGGER`/`DROP TRIGGER`（BEFORE/AFTER INSERT/UPDATE/DELETE）
 - `CREATE PROCEDURE`/`DROP PROCEDURE`（含 IN/OUT/INOUT、游标、条件处理、诊断）
 - `CREATE FUNCTION`/`DROP FUNCTION`
+- Routine 局部变量显式 `CHARACTER SET`/`COLLATE`：比较、`LIKE`、CASE/IF、DML、`COLLATION()`/`CHARSET()` 路径已接入；默认数据库字符集与完整排序规则权重仍按兼容矩阵推进
 - `CREATE EVENT`/`DROP EVENT`
 - `TRUNCATE TABLE`、`RENAME TABLE`
 
@@ -476,7 +482,9 @@ mysql -h 127.0.0.1 -P 3306 game < game.sql
 - `INSERT ... SELECT`
 - `UPDATE`（单表、JOIN UPDATE、ORDER BY/LIMIT）
 - `DELETE`（单表、多表 DELETE、USING 语法）
-- `SELECT`（JOIN、子查询、CTE、窗口函数、GROUP BY、聚合、HAVING、ORDER BY、LIMIT/OFFSET、DISTINCT、SQL_CALC_FOUND_ROWS）
+- `JOIN ... ON` 支持列对列等值/范围、常量、常用标量函数与算术表达式；锁定读对非索引表达式使用安全表级回退
+- `SELECT`（JOIN、子查询、CTE、窗口函数、GROUP BY、聚合、HAVING（含常用未关联与分组相关标量子查询）、ORDER BY、LIMIT/OFFSET、DISTINCT、SQL_CALC_FOUND_ROWS）
+- `MATCH(...) AGAINST(...)` 基础自然语言/布尔检索；`ST_GeomFromText`、`ST_AsText`、`ST_X`、`ST_Y`、`ST_GeometryType`
 - `LOAD DATA [LOCAL] INFILE`
 - `PREPARE`/`EXECUTE`/`DEALLOCATE PREPARE`（SQL 级命名预处理语句）
 
@@ -499,8 +507,8 @@ mysql -h 127.0.0.1 -P 3306 game < game.sql
 
 ### 系统表
 
-- `information_schema`（SCHEMATA、TABLES、COLUMNS、STATISTICS、TABLE_CONSTRAINTS、KEY_COLUMN_USAGE、CHECK_CONSTRAINTS、REFERENTIAL_CONSTRAINTS、VIEWS、TRIGGERS、ROUTINES、PARAMETERS、EVENTS 等）
-- `mysql` 系统库（用户、权限、角色）
+- `information_schema`（SCHEMATA、TABLES、COLUMNS、STATISTICS、TABLE_CONSTRAINTS、KEY_COLUMN_USAGE、CHECK_CONSTRAINTS、REFERENTIAL_CONSTRAINTS、VIEWS、TRIGGERS、ROUTINES、PARAMETERS、EVENTS、APPLICABLE_ROLES 等）；系统库自身的 TABLES/COLUMNS 元数据也可自描述，方便 DataGrip/JDBC/ORM 二次探测
+- `mysql` 系统库（用户、权限、角色、`role_edges` 与 MariaDB/GoLand 兼容的 `roles_mapping`）
 - `performance_schema`（常用表）
 - `sys` 视图
 
@@ -551,16 +559,16 @@ bash scripts/docker-smoke.sh
 
 ## 📊 性能
 
-> 完整测试方法、运行指标和发布前验证见 [性能报告.md](性能报告.md)。下表是 2026-08-11 的本机 MySQL 8.0.45 基线；本轮 MVCC/锁变更尚未重新生成正式性能报告。
+> 完整测试方法、运行指标和发布前验证见 [性能报告.md](性能报告.md)。下表为 2026-08-14 本机 Windows 实测；MyDB 与 MySQL 8.4.11 均使用 fsync 持久化，3 次采样取中位数。
 >
-> 本轮数据：`d325944`，2026-08-11，本机 Windows；MySQL 8.0.45，`innodb_flush_log_at_trx_commit=1`、`sync_binlog=1`。
+> 本轮数据：2026-08-14，本机 Windows；MySQL 8.4.11，`innodb_flush_log_at_trx_commit=1`、`sync_binlog=1`。MySQL 基准服务为同机 Docker `127.0.0.1:13306`，MyDB 隔离 release 服务为 `127.0.0.1:13307`。
 
-| 场景 | MyDB | MySQL 8.0.45 | MyDB / MySQL |
+| 场景 | MyDB | MySQL 8.4.11 | MyDB / MySQL |
 |------|------|--------------|--------------|
-| 单表写（fsync-per-commit） | 90 ops/s | 133 ops/s | 0.68x |
-| 8 actor / 8表 写 P99 延迟 | 24.2 ms | 40.5 ms | 1.67x（低更好） |
-| 8 actor / 8表 Group Commit | 552 ops/s | 520 ops/s | 1.06x |
-| 读 P50 延迟 | 164 μs | 85 μs | - |
+| 单表写（fsync-per-commit） | 254 ops/s | 366 ops/s | 0.69x |
+| 8 actor / 8表 写 P99 延迟 | 30.5 ms | 47.2 ms | 1.55x（低更好） |
+| 8 actor / 8表 Group Commit | 770 ops/s | 916 ops/s | 0.84x |
+| 读 P50 延迟 | 361 μs | 648 μs | - |
 
 性能优化不以关闭 WAL 持久化或弱化恢复语义换取数字。默认 250μs Group Commit 窗口优先并发吞吐，checkpoint 按 1024 个已提交请求触发；不声明未经实测证明的固定倍数。
 
@@ -570,11 +578,16 @@ bash scripts/docker-smoke.sh
 
 当前开发状态、已完成项、未完成项、差分证据统一维护在 [CheckList.md](CheckList.md)。只有可复现实测证明的项目才会打勾。
 
-**本轮本地门槛（2026-08-11）：**
-- ✅ `cargo test --workspace`
+**本轮本地门槛（2026-08-14）：**
+- ✅ `cargo test --workspace`（385 个测试通过，含 parser 4、server 11、wire 257、storage 61 + 17 集成、WAL 18）
 - ✅ `cargo clippy --workspace --all-targets -- -D warnings`
-- ✅ `cargo build --release -p mydb-server -p mydb-bench`
-- ⏳ Docker 崩溃恢复、限额性能与跨平台生产验收：以 [CheckList.md](CheckList.md) 与 [性能报告.md](性能报告.md) 为准
+- ✅ `cargo build --release -p mydb-server -p mydb-cli -p mydb-migrate -p mydb-dump`
+- ✅ MySQL 8.4 CLI 3306 连接、`event_scheduler`/版本探测
+- ✅ Connector/J 9.1.0、Node mysql2 3.23.3 已完成 3306 普通/预处理查询 smoke；Go `database/sql` + go-sql-driver/mysql 1.10.0 已完成当前 release 3306 服务的 Ping、中文、DATE、普通/预处理查询回归
+- ✅ MySQL `'user'@'host'` 基础账户匹配：精确主机优先于通配主机，握手按账户插件选择认证方式
+- ✅ `scripts/docker-smoke.ps1`：当前源码 Docker release 镜像通过 SIGKILL、WAL 损坏、只读/ENOSPC、事务锁、LOAD DATA、备份/PITR 与 Web/Agent smoke
+- ✅ `scripts/mysql84-diff.ps1`：当前 release 物理 3306 与同机 Docker MySQL 8.4，83/83 差分通过；含生成列 INSERT/UPDATE/UPSERT/INSERT SELECT 显式写入错误码/消息对照
+- ⏳ Ubuntu 24.04 物理性能、macOS 原生验收、宿主断电/恢复中断、大数据压力与生产安全运维验收：以 [CheckList.md](CheckList.md) 与 [性能报告.md](性能报告.md) 为准
 
 ---
 

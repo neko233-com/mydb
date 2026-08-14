@@ -164,6 +164,19 @@ impl MvccManager {
         }
     }
 
+    pub fn record_insert_rows(
+        &self,
+        database: &str,
+        table: &str,
+        row_ids: &[u64],
+        commit_id: CommitId,
+    ) {
+        let mut current = self.current_commit.write();
+        for row_id in row_ids.iter().copied().filter(|row_id| *row_id != 0) {
+            current.insert((database.to_string(), table.to_string(), row_id), commit_id);
+        }
+    }
+
     pub fn visible_table(
         &self,
         database: &str,
@@ -308,7 +321,7 @@ mod tests {
         let view = manager.read_view(transaction).expect("read view");
         let inserted = row("1", "after");
         let commit = manager.allocate_commit_id();
-        manager.record_table_commit("db", "t", &[], std::slice::from_ref(&inserted), commit);
+        manager.record_insert_rows("db", "t", &[inserted.row_id], commit);
 
         assert!(manager
             .visible_table("db", "t", &[inserted], &view)

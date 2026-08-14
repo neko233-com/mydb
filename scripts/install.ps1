@@ -14,11 +14,11 @@
     .\install.ps1 -Version v0.1.0
     .\install.ps1 -NoService -NoRemoteFirewall
     .\install.ps1 -Component server -InstallDir C:\Server\mydb\mydb-server
-    .\install.ps1 -Component router -NoService
+    .\install.ps1 -Quiet -PackagePath .\mydb-windows-x86_64.zip
 #>
 
 param(
-    [ValidateSet("server", "cli", "router", "migrate", "dump", "all")]
+    [ValidateSet("server", "cli", "migrate", "dump", "all")]
     [string]$Component = "all",
 
     [string]$Version = "latest",
@@ -37,19 +37,25 @@ param(
 
     [switch]$NoService,
 
+    [switch]$Quiet,
+
     [switch]$NoRemoteFirewall
 )
 
 $ErrorActionPreference = "Stop"
 $repo = "neko233-com/mydb"
 $firewallRuleName = "MyDB Server (MySQL TCP 3306)"
-$routerFirewallRuleName = "MyDB Router (MySQL TCP 13306)"
-$routerServiceName = "MyDBRouter"
 
-function Write-Info { Write-Host "[INFO] $args" -ForegroundColor Blue }
-function Write-Success { Write-Host "[OK] $args" -ForegroundColor Green }
-function Write-Warn { Write-Host "[WARN] $args" -ForegroundColor Yellow }
-function Stop-WithError { param([string]$Message); Write-Host "[ERROR] $Message" -ForegroundColor Red; exit 1 }
+function Write-Info { if (-not $Quiet) { Write-Host "[INFO] $args" -ForegroundColor Blue } }
+function Write-Success { if (-not $Quiet) { Write-Host "[OK] $args" -ForegroundColor Green } }
+function Write-Warn { if (-not $Quiet) { Write-Host "[WARN] $args" -ForegroundColor Yellow } }
+function Stop-WithError {
+    param([string]$Message)
+    if (-not $Quiet) {
+        Write-Host "[ERROR] $Message" -ForegroundColor Red
+    }
+    exit 1
+}
 
 function Test-IsAdministrator {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -75,7 +81,11 @@ function Invoke-CheckedNative {
         [string[]]$ArgumentList,
         [string]$FailureMessage
     )
-    & $FilePath @ArgumentList
+    if ($Quiet) {
+        & $FilePath @ArgumentList *> $null
+    } else {
+        & $FilePath @ArgumentList
+    }
     if ($LASTEXITCODE -ne 0) {
         Stop-WithError $FailureMessage
     }
@@ -146,12 +156,27 @@ function Stop-MyDbService {
     }
 }
 
-function Stop-MyDbRouterService {
-    $service = Get-Service -Name $routerServiceName -ErrorAction SilentlyContinue
-    if ($null -ne $service -and $service.Status -ne "Stopped") {
-        Write-Info "Stopping $routerServiceName before update..."
-        Stop-Service -Name $routerServiceName -Force
-        $service.WaitForStatus("Stopped", [TimeSpan]::FromSeconds(30))
+function Remove-LegacyRouter {
+    $legacyService = Get-Service -Name "MyDBRouter" -ErrorAction SilentlyContinue
+    if ($null -ne $legacyService) {
+        if ($legacyService.Status -ne "Stopped") {
+            Write-Info "Stopping legacy MyDBRouter service..."
+            Stop-Service -Name "MyDBRouter" -Force
+            (Get-Service -Name "MyDBRouter").WaitForStatus("Stopped", [TimeSpan]::FromSeconds(30))
+        }
+        Invoke-CheckedNative "sc.exe" @("delete", "MyDBRouter") "Failed to remove legacy MyDBRouter service"
+    }
+    $legacyRule = Get-NetFirewallRule -DisplayName "MyDB Router (MySQL TCP 13306)" -ErrorAction SilentlyContinue
+    if ($null -ne $legacyRule) {
+        Remove-NetFirewallRule -DisplayName "MyDB Router (MySQL TCP 13306)"
+    }
+    foreach ($path in @(
+        (Join-Path $InstallDir "mydb-router.exe"),
+        (Join-Path $InstallDir "router.yaml")
+    )) {
+        if (Test-Path -LiteralPath $path) {
+            Remove-Item -LiteralPath $path -Force
+        }
     }
 }
 
@@ -199,7 +224,7 @@ memory:
 security:
   default_username: "root"
   default_password: "root"
-  authentication: "mysql_native_password"
+  authentication: "caching_sha2_password"
   require_secure_transport: false
   tls_cert: null
   tls_key: null
@@ -239,27 +264,6 @@ function Ensure-Path {
     }
 }
 
-function Ensure-RouterConfig {
-    $routerConfig = Join-Path $InstallDir "router.yaml"
-    if (Test-Path -LiteralPath $routerConfig) {
-        Write-Info "Keeping existing router config: $routerConfig"
-        return
-    }
-    @"
-# Transparent MySQL wire router; each TCP session stays on one backend.
-listen_host: "0.0.0.0"
-listen_port: 13306
-connect_timeout_ms: 2000
-max_connections: 4096
-tcp_nodelay: true
-backends:
-  - host: "127.0.0.1"
-    port: 3306
-    weight: 1
-"@ | Set-Content -LiteralPath $routerConfig -Encoding UTF8
-    Write-Success "Router config created: $routerConfig"
-}
-
 function Ensure-Firewall {
     if ($NoRemoteFirewall) { return }
     if (-not (Get-Command New-NetFirewallRule -ErrorAction SilentlyContinue)) {
@@ -272,21 +276,6 @@ function Ensure-Firewall {
         Write-Success "Allowed inbound MySQL-compatible TCP 3306"
     } else {
         Write-Info "Firewall rule already exists: $firewallRuleName"
-    }
-}
-
-function Ensure-RouterFirewall {
-    if ($NoRemoteFirewall) { return }
-    if (-not (Get-Command New-NetFirewallRule -ErrorAction SilentlyContinue)) {
-        Write-Warn "New-NetFirewallRule unavailable; TCP 13306 firewall rule not created"
-        return
-    }
-    $rule = Get-NetFirewallRule -DisplayName $routerFirewallRuleName -ErrorAction SilentlyContinue
-    if ($null -eq $rule) {
-        New-NetFirewallRule -DisplayName $routerFirewallRuleName -Direction Inbound -Action Allow -Protocol TCP -LocalPort 13306 -Profile Any | Out-Null
-        Write-Success "Allowed inbound MySQL-compatible TCP 13306"
-    } else {
-        Write-Info "Router firewall rule already exists: $routerFirewallRuleName"
     }
 }
 
@@ -303,7 +292,7 @@ function Ensure-Service {
         New-Service -Name $ServiceName -BinaryPathName $binPath -DisplayName "MyDB Server" -Description "MySQL-compatible Neko233 database server" -StartupType Automatic | Out-Null
         Write-Success "Windows service created: $ServiceName"
     } else {
-        Invoke-CheckedNative "sc.exe" @("config", $ServiceName, "binPath= $binPath", "start= auto") "Failed to update Windows service $ServiceName"
+        Invoke-CheckedNative "sc.exe" @("config", $ServiceName, "binPath=", $binPath, "start=", "auto") "Failed to update Windows service $ServiceName"
         Write-Info "Windows service updated: $ServiceName"
     }
     Invoke-CheckedNative "sc.exe" @("description", $ServiceName, "MySQL-compatible Neko233 database server") "Failed to update service description"
@@ -312,75 +301,39 @@ function Ensure-Service {
     Write-Success "Windows service running and set to Automatic"
 }
 
-function Ensure-RouterService {
-    $routerPath = Join-Path $InstallDir "mydb-router.exe"
-    $routerConfig = Join-Path $InstallDir "router.yaml"
-    if (-not (Test-Path -LiteralPath $routerPath)) {
-        Stop-WithError "mydb-router.exe not found: $routerPath"
-    }
-    if (-not (Test-Path -LiteralPath $routerConfig)) {
-        Stop-WithError "router.yaml not found: $routerConfig"
-    }
-
-    $binPath = '"' + $routerPath + '" --service run --config "' + $routerConfig + '"'
-    $service = Get-Service -Name $routerServiceName -ErrorAction SilentlyContinue
-    if ($null -eq $service) {
-        New-Service -Name $routerServiceName -BinaryPathName $binPath -DisplayName "MyDB Router" -Description "Transparent MySQL wire router for MyDB" -StartupType Automatic | Out-Null
-        Write-Success "Windows service created: $routerServiceName"
-    } else {
-        Invoke-CheckedNative "sc.exe" @("config", $routerServiceName, "binPath= $binPath", "start= auto") "Failed to update Windows service $routerServiceName"
-        Write-Info "Windows service updated: $routerServiceName"
-    }
-    Invoke-CheckedNative "sc.exe" @("description", $routerServiceName, "Transparent MySQL wire router for MyDB") "Failed to update router service description"
-    Start-Service -Name $routerServiceName
-    (Get-Service -Name $routerServiceName).WaitForStatus("Running", [TimeSpan]::FromSeconds(30))
-    Write-Success "MyDB router running on TCP 13306"
-}
-
 function Main {
     if (-not (Test-IsAdministrator)) {
         Stop-WithError "Run PowerShell as Administrator. Service/firewall setup requires elevation."
     }
 
+    Remove-LegacyRouter
+
     $binaries = switch ($Component) {
         "server" { @("mydb-server.exe") }
         "cli" { @("mydb-cli.exe") }
-        "router" { @("mydb-router.exe") }
         "migrate" { @("mydb-migrate.exe") }
         "dump" { @("mydbdump.exe") }
-        default { @("mydb-server.exe", "mydb-cli.exe", "mydb-router.exe", "mydb-migrate.exe", "mydbdump.exe") }
+        default { @("mydb-server.exe", "mydb-cli.exe", "mydb-migrate.exe", "mydbdump.exe") }
     }
 
     if ($binaries -contains "mydb-server.exe") {
         Stop-MyDbService
     }
-    if ($binaries -contains "mydb-router.exe") {
-        Stop-MyDbRouterService
-    }
     Install-Binaries -Names $binaries
     Ensure-Config
-    if ($binaries -contains "mydb-router.exe") {
-        Ensure-RouterConfig
-    }
     Ensure-Path
 
     if (($binaries -contains "mydb-server.exe") -and -not $NoService) {
         Ensure-Firewall
         Ensure-Service
     }
-    if (($binaries -contains "mydb-router.exe") -and -not $NoService) {
-        Ensure-RouterFirewall
-        Ensure-RouterService
-    }
-
-    Write-Host ""
-    Write-Success "MyDB install/update complete"
-    Write-Host "Config: $ConfigDir\config.yaml"
-    Write-Host "Data:   $DataDir"
-    Write-Host "JDBC/Go/Node endpoint: 127.0.0.1:3306, user root, password root"
-    Write-Host "Remote endpoint: <server-ip>:3306 (firewall rule enabled unless -NoRemoteFirewall)"
-    if ($binaries -contains "mydb-router.exe") {
-        Write-Host "Router endpoint: <server-ip>:13306 (fixed-backend TCP session routing)"
+    if (-not $Quiet) {
+        Write-Host ""
+        Write-Success "MyDB install/update complete"
+        Write-Host "Config: $ConfigDir\config.yaml"
+        Write-Host "Data:   $DataDir"
+        Write-Host "JDBC/Go/Node endpoint: 127.0.0.1:3306, user root, password root"
+        Write-Host "Remote endpoint: <server-ip>:3306 (firewall rule enabled unless -NoRemoteFirewall)"
     }
 }
 

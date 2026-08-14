@@ -173,6 +173,14 @@ try {
     Wait-Tcp $MySqlTarget.Host $MySqlTarget.Port
 
     $mysqlProbe = Invoke-Bench "MySQL" @("--url", $MySqlTarget.Url, "--probe-server") "mysql-probe"
+    if ($mysqlProbe.version_comment -notmatch "MySQL Community Server" -or
+        $mysqlProbe.version -notmatch "^8\.4\.") {
+        throw "MySqlUrl is not a MySQL 8.4 server: version=$($mysqlProbe.version), comment=$($mysqlProbe.version_comment)"
+    }
+    if ([int]$mysqlProbe.innodb_flush_log_at_trx_commit -ne 1 -or
+        [int]$mysqlProbe.sync_binlog -ne 1) {
+        throw "MySQL persistence settings must be innodb_flush_log_at_trx_commit=1 and sync_binlog=1"
+    }
     Write-Step "Warmup"
     $warmup = @("--actors", "8", "--table-count", "8", "--transaction-size", "10", "--writes-per-actor", "100", "--reads-per-actor", "0", "--write-mode", "actor-batch")
     [void](Invoke-Bench "MyDB" (@("--url", $MyDbTarget.Url, "--reconnect-every-transactions", "0", "--payload-bytes", "256") + $warmup) "mydb-warmup")
@@ -217,6 +225,9 @@ try {
     $p99Ratio = [math]::Round($concurrentP99.mysql.write_transactions_p99_us / $concurrentP99.mydb.write_transactions_p99_us, 2)
     $tpRatio = [math]::Round($concurrentTp.mydb.operations_per_second / $concurrentTp.mysql.operations_per_second, 2)
     $commitHash = (git rev-parse --short HEAD).Trim()
+    if (@(git status --porcelain).Count -gt 0) {
+        $commitHash += "-dirty"
+    }
     $dateStr = Get-Date -Format "yyyy-MM-dd"
     $cpu = "{0}; {1} logical CPUs" -f $env:PROCESSOR_IDENTIFIER, [Environment]::ProcessorCount
 

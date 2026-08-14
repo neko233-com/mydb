@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -16,7 +16,9 @@ use clap::Parser;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::sync::{Notify, Semaphore};
+#[cfg(target_os = "windows")]
+use tokio::sync::Notify;
+use tokio::sync::Semaphore;
 use tower_http::trace::TraceLayer;
 use tracing::info;
 
@@ -71,6 +73,13 @@ struct AdminState {
     config: Arc<RwLock<mydb_config::ServerConfig>>,
     config_path: Option<PathBuf>,
     started: Instant,
+    sessions: Arc<parking_lot::Mutex<HashMap<String, AdminSession>>>,
+}
+
+#[derive(Debug, Clone)]
+struct AdminSession {
+    expires_at: Instant,
+    sql_user: String,
 }
 
 fn main() -> Result<()> {
@@ -167,6 +176,24 @@ fn runtime_worker_threads(configured: u32) -> usize {
         .unwrap_or(1)
 }
 
+async fn bind_http_listener(
+    config: &mydb_config::ServerConfig,
+) -> Result<Option<tokio::net::TcpListener>> {
+    if !config.http.enabled {
+        return Ok(None);
+    }
+    let address = format!("{}:{}", config.http.host, config.http.port);
+    let listener = tokio::net::TcpListener::bind(&address)
+        .await
+        .with_context(|| {
+            format!(
+            "failed to bind HTTP management listener at {address}; port {} may already be in use",
+            config.http.port
+        )
+        })?;
+    Ok(Some(listener))
+}
+
 async fn run_server(args: Args, config: mydb_config::ServerConfig) -> Result<()> {
     // Ensure data directory exists
     std::fs::create_dir_all(&config.storage.data_dir)?;
@@ -204,9 +231,13 @@ async fn run_server(args: Args, config: mydb_config::ServerConfig) -> Result<()>
     info!("HTTP management API port: {}", config.http.port);
 
     let wire_stats = Arc::new(mydb_wire::WireStats::default());
+    wire_stats.initialize_xa_catalog(config.storage.data_dir.join("xa"), storage.as_ref())?;
     let protocol_config = Arc::new(RwLock::new(protocol_config_for(&config)?));
+    let sessions = Arc::new(parking_lot::Mutex::new(HashMap::new()));
 
-    if config.http.enabled {
+    let http_listener = bind_http_listener(&config).await?;
+
+    if let Some(listener) = http_listener {
         let state = AdminState {
             storage: storage.clone(),
             wire_stats: wire_stats.clone(),
@@ -214,10 +245,10 @@ async fn run_server(args: Args, config: mydb_config::ServerConfig) -> Result<()>
             config: Arc::new(RwLock::new(config.clone())),
             config_path: args.config.clone(),
             started: Instant::now(),
+            sessions: sessions.clone(),
         };
-        let address = format!("{}:{}", config.http.host, config.http.port);
         tokio::spawn(async move {
-            if let Err(error) = run_admin_server(&address, state).await {
+            if let Err(error) = run_admin_server(listener, state).await {
                 tracing::error!("HTTP management server stopped: {}", error);
             }
         });
@@ -301,6 +332,15 @@ async fn run_server(args: Args, config: mydb_config::ServerConfig) -> Result<()>
 }
 
 fn validate_runtime_security(config: &mydb_config::ServerConfig) -> Result<()> {
+    if !matches!(
+        config.security.authentication.as_str(),
+        "mysql_native_password" | "caching_sha2_password"
+    ) {
+        anyhow::bail!(
+            "unsupported authentication plugin '{}'; use mysql_native_password or caching_sha2_password",
+            config.security.authentication
+        );
+    }
     if config.security.tls_cert.is_some() != config.security.tls_key.is_some() {
         anyhow::bail!("tls_cert and tls_key must be configured together");
     }
@@ -356,7 +396,12 @@ fn protocol_config_for(config: &mydb_config::ServerConfig) -> Result<mydb_wire::
     Ok(mydb_wire::ProtocolConfig {
         username: config.security.default_username.clone(),
         password: config.security.default_password.clone(),
-        default_database: "mydb".to_string(),
+        authentication: config.security.authentication.clone(),
+        default_sql_mode: mydb_wire::MYSQL84_DEFAULT_SQL_MODE.to_string(),
+        // MySQL leaves the session schema unset when the handshake omits
+        // CLIENT_CONNECT_WITH_DB. The client must issue USE or provide a DSN
+        // database; keep the built-in mydb schema without selecting it.
+        default_database: String::new(),
         slow_query_threshold_ms: config.agent.slow_query_threshold_ms,
         max_slow_queries: config.agent.max_slow_queries,
         lock_wait_timeout_ms: 5_000,
@@ -420,9 +465,14 @@ async fn shutdown_signal() {
     }
 }
 
-async fn run_admin_server(address: &str, state: AdminState) -> Result<()> {
+async fn run_admin_server(listener: tokio::net::TcpListener, state: AdminState) -> Result<()> {
     let app = Router::new()
+        .route("/", get(admin_ui))
+        .route("/admin", get(admin_ui))
+        .route("/admin/doc", get(admin_doc))
         .route("/metrics", get(metrics))
+        .route("/api/v1/auth/login", post(auth_login))
+        .route("/api/v1/auth/logout", post(auth_logout))
         .route("/api/v1/status", get(status))
         .route("/api/v1/config", get(get_config).put(put_config))
         .route("/api/v1/config/reload", post(reload_config))
@@ -442,9 +492,10 @@ async fn run_admin_server(address: &str, state: AdminState) -> Result<()> {
         .route("/api/v1/agent/ask", post(agent_diagnose))
         .route("/api/v1/agent/diagnose", post(agent_diagnose))
         .route("/api/v1/agent/sql", post(agent_sql_debug))
+        .route("/api/v1/sql/query", post(sql_query))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
-    let listener = tokio::net::TcpListener::bind(address).await?;
+    let address = listener.local_addr()?;
     info!(
         "HTTP management and Prometheus metrics listening on {}",
         address
@@ -453,16 +504,156 @@ async fn run_admin_server(address: &str, state: AdminState) -> Result<()> {
     Ok(())
 }
 
-fn authorize(headers: &HeaderMap, state: &AdminState) -> Result<(), StatusCode> {
-    let expected = format!("Bearer {}", state.config.read().http.admin_password);
-    let actual = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok());
-    if actual.is_some_and(|actual| constant_time_eq(expected.as_bytes(), actual.as_bytes())) {
-        Ok(())
-    } else {
-        Err(StatusCode::UNAUTHORIZED)
+async fn admin_ui() -> impl IntoResponse {
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        include_str!("admin.html"),
+    )
+}
+
+async fn admin_doc() -> impl IntoResponse {
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        include_str!("admin_doc.html"),
+    )
+}
+
+#[derive(Debug, Deserialize)]
+struct LoginRequest {
+    username: String,
+    password: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SqlQueryRequest {
+    sql: String,
+    database: Option<String>,
+}
+
+async fn auth_login(
+    State(state): State<AdminState>,
+    Json(request): Json<LoginRequest>,
+) -> Result<Json<Value>, StatusCode> {
+    let config = state.config.read().clone();
+    let valid_user = constant_time_eq(
+        request.username.as_bytes(),
+        config.http.admin_username.as_bytes(),
+    );
+    let valid_password = constant_time_eq(
+        request.password.as_bytes(),
+        config.http.admin_password.as_bytes(),
+    );
+    let database_user = state
+        .protocol_config
+        .read()
+        .auth_catalog
+        .verify_password(&request.username, &request.password);
+    if (!valid_user || !valid_password) && database_user.is_none() {
+        return Err(StatusCode::UNAUTHORIZED);
     }
+    let sql_user = database_user.unwrap_or(config.security.default_username.clone());
+    let token = uuid::Uuid::new_v4().to_string();
+    let expires_at = Instant::now() + std::time::Duration::from_secs(12 * 60 * 60);
+    let mut sessions = state.sessions.lock();
+    sessions.retain(|_, session| session.expires_at > Instant::now());
+    sessions.insert(
+        token.clone(),
+        AdminSession {
+            expires_at,
+            sql_user,
+        },
+    );
+    Ok(Json(json!({
+        "token": token,
+        "expires_in_seconds": 12 * 60 * 60,
+        "username": request.username,
+    })))
+}
+
+async fn auth_logout(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, StatusCode> {
+    let token = bearer_token(&headers).ok_or(StatusCode::UNAUTHORIZED)?;
+    state.sessions.lock().remove(token);
+    Ok(Json(json!({"logged_out": true})))
+}
+
+async fn sql_query(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Json(request): Json<SqlQueryRequest>,
+) -> std::result::Result<Json<mydb_wire::AdminSqlResult>, axum::response::Response> {
+    let sql = request.sql.trim();
+    if sql.is_empty() || sql.len() > 4 * 1024 * 1024 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "SQL must contain 1..4194304 bytes",
+                "code": "ER_BAD_REQUEST"
+            })),
+        )
+            .into_response());
+    }
+    let protocol_config = Arc::new(state.protocol_config.read().clone());
+    let sql_user = authorized_identity(&headers, &state).map_err(IntoResponse::into_response)?;
+    let result = mydb_wire::execute_admin_sql(
+        state.storage.clone(),
+        protocol_config,
+        state.wire_stats.clone(),
+        &sql_user,
+        request.database.as_deref(),
+        sql,
+    )
+    .await
+    .map_err(|error| {
+        let message = error.to_string();
+        tracing::warn!(error = %message, sql = %sql, "Admin SQL failed");
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "error": message,
+                "code": "ER_ADMIN_SQL"
+            })),
+        )
+            .into_response()
+    })?;
+    Ok(Json(result))
+}
+
+fn authorize(headers: &HeaderMap, state: &AdminState) -> Result<(), StatusCode> {
+    authorized_identity(headers, state).map(|_| ())
+}
+
+fn authorized_identity(headers: &HeaderMap, state: &AdminState) -> Result<String, StatusCode> {
+    let Some(token) = bearer_token(headers) else {
+        return Err(StatusCode::UNAUTHORIZED);
+    };
+    let config = state.config.read().clone();
+    let expected = format!("Bearer {}", config.http.admin_password);
+    if constant_time_eq(
+        expected.trim_start_matches("Bearer ").as_bytes(),
+        token.as_bytes(),
+    ) {
+        return Ok(config.security.default_username);
+    }
+    let mut sessions = state.sessions.lock();
+    let Some(session) = sessions.get(token).cloned() else {
+        return Err(StatusCode::UNAUTHORIZED);
+    };
+    if session.expires_at <= Instant::now() {
+        sessions.remove(token);
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    Ok(session.sql_user)
+}
+
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .filter(|token| !token.is_empty())
 }
 
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
@@ -2137,6 +2328,20 @@ mod tests {
         assert_eq!(runtime_worker_threads(1), 1);
         assert_eq!(runtime_worker_threads(8), 8);
         assert!(runtime_worker_threads(0) >= 1);
+    }
+
+    #[tokio::test]
+    async fn http_port_conflict_fails_startup_before_mysql_listener() {
+        let blocker = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = blocker.local_addr().unwrap().port();
+        let mut config = mydb_config::ServerConfig::default();
+        config.http.host = "127.0.0.1".to_string();
+        config.http.port = port;
+        config.http.enabled = true;
+
+        let error = bind_http_listener(&config).await.unwrap_err();
+        assert!(error.to_string().contains("HTTP management listener"));
+        assert!(error.to_string().contains(&port.to_string()));
     }
 
     #[test]

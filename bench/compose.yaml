@@ -1,0 +1,87 @@
+# Docker-controlled MyDB vs MySQL benchmark.
+#
+# Both databases run under IDENTICAL resource limits (cpus + mem_limit) so the
+# comparison is fair and reproducible. Durability is identical:
+#   MyDB  : per-group WAL fsync (innodb_flush_log_at_trx_commit equivalent)
+#   MySQL : innodb_flush_log_at_trx_commit=1 + sync_binlog=1
+#
+# Symmetric limits (override on the command line if you want to change them):
+#   MYDB_CPUS / MYDB_MEM   - MyDB container limits
+#   MYSQL_CPUS / MYSQL_MEM - MySQL container limits
+services:
+  mydb:
+    build:
+      context: ..
+      dockerfile: bench/Dockerfile.mydb
+    image: mydb:bench
+    container_name: mydb-bench
+    init: true
+    environment:
+      MYDB_ROOT_PASSWORD: "root"
+      MYDB_ADMIN_PASSWORD: "root"
+      MYDB_ENFORCE_STRONG_PASSWORDS: "false"
+      MYDB_GROUP_COMMIT_WINDOW_US: "250"
+      MYDB_LOG_LEVEL: "info"
+    ports:
+      - "${MYDB_HOST_PORT:-13316}:3306"
+      - "${MYDB_HOST_HTTP_PORT:-14306}:4306"
+    volumes:
+      - mydb-data:/var/lib/mydb
+    cpus: "${MYDB_CPUS:-2.0}"
+    mem_limit: "${MYDB_MEM:-1g}"
+    mem_reservation: "${MYDB_MEM_RESERVE:-512m}"
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "mydb-server", "--healthcheck"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+  mysql:
+    image: mysql:8.4
+    container_name: mysql-bench
+    init: true
+    environment:
+      MYSQL_ROOT_PASSWORD: "root"
+    command:
+      - --innodb_flush_log_at_trx_commit=1
+      - --sync_binlog=1
+      - --transaction-isolation=REPEATABLE-READ
+      - --innodb-buffer-pool-size=320M
+      - --max-connections=1000
+    ports:
+      - "${MYSQL_HOST_PORT:-13307}:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+    cpus: "${MYSQL_CPUS:-2.0}"
+    mem_limit: "${MYSQL_MEM:-1g}"
+    mem_reservation: "${MYSQL_MEM_RESERVE:-512m}"
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-proot"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 30s
+
+  bench:
+    build:
+      context: ..
+      dockerfile: scripts/Dockerfile.bench
+    image: mydb-bench:bench
+    init: true
+    depends_on:
+      mydb:
+        condition: service_healthy
+      mysql:
+        condition: service_healthy
+    environment:
+      MYDB_URL: "mysql://root:root@mydb:3306"
+      MYSQL_URL: "mysql://root:root@mysql:3306"
+    # No long-running process; the orchestrator (scripts/bench_docker.py) drives
+    # `docker compose run bench --url ...` for each scenario/sample.
+
+volumes:
+  mydb-data:
+  mysql-data:

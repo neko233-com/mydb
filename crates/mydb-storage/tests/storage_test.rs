@@ -854,6 +854,7 @@ async fn test_unique_index_is_enforced_atomically_and_allows_multiple_nulls() {
                     name: "email_unique".into(),
                     columns: vec!["email".into()],
                     unique: true,
+                    kind: mydb_storage::IndexKind::BTree,
                 }],
                 triggers: Vec::new(),
                 next_page_number: 0,

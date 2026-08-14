@@ -117,7 +117,7 @@ storage:
   page_size: 16384
 
 security:
-  authentication: "mysql_native_password"
+  authentication: "caching_sha2_password"
   require_secure_transport: false
 
 logging:
@@ -196,6 +196,10 @@ main() {
     
     local os=$(detect_os)
     local arch=$(detect_arch)
+
+    # Remove files left by pre-single-node releases. The current package has
+    # no router component; MyDB clients connect directly to TCP 3306.
+    rm -f "$INSTALL_DIR/mydb-router" "$INSTALL_DIR/router.yaml"
     
     info "OS: ${os}"
     info "Architecture: ${arch}"

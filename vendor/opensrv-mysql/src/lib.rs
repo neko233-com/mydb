@@ -132,8 +132,16 @@ pub trait AsyncMysqlShim<W: Send> {
     }
 
     /// get auth plugin
-    async fn auth_plugin_for_username(&self, _user: &[u8]) -> &str {
-        MYSQL_NATIVE_PASSWORD
+    async fn auth_plugin_for_username(&self, _user: &[u8]) -> String {
+        MYSQL_NATIVE_PASSWORD.to_string()
+    }
+
+    /// Whether a client-provided plugin may be verified without an auth switch.
+    ///
+    /// This keeps compatibility with clients that select a stronger plugin per
+    /// account while preserving the server's advertised default plugin.
+    fn accepts_auth_plugin(&self, _auth_plugin: &str) -> bool {
+        false
     }
 
     /// Default salt(scramble) for auth plugin
@@ -501,7 +509,6 @@ where
             let mut auth_response = handshake.auth_response.clone();
             if let Some(username) = &handshake.username {
                 let auth_plugin_expect = self.shim.auth_plugin_for_username(username).await;
-
                 // auth switch: whenever the client's auth plugin differs from
                 // what the server expects (including when it sent non-empty
                 // auth data with a plugin we don't natively support, e.g.
@@ -534,21 +541,17 @@ where
                 }
 
                 self.writer.set_seq(seq + 1);
+                let auth_plugin = auth_plugin_expect.as_str();
 
                 if !self
                     .shim
-                    .authenticate(
-                        auth_plugin_expect,
-                        username,
-                        &scramble,
-                        auth_response.as_slice(),
-                    )
+                    .authenticate(auth_plugin, username, &scramble, auth_response.as_slice())
                     .await
                 {
                     let err_msg = format!(
                         "Authenticate failed, user: {:?}, auth_plugin: {:?}",
                         String::from_utf8_lossy(username),
-                        auth_plugin_expect,
+                        auth_plugin,
                     );
                     writers::write_err(
                         ErrorKind::ER_ACCESS_DENIED_NO_PASSWORD_ERROR,
@@ -558,6 +561,16 @@ where
                     .await?;
                     self.writer.flush_all().await?;
                     return Err(io::Error::new(io::ErrorKind::PermissionDenied, err_msg).into());
+                }
+
+                // caching_sha2_password has one protocol step between the
+                // client response and the final OK packet. MySQL 8.x CLI
+                // consumes the fast-auth success marker (0x01, 0x03); JDBC
+                // clients commonly tolerate the direct OK path, but omitting
+                // this marker makes the official client fail with ER_UNKNOWN.
+                if auth_plugin == "caching_sha2_password" {
+                    self.writer.write_all(&[0x01, 0x03])?;
+                    self.writer.end_packet().await?;
                 }
 
                 if let Some(Ok(db)) = handshake.db.as_ref().map(|x| std::str::from_utf8(x)) {

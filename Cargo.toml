@@ -12,7 +12,6 @@ members = [
     "crates/mydb-migrate",
     "crates/mydb-dump",
     "crates/mydb-bench",
-    "crates/mydb-router",
 ]
 exclude = ["vendor/opensrv-mysql"]
 

@@ -71,10 +71,10 @@ pub struct StorageSection {
     #[serde(default = "default_group_commit_window_us")]
     pub group_commit_window_us: u64,
     /// Number of independent commit shards (Leader/Follower groups, each with
-    /// its own WAL and fsync). `0` (default) auto-detects the logical CPU count
-    /// so multi-core commit throughput scales with the hardware. The storage
-    /// engine contains no actor/mailbox model; each shard is driven on the
-    /// caller's task.
+    /// its own WAL and fsync). `0` selects the platform default: one shard on
+    /// Windows and logical CPU count on other platforms. More shards can be
+    /// requested explicitly. The storage engine contains no actor/mailbox
+    /// model; each shard is driven on the caller's task.
     #[serde(default)]
     pub shard_count: usize,
 }
@@ -217,7 +217,7 @@ fn default_sort_buffer_size() -> String {
     "4M".to_string()
 }
 fn default_authentication() -> String {
-    "mysql_native_password".to_string()
+    "caching_sha2_password".to_string()
 }
 fn default_root_username() -> String {
     "root".to_string()
