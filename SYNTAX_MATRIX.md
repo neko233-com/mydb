@@ -6,7 +6,7 @@
 >
 > **非单机能力明确不支持（设计决定，非临时延迟）**：binlog 复制拓扑 / GTID、读写分离、Group Replication / Galera、分布式 XA 两阶段协调、跨节点一致性。这些在 [`SYNTAX_MATRIX.md`](SYNTAX_MATRIX.md) 中统一标记为 ❌ 明确不支持，不会纳入范围，也不视为“缺失”。单机本地 XA 支持跨连接 prepared 分支、锁保留、RECOVER、one-phase 与 durable WAL commit marker 故障恢复。
 >
-> 最后更新：2026-08-15（补齐 `event_scheduler` 全局变量 ON/OFF/DISABLED、DataGrip/GoLand 探测路径、无默认 schema 的 `DATABASE()`、明文 `SHOW STATUS LIKE 'ssl_version'`、SHOW 元数据 LIKE 大小写不敏感、CASE 文本投影中的嵌套 `IN`、持久 row-id、MVCC 读视图/历史版本、基础 statement-duration MDL、主键/单列二级索引 next-key/gap 区间锁、二级索引插入意向锁、RC 记录锁、复合索引全等值/左前缀范围锁、单列索引 `LIKE` 前缀范围锁、无主键基础隐藏行锁和 JOIN 基础 `SKIP LOCKED` 行过滤；新增单基表直接列投影可更新视图和 LOCAL/CASCADED CHECK OPTION、逻辑表级 RANGE/LIST/HASH/KEY 分区及常用表达式函数、`information_schema.PARTITIONS` 行级元数据、`LOAD DATA ... PARTITION` 逻辑分区校验、`PAD SPACE/NO PAD` 与字符串 `_bin` 排序规则边界；新增二级索引锁定读同步锁聚簇记录、JOIN 二级索引点锁、列对列比较范围锁、JOIN ON 常量/常用标量函数/算术表达式、HAVING 未关联标量子查询/`IN (SELECT ...)` 与存储层 UPSERT 唯一键候选镜像校验回归；本轮新增按前置表行隐式关联的 `JSON_TABLE`，当前 MySQL 8.4 差分 113/113；完整 InnoDB 语义仍按清单逐项验收）。
+> 最后更新：2026-08-15（补齐 `event_scheduler` 全局变量 ON/OFF/DISABLED、DataGrip/GoLand 探测路径、无默认 schema 的 `DATABASE()`、明文 `SHOW STATUS LIKE 'ssl_version'`、SHOW 元数据 LIKE 大小写不敏感、CASE 文本投影中的嵌套 `IN`、持久 row-id、MVCC 读视图/历史版本、基础 statement-duration MDL、主键/单列二级索引 next-key/gap 区间锁、二级索引插入意向锁、RC 记录锁、复合索引全等值/左前缀范围锁、单列索引 `LIKE` 前缀范围锁、无主键基础隐藏行锁和 JOIN 基础 `SKIP LOCKED` 行过滤；新增单基表直接列投影可更新视图和 LOCAL/CASCADED CHECK OPTION、逻辑表级 RANGE/LIST/HASH/KEY 分区及常用表达式函数、`information_schema.PARTITIONS` 行级元数据、`LOAD DATA ... PARTITION` 逻辑分区校验、`PAD SPACE/NO PAD` 与字符串 `_bin` 排序规则边界；新增二级索引锁定读同步锁聚簇记录、JOIN 二级索引点锁、列对列比较范围锁、JOIN ON 常量/常用标量函数/算术表达式、HAVING 未关联标量子查询/`IN (SELECT ...)` 与存储层 UPSERT 唯一键候选镜像校验回归；新增基础空间构造器、度量、SRID 轴序和空间谓词差分，当前 MySQL 8.4 差分 116/116；完整 InnoDB/GIS 语义仍按清单逐项验收）。
 
 ## 状态图例
 
@@ -52,7 +52,7 @@
 | `RENAME TABLE`（多项）、`ALTER TABLE RENAME` | ✅ Verified | 原子镜像、跨库 |
 | 表/列 `COMMENT` 持久化 | ✅ Verified | CREATE/ALTER TABLE comment 通过 CREATE SQL 持久化；SHOW FULL COLUMNS、SHOW TABLE STATUS、information_schema.tables/columns、SHOW CREATE TABLE 已回归；复杂 MODIFY 边界仍待补 |
 | `PARTITION BY`（表级） | 🟡 Partial | 逻辑表级 RANGE/LIST/HASH/KEY、`RANGE/LIST COLUMNS`、常用表达式 `YEAR/MONTH/DAY/QUARTER/TO_DAYS/TO_SECONDS/UNIX_TIMESTAMP/ABS/MOD` 与基础算术的写入校验、重启恢复和 `information_schema.PARTITIONS` 元数据已验证；数据仍保持单表物理布局，子分区、在线重组与物理分区裁剪 Deferred；窗口函数 `PARTITION BY` 为独立语义 |
-| `SPATIAL` / `FULLTEXT` 索引 | 🟡 Partial | `IndexKind` 已持久化区分 BTREE/FULLTEXT/SPATIAL；CREATE/ALTER、SHOW INDEX、`information_schema.STATISTICS`、FULLTEXT TF-IDF 基础相关性、布尔必选/排除/短语/前缀、基础 `WITH QUERY EXPANSION` 检索、基础 `ST_GeomFromText`/`ST_AsText`/`ST_X`/`ST_Y`/`ST_GeometryType` 已与 MySQL 8.4 真实差分覆盖。完整 InnoDB 倒排索引/可配置停止词、CJK ngram、完整 GIS 类型与空间谓词/优化仍待落地。 |
+| `SPATIAL` / `FULLTEXT` 索引 | 🟡 Partial | `IndexKind` 已持久化区分 BTREE/FULLTEXT/SPATIAL；CREATE/ALTER、SHOW INDEX、`information_schema.STATISTICS`、FULLTEXT TF-IDF 基础相关性、布尔必选/排除/短语/前缀、基础 `WITH QUERY EXPANSION` 检索，以及 POINT/LINESTRING/POLYGON 的基础构造器、WKT、坐标/类型/维度、长度/面积/距离、线面访问器、SRID 轴序和基础空间谓词已与 MySQL 8.4 真实差分覆盖（116/116）。完整 InnoDB 倒排索引/可配置停止词、CJK ngram、多数 GIS 类型、鲁棒拓扑边界、空间索引优化和完整 OGC 语义仍待落地。 |
 | `ENGINE=` 其它引擎（除 InnoDB/MEMORY） | ⚪ Absent | 返回错误（InnoDB 为 Neko233 别名） |
 | `CREATE TABLESPACE` | ⚪ Absent | 仅权限名占位 |
 

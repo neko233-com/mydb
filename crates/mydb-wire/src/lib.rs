@@ -45,7 +45,7 @@ use mydb_storage::{
     TriggerDefinition, TriggerEvent, TriggerTiming, UpdateValueExpression, WriteCommand,
 };
 
-pub const SERVER_VERSION: &str = "8.4.0-mydb-0.1.17";
+pub const SERVER_VERSION: &str = "8.4.0-mydb-0.1.18";
 pub const MYSQL84_DEFAULT_SQL_MODE: &str = "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION";
 /// MySQL 8.4 default `innodb_lock_wait_timeout`, in seconds.
 pub const MYSQL84_DEFAULT_INNODB_LOCK_WAIT_TIMEOUT_SECONDS: u64 = 50;
@@ -30482,7 +30482,7 @@ fn evaluate_scalar_expression(value: &str, row: &Row) -> anyhow::Result<Option<V
         return Ok(Some(value));
     }
     if let Some(value) = evaluate_spatial_expression(expression, row)? {
-        return Ok(Some(value));
+        return Ok(value);
     }
     let is_condition = ["<=>", ">=", "<=", "<>", "!=", ">", "<", "="]
         .into_iter()
@@ -33571,7 +33571,7 @@ fn evaluate_scalar_expression_with_schema_and_collection(
         return Ok(Some(value));
     }
     if let Some(value) = evaluate_spatial_expression(expression, row)? {
-        return Ok(Some(value));
+        return Ok(value);
     }
     let is_condition = ["<=>", ">=", "<=", "<>", "!=", ">", "<", "="]
         .into_iter()
@@ -33971,84 +33971,829 @@ fn fulltext_phrase_matches(document: &str, phrase: &[String]) -> bool {
             .any(|window| window.iter().zip(phrase).all(|(left, right)| left == right))
 }
 
-fn evaluate_spatial_expression(expression: &str, row: &Row) -> anyhow::Result<Option<Vec<u8>>> {
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SpatialPoint {
+    x: f64,
+    y: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum SpatialGeometry {
+    Point(SpatialPoint),
+    LineString(Vec<SpatialPoint>),
+    Polygon(Vec<Vec<SpatialPoint>>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct SpatialValue {
+    srid: u32,
+    geometry: SpatialGeometry,
+}
+
+fn evaluate_spatial_expression(
+    expression: &str,
+    row: &Row,
+) -> anyhow::Result<Option<Option<Vec<u8>>>> {
+    let expression = expression.trim();
+    let Some((function, arguments)) = spatial_function_call(expression) else {
+        return Ok(None);
+    };
+    let Some(constructor_kind) = spatial_constructor_kind(&function) else {
+        return evaluate_spatial_operation(&function, &arguments, row);
+    };
+    if !matches!(arguments.len(), 1 | 2) {
+        anyhow::bail!("{function} requires one or two arguments");
+    }
+    let Some(raw) = evaluate_scalar_expression(&arguments[0], row)? else {
+        return Ok(Some(None));
+    };
+    let value = parse_spatial_value(&raw)?;
+    if !spatial_constructor_accepts(constructor_kind, &value.geometry) {
+        anyhow::bail!("Cannot get geometry object from data you send to the GEOMETRY field");
+    }
+    let srid = if let Some(argument) = arguments.get(1) {
+        parse_spatial_srid(&evaluate_scalar_expression(argument, row)?)?
+    } else {
+        value.srid
+    };
+    Ok(Some(Some(serialize_spatial_value(&SpatialValue {
+        srid,
+        geometry: value.geometry,
+    }))))
+}
+
+fn spatial_function_call(expression: &str) -> Option<(String, Vec<String>)> {
+    const FUNCTIONS: &[&str] = &[
+        "ST_GEOMFROMTEXT",
+        "GEOMFROMTEXT",
+        "ST_GEOMETRYFROMTEXT",
+        "ST_POINTFROMTEXT",
+        "POINTFROMTEXT",
+        "ST_LINEFROMTEXT",
+        "LINEFROMTEXT",
+        "ST_POLYFROMTEXT",
+        "POLYFROMTEXT",
+        "ST_POLYGONFROMTEXT",
+        "POLYGONFROMTEXT",
+        "ST_ASTEXT",
+        "ASTEXT",
+        "ST_X",
+        "ST_Y",
+        "ST_ISVALID",
+        "ST_SRID",
+        "ST_GEOMETRYTYPE",
+        "ST_DIMENSION",
+        "ST_NUMPOINTS",
+        "ST_NUMINTERIORRING",
+        "ST_NUMINTERIORRINGS",
+        "ST_EXTERIORRING",
+        "ST_STARTPOINT",
+        "ST_ENDPOINT",
+        "ST_POINTN",
+        "ST_LENGTH",
+        "ST_AREA",
+        "ST_DISTANCE",
+        "ST_EQUALS",
+        "ST_CONTAINS",
+        "ST_WITHIN",
+        "ST_INTERSECTS",
+        "ST_DISJOINT",
+        "ST_TOUCHES",
+        "ST_CROSSES",
+        "ST_OVERLAPS",
+    ];
     let upper = expression.to_ascii_uppercase();
-    for (function, operation) in [
-        ("ST_GEOMFROMTEXT", "FROM_TEXT"),
-        ("GEOMFROMTEXT", "FROM_TEXT"),
-        ("ST_ASTEXT", "AS_TEXT"),
-        ("ASTEXT", "AS_TEXT"),
-        ("ST_X", "X"),
-        ("ST_Y", "Y"),
-        ("ST_ISVALID", "IS_VALID"),
-        ("ST_SRID", "SRID"),
-        ("ST_GEOMETRYTYPE", "GEOMETRY_TYPE"),
-        ("ST_DIMENSION", "DIMENSION"),
-    ] {
+    FUNCTIONS.iter().find_map(|function| {
         let prefix = format!("{function}(");
-        if !upper.starts_with(&prefix) || !expression.ends_with(')') {
-            continue;
+        if upper.starts_with(&prefix) && expression.ends_with(')') {
+            Some((
+                (*function).to_string(),
+                split_csv(&expression[prefix.len()..expression.len() - 1]),
+            ))
+        } else {
+            None
         }
-        let arguments = split_csv(&expression[prefix.len()..expression.len() - 1]);
-        if arguments.len() != 1 {
-            anyhow::bail!("{function} requires one argument");
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SpatialConstructorKind {
+    Geometry,
+    Point,
+    LineString,
+    Polygon,
+}
+
+fn spatial_constructor_kind(function: &str) -> Option<SpatialConstructorKind> {
+    match function {
+        "ST_GEOMFROMTEXT" | "GEOMFROMTEXT" | "ST_GEOMETRYFROMTEXT" => {
+            Some(SpatialConstructorKind::Geometry)
         }
-        let Some(value) = evaluate_scalar_expression(&arguments[0], row)? else {
-            return Ok(None);
-        };
-        let text = String::from_utf8_lossy(&value);
-        let text = text.trim();
-        if operation == "FROM_TEXT" {
-            if !text.to_ascii_uppercase().starts_with("POINT(")
-                && !text.to_ascii_uppercase().starts_with("LINESTRING(")
-                && !text.to_ascii_uppercase().starts_with("POLYGON(")
-            {
-                anyhow::bail!(
-                    "Cannot get geometry object from data you send to the GEOMETRY field"
-                );
+        "ST_POINTFROMTEXT" | "POINTFROMTEXT" => Some(SpatialConstructorKind::Point),
+        "ST_LINEFROMTEXT" | "LINEFROMTEXT" => Some(SpatialConstructorKind::LineString),
+        "ST_POLYFROMTEXT" | "POLYFROMTEXT" | "ST_POLYGONFROMTEXT" | "POLYGONFROMTEXT" => {
+            Some(SpatialConstructorKind::Polygon)
+        }
+        _ => None,
+    }
+}
+
+fn spatial_constructor_accepts(kind: SpatialConstructorKind, geometry: &SpatialGeometry) -> bool {
+    match kind {
+        SpatialConstructorKind::Geometry => true,
+        SpatialConstructorKind::Point => matches!(geometry, SpatialGeometry::Point(_)),
+        SpatialConstructorKind::LineString => matches!(geometry, SpatialGeometry::LineString(_)),
+        SpatialConstructorKind::Polygon => matches!(geometry, SpatialGeometry::Polygon(_)),
+    }
+}
+
+fn evaluate_spatial_operation(
+    function: &str,
+    arguments: &[String],
+    row: &Row,
+) -> anyhow::Result<Option<Option<Vec<u8>>>> {
+    match function {
+        "ST_ASTEXT" | "ASTEXT" => {
+            let Some(value) = evaluate_spatial_unary_argument(function, arguments, row)? else {
+                return Ok(Some(None));
+            };
+            Ok(Some(Some(
+                spatial_geometry_wkt(&value.geometry).into_bytes(),
+            )))
+        }
+        "ST_SRID" => {
+            if arguments.len() == 1 {
+                let Some(value) = evaluate_spatial_unary_argument(function, arguments, row)? else {
+                    return Ok(Some(None));
+                };
+                return Ok(Some(Some(value.srid.to_string().into_bytes())));
             }
-            return Ok(Some(text.as_bytes().to_vec()));
+            if arguments.len() != 2 {
+                anyhow::bail!("ST_SRID requires one or two arguments");
+            }
+            let Some(mut value) = evaluate_spatial_argument(&arguments[0], row)? else {
+                return Ok(Some(None));
+            };
+            let srid = parse_spatial_srid(&evaluate_scalar_expression(&arguments[1], row)?)?;
+            if spatial_srid_uses_latitude_longitude(value.srid)
+                != spatial_srid_uses_latitude_longitude(srid)
+            {
+                value.geometry = spatial_swap_axes(value.geometry);
+            }
+            value.srid = srid;
+            Ok(Some(Some(serialize_spatial_value(&value))))
         }
-        if operation == "AS_TEXT" {
-            return Ok(Some(text.as_bytes().to_vec()));
+        "ST_GEOMETRYTYPE" => {
+            let Some(value) = evaluate_spatial_unary_argument(function, arguments, row)? else {
+                return Ok(Some(None));
+            };
+            Ok(Some(Some(
+                spatial_geometry_type(&value.geometry).as_bytes().to_vec(),
+            )))
         }
-        if operation == "IS_VALID" {
-            return Ok(Some(if text.contains('(') && text.ends_with(')') {
+        "ST_ISVALID" => {
+            let Some(value) = evaluate_spatial_unary_argument(function, arguments, row)? else {
+                return Ok(Some(None));
+            };
+            Ok(Some(Some(if spatial_geometry_is_valid(&value.geometry) {
                 b"1".to_vec()
             } else {
                 b"0".to_vec()
-            }));
+            })))
         }
-        if operation == "SRID" {
-            return Ok(Some(b"0".to_vec()));
+        "ST_DIMENSION" => {
+            let Some(value) = evaluate_spatial_unary_argument(function, arguments, row)? else {
+                return Ok(Some(None));
+            };
+            Ok(Some(Some(
+                spatial_geometry_dimension(&value.geometry)
+                    .to_string()
+                    .into_bytes(),
+            )))
         }
-        if operation == "GEOMETRY_TYPE" {
-            let geometry = text.split('(').next().unwrap_or("").to_ascii_uppercase();
-            return Ok(Some(geometry.into_bytes()));
+        "ST_NUMPOINTS" => {
+            let Some(value) = evaluate_spatial_unary_argument(function, arguments, row)? else {
+                return Ok(Some(None));
+            };
+            let SpatialGeometry::LineString(points) = value.geometry else {
+                return Ok(Some(None));
+            };
+            Ok(Some(Some(points.len().to_string().into_bytes())))
         }
-        if operation == "DIMENSION" {
-            return Ok(Some(b"0".to_vec()));
+        "ST_NUMINTERIORRING" | "ST_NUMINTERIORRINGS" => {
+            let Some(value) = evaluate_spatial_unary_argument(function, arguments, row)? else {
+                return Ok(Some(None));
+            };
+            let SpatialGeometry::Polygon(rings) = value.geometry else {
+                return Ok(Some(None));
+            };
+            Ok(Some(Some(
+                rings.len().saturating_sub(1).to_string().into_bytes(),
+            )))
         }
-        let point = text
-            .strip_prefix("POINT(")
-            .or_else(|| text.strip_prefix("point("))
-            .and_then(|value| value.strip_suffix(')'))
-            .ok_or_else(|| anyhow::anyhow!("Argument is not a POINT geometry"))?;
-        let coordinates = point.split_whitespace().collect::<Vec<_>>();
-        if coordinates.len() != 2 {
-            anyhow::bail!("Invalid POINT geometry");
+        "ST_EXTERIORRING" => {
+            let Some(value) = evaluate_spatial_unary_argument(function, arguments, row)? else {
+                return Ok(Some(None));
+            };
+            let SpatialGeometry::Polygon(rings) = value.geometry else {
+                return Ok(Some(None));
+            };
+            let Some(exterior) = rings.first() else {
+                return Ok(Some(None));
+            };
+            Ok(Some(Some(serialize_spatial_value(&SpatialValue {
+                srid: value.srid,
+                geometry: SpatialGeometry::LineString(exterior.clone()),
+            }))))
         }
-        return Ok(Some(
-            if operation == "X" {
-                coordinates[0]
+        "ST_STARTPOINT" | "ST_ENDPOINT" => {
+            let Some(value) = evaluate_spatial_unary_argument(function, arguments, row)? else {
+                return Ok(Some(None));
+            };
+            let SpatialGeometry::LineString(points) = value.geometry else {
+                return Ok(Some(None));
+            };
+            let point = if function == "ST_STARTPOINT" {
+                points.first()
             } else {
-                coordinates[1]
+                points.last()
+            };
+            let Some(point) = point else {
+                return Ok(Some(None));
+            };
+            Ok(Some(Some(serialize_spatial_value(&SpatialValue {
+                srid: value.srid,
+                geometry: SpatialGeometry::Point(*point),
+            }))))
+        }
+        "ST_POINTN" => {
+            if arguments.len() != 2 {
+                anyhow::bail!("ST_POINTN requires two arguments");
             }
-            .as_bytes()
-            .to_vec(),
-        ));
+            let Some(value) = evaluate_spatial_argument(&arguments[0], row)? else {
+                return Ok(Some(None));
+            };
+            let Some(index) = evaluate_scalar_expression(&arguments[1], row)? else {
+                return Ok(Some(None));
+            };
+            let index = parse_scalar_number(&index)? as isize;
+            let SpatialGeometry::LineString(points) = value.geometry else {
+                return Ok(Some(None));
+            };
+            let Some(point) = index
+                .checked_sub(1)
+                .and_then(|index| usize::try_from(index).ok())
+                .and_then(|index| points.get(index))
+            else {
+                return Ok(Some(None));
+            };
+            Ok(Some(Some(serialize_spatial_value(&SpatialValue {
+                srid: value.srid,
+                geometry: SpatialGeometry::Point(*point),
+            }))))
+        }
+        "ST_X" | "ST_Y" => {
+            let Some(value) = evaluate_spatial_unary_argument(function, arguments, row)? else {
+                return Ok(Some(None));
+            };
+            let SpatialGeometry::Point(point) = value.geometry else {
+                return Ok(Some(None));
+            };
+            let coordinate = if function == "ST_X" { point.x } else { point.y };
+            Ok(Some(Some(format_mysql_number(coordinate).into_bytes())))
+        }
+        "ST_LENGTH" | "ST_AREA" => {
+            let Some(value) = evaluate_spatial_unary_argument(function, arguments, row)? else {
+                return Ok(Some(None));
+            };
+            let result = if function == "ST_LENGTH" {
+                match value.geometry {
+                    SpatialGeometry::LineString(points) => spatial_line_length(&points),
+                    _ => 0.0,
+                }
+            } else {
+                match value.geometry {
+                    SpatialGeometry::Polygon(rings) => spatial_polygon_area(&rings),
+                    _ => 0.0,
+                }
+            };
+            Ok(Some(Some(format_mysql_number(result).into_bytes())))
+        }
+        "ST_DISTANCE" => evaluate_spatial_distance(arguments, row),
+        "ST_EQUALS" | "ST_CONTAINS" | "ST_WITHIN" | "ST_INTERSECTS" | "ST_DISJOINT"
+        | "ST_TOUCHES" | "ST_CROSSES" | "ST_OVERLAPS" => {
+            evaluate_spatial_binary_operation(function, arguments, row, |left, right| {
+                Some(if function == "ST_EQUALS" {
+                    spatial_geometry_equals(&left.geometry, &right.geometry)
+                } else if function == "ST_CONTAINS" {
+                    spatial_contains(&left.geometry, &right.geometry)
+                } else if function == "ST_WITHIN" {
+                    spatial_contains(&right.geometry, &left.geometry)
+                } else if function == "ST_INTERSECTS" {
+                    spatial_intersects(&left.geometry, &right.geometry)
+                } else if function == "ST_DISJOINT" {
+                    !spatial_intersects(&left.geometry, &right.geometry)
+                } else if function == "ST_TOUCHES" {
+                    spatial_touches(&left.geometry, &right.geometry)
+                } else if function == "ST_CROSSES" {
+                    spatial_crosses(&left.geometry, &right.geometry)
+                } else {
+                    spatial_overlaps(&left.geometry, &right.geometry)
+                })
+            })
+        }
+        _ => Ok(None),
     }
-    Ok(None)
+}
+
+fn evaluate_spatial_unary_argument(
+    function: &str,
+    arguments: &[String],
+    row: &Row,
+) -> anyhow::Result<Option<SpatialValue>> {
+    if arguments.len() != 1 {
+        anyhow::bail!("{function} requires one argument");
+    }
+    evaluate_spatial_argument(&arguments[0], row)
+}
+
+fn evaluate_spatial_distance(
+    arguments: &[String],
+    row: &Row,
+) -> anyhow::Result<Option<Option<Vec<u8>>>> {
+    if arguments.len() != 2 {
+        anyhow::bail!("ST_DISTANCE requires two arguments");
+    }
+    let Some(left) = evaluate_spatial_argument(&arguments[0], row)? else {
+        return Ok(Some(None));
+    };
+    let Some(right) = evaluate_spatial_argument(&arguments[1], row)? else {
+        return Ok(Some(None));
+    };
+    let Some(distance) = spatial_geometry_distance(&left.geometry, &right.geometry) else {
+        return Ok(Some(None));
+    };
+    Ok(Some(Some(format_mysql_number(distance).into_bytes())))
+}
+
+fn evaluate_spatial_binary_operation<F>(
+    function: &str,
+    arguments: &[String],
+    row: &Row,
+    operation: F,
+) -> anyhow::Result<Option<Option<Vec<u8>>>>
+where
+    F: FnOnce(&SpatialValue, &SpatialValue) -> Option<bool>,
+{
+    if arguments.len() != 2 {
+        anyhow::bail!("{function} requires two arguments");
+    }
+    let Some(left) = evaluate_spatial_argument(&arguments[0], row)? else {
+        return Ok(Some(None));
+    };
+    let Some(right) = evaluate_spatial_argument(&arguments[1], row)? else {
+        return Ok(Some(None));
+    };
+    let Some(value) = operation(&left, &right) else {
+        return Ok(Some(None));
+    };
+    Ok(Some(Some(if value { b"1" } else { b"0" }.to_vec())))
+}
+
+fn evaluate_spatial_argument(argument: &str, row: &Row) -> anyhow::Result<Option<SpatialValue>> {
+    let Some(value) = evaluate_scalar_expression(argument, row)? else {
+        return Ok(None);
+    };
+    Ok(Some(parse_spatial_value(&value)?))
+}
+
+fn parse_spatial_srid(value: &Option<Vec<u8>>) -> anyhow::Result<u32> {
+    let Some(value) = value else {
+        anyhow::bail!("SRID cannot be NULL");
+    };
+    let number = std::str::from_utf8(value)?.trim().parse::<u64>()?;
+    u32::try_from(number).map_err(|_| anyhow::anyhow!("SRID is out of range"))
+}
+
+fn parse_spatial_value(value: &[u8]) -> anyhow::Result<SpatialValue> {
+    let text = std::str::from_utf8(value)?.trim();
+    let (srid, wkt) = if text.len() >= 6 && text[..5].eq_ignore_ascii_case("SRID=") {
+        let separator = text
+            .find(';')
+            .ok_or_else(|| anyhow::anyhow!("Invalid spatial SRID prefix"))?;
+        let srid = text[5..separator].parse::<u32>()?;
+        (srid, text[separator + 1..].trim())
+    } else {
+        (0, text)
+    };
+    let open = wkt
+        .find('(')
+        .ok_or_else(|| anyhow::anyhow!("Invalid geometry text"))?;
+    if !wkt.ends_with(')') {
+        anyhow::bail!("Invalid geometry text");
+    }
+    let kind = wkt[..open].trim().to_ascii_uppercase();
+    let body = &wkt[open + 1..wkt.len() - 1];
+    let geometry = match kind.as_str() {
+        "POINT" => SpatialGeometry::Point(parse_spatial_point(body)?),
+        "LINESTRING" => SpatialGeometry::LineString(parse_spatial_point_list(body)?),
+        "POLYGON" => SpatialGeometry::Polygon(
+            split_spatial_parts(body)
+                .into_iter()
+                .map(|ring| parse_spatial_point_list(strip_spatial_parentheses(&ring)?))
+                .collect::<anyhow::Result<Vec<_>>>()?,
+        ),
+        _ => anyhow::bail!("Unsupported geometry type '{kind}'"),
+    };
+    Ok(SpatialValue { srid, geometry })
+}
+
+fn serialize_spatial_value(value: &SpatialValue) -> Vec<u8> {
+    let wkt = spatial_geometry_wkt(&value.geometry);
+    if value.srid == 0 {
+        wkt.into_bytes()
+    } else {
+        format!("SRID={};{wkt}", value.srid).into_bytes()
+    }
+}
+
+fn spatial_geometry_wkt(geometry: &SpatialGeometry) -> String {
+    match geometry {
+        SpatialGeometry::Point(point) => format!(
+            "POINT({} {})",
+            format_mysql_number(point.x),
+            format_mysql_number(point.y)
+        ),
+        SpatialGeometry::LineString(points) => format!(
+            "LINESTRING({})",
+            points
+                .iter()
+                .map(|point| format!(
+                    "{} {}",
+                    format_mysql_number(point.x),
+                    format_mysql_number(point.y)
+                ))
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        SpatialGeometry::Polygon(rings) => format!(
+            "POLYGON({})",
+            rings
+                .iter()
+                .map(|ring| format!(
+                    "({})",
+                    ring.iter()
+                        .map(|point| format!(
+                            "{} {}",
+                            format_mysql_number(point.x),
+                            format_mysql_number(point.y)
+                        ))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ))
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+    }
+}
+
+fn spatial_srid_uses_latitude_longitude(srid: u32) -> bool {
+    srid == 4326
+}
+
+fn spatial_swap_axes(geometry: SpatialGeometry) -> SpatialGeometry {
+    let swap = |point: SpatialPoint| SpatialPoint {
+        x: point.y,
+        y: point.x,
+    };
+    match geometry {
+        SpatialGeometry::Point(point) => SpatialGeometry::Point(swap(point)),
+        SpatialGeometry::LineString(points) => {
+            SpatialGeometry::LineString(points.into_iter().map(swap).collect())
+        }
+        SpatialGeometry::Polygon(rings) => SpatialGeometry::Polygon(
+            rings
+                .into_iter()
+                .map(|ring| ring.into_iter().map(swap).collect())
+                .collect(),
+        ),
+    }
+}
+
+fn spatial_geometry_type(geometry: &SpatialGeometry) -> &'static str {
+    match geometry {
+        SpatialGeometry::Point(_) => "POINT",
+        SpatialGeometry::LineString(_) => "LINESTRING",
+        SpatialGeometry::Polygon(_) => "POLYGON",
+    }
+}
+
+fn spatial_geometry_dimension(geometry: &SpatialGeometry) -> u8 {
+    match geometry {
+        SpatialGeometry::Point(_) => 0,
+        SpatialGeometry::LineString(_) => 1,
+        SpatialGeometry::Polygon(_) => 2,
+    }
+}
+
+fn spatial_geometry_is_valid(geometry: &SpatialGeometry) -> bool {
+    match geometry {
+        SpatialGeometry::Point(point) => point.x.is_finite() && point.y.is_finite(),
+        SpatialGeometry::LineString(points) => {
+            points.len() >= 2
+                && points
+                    .iter()
+                    .all(|point| point.x.is_finite() && point.y.is_finite())
+        }
+        SpatialGeometry::Polygon(rings) => {
+            !rings.is_empty()
+                && rings.iter().all(|ring| {
+                    ring.len() >= 4
+                        && ring.first() == ring.last()
+                        && spatial_ring_area(ring).abs() > f64::EPSILON
+                })
+        }
+    }
+}
+
+fn parse_spatial_point(value: &str) -> anyhow::Result<SpatialPoint> {
+    let coordinates = value.split_whitespace().collect::<Vec<_>>();
+    if coordinates.len() != 2 {
+        anyhow::bail!("Invalid POINT geometry");
+    }
+    Ok(SpatialPoint {
+        x: coordinates[0].parse()?,
+        y: coordinates[1].parse()?,
+    })
+}
+
+fn parse_spatial_point_list(value: &str) -> anyhow::Result<Vec<SpatialPoint>> {
+    let points = split_spatial_parts(value)
+        .into_iter()
+        .map(|point| parse_spatial_point(&point))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    if points.is_empty() {
+        anyhow::bail!("Geometry requires at least one point");
+    }
+    Ok(points)
+}
+
+fn split_spatial_parts(value: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (index, character) in value.char_indices() {
+        match character {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                parts.push(value[start..index].trim().to_string());
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(value[start..].trim().to_string());
+    parts
+}
+
+fn strip_spatial_parentheses(value: &str) -> anyhow::Result<&str> {
+    let value = value.trim();
+    if value.starts_with('(') && value.ends_with(')') {
+        Ok(&value[1..value.len() - 1])
+    } else {
+        anyhow::bail!("Invalid POLYGON ring")
+    }
+}
+
+fn spatial_ring_area(ring: &[SpatialPoint]) -> f64 {
+    ring.windows(2)
+        .map(|points| points[0].x * points[1].y - points[1].x * points[0].y)
+        .sum::<f64>()
+        / 2.0
+}
+
+fn spatial_polygon_area(rings: &[Vec<SpatialPoint>]) -> f64 {
+    rings
+        .first()
+        .map(|ring| spatial_ring_area(ring).abs())
+        .unwrap_or(0.0)
+        - rings
+            .iter()
+            .skip(1)
+            .map(|ring| spatial_ring_area(ring).abs())
+            .sum::<f64>()
+}
+
+fn spatial_line_length(points: &[SpatialPoint]) -> f64 {
+    points
+        .windows(2)
+        .map(|segment| {
+            let dx = segment[1].x - segment[0].x;
+            let dy = segment[1].y - segment[0].y;
+            dx.hypot(dy)
+        })
+        .sum()
+}
+
+fn spatial_geometry_distance(left: &SpatialGeometry, right: &SpatialGeometry) -> Option<f64> {
+    match (left, right) {
+        (SpatialGeometry::Point(left), SpatialGeometry::Point(right)) => {
+            Some((left.x - right.x).hypot(left.y - right.y))
+        }
+        _ => None,
+    }
+}
+
+fn point_on_segment(point: SpatialPoint, start: SpatialPoint, end: SpatialPoint) -> bool {
+    let cross = (point.y - start.y) * (end.x - start.x) - (point.x - start.x) * (end.y - start.y);
+    if cross.abs() > 1e-9 {
+        return false;
+    }
+    point.x >= start.x.min(end.x) - 1e-9
+        && point.x <= start.x.max(end.x) + 1e-9
+        && point.y >= start.y.min(end.y) - 1e-9
+        && point.y <= start.y.max(end.y) + 1e-9
+}
+
+fn segment_intersects(
+    left_start: SpatialPoint,
+    left_end: SpatialPoint,
+    right_start: SpatialPoint,
+    right_end: SpatialPoint,
+) -> bool {
+    fn orientation(first: SpatialPoint, second: SpatialPoint, third: SpatialPoint) -> f64 {
+        (second.x - first.x) * (third.y - first.y) - (second.y - first.y) * (third.x - first.x)
+    }
+    let first = orientation(left_start, left_end, right_start);
+    let second = orientation(left_start, left_end, right_end);
+    let third = orientation(right_start, right_end, left_start);
+    let fourth = orientation(right_start, right_end, left_end);
+    (first * second < 0.0 && third * fourth < 0.0)
+        || (first.abs() <= 1e-9 && point_on_segment(right_start, left_start, left_end))
+        || (second.abs() <= 1e-9 && point_on_segment(right_end, left_start, left_end))
+        || (third.abs() <= 1e-9 && point_on_segment(left_start, right_start, right_end))
+        || (fourth.abs() <= 1e-9 && point_on_segment(left_end, right_start, right_end))
+}
+
+fn spatial_ring_boundary_intersects(left: &[SpatialPoint], right: &[SpatialPoint]) -> bool {
+    left.windows(2).any(|left_segment| {
+        right.windows(2).any(|right_segment| {
+            segment_intersects(
+                left_segment[0],
+                left_segment[1],
+                right_segment[0],
+                right_segment[1],
+            )
+        })
+    })
+}
+
+fn spatial_point_in_ring(point: SpatialPoint, ring: &[SpatialPoint]) -> (bool, bool) {
+    let mut inside = false;
+    for segment in ring.windows(2) {
+        if point_on_segment(point, segment[0], segment[1]) {
+            return (false, true);
+        }
+        if (segment[0].y > point.y) != (segment[1].y > point.y)
+            && point.x
+                < (segment[1].x - segment[0].x) * (point.y - segment[0].y)
+                    / (segment[1].y - segment[0].y)
+                    + segment[0].x
+        {
+            inside = !inside;
+        }
+    }
+    (inside, false)
+}
+
+fn spatial_point_in_polygon(point: SpatialPoint, rings: &[Vec<SpatialPoint>]) -> (bool, bool) {
+    let Some(exterior) = rings.first() else {
+        return (false, false);
+    };
+    let (inside, boundary) = spatial_point_in_ring(point, exterior);
+    if boundary {
+        return (false, true);
+    }
+    if !inside {
+        return (false, false);
+    }
+    for hole in rings.iter().skip(1) {
+        let (inside_hole, boundary_hole) = spatial_point_in_ring(point, hole);
+        if boundary_hole {
+            return (false, true);
+        }
+        if inside_hole {
+            return (false, false);
+        }
+    }
+    (true, false)
+}
+
+fn spatial_geometry_equals(left: &SpatialGeometry, right: &SpatialGeometry) -> bool {
+    left == right
+}
+
+fn spatial_contains(left: &SpatialGeometry, right: &SpatialGeometry) -> bool {
+    match (left, right) {
+        (SpatialGeometry::Polygon(rings), SpatialGeometry::Point(point)) => {
+            spatial_point_in_polygon(*point, rings).0
+        }
+        (SpatialGeometry::Polygon(rings), SpatialGeometry::LineString(points)) => points
+            .iter()
+            .all(|point| spatial_point_in_polygon(*point, rings).0),
+        (SpatialGeometry::Polygon(left_rings), SpatialGeometry::Polygon(right_rings)) => {
+            right_rings
+                .first()
+                .and_then(|ring| ring.first())
+                .is_some_and(|point| spatial_point_in_polygon(*point, left_rings).0)
+        }
+        (SpatialGeometry::Point(left), SpatialGeometry::Point(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn spatial_intersects(left: &SpatialGeometry, right: &SpatialGeometry) -> bool {
+    match (left, right) {
+        (SpatialGeometry::Point(left), SpatialGeometry::Point(right)) => left == right,
+        (SpatialGeometry::Point(point), SpatialGeometry::LineString(line))
+        | (SpatialGeometry::LineString(line), SpatialGeometry::Point(point)) => line
+            .windows(2)
+            .any(|segment| point_on_segment(*point, segment[0], segment[1])),
+        (SpatialGeometry::Point(point), SpatialGeometry::Polygon(rings))
+        | (SpatialGeometry::Polygon(rings), SpatialGeometry::Point(point)) => {
+            let (inside, boundary) = spatial_point_in_polygon(*point, rings);
+            inside || boundary
+        }
+        (SpatialGeometry::LineString(left), SpatialGeometry::LineString(right)) => {
+            left.windows(2).any(|left_segment| {
+                right.windows(2).any(|right_segment| {
+                    segment_intersects(
+                        left_segment[0],
+                        left_segment[1],
+                        right_segment[0],
+                        right_segment[1],
+                    )
+                })
+            })
+        }
+        (SpatialGeometry::LineString(line), SpatialGeometry::Polygon(rings))
+        | (SpatialGeometry::Polygon(rings), SpatialGeometry::LineString(line)) => {
+            line.iter()
+                .any(|point| spatial_point_in_polygon(*point, rings).0)
+                || rings
+                    .iter()
+                    .any(|ring| spatial_ring_boundary_intersects(line, ring))
+        }
+        (SpatialGeometry::Polygon(left), SpatialGeometry::Polygon(right)) => {
+            left.iter().any(|left_ring| {
+                right
+                    .iter()
+                    .any(|right_ring| spatial_ring_boundary_intersects(left_ring, right_ring))
+            }) || left
+                .first()
+                .and_then(|ring| ring.first())
+                .is_some_and(|point| spatial_point_in_polygon(*point, right).0)
+                || right
+                    .first()
+                    .and_then(|ring| ring.first())
+                    .is_some_and(|point| spatial_point_in_polygon(*point, left).0)
+        }
+    }
+}
+
+fn spatial_touches(left: &SpatialGeometry, right: &SpatialGeometry) -> bool {
+    match (left, right) {
+        (SpatialGeometry::Point(point), SpatialGeometry::Polygon(rings))
+        | (SpatialGeometry::Polygon(rings), SpatialGeometry::Point(point)) => {
+            spatial_point_in_polygon(*point, rings).1
+        }
+        _ => {
+            spatial_intersects(left, right)
+                && !spatial_contains(left, right)
+                && !spatial_contains(right, left)
+        }
+    }
+}
+
+fn spatial_crosses(left: &SpatialGeometry, right: &SpatialGeometry) -> bool {
+    matches!(
+        (left, right),
+        (
+            SpatialGeometry::LineString(_),
+            SpatialGeometry::LineString(_)
+        )
+    ) && spatial_intersects(left, right)
+        && !spatial_geometry_equals(left, right)
+}
+
+fn spatial_overlaps(left: &SpatialGeometry, right: &SpatialGeometry) -> bool {
+    matches!(
+        (left, right),
+        (SpatialGeometry::Polygon(_), SpatialGeometry::Polygon(_))
+    ) && spatial_intersects(left, right)
+        && !spatial_contains(left, right)
+        && !spatial_contains(right, left)
 }
 
 fn parse_scalar_number(value: &[u8]) -> anyhow::Result<f64> {
@@ -63744,6 +64489,18 @@ mod tests {
                 .db_name(Some("mydb"))
                 .prefer_socket(false);
             let mut connection = mysql::Conn::new(options).unwrap();
+            type SpatialMetrics = (
+                String,
+                String,
+                String,
+                String,
+                String,
+                String,
+                String,
+                String,
+                String,
+            );
+            type SpatialPredicates = (u8, u8, u8, u8, u8, u8, u8, u8);
             let scores: Vec<(f64,)> = connection
                 .query(
                     "SELECT ROUND(MATCH(title,body) AGAINST ('database'), 6)
@@ -63787,6 +64544,57 @@ mod tests {
                     "POINT".to_string(),
                 ))
             );
+            let spatial_metrics: Option<SpatialMetrics> = connection
+                .query_first(
+                    "SELECT ST_GeometryType(ST_LineFromText('LINESTRING(0 0,3 4,6 0)')),
+                            ST_Dimension(ST_PolyFromText('POLYGON((0 0,4 0,4 3,0 0))')),
+                            ST_NumPoints(ST_LineFromText('LINESTRING(0 0,3 4,6 0)')),
+                            ST_AsText(ST_PointN(ST_LineFromText('LINESTRING(0 0,3 4,6 0)'),2)),
+                            ST_Length(ST_LineFromText('LINESTRING(0 0,3 4,6 0)')),
+                            ST_Area(ST_PolyFromText('POLYGON((0 0,4 0,4 3,0 0))')),
+                            ST_NumInteriorRing(ST_PolyFromText('POLYGON((0 0,4 0,4 3,0 0))')),
+                            ST_AsText(ST_ExteriorRing(ST_PolyFromText('POLYGON((0 0,4 0,4 3,0 0))'))),
+                            ST_Distance(ST_PointFromText('POINT(0 0)'),ST_PointFromText('POINT(3 4)'))",
+                )
+                .unwrap();
+            assert_eq!(
+                spatial_metrics,
+                Some((
+                    "LINESTRING".to_string(),
+                    "2".to_string(),
+                    "3".to_string(),
+                    "POINT(3 4)".to_string(),
+                    "10".to_string(),
+                    "6".to_string(),
+                    "0".to_string(),
+                    "LINESTRING(0 0,4 0,4 3,0 0)".to_string(),
+                    "5".to_string(),
+                ))
+            );
+            let spatial_srid: Option<(String, u32, String)> = connection
+                .query_first(
+                    "SELECT ST_AsText(ST_GeomFromText('POINT(1 2)',4326)),
+                            ST_SRID(ST_GeomFromText('POINT(1 2)',4326)),
+                            ST_AsText(ST_SRID(ST_GeomFromText('POINT(1 2)',4326),3857))",
+                )
+                .unwrap();
+            assert_eq!(
+                spatial_srid,
+                Some(("POINT(1 2)".to_string(), 4326, "POINT(2 1)".to_string()))
+            );
+            let spatial_predicates: Option<SpatialPredicates> = connection
+                .query_first(
+                    "SELECT ST_Equals(ST_PointFromText('POINT(1 2)'),ST_PointFromText('POINT(1 2)')),
+                            ST_Contains(ST_PolyFromText('POLYGON((0 0,4 0,4 4,0 4,0 0))'),ST_PointFromText('POINT(1 1)')),
+                            ST_Within(ST_PointFromText('POINT(1 1)'),ST_PolyFromText('POLYGON((0 0,4 0,4 4,0 4,0 0))')),
+                            ST_Intersects(ST_LineFromText('LINESTRING(0 0,4 4)'),ST_LineFromText('LINESTRING(0 4,4 0)')),
+                            ST_Disjoint(ST_PointFromText('POINT(9 9)'),ST_PolyFromText('POLYGON((0 0,4 0,4 4,0 4,0 0))')),
+                            ST_Touches(ST_PointFromText('POINT(0 0)'),ST_PolyFromText('POLYGON((0 0,4 0,4 4,0 4,0 0))')),
+                            ST_Overlaps(ST_PolyFromText('POLYGON((0 0,4 0,4 3,0 0))'),ST_PolyFromText('POLYGON((1 0,5 0,5 3,1 0))')),
+                            ST_Crosses(ST_LineFromText('LINESTRING(0 0,4 4)'),ST_LineFromText('LINESTRING(0 4,4 0)'))",
+                )
+                .unwrap();
+            assert_eq!(spatial_predicates, Some((1, 1, 1, 1, 1, 1, 1, 1)));
             let index_types: Vec<(String, String)> = connection
                 .query(
                     "SELECT INDEX_NAME,INDEX_TYPE
