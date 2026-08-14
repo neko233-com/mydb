@@ -45,7 +45,7 @@ use mydb_storage::{
     TriggerDefinition, TriggerEvent, TriggerTiming, UpdateValueExpression, WriteCommand,
 };
 
-pub const SERVER_VERSION: &str = "8.4.0-mydb-0.1.2";
+pub const SERVER_VERSION: &str = "8.4.0-mydb-0.1.3";
 pub const MYSQL84_DEFAULT_SQL_MODE: &str = "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION";
 /// MySQL 8.4 default `innodb_lock_wait_timeout`, in seconds.
 pub const MYSQL84_DEFAULT_INNODB_LOCK_WAIT_TIMEOUT_SECONDS: u64 = 50;
@@ -754,6 +754,8 @@ struct AuthUser {
     routine_privileges: AuthRoutinePrivileges,
     roles: HashSet<String>,
     #[serde(default)]
+    admin_roles: HashSet<String>,
+    #[serde(default)]
     default_roles: AuthDefaultRoles,
 }
 
@@ -788,6 +790,8 @@ struct AuthRole {
     routine_privileges: AuthRoutinePrivileges,
     #[serde(default)]
     roles: HashSet<String>,
+    #[serde(default)]
+    admin_roles: HashSet<String>,
 }
 
 /// Table grants use database/table keys so legacy auth JSON remains readable
@@ -977,6 +981,7 @@ impl AuthCatalog {
                     column_privileges: AuthColumnPrivileges::default(),
                     routine_privileges: AuthRoutinePrivileges::default(),
                     roles: HashSet::new(),
+                    admin_roles: HashSet::new(),
                     default_roles: AuthDefaultRoles::default(),
                 },
             );
@@ -1018,6 +1023,7 @@ impl AuthCatalog {
                 column_privileges: AuthColumnPrivileges::default(),
                 routine_privileges: AuthRoutinePrivileges::default(),
                 roles: HashSet::new(),
+                admin_roles: HashSet::new(),
                 default_roles: AuthDefaultRoles::default(),
             },
         );
@@ -1227,6 +1233,42 @@ impl AuthCatalog {
             .get(&user_key)
             .map(|entry| entry.roles.clone())
             .unwrap_or_default()
+    }
+
+    fn has_role_admin_option(&self, user: &str, sought_role: &str) -> bool {
+        let data = self.data.read();
+        let Some(user_key) = resolve_auth_user_key(&data.users, user) else {
+            return false;
+        };
+        let Some(user) = data.users.get(&user_key) else {
+            return false;
+        };
+        privilege_set_allows(&user.global_privileges, "GRANT OPTION")
+            || user.admin_roles.contains(sought_role)
+            || user
+                .roles
+                .iter()
+                .any(|role| role_has_admin_option(&data, role, sought_role, &mut HashSet::new()))
+    }
+
+    fn has_role_admin_option_with_roles(
+        &self,
+        user: &str,
+        sought_role: &str,
+        active_roles: &HashSet<String>,
+    ) -> bool {
+        let data = self.data.read();
+        let Some(user_key) = resolve_auth_user_key(&data.users, user) else {
+            return false;
+        };
+        let Some(user) = data.users.get(&user_key) else {
+            return false;
+        };
+        privilege_set_allows(&user.global_privileges, "GRANT OPTION")
+            || user.admin_roles.contains(sought_role)
+            || active_roles
+                .iter()
+                .any(|role| role_has_admin_option(&data, role, sought_role, &mut HashSet::new()))
     }
 
     fn default_roles(&self, user: &str) -> HashSet<String> {
@@ -1463,6 +1505,7 @@ impl AuthCatalog {
                         column_privileges: AuthColumnPrivileges::default(),
                         routine_privileges: AuthRoutinePrivileges::default(),
                         roles: HashSet::new(),
+                        admin_roles: HashSet::new(),
                         default_roles: AuthDefaultRoles::default(),
                     },
                 );
@@ -1518,6 +1561,7 @@ impl AuthCatalog {
                         column_privileges: AuthColumnPrivileges::default(),
                         routine_privileges: AuthRoutinePrivileges::default(),
                         roles: HashSet::new(),
+                        admin_roles: HashSet::new(),
                         default_roles: AuthDefaultRoles::default(),
                     },
                 );
@@ -2036,11 +2080,13 @@ impl AuthCatalog {
             for user in data.users.values_mut() {
                 for role in &roles {
                     user.roles.remove(role);
+                    user.admin_roles.remove(role);
                 }
             }
             for inherited_role in data.roles.values_mut() {
                 for role in &roles {
                     inherited_role.roles.remove(role);
+                    inherited_role.admin_roles.remove(role);
                 }
             }
             Ok(())
@@ -2050,7 +2096,7 @@ impl AuthCatalog {
     fn show_grants(&self, principal: &str, using_roles: &[String]) -> anyhow::Result<Vec<String>> {
         let principal = normalize_auth_name(principal);
         let data = self.data.read();
-        let (mut global, mut databases, mut tables, mut columns, mut routines, roles) =
+        let (mut global, mut databases, mut tables, mut columns, mut routines, roles, admin_roles) =
             if let Some(user) = data.users.get(&principal) {
                 (
                     user.global_privileges.clone(),
@@ -2059,6 +2105,7 @@ impl AuthCatalog {
                     user.column_privileges.clone(),
                     user.routine_privileges.clone(),
                     user.roles.clone(),
+                    user.admin_roles.clone(),
                 )
             } else if let Some(role) = data.roles.get(&principal) {
                 (
@@ -2068,6 +2115,7 @@ impl AuthCatalog {
                     role.column_privileges.clone(),
                     role.routine_privileges.clone(),
                     role.roles.clone(),
+                    role.admin_roles.clone(),
                 )
             } else {
                 anyhow::bail!("Unknown user or role '{}'", principal);
@@ -2158,16 +2206,24 @@ impl AuthCatalog {
         let mut roles = roles.into_iter().collect::<Vec<_>>();
         roles.sort();
         for role in roles {
-            grants.push(format!(
-                "GRANT `{}`@`%` TO {}",
-                role.replace('`', "``"),
-                subject
-            ));
+            let admin_option = if admin_roles.contains(&role) {
+                " WITH ADMIN OPTION"
+            } else {
+                ""
+            };
+            grants.push(
+                format!("GRANT `{}`@`%` TO {}", role.replace('`', "``"), subject) + admin_option,
+            );
         }
         Ok(grants)
     }
 
-    fn grant_roles(&self, roles: &[String], principals: &[String]) -> anyhow::Result<()> {
+    fn grant_roles(
+        &self,
+        roles: &[String],
+        principals: &[String],
+        with_admin_option: bool,
+    ) -> anyhow::Result<()> {
         let roles = normalize_auth_names(roles)?;
         let principals = normalize_auth_names(principals)?;
         self.mutate(|data| {
@@ -2178,14 +2234,19 @@ impl AuthCatalog {
             }
             for principal in &principals {
                 for role in &roles {
-                    grant_role_to_principal(data, role, principal)?;
+                    grant_role_to_principal(data, role, principal, with_admin_option)?;
                 }
             }
             Ok(())
         })
     }
 
-    fn revoke_roles(&self, roles: &[String], principals: &[String]) -> anyhow::Result<()> {
+    fn revoke_roles(
+        &self,
+        roles: &[String],
+        principals: &[String],
+        admin_option_only: bool,
+    ) -> anyhow::Result<()> {
         let roles = normalize_auth_names(roles)?;
         let principals = normalize_auth_names(principals)?;
         self.mutate(|data| {
@@ -2195,15 +2256,19 @@ impl AuthCatalog {
                 }
             }
             for principal in &principals {
-                let entry = if let Some(entry) = data.users.get_mut(principal) {
-                    &mut entry.roles
-                } else if let Some(entry) = data.roles.get_mut(principal) {
-                    &mut entry.roles
-                } else {
-                    anyhow::bail!("Unknown user or role '{}'", principal);
-                };
+                let (entry_roles, entry_admin_roles) =
+                    if let Some(entry) = data.users.get_mut(principal) {
+                        (&mut entry.roles, &mut entry.admin_roles)
+                    } else if let Some(entry) = data.roles.get_mut(principal) {
+                        (&mut entry.roles, &mut entry.admin_roles)
+                    } else {
+                        anyhow::bail!("Unknown user or role '{}'", principal);
+                    };
                 for role in &roles {
-                    entry.remove(role);
+                    entry_admin_roles.remove(role);
+                    if !admin_option_only {
+                        entry_roles.remove(role);
+                    }
                 }
             }
             Ok(())
@@ -2685,13 +2750,36 @@ fn role_inherits(
             .any(|nested| role_inherits(data, nested, sought_role, visited))
 }
 
+fn role_has_admin_option(
+    data: &AuthCatalogData,
+    role_name: &str,
+    sought_role: &str,
+    visited: &mut HashSet<String>,
+) -> bool {
+    if !visited.insert(role_name.to_string()) {
+        return false;
+    }
+    let Some(role) = data.roles.get(role_name) else {
+        return false;
+    };
+    role.admin_roles.contains(sought_role)
+        || role
+            .roles
+            .iter()
+            .any(|nested| role_has_admin_option(data, nested, sought_role, visited))
+}
+
 fn grant_role_to_principal(
     data: &mut AuthCatalogData,
     role: &str,
     principal: &str,
+    with_admin_option: bool,
 ) -> anyhow::Result<()> {
     if let Some(entry) = data.users.get_mut(principal) {
         entry.roles.insert(role.to_string());
+        if with_admin_option {
+            entry.admin_roles.insert(role.to_string());
+        }
         return Ok(());
     }
     if !data.roles.contains_key(principal) {
@@ -2709,6 +2797,13 @@ fn grant_role_to_principal(
         .expect("role was checked above")
         .roles
         .insert(role.to_string());
+    if with_admin_option {
+        data.roles
+            .get_mut(principal)
+            .expect("role was checked above")
+            .admin_roles
+            .insert(role.to_string());
+    }
     Ok(())
 }
 
@@ -9899,6 +9994,17 @@ impl Backend {
         }
     }
 
+    fn auth_has_role_admin_option(&self, user: &str, role: &str) -> bool {
+        if normalize_auth_name(user) == normalize_auth_name(&self.authenticated_username()) {
+            let roles = self.active_role_set();
+            self.config
+                .auth_catalog
+                .has_role_admin_option_with_roles(user, role, &roles)
+        } else {
+            self.config.auth_catalog.has_role_admin_option(user, role)
+        }
+    }
+
     fn current_role_value(&self) -> String {
         let roles = self
             .config
@@ -10040,11 +10146,28 @@ impl Backend {
         let upper_remainder = remainder.to_ascii_uppercase();
         let Some(on) = upper_remainder.find(" ON ") else {
             let user = self.authenticated_username();
-            if self.auth_has_privilege(&user, "", "GRANT OPTION") {
+            let marker = if revoke { " FROM " } else { " TO " };
+            let Some(target_index) = upper_remainder.find(marker) else {
+                anyhow::bail!("authorization statement requires {}", marker.trim());
+            };
+            let role_spec = if revoke && upper_remainder.starts_with("ADMIN OPTION FOR ") {
+                &remainder["ADMIN OPTION FOR ".len()..target_index]
+            } else {
+                &remainder[..target_index]
+            };
+            let roles = split_csv(role_spec)
+                .into_iter()
+                .map(|role| normalize_auth_name(&role))
+                .collect::<Vec<_>>();
+            if !roles.is_empty()
+                && roles
+                    .iter()
+                    .all(|role| self.auth_has_role_admin_option(&user, role))
+            {
                 return Ok(());
             }
             anyhow::bail!(
-                "Access denied; user '{}' lacks GRANT OPTION for role administration",
+                "Access denied; user '{}' lacks ADMIN OPTION for role administration",
                 user
             );
         };
@@ -11027,12 +11150,36 @@ impl Backend {
         let target_index = upper_remainder
             .find(marker)
             .ok_or_else(|| anyhow::anyhow!("authorization statement requires {}", marker.trim()))?;
-        let roles = split_csv(remainder[..target_index].trim());
-        let principals = split_csv(remainder[target_index + marker.len()..].trim());
-        if revoke {
-            self.config.auth_catalog.revoke_roles(&roles, &principals)?;
+        let role_clause = remainder[..target_index].trim();
+        let admin_option_only = revoke
+            && role_clause
+                .to_ascii_uppercase()
+                .starts_with("ADMIN OPTION FOR ");
+        let roles = if admin_option_only {
+            split_csv(role_clause["ADMIN OPTION FOR ".len()..].trim())
         } else {
-            self.config.auth_catalog.grant_roles(&roles, &principals)?;
+            split_csv(role_clause)
+        };
+        let principal_clause = remainder[target_index + marker.len()..].trim();
+        let with_admin_option = !revoke
+            && principal_clause
+                .to_ascii_uppercase()
+                .strip_suffix(" WITH ADMIN OPTION")
+                .is_some();
+        let principal_clause = if with_admin_option {
+            principal_clause[..principal_clause.len() - " WITH ADMIN OPTION".len()].trim()
+        } else {
+            principal_clause
+        };
+        let principals = split_csv(principal_clause);
+        if revoke {
+            self.config
+                .auth_catalog
+                .revoke_roles(&roles, &principals, admin_option_only)?;
+        } else {
+            self.config
+                .auth_catalog
+                .grant_roles(&roles, &principals, with_admin_option)?;
         }
         Ok(QueryOutcome::ok(0))
     }
@@ -24497,6 +24644,7 @@ struct AuthPrincipalMetadata {
     database_privileges: HashMap<String, HashSet<String>>,
     table_privileges: AuthTablePrivileges,
     roles: HashSet<String>,
+    admin_roles: HashSet<String>,
     column_privileges: AuthColumnPrivileges,
     routine_privileges: AuthRoutinePrivileges,
     plugin: String,
@@ -24596,6 +24744,7 @@ fn auth_catalog_metadata_principals(
             database_privileges: user.database_privileges.clone(),
             table_privileges: user.table_privileges.clone(),
             roles: user.roles.clone(),
+            admin_roles: user.admin_roles.clone(),
             column_privileges: user.column_privileges.clone(),
             routine_privileges: user.routine_privileges.clone(),
             plugin: user.plugin.clone(),
@@ -24612,6 +24761,7 @@ fn auth_catalog_metadata_principals(
                     database_privileges: role.database_privileges.clone(),
                     table_privileges: role.table_privileges.clone(),
                     roles: role.roles.clone(),
+                    admin_roles: role.admin_roles.clone(),
                     column_privileges: role.column_privileges.clone(),
                     routine_privileges: role.routine_privileges.clone(),
                     plugin: default_authentication_plugin(),
@@ -24975,11 +25125,19 @@ fn information_schema_applicable_roles_rows(
         return Vec::new();
     };
     let (user, host) = mysql_account_parts(&principal);
-    let grantable = data
-        .users
-        .get(&principal)
-        .map(|account| auth_grantable(&account.global_privileges) == "YES")
-        .unwrap_or(false);
+    let (grantable, admin_roles) = if let Some(account) = data.users.get(&principal) {
+        (
+            auth_grantable(&account.global_privileges) == "YES",
+            account.admin_roles.clone(),
+        )
+    } else if let Some(role) = data.roles.get(&principal) {
+        (
+            auth_grantable(&role.global_privileges) == "YES",
+            role.admin_roles.clone(),
+        )
+    } else {
+        (false, HashSet::new())
+    };
     let default_roles = data
         .users
         .get(&principal)
@@ -25019,7 +25177,11 @@ fn information_schema_applicable_roles_rows(
             bytes(&host),
             bytes(&role_user),
             bytes(&role_host),
-            bytes(if grantable { "YES" } else { "NO" }),
+            bytes(if grantable || admin_roles.contains(&role_name) {
+                "YES"
+            } else {
+                "NO"
+            }),
             bytes(if default_roles.contains(&role_name) {
                 "YES"
             } else {
@@ -25110,18 +25272,23 @@ fn mysql_virtual_tables(auth_catalog: &AuthCatalog, viewer: &str) -> HashMap<Str
         }
         for role in &principal.roles {
             let (from_user, from_host) = mysql_account_parts(role);
+            let admin_option = if principal.admin_roles.contains(role) {
+                "Y"
+            } else {
+                "N"
+            };
             role_edges_rows.push(vec![
                 bytes(&from_host),
                 bytes(&from_user),
                 bytes(&host),
                 bytes(&user),
-                bytes("N"),
+                bytes(admin_option),
             ]);
             roles_mapping_rows.push(vec![
                 bytes(&host),
                 bytes(&user),
                 bytes(&from_user),
-                bytes("N"),
+                bytes(admin_option),
             ]);
         }
         for (database, tables) in &principal.table_privileges {
@@ -49609,7 +49776,11 @@ mod tests {
             )
             .unwrap();
         catalog
-            .grant_roles(&["analyst".to_string()], &["game_writer".to_string()])
+            .grant_roles(
+                &["analyst".to_string()],
+                &["game_writer".to_string()],
+                false,
+            )
             .unwrap();
         drop(catalog);
 
@@ -51862,6 +52033,81 @@ mod tests {
             .config
             .auth_catalog
             .has_privilege("nested_reader", "mydb", "SELECT"));
+    }
+
+    #[tokio::test]
+    async fn role_admin_option_is_scoped_and_revocable() {
+        let (_temp, _storage, mut backend, _second) = transaction_backends().await;
+        backend
+            .execute(
+                "CREATE USER role_admin IDENTIFIED BY 'admin-password', \
+                 recipient IDENTIFIED BY 'recipient-password', \
+                 other_recipient IDENTIFIED BY 'other-password'",
+            )
+            .await
+            .expect("role administration users should be created");
+        backend
+            .execute("CREATE ROLE reporting, payroll")
+            .await
+            .expect("roles should be created");
+        backend
+            .execute("GRANT reporting TO role_admin WITH ADMIN OPTION")
+            .await
+            .expect("root should grant role admin option");
+
+        *backend.authenticated_user.lock() = Some("role_admin".into());
+        *backend.active_roles.lock() = None;
+        backend
+            .execute("GRANT reporting TO recipient")
+            .await
+            .expect("role admin should delegate its role");
+        backend
+            .execute("GRANT reporting TO other_recipient WITH ADMIN OPTION")
+            .await
+            .expect("role admin should delegate admin option");
+        assert!(backend.execute("GRANT payroll TO recipient").await.is_err());
+        backend
+            .execute("REVOKE ADMIN OPTION FOR reporting FROM other_recipient")
+            .await
+            .expect("role admin should revoke only admin option");
+
+        {
+            let data = backend.config.auth_catalog.data.read();
+            assert!(data.users["recipient"].roles.contains("reporting"));
+            assert!(!data.users["recipient"].admin_roles.contains("reporting"));
+            assert!(data.users["other_recipient"].roles.contains("reporting"));
+            assert!(!data.users["other_recipient"]
+                .admin_roles
+                .contains("reporting"));
+        }
+
+        backend
+            .execute("REVOKE reporting FROM recipient")
+            .await
+            .expect("role admin should revoke its role");
+        assert!(!backend.config.auth_catalog.data.read().users["recipient"]
+            .roles
+            .contains("reporting"));
+
+        *backend.authenticated_user.lock() = Some("root".into());
+        assert!(query_rows(
+            &mut backend,
+            "SELECT FROM_USER,TO_USER,WITH_ADMIN_OPTION FROM mysql.role_edges \
+             WHERE TO_USER='other_recipient'",
+        )
+        .await
+        .iter()
+        .any(|row| { row == &vec![bytes("reporting"), bytes("other_recipient"), bytes("N")] }));
+        let grants = query_rows(&mut backend, "SHOW GRANTS FOR other_recipient")
+            .await
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|value| String::from_utf8(value).expect("SHOW GRANTS should be UTF-8"))
+            .collect::<Vec<_>>();
+        assert!(grants
+            .iter()
+            .any(|grant| grant.contains("GRANT `reporting`@`%` TO `other_recipient`@`%`")));
     }
 
     #[tokio::test]

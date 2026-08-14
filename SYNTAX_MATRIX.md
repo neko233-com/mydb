@@ -117,7 +117,7 @@
 | `RENAME USER old TO new` | ✅ Verified | 本轮新增（`AuthCatalog::rename_user`） |
 | `SET PASSWORD [FOR user] = '...'` | ✅ Verified | 本轮新增，路由到 `alter_user_passwords` |
 | `SHOW GRANTS` | ✅ Verified | |
-| 表级 / 列级权限（`tables_priv`/`columns_priv`） | 🟡 Partial | 表级与 `GRANT SELECT/INSERT/UPDATE/REFERENCES (列)` 已持久化、角色继承、`SHOW GRANTS`/虚拟表展示；复杂 JOIN 的每个基表及 JOIN/WHERE/GROUP/HAVING/ORDER 投影列级 SELECT、JOIN UPDATE/DELETE 的逐目标表/逐读取列授权、`INSERT ... SELECT` 目标写列/来源读列授权、`ON DUPLICATE KEY UPDATE` 的 INSERT/UPDATE/既有行 SELECT 与 `VALUES(col)` 入参边界已验证；全局/库/表/列/例程授权委托现按被授予权限与同级或更宽范围 `GRANT OPTION` 校验，跨库/越权委托已回归；角色 `ADMIN OPTION` 与完整授权撤销矩阵仍待补齐 |
+| 表级 / 列级权限（`tables_priv`/`columns_priv`） | 🟡 Partial | 表级与 `GRANT SELECT/INSERT/UPDATE/REFERENCES (列)` 已持久化、角色继承、`SHOW GRANTS`/虚拟表展示；复杂 JOIN 的每个基表及 JOIN/WHERE/GROUP/HAVING/ORDER 投影列级 SELECT、JOIN UPDATE/DELETE 的逐目标表/逐读取列授权、`INSERT ... SELECT` 目标写列/来源读列授权、`ON DUPLICATE KEY UPDATE` 的 INSERT/UPDATE/既有行 SELECT 与 `VALUES(col)` 入参边界已验证；全局/库/表/列/例程授权委托现按被授予权限与同级或更宽范围 `GRANT OPTION` 校验，角色委托按 `ADMIN OPTION` 校验并支持 `REVOKE ADMIN OPTION FOR`，跨库/越权委托已回归；完整授权撤销矩阵仍待补齐 |
 | `mysql.user` / `mysql.db` / `mysql.role_edges` / `mysql.roles_mapping` 虚拟表 | ✅ Verified | 真实填充；兼容 MySQL 与 MariaDB/GoLand 角色元数据查询 |
 | `mysql.global_grants` / `default_roles` / `tables_priv` / `columns_priv` / `procs_priv` / `func` 虚拟表 | ✅ Verified | `procs_priv` 反映用户/角色的例程权限；动态全局权限未实现，`global_grants` 故意为空 |
 | 审计日志 | ✅ Verified | `AuditLog` 轮转 worker + metrics |
@@ -214,4 +214,4 @@
 - **已实现并经测试**：DDL 全量、DML 全量、事务与锁常用面、存储函数/事件调度、账号/角色/审计、information_schema+mysql 虚拟库、时区、错误码、协议与迁移。
 - **本轮补齐（兼容 no-op / 虚拟表 / 表面）**：performance_schema、sys、RENAME USER、SET PASSWORD、ALTER DATABASE 选项、ANALYZE/OPTIMIZE/CHECK/REPAIR/CHECKSUM TABLE、FLUSH、CACHE INDEX、复制 SHOW 表面；本地 XA 已从兼容 no-op 提升为跨连接 prepared 分支与锁生命周期语义。
 - **明确不支持（设计决定，非临时延迟 ❌）**：binlog 复制拓扑 / GTID、读写分离、Group Replication / Galera、分布式 XA 两阶段协调、跨节点一致性。这些是**非单机能力**，与 MyDB“替代 MySQL 的单机数据库”定位相悖，不会实现，也不计入“缺失”。复制 SHOW 表面（空结果）与本地 XA（会话内事务）仍作为兼容表面保留。
-- **尚未完成（单机范围内的语义 🔴 Deferred）**：完整 next-key/gap 锁与全部隐式锁边界、复杂 UPSERT 表达式的全语法逐列权限、角色 `ADMIN OPTION` 与完整授权撤销矩阵、排序规则在所有 `ORDER BY`/JOIN/GROUP BY 路径的真实权重（`*_general_ci`/`*_ai_ci`）、更复杂关联 HAVING 谓词树、routine 局部变量 charset/collation、冷门语句清理边缘。基础多方死锁与成本化 victim、分组相关标量 HAVING、`AND`+关联 EXISTS、复杂 JOIN 的 SELECT 基表/列授权、JOIN DML 与 `INSERT ... SELECT` 的核心列授权、递归 CTE 的 MySQL 拒绝边界已完成。它们仍是“完整 MySQL 8.4 对外表现”目标的未完成项。
+- **尚未完成（单机范围内的语义 🔴 Deferred）**：完整 next-key/gap 锁与全部隐式锁边界、复杂 UPSERT 表达式的全语法逐列权限、完整授权撤销矩阵、排序规则在所有 `ORDER BY`/JOIN/GROUP BY 路径的真实权重（`*_general_ci`/`*_ai_ci`）、更复杂关联 HAVING 谓词树、routine 局部变量 charset/collation、冷门语句清理边缘。基础多方死锁与成本化 victim、分组相关标量 HAVING、`AND`+关联 EXISTS、复杂 JOIN 的 SELECT 基表/列授权、JOIN DML 与 `INSERT ... SELECT` 的核心列授权、角色 `ADMIN OPTION`、递归 CTE 的 MySQL 拒绝边界已完成。它们仍是“完整 MySQL 8.4 对外表现”目标的未完成项。
