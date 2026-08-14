@@ -901,9 +901,7 @@ impl AuthRoutinePrivileges {
             return;
         };
         if let Some(current) = routines.get_mut(&routine) {
-            for privilege in privileges {
-                current.remove(privilege);
-            }
+            revoke_privilege_set(current, privileges);
             if current.is_empty() {
                 routines.remove(&routine);
             }
@@ -1803,9 +1801,7 @@ impl AuthCatalog {
                 };
                 if let Some(tables) = grants.get_mut(&database) {
                     if let Some(current) = tables.get_mut(&table) {
-                        for privilege in privileges {
-                            current.remove(privilege);
-                        }
+                        revoke_privilege_set(current, privileges);
                         if current.is_empty() {
                             tables.remove(&table);
                         }
@@ -1891,9 +1887,7 @@ impl AuthCatalog {
                     if let Some(current) = tables.get_mut(&table) {
                         for (column, privileges) in columns {
                             if let Some(existing) = current.get_mut(&column.to_ascii_lowercase()) {
-                                for privilege in privileges {
-                                    existing.remove(privilege);
-                                }
+                                revoke_privilege_set(existing, privileges);
                                 if existing.is_empty() {
                                     current.remove(&column.to_ascii_lowercase());
                                 }
@@ -1942,9 +1936,7 @@ impl AuthCatalog {
                         .and_then(|database| role.database_privileges.get_mut(database))
                         .unwrap_or(&mut role.global_privileges)
                 };
-                for privilege in privileges {
-                    target.remove(privilege);
-                }
+                revoke_privilege_set(target, privileges);
             }
             Ok(())
         })
@@ -2534,6 +2526,47 @@ fn verify_caching_sha2_password_sha256(hash: &str, salt: &[u8], response: &[u8])
 
 fn privilege_set_allows(set: &HashSet<String>, privilege: &str) -> bool {
     set.contains("ALL") || set.contains(&privilege.to_ascii_uppercase())
+}
+
+const ALL_AUTH_PRIVILEGES: &[&str] = &[
+    "SELECT",
+    "INSERT",
+    "UPDATE",
+    "DELETE",
+    "CREATE",
+    "DROP",
+    "ALTER",
+    "INDEX",
+    "EXECUTE",
+    "CREATE ROUTINE",
+    "ALTER ROUTINE",
+    "CREATE USER",
+    "GRANT OPTION",
+    "FILE",
+    "PROCESS",
+    "RELOAD",
+    "LOCK TABLES",
+    "CONNECTION_ADMIN",
+    "SET_USER_ID",
+    "EVENT",
+];
+
+fn revoke_privilege_set(current: &mut HashSet<String>, revoked: &HashSet<String>) {
+    if revoked.contains("ALL") {
+        current.clear();
+        return;
+    }
+    if current.remove("ALL") {
+        current.extend(
+            ALL_AUTH_PRIVILEGES
+                .iter()
+                .filter(|privilege| !revoked.contains(**privilege))
+                .map(|privilege| (*privilege).to_string()),
+        );
+    }
+    for privilege in revoked {
+        current.remove(privilege);
+    }
 }
 
 fn role_has_privilege(
@@ -51167,6 +51200,121 @@ mod tests {
             .execute("GRANT SELECT ON mydb.grant_scope TO recipient")
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn revoke_partial_all_removes_effective_privilege_at_each_scope() {
+        let (_temp, _storage, mut backend, _second) = transaction_backends().await;
+        backend
+            .execute("CREATE TABLE revoke_scope (id BIGINT PRIMARY KEY, name VARCHAR(32))")
+            .await
+            .expect("revoke test table should be created");
+        backend
+            .execute(
+                "CREATE USER partial_global IDENTIFIED BY 'global-password', \
+                 partial_table IDENTIFIED BY 'table-password', \
+                 partial_column IDENTIFIED BY 'column-password', \
+                 partial_routine IDENTIFIED BY 'routine-password'",
+            )
+            .await
+            .expect("revoke test objects should be created");
+        backend
+            .execute("CREATE PROCEDURE mydb.revoke_proc() SELECT 1")
+            .await
+            .expect("revoke test routine should be created");
+
+        backend
+            .execute("GRANT ALL ON *.* TO partial_global")
+            .await
+            .expect("global ALL grant should succeed");
+        backend
+            .execute("REVOKE SELECT ON *.* FROM partial_global")
+            .await
+            .expect("global partial revoke should succeed");
+        assert!(!backend
+            .config
+            .auth_catalog
+            .has_privilege("partial_global", "mydb", "SELECT"));
+        assert!(backend
+            .config
+            .auth_catalog
+            .has_privilege("partial_global", "mydb", "UPDATE"));
+        backend
+            .execute("REVOKE GRANT OPTION FOR UPDATE ON *.* FROM partial_global")
+            .await
+            .expect("global grant option revoke should succeed");
+        assert!(!backend.config.auth_catalog.has_privilege(
+            "partial_global",
+            "mydb",
+            "GRANT OPTION"
+        ));
+
+        backend
+            .execute("GRANT ALL ON mydb.revoke_scope TO partial_table")
+            .await
+            .expect("table ALL grant should succeed");
+        backend
+            .execute("REVOKE SELECT ON mydb.revoke_scope FROM partial_table")
+            .await
+            .expect("table partial revoke should succeed");
+        assert!(!backend.config.auth_catalog.has_table_privilege(
+            "partial_table",
+            "mydb",
+            "revoke_scope",
+            "SELECT"
+        ));
+        assert!(backend.config.auth_catalog.has_table_privilege(
+            "partial_table",
+            "mydb",
+            "revoke_scope",
+            "UPDATE"
+        ));
+
+        backend
+            .execute("GRANT SELECT (name), UPDATE (name) ON mydb.revoke_scope TO partial_column")
+            .await
+            .expect("column grants should succeed");
+        backend
+            .execute("REVOKE SELECT (name) ON mydb.revoke_scope FROM partial_column")
+            .await
+            .expect("column partial revoke should succeed");
+        assert!(!backend.config.auth_catalog.has_column_privilege(
+            "partial_column",
+            "mydb",
+            "revoke_scope",
+            "name",
+            "SELECT"
+        ));
+        assert!(backend.config.auth_catalog.has_column_privilege(
+            "partial_column",
+            "mydb",
+            "revoke_scope",
+            "name",
+            "UPDATE"
+        ));
+
+        backend
+            .execute("GRANT ALL ON PROCEDURE mydb.revoke_proc TO partial_routine")
+            .await
+            .expect("routine ALL grant should succeed");
+        backend
+            .execute("REVOKE EXECUTE ON PROCEDURE mydb.revoke_proc FROM partial_routine")
+            .await
+            .expect("routine partial revoke should succeed");
+        assert!(!backend.config.auth_catalog.has_routine_privilege(
+            "partial_routine",
+            RoutineKind::Procedure,
+            "mydb",
+            "revoke_proc",
+            "EXECUTE"
+        ));
+        assert!(backend.config.auth_catalog.has_routine_privilege(
+            "partial_routine",
+            RoutineKind::Procedure,
+            "mydb",
+            "revoke_proc",
+            "ALTER ROUTINE"
+        ));
     }
 
     #[tokio::test]
