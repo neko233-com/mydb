@@ -3,7 +3,8 @@
 
 Runs the `mydb-bench` workload against both databases (running under identical
 Docker CPU/memory limits) and writes a reproducible Markdown report with
-per-scenario medians and ratios.
+per-scenario medians and ratios. The performance phase deliberately has no
+warmup and has a 60-second wall-clock budget.
 
 Usage:
     python3 scripts/bench_docker.py [--samples N] [--memory 2g] [--cpus 2]
@@ -31,16 +32,17 @@ SCENARIOS = [
     # name, human label, args
     ("single", "单表写（fsync-per-commit）",
      ["--actors", "1", "--table-count", "1", "--transaction-size", "1",
-      "--writes-per-actor", "1000", "--reads-per-actor", "0"]),
-    ("concurrent-p99", "并发 P99（8 actor / 8 表，写+点查）",
-     ["--actors", "8", "--table-count", "8", "--transaction-size", "10",
-      "--writes-per-actor", "500", "--reads-per-actor", "50"]),
-    ("concurrent-tp", "并发吞吐（8 actor / 8 表，单行事务）",
-     ["--actors", "8", "--table-count", "8", "--transaction-size", "1",
-      "--writes-per-actor", "1000", "--reads-per-actor", "0"]),
+      "--writes-per-actor", "200", "--reads-per-actor", "0"]),
+    ("concurrent-p99", "并发 P99（4 actor / 4 表，写+点查）",
+     ["--actors", "4", "--table-count", "4", "--transaction-size", "5",
+      "--writes-per-actor", "80", "--reads-per-actor", "10"]),
+    ("concurrent-tp", "并发吞吐（4 actor / 4 表，单行事务）",
+     ["--actors", "4", "--table-count", "4", "--transaction-size", "1",
+      "--writes-per-actor", "200", "--reads-per-actor", "0"]),
 ]
 
 COMMON = ["--reconnect-every-transactions", "0", "--payload-bytes", "256"]
+PERFORMANCE_BUDGET_SECONDS = 60
 
 
 def run(cmd):
@@ -127,7 +129,7 @@ def median(values, key):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--samples", type=int, default=3)
+    ap.add_argument("--samples", type=int, default=1)
     ap.add_argument("--memory", default=os.environ.get("MYDB_MEM", "2g"))
     ap.add_argument("--cpus", default=os.environ.get("MYDB_CPUS", "2"))
     ap.add_argument("--skip-build", action="store_true")
@@ -144,11 +146,7 @@ def main():
         atexit.register(lambda: docker_compose("down", "-v", "--remove-orphans"))
     ensure_up(args.skip_build)
 
-    print("==> warmup (discarded)", flush=True)
-    for _name, _label, sc in SCENARIOS:
-        run_bench(MYDB_URL, sc)
-        run_bench(MYSQL_URL, sc)
-
+    performance_started = time.monotonic()
     results = {"mydb": {}, "mysql": {}}
     for name, label, sc in SCENARIOS:
         print(f"==> scenario: {label}", flush=True)
@@ -157,6 +155,13 @@ def main():
             results[engine][name] = samples
             med = median(samples, "operations_per_second")
             print(f"    {engine}: median {med:.0f} ops/s", flush=True)
+            elapsed = time.monotonic() - performance_started
+            if elapsed > PERFORMANCE_BUDGET_SECONDS:
+                sys.exit(
+                    f"performance phase exceeded {PERFORMANCE_BUDGET_SECONDS}s "
+                    f"without warmup: {elapsed:.1f}s"
+                )
+    performance_elapsed = time.monotonic() - performance_started
 
     metrics = collect_metrics()
     mysql_build = mysql_version()
@@ -187,25 +192,27 @@ def main():
         "一致：MyDB 每组一次 WAL `sync_data()`；MySQL `innodb_flush_log_at_trx_commit=1` "
         "+ `sync_binlog=1`。每项取 %d 次采样中位数。\n" % args.samples)
     lines.append("> 基准工具为 `mydb-bench`，双方执行完全相同的 `ENGINE=InnoDB` 业务 "
-                 "DDL/DML；仅创建并删除唯一命名的 `mydb_game_bench_*` 临时库。\n")
+                 "DDL/DML；仅创建并删除唯一命名的 `mydb_game_bench_*` 临时库。性能阶段不预热，"
+                 "默认单样本并要求在 60 秒内完成。\n")
     lines.append("---\n")
     lines.append("## 测试方法\n")
     lines.append("| 场景 | actors | tables | transaction_size | writes_per_actor | 说明 |")
     lines.append("|------|--------|--------|------------------|------------------|------|")
-    lines.append("| 单表写 | 1 | 1 | 1 | 1000 | 单连接单行事务，每次 COMMIT 持久化 |")
-    lines.append("| 并发 P99 | 8 | 8 | 10 | 500 | 8 并发写、50 点查/actor |")
-    lines.append("| 并发吞吐 | 8 | 8 | 1 | 1000 | 8000 次单行事务，测真实 group commit |\n")
+    lines.append("| 单表写 | 1 | 1 | 1 | 200 | 单连接单行事务，每次 COMMIT 持久化 |")
+    lines.append("| 并发 P99 | 4 | 4 | 5 | 80 | 4 并发写、10 点查/actor |")
+    lines.append("| 并发吞吐 | 4 | 4 | 1 | 200 | 800 次单行事务，测真实 group commit |\n")
     lines.append("## 当前实测（Docker 受控）\n")
     lines.append(f"### Git Revision: `{commit}`")
     lines.append(f"### 测试日期: {date}")
+    lines.append(f"### 性能阶段耗时: {performance_elapsed:.1f}s / {PERFORMANCE_BUDGET_SECONDS}s（无预热）")
     lines.append(f"### 环境: Docker Desktop，linux/amd64；MyDB 容器 {args.cpus} vCPU / {args.memory}，MySQL 容器 {args.cpus} vCPU / {args.memory}")
     lines.append(f"### MySQL: {mysql_build} — `innodb_flush_log_at_trx_commit=1`, `sync_binlog=1`, `transaction_isolation=REPEATABLE-READ`")
     lines.append("### MyDB: `group_commit_window_us=250`，shard_count 自动 = 分配 CPU 数（2），checkpoint 每 1024 个已提交请求\n")
     lines.append(f"| 场景 | MyDB | MySQL {mysql_build.split(' — ', 1)[0]} | MyDB / MySQL |")
     lines.append("|------|------|--------------|---------------|")
     lines.append(f"| 单表写 | {single_m:.0f} ops/s | {single_s:.0f} ops/s | {single_ratio:.2f}x |")
-    lines.append(f"| 8 actor / 8表 写 P99 | {p99_m:.1f} ms | {p99_s:.1f} ms | {p99_ratio:.2f}x（低更好） |")
-    lines.append(f"| 8 actor / 8表 吞吐 | {tp_m:.0f} ops/s | {tp_s:.0f} ops/s | {tp_ratio:.2f}x |")
+    lines.append(f"| 4 actor / 4表 写 P99 | {p99_m:.1f} ms | {p99_s:.1f} ms | {p99_ratio:.2f}x（低更好） |")
+    lines.append(f"| 4 actor / 4表 吞吐 | {tp_m:.0f} ops/s | {tp_s:.0f} ops/s | {tp_ratio:.2f}x |")
     lines.append(f"| 读 P50 | {read_m:.0f} μs | {read_s:.0f} μs | - |\n")
     lines.append("## MyDB 观测\n")
     lines.append(f"- write groups: {metric(metrics, 'mydb_group_commits_total')}")

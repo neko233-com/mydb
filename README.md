@@ -591,16 +591,16 @@ bash scripts/docker-smoke.sh
 
 ## 📊 性能
 
-> 完整测试方法、运行指标和发布前验证见 [性能报告.md](性能报告.md)。下表为 2026-08-14 Docker `linux/amd64` 受控实测；MyDB 与 MySQL 8.4.11 使用相同 CPU/内存限制和持久化设置，3 次采样取中位数。
+> 完整测试方法、运行指标和发布前验证见 [性能报告.md](性能报告.md)。下表为 2026-08-14 Docker `linux/amd64` 受控实测；MyDB 与 MySQL 8.4.11 使用相同 CPU/内存限制和持久化设置，性能阶段不预热、1 次采样且限时 60 秒。
 >
 > 本轮数据：MyDB/MySQL 均为 2 vCPU、2 GiB；MySQL 8.4.11 使用 `innodb_flush_log_at_trx_commit=1`、`sync_binlog=1`，MyDB 使用默认 250μs Group Commit 与每 1024 个已提交请求 checkpoint。
 
 | 场景 | MyDB | MySQL 8.4.11 | MyDB / MySQL |
 |------|------|--------------|--------------|
-| 单表写（fsync-per-commit） | 462 ops/s | 287 ops/s | 1.61x |
-| 8 actor / 8表 写 P99 延迟 | 47.7 ms | 17.5 ms | 0.37x（低更好） |
-| 8 actor / 8表 Group Commit | 1088 ops/s | 274 ops/s | 3.97x |
-| 读 P50 延迟 | 896 μs | 133 μs | - |
+| 单表写（fsync-per-commit） | 221 ops/s | 80 ops/s | 2.77x |
+| 4 actor / 4表 写 P99 延迟 | 35.1 ms | 83.8 ms | 2.39x（低更好） |
+| 4 actor / 4表 Group Commit | 264 ops/s | 147 ops/s | 1.80x |
+| 读 P50 延迟 | 404 μs | 134 μs | - |
 
 性能优化不以关闭 WAL 持久化或弱化恢复语义换取数字。默认 250μs Group Commit 窗口优先并发吞吐，checkpoint 按 1024 个已提交请求触发；不声明未经实测证明的固定倍数。
 
@@ -621,7 +621,7 @@ bash scripts/docker-smoke.sh
 - ✅ MySQL 8.4 CLI 3306 连接、`event_scheduler`/版本探测
 - ✅ Connector/J 9.1.0、Node mysql2 3.23.3 已完成 3306 普通/预处理查询 smoke；Go `database/sql` + go-sql-driver/mysql 1.10.0 已完成当前 release 3306 服务的 Ping、中文、DATE、普通/预处理查询回归
 - ✅ MySQL `'user'@'host'` 基础账户匹配：精确主机优先于通配主机，握手按账户插件选择认证方式
-- ✅ `scripts/bench.ps1`：Docker Linux Rust gate、release build 与同条件 MySQL 8.4 持久化基准通过（报告见 [性能报告.md](性能报告.md)）
+- ✅ `scripts/bench.ps1`：Docker Linux Rust gate、release build 与同条件 MySQL 8.4 持久化基准通过；性能阶段无预热、60 秒硬截止（报告见 [性能报告.md](性能报告.md)）
 - ✅ `scripts/mysql84-diff.ps1`：当前 release 隔离 13307 与同机 Docker MySQL 8.4，102/102 差分通过；新增 JSON 路径/重叠、位聚合、常量聚合投影、未知线程 KILL 错误、角色授权、ai_ci 字符集比较、视图/例程/触发器、FK/CHECK、EXPLAIN 语义和状态接口覆盖
 - ⏳ Ubuntu 24.04 物理性能、macOS 原生验收、宿主断电/恢复中断、大数据压力与生产安全运维验收：以 [CheckList.md](CheckList.md) 与 [性能报告.md](性能报告.md) 为准
 

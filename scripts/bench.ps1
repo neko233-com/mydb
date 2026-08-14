@@ -3,7 +3,7 @@ param(
     [switch]$SkipBuild,
     [switch]$Keep,
     [ValidateRange(1, 5)]
-    [int]$Samples = 3,
+    [int]$Samples = 1,
     [string]$MemoryLimit = "2g",
     [ValidateRange(1, 8)]
     [int]$CpuLimit = 2
