@@ -32935,6 +32935,7 @@ fn evaluate_fulltext_match(
     let against_body = &against[against_open + 1..against_close];
     let against_body_upper = against_body.to_ascii_uppercase();
     let boolean_mode = against_body_upper.contains("IN BOOLEAN MODE");
+    let query_expansion = against_body_upper.contains("WITH QUERY EXPANSION");
     let query_expression = [" IN BOOLEAN MODE", " IN NATURAL LANGUAGE MODE"]
         .into_iter()
         .filter_map(|keyword| {
@@ -32942,6 +32943,11 @@ fn evaluate_fulltext_match(
                 .find(keyword)
                 .map(|position| (position, keyword))
         })
+        .chain([" WITH QUERY EXPANSION"].into_iter().filter_map(|keyword| {
+            against_body_upper
+                .find(keyword)
+                .map(|position| (position, keyword))
+        }))
         .min_by_key(|(position, _)| *position)
         .map_or(against_body, |(position, _)| &against_body[..position]);
     let query = evaluate_scalar_expression(query_expression.trim(), row)?;
@@ -32978,6 +32984,35 @@ fn evaluate_fulltext_match(
                 .join(" ")
         })
         .collect::<Vec<_>>();
+    if query_expansion && !boolean_mode {
+        let base_terms = terms.clone();
+        let mut ranked_documents = documents
+            .iter()
+            .enumerate()
+            .map(|(index, candidate)| {
+                (
+                    index,
+                    fulltext_natural_score(candidate, &documents, &base_terms),
+                )
+            })
+            .filter(|(_, score)| *score > 0.0)
+            .collect::<Vec<_>>();
+        ranked_documents.sort_by(|left, right| {
+            right
+                .1
+                .total_cmp(&left.1)
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        for (index, _) in ranked_documents.into_iter().take(3) {
+            for term in fulltext_tokens(&documents[index]) {
+                if fulltext_searchable_term(&term)
+                    && !terms.iter().any(|(existing, _, _, _)| existing == &term)
+                {
+                    terms.push((term, false, false, false));
+                }
+            }
+        }
+    }
     let document = columns
         .iter()
         .filter_map(|column| row.get(column))
@@ -33024,6 +33059,35 @@ fn evaluate_fulltext_match(
         return Ok(Some(b"0".to_vec()));
     }
     Ok(Some(format_mysql_number(score).into_bytes()))
+}
+
+fn fulltext_natural_score(
+    document: &str,
+    documents: &[String],
+    terms: &[(String, bool, bool, bool)],
+) -> f64 {
+    let total_documents = documents.len().max(1) as f64;
+    terms
+        .iter()
+        .filter_map(|(term, _, excluded, prefix)| {
+            if *excluded {
+                return None;
+            }
+            let count = fulltext_term_count(document, term, *prefix);
+            if count == 0 {
+                return None;
+            }
+            let matching_documents = documents
+                .iter()
+                .filter(|candidate| fulltext_term_count(candidate, term, *prefix) > 0)
+                .count();
+            (matching_documents > 0).then(|| {
+                let inverse_document_frequency =
+                    (total_documents / matching_documents as f64).log10();
+                count as f64 * inverse_document_frequency * inverse_document_frequency
+            })
+        })
+        .sum()
 }
 
 fn fulltext_searchable_term(term: &str) -> bool {
@@ -62353,6 +62417,13 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(prefix_matches, vec![(1,), (0,)]);
+            let expansion_matches: Vec<(u8,)> = connection
+                .query(
+                    "SELECT MATCH(title,body) AGAINST ('database' WITH QUERY EXPANSION) > 0
+                     FROM wire_fulltext ORDER BY id",
+                )
+                .unwrap();
+            assert_eq!(expansion_matches, vec![(1,), (0,)]);
             let spatial: Option<(String, String, String, String)> = connection
                 .query_first(
                     "SELECT ST_AsText(point_value),ST_X(point_value),
