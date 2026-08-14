@@ -113,19 +113,62 @@ download_binary() {
     mkdir -p "$INSTALL_DIR"
     case "$name" in
         server) mv "${source_dir}/mydb-server" "$INSTALL_DIR/" ;;
-        cli) mv "${source_dir}/mydb-cli" "$INSTALL_DIR/" ;;
+        cli)
+            mv "${source_dir}/mydb-cli" "$INSTALL_DIR/"
+            mv "${source_dir}/mydb" "$INSTALL_DIR/"
+            ;;
         migrate) mv "${source_dir}/mydb-migrate" "$INSTALL_DIR/" ;;
         dump) mv "${source_dir}/mydbdump" "$INSTALL_DIR/" ;;
         all)
             mv "${source_dir}/mydb-server" "$INSTALL_DIR/"
             mv "${source_dir}/mydb-cli" "$INSTALL_DIR/"
+            mv "${source_dir}/mydb" "$INSTALL_DIR/"
             mv "${source_dir}/mydb-migrate" "$INSTALL_DIR/"
             mv "${source_dir}/mydbdump" "$INSTALL_DIR/"
             ;;
     esac
-    chmod +x "$INSTALL_DIR"/mydb-* 2>/dev/null || true
+    chmod +x "$INSTALL_DIR"/mydb "$INSTALL_DIR"/mydb-* 2>/dev/null || true
     
     rm -rf "$tmp_dir"
+}
+
+# Update only the executable payload. This path intentionally leaves config,
+# data, secrets, and service definitions untouched.
+update_binaries() {
+    local os arch
+    os=$(detect_os)
+    arch=$(detect_arch)
+
+    if [ -n "${WAIT_FOR_PID:-}" ]; then
+        for _ in $(seq 1 240); do
+            if ! kill -0 "$WAIT_FOR_PID" 2>/dev/null; then
+                break
+            fi
+            sleep 0.25
+        done
+        if kill -0 "$WAIT_FOR_PID" 2>/dev/null; then
+            error "timed out waiting for the mydb update command to exit"
+        fi
+    fi
+
+    local service_was_active=false
+    if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "$SERVICE_NAME"; then
+        if systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || sudo systemctl stop "$SERVICE_NAME" >/dev/null 2>&1; then
+            service_was_active=true
+        else
+            error "cannot stop active service $SERVICE_NAME"
+        fi
+    fi
+
+    download_binary all "$os" "$arch"
+
+    if $service_was_active; then
+        systemctl start "$SERVICE_NAME" >/dev/null 2>&1 || sudo systemctl start "$SERVICE_NAME" >/dev/null 2>&1 || error "cannot restart service $SERVICE_NAME"
+    fi
+    if [ -n "${UPDATE_TEMP_ROOT:-}" ] && [ -d "$UPDATE_TEMP_ROOT" ]; then
+        rm -rf "$UPDATE_TEMP_ROOT"
+    fi
+    success "MyDB binaries updated in $INSTALL_DIR"
 }
 
 # Create production-safe secret files. Existing secrets are never rotated by an update.
@@ -341,13 +384,16 @@ main() {
     info "Architecture: ${arch}"
     
     case "$component" in
+        update)
+            update_binaries
+            ;;
         server)
             download_binary "server" "$os" "$arch"
             success "Server installed to ${INSTALL_DIR}/mydb-server"
             ;;
         cli)
             download_binary "cli" "$os" "$arch"
-            success "CLI installed to ${INSTALL_DIR}/mydb-cli"
+            success "CLI installed to ${INSTALL_DIR}/mydb and ${INSTALL_DIR}/mydb-cli"
             ;;
         migrate)
             download_binary "migrate" "$os" "$arch"
@@ -359,17 +405,20 @@ main() {
             ;;
         all)
             download_binary "all" "$os" "$arch"
-            success "Server, CLI, and migration tool installed to ${INSTALL_DIR}"
+            success "Server, CLI (mydb/mydb-cli), and migration tool installed to ${INSTALL_DIR}"
             ;;
         service)
             install_service
             ;;
         *)
-            echo "Usage: $0 [server|cli|migrate|dump|all|service]"
+            echo "Usage: $0 [update|server|cli|migrate|dump|all|service]"
             exit 1
             ;;
     esac
     
+    if [ "$component" = "update" ]; then
+        return
+    fi
     if [ "$component" != "service" ]; then
         create_secrets
         create_config

@@ -39,6 +39,12 @@ param(
 
     [switch]$Quiet,
 
+    [switch]$BinariesOnly,
+
+    [uint32]$WaitForProcessId = 0,
+
+    [string]$UpdateTempRoot = "",
+
     [switch]$NoRemoteFirewall
 )
 
@@ -174,6 +180,44 @@ function Stop-MyDbService {
         Stop-Service -Name $ServiceName -Force
         $service.WaitForStatus("Stopped", [TimeSpan]::FromSeconds(30))
     }
+}
+
+function Wait-ForParentExit {
+    if ($WaitForProcessId -eq 0) { return }
+    for ($attempt = 0; $attempt -lt 240; $attempt++) {
+        if ($null -eq (Get-Process -Id $WaitForProcessId -ErrorAction SilentlyContinue)) {
+            return
+        }
+        Start-Sleep -Milliseconds 250
+    }
+    Stop-WithError "Timed out waiting for the mydb update command to exit"
+}
+
+function Update-BinariesOnly {
+    Wait-ForParentExit
+    $service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+    $wasRunning = $null -ne $service -and $service.Status -ne "Stopped"
+    try {
+        if ($wasRunning) {
+            Stop-MyDbService
+        }
+        Install-Binaries -Names @(
+            "mydb-server.exe",
+            "mydb-cli.exe",
+            "mydb.exe",
+            "mydb-migrate.exe",
+            "mydbdump.exe"
+        )
+    } finally {
+        if ($wasRunning) {
+            Start-Service -Name $ServiceName
+            (Get-Service -Name $ServiceName).WaitForStatus("Running", [TimeSpan]::FromSeconds(30))
+        }
+        if (-not [string]::IsNullOrWhiteSpace($UpdateTempRoot) -and (Test-Path -LiteralPath $UpdateTempRoot)) {
+            Remove-Item -LiteralPath $UpdateTempRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    Write-Success "MyDB binaries updated in $InstallDir"
 }
 
 function Remove-LegacyRouter {
@@ -367,18 +411,23 @@ function Ensure-Service {
 }
 
 function Main {
-    if (-not (Test-IsAdministrator)) {
+    if (-not $BinariesOnly -and -not (Test-IsAdministrator)) {
         Stop-WithError "Run PowerShell as Administrator. Service/firewall setup requires elevation."
+    }
+
+    if ($BinariesOnly) {
+        Update-BinariesOnly
+        return
     }
 
     Remove-LegacyRouter
 
     $binaries = switch ($Component) {
         "server" { @("mydb-server.exe") }
-        "cli" { @("mydb-cli.exe") }
+        "cli" { @("mydb-cli.exe", "mydb.exe") }
         "migrate" { @("mydb-migrate.exe") }
         "dump" { @("mydbdump.exe") }
-        default { @("mydb-server.exe", "mydb-cli.exe", "mydb-migrate.exe", "mydbdump.exe") }
+        default { @("mydb-server.exe", "mydb-cli.exe", "mydb.exe", "mydb-migrate.exe", "mydbdump.exe") }
     }
 
     if ($binaries -contains "mydb-server.exe") {

@@ -184,6 +184,7 @@
 - [ ] 当前最终提交在真实 macOS Docker Desktop 上完成 smoke
 - [ ] Windows 安装脚本、Linux systemd、macOS launchctl 在干净真实机器端到端通过
 - [x] Windows/Bash 发布脚本为压缩包生成并上传 SHA-256 sidecar；签名、透明密钥和升级/降级演练仍待完成
+- [ ] `mydb update` / `mydb-cli update` 跨平台在线更新：当前代码已实现 Release 资产下载、SHA-256 校验、仅替换二进制和服务重启路径；待随下一版真实 Windows 服务与 Linux systemd 安装验证，并完成失败回滚演练
 - [ ] 发布产物签名、升级/降级和卸载流程验证
 
 ## 当前可复现证据

@@ -164,9 +164,9 @@ cd mydb
 # 编译（Release 模式）
 cargo build --release
 
-# 正式包只包含 server/cli/migrate/dump、配置、安装脚本和文档；
+# 正式包只包含 server/cli/mydb/migrate/dump、配置、安装脚本和文档；
 # mydb-bench、测试结果与 target/bench 不进入发布包
-.\scripts\build-release.ps1 -Version "0.1.4"
+.\scripts\build-release.ps1 -Version "0.1.5"
 # 发布包同时生成同名 `.sha256` 校验文件；发布脚本会拒绝覆盖已存在的 GitHub Release。
 
 # 安装到系统
@@ -175,6 +175,23 @@ cargo install --path crates/mydb-cli
 cargo install --path crates/mydb-migrate
 cargo install --path crates/mydb-dump
 ```
+
+### 命令行更新
+
+发布包提供 `mydb`（兼容保留 `mydb-cli`）命令。更新只替换二进制，保留现有配置、数据目录和密钥；下载包与 `.sha256` sidecar 会先校验。
+
+```bash
+# 检查最新稳定版，不改文件
+mydb update --check
+
+# 更新到最新稳定版
+mydb update
+
+# 指定版本
+mydb update --version v0.1.5
+```
+
+Windows 服务更新会在当前 CLI 退出后由后台 helper 完成，日志写入安装目录的 `mydb-update.log`；Linux 更新会自动处理同名 systemd 服务。
 
 ---
 
@@ -610,14 +627,15 @@ bash scripts/docker-smoke.sh
 
 当前开发状态、已完成项、未完成项、差分证据统一维护在 [CheckList.md](CheckList.md)。只有可复现实测证明的项目才会打勾。
 
-### v0.1.4 发布候选
+### v0.1.5 发布候选
 
-本版面向单机 MySQL 8.4 常用生产工作负载：3306 提供 MySQL 协议，4306 提供登录保护的 Web SQL IDE/管理 API；补齐 `GRANT OPTION` 越权委派防护、角色 `ADMIN OPTION` 授权/撤销/元数据，以及 `GRANT ALL` 后各层部分 `REVOKE` 的实际权限降级。发布不宣称复制/集群、完整 InnoDB 全部锁边界、全部冷门字符集或全部 MySQL 错误码已完成；逐项状态见 [CheckList.md](CheckList.md) 和 [SYNTAX_MATRIX.md](SYNTAX_MATRIX.md)。
+本版面向单机 MySQL 8.4 常用生产工作负载：3306 提供 MySQL 协议，4306 提供登录保护的 Web SQL IDE/管理 API；补齐 `GRANT OPTION` 越权委派防护、角色 `ADMIN OPTION` 授权/撤销/元数据、`GRANT ALL` 后各层部分 `REVOKE` 的实际权限降级，以及 `mydb update` 在线更新命令。发布不宣称复制/集群、完整 InnoDB 全部锁边界、全部冷门字符集或全部 MySQL 错误码已完成；逐项状态见 [CheckList.md](CheckList.md) 和 [SYNTAX_MATRIX.md](SYNTAX_MATRIX.md)。
 
 **本轮本地门槛（2026-08-14）：**
 - ✅ `cargo test --workspace --locked`：Docker Linux 门禁通过；wire 269（含权限委派/角色 ADMIN OPTION/ALL 部分撤销），其他 workspace 测试与文档测试全部通过
 - ✅ `cargo clippy --workspace --all-targets -- -D warnings`
 - ✅ `cargo build --release -p mydb-server -p mydb-cli -p mydb-migrate -p mydb-dump`
+- ✅ `mydb update --check`：GitHub Release 资产下载、SHA-256 校验和包结构验证通过；更新仅替换二进制并保留配置/数据/密钥
 - ✅ MySQL 8.4 CLI 3306 连接、`event_scheduler`/版本探测
 - ✅ Connector/J 9.1.0、Node mysql2 3.23.3 已完成 3306 普通/预处理查询 smoke；Go `database/sql` + go-sql-driver/mysql 1.10.0 已完成当前 release 3306 服务的 Ping、中文、DATE、普通/预处理查询回归
 - ✅ MySQL `'user'@'host'` 基础账户匹配：精确主机优先于通配主机，握手按账户插件选择认证方式

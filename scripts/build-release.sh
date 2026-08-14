@@ -63,7 +63,7 @@ fi
 
 # A release is immutable. Run the same Rust gates required before pushing.
 info "Running Docker Rust quality gate (2 GiB limit)..."
-MYDB_TEST_MEMORY=2g MYDB_TEST_CPUS=2 MYDB_TEST_JOBS=2 \
+MYDB_TEST_MEMORY=2g MYDB_TEST_CPUS=2 MYDB_TEST_JOBS=1 \
     "$PWD/scripts/test-docker.sh"
 
 # 构建 release 版本
@@ -80,11 +80,13 @@ mkdir -p "$BUILD_DIR"
 if [ "$OS" = "windows" ]; then
     cp target/release/mydb-server.exe "$BUILD_DIR/"
     cp target/release/mydb-cli.exe "$BUILD_DIR/"
+    cp target/release/mydb.exe "$BUILD_DIR/"
     cp target/release/mydb-migrate.exe "$BUILD_DIR/"
     cp target/release/mydbdump.exe "$BUILD_DIR/"
 else
     cp target/release/mydb-server "$BUILD_DIR/"
     cp target/release/mydb-cli "$BUILD_DIR/"
+    cp target/release/mydb "$BUILD_DIR/"
     cp target/release/mydb-migrate "$BUILD_DIR/"
     cp target/release/mydbdump "$BUILD_DIR/"
 fi

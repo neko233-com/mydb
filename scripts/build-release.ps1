@@ -86,6 +86,7 @@ New-Item -ItemType Directory -Path $buildDir -Force | Out-Null
 # 复制二进制文件
 Copy-Item "target/release/mydb-server.exe" "$buildDir/"
 Copy-Item "target/release/mydb-cli.exe" "$buildDir/"
+Copy-Item "target/release/mydb.exe" "$buildDir/"
 Copy-Item "target/release/mydb-migrate.exe" "$buildDir/"
 Copy-Item "target/release/mydbdump.exe" "$buildDir/"
 
