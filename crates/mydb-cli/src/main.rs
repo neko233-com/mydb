@@ -125,6 +125,7 @@ async fn main() -> Result<()> {
         run_agent_command(
             &args.host,
             args.http_port,
+            &args.user,
             admin_password,
             command.as_ref().expect("checked above"),
         )
@@ -419,6 +420,7 @@ fn split_sql(script: &str) -> Result<(Vec<String>, String)> {
 async fn run_agent_command(
     host: &str,
     port: u16,
+    username: &str,
     password: &str,
     command: &AgentCommand,
 ) -> Result<()> {
@@ -437,7 +439,8 @@ async fn run_agent_command(
         ),
         AgentCommand::Optimize { sql } => ("POST", "/api/v1/agent/sql", Some(json!({"sql": sql}))),
     };
-    let response = agent_http_request(host, port, password, method, path, body.as_ref()).await?;
+    let response =
+        agent_http_request(host, port, username, password, method, path, body.as_ref()).await?;
     println!("{}", serde_json::to_string_pretty(&response)?);
     Ok(())
 }
@@ -445,7 +448,32 @@ async fn run_agent_command(
 async fn agent_http_request(
     host: &str,
     port: u16,
+    username: &str,
     password: &str,
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+) -> Result<Value> {
+    let login = agent_http_request_with_token(
+        host,
+        port,
+        None,
+        "POST",
+        "/api/v1/auth/login",
+        Some(&json!({"username": username, "password": password})),
+    )
+    .await?;
+    let token = login
+        .get("token")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("Auth API returned no session token"))?;
+    agent_http_request_with_token(host, port, Some(token), method, path, body).await
+}
+
+async fn agent_http_request_with_token(
+    host: &str,
+    port: u16,
+    token: Option<&str>,
     method: &str,
     path: &str,
     body: Option<&Value>,
@@ -457,8 +485,11 @@ async fn agent_http_request(
     let mut stream = tokio::net::TcpStream::connect((host, port))
         .await
         .with_context(|| format!("cannot connect to Agent API at {host}:{port}"))?;
+    let authorization = token
+        .map(|token| format!("Authorization: Bearer {token}\r\n"))
+        .unwrap_or_default();
     let request = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\nAuthorization: Bearer {password}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\n{authorization}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         payload.len()
     );
     stream.write_all(request.as_bytes()).await?;

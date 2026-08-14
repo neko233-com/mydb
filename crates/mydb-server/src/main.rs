@@ -9,7 +9,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use axum::extract::{Path as AxumPath, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use clap::Parser;
@@ -630,11 +630,7 @@ fn authorized_identity(headers: &HeaderMap, state: &AdminState) -> Result<String
         return Err(StatusCode::UNAUTHORIZED);
     };
     let config = state.config.read().clone();
-    let expected = format!("Bearer {}", config.http.admin_password);
-    if constant_time_eq(
-        expected.trim_start_matches("Bearer ").as_bytes(),
-        token.as_bytes(),
-    ) {
+    if legacy_admin_bearer_matches(&config, token) {
         return Ok(config.security.default_username);
     }
     let mut sessions = state.sessions.lock();
@@ -665,6 +661,11 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     difference == 0
 }
 
+fn legacy_admin_bearer_matches(config: &mydb_config::ServerConfig, token: &str) -> bool {
+    !config.security.enforce_strong_passwords
+        && constant_time_eq(config.http.admin_password.as_bytes(), token.as_bytes())
+}
+
 fn authorize_agent(headers: &HeaderMap, state: &AdminState) -> Result<(), StatusCode> {
     if !state.config.read().agent.enabled {
         return Err(StatusCode::NOT_FOUND);
@@ -672,7 +673,11 @@ fn authorize_agent(headers: &HeaderMap, state: &AdminState) -> Result<(), Status
     authorize(headers, state)
 }
 
-async fn metrics(State(state): State<AdminState>) -> impl IntoResponse {
+async fn metrics(State(state): State<AdminState>, headers: HeaderMap) -> Response {
+    if state.config.read().security.enforce_strong_passwords && authorize(&headers, &state).is_err()
+    {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
     let wire = state.wire_stats.snapshot();
     let storage = state.storage.stats();
     let audit = state.protocol_config.read().audit_log.snapshot();
@@ -750,6 +755,7 @@ async fn metrics(State(state): State<AdminState>) -> impl IntoResponse {
         ],
         body,
     )
+        .into_response()
 }
 
 async fn status(
@@ -2290,6 +2296,20 @@ mod tests {
         assert!(!constant_time_eq(
             b"Bearer production-token",
             b"Bearer production"
+        ));
+    }
+
+    #[test]
+    fn strong_password_mode_rejects_raw_admin_bearer() {
+        let mut config = mydb_config::ServerConfig::default();
+        assert!(legacy_admin_bearer_matches(
+            &config,
+            &config.http.admin_password
+        ));
+        config.security.enforce_strong_passwords = true;
+        assert!(!legacy_admin_bearer_matches(
+            &config,
+            &config.http.admin_password
         ));
     }
 

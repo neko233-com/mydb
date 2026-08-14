@@ -2072,9 +2072,11 @@ impl AuthCatalog {
             )?;
         }
 
-        let subject = format!("'{}'@'%'", principal.replace('\'', "''"));
+        let subject = mysql_show_grant_subject(&principal);
         let mut grants = Vec::new();
-        if !global.is_empty() {
+        if global.is_empty() {
+            grants.push(format!("GRANT USAGE ON *.* TO {subject}"));
+        } else {
             grants.push(format!(
                 "GRANT {} ON *.* TO {}",
                 render_privileges(&global),
@@ -2141,7 +2143,7 @@ impl AuthCatalog {
         roles.sort();
         for role in roles {
             grants.push(format!(
-                "GRANT `{}` TO {}",
+                "GRANT `{}`@`%` TO {}",
                 role.replace('`', "``"),
                 subject
             ));
@@ -2242,6 +2244,15 @@ fn normalize_auth_name(name: &str) -> String {
         .to_ascii_lowercase();
     }
     name.trim_matches(['`', '\'', '"']).to_ascii_lowercase()
+}
+
+fn mysql_show_grant_subject(principal: &str) -> String {
+    let (user, host) = mysql_account_parts(principal);
+    format!(
+        "`{}`@`{}`",
+        user.replace('`', "``"),
+        host.replace('`', "``")
+    )
 }
 
 fn resolve_auth_user_key(users: &HashMap<String, AuthUser>, requested: &str) -> Option<String> {
@@ -7643,7 +7654,11 @@ impl Backend {
                 .into_iter()
                 .map(|grant| vec![Some(grant)])
                 .collect();
-            return Ok(QueryOutcome::rows(vec!["Grants"], rows));
+            let (grant_user, grant_host) = mysql_account_parts(&principal);
+            return Ok(QueryOutcome::rows(
+                vec![format!("Grants for {grant_user}@{grant_host}")],
+                rows,
+            ));
         }
         if let Some(filter) = parse_show_command_filter(sql, "DATABASES") {
             let filter = filter?;
@@ -17588,7 +17603,7 @@ impl Backend {
                             })
                         })?
                     });
-                    let rows = if key.as_deref() == Some("PRIMARY") {
+                    let rows = if key.is_some() {
                         1
                     } else {
                         self.storage
@@ -17608,7 +17623,13 @@ impl Backend {
                             "ALL"
                         },
                         indexed.then(|| "const".to_string()),
-                        if filter.is_some() { "Using where" } else { "" },
+                        if primary {
+                            ""
+                        } else if filter.is_some() {
+                            "Using where"
+                        } else {
+                            ""
+                        },
                     )
                 } else {
                     let rows = source_rows.map_or_else(
@@ -17640,7 +17661,9 @@ impl Backend {
                         ),
                     }
                 };
-            let indexed = key.is_some();
+            let key_len = key
+                .as_deref()
+                .and_then(|key| explain_key_length(&source.schema, key));
             plan_rows.push(vec![
                 Some("1".into()),
                 Some(if derived { "DERIVED" } else { "SIMPLE" }.into()),
@@ -17649,11 +17672,11 @@ impl Backend {
                 Some(access_type.into()),
                 key.clone(),
                 key,
-                indexed.then(|| "?".into()),
+                key_len.map(|value| value.to_string()),
                 reference,
                 Some(rows.to_string()),
                 Some("100.00".into()),
-                Some(extra.into()),
+                (!extra.is_empty()).then(|| extra.to_string()),
             ]);
         }
         Ok(QueryOutcome::rows(
@@ -17680,24 +17703,85 @@ impl Backend {
             unreachable!("EXPLAIN always returns rows")
         };
         let row = rows.first().expect("EXPLAIN produces one row");
+        let key_name = row[6]
+            .as_deref()
+            .map(|value| String::from_utf8_lossy(value).into_owned());
+        let schema = find_top_level_keyword(statement, " FROM ", 0).and_then(|from| {
+            let source_start = from + 6;
+            let source_end = select_from_clause_end(statement, source_start);
+            self.join_source(statement[source_start..source_end].trim())
+                .ok()
+                .map(|source| source.schema)
+        });
+        let key_columns = key_name.as_deref().and_then(|key| {
+            schema
+                .as_ref()
+                .map(|schema| explain_key_columns(schema, key))
+        });
+        let possible_keys = row[5]
+            .as_deref()
+            .map(|value| vec![String::from_utf8_lossy(value).into_owned()]);
+        let mut used_columns = statement
+            .split_once(" FROM ")
+            .map(|(projection, _)| {
+                split_csv(projection.trim_start_matches("SELECT "))
+                    .into_iter()
+                    .map(|value| unqualified_column(value.trim()).to_string())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if let Some(key_columns) = &key_columns {
+            for column in key_columns {
+                if !used_columns
+                    .iter()
+                    .any(|value| value.eq_ignore_ascii_case(column))
+                {
+                    used_columns.push(column.clone());
+                }
+            }
+        }
         let table = |row: &Vec<Option<Vec<u8>>>| {
+            let rows_examined = String::from_utf8_lossy(row[9].as_deref().unwrap_or_default())
+                .parse::<usize>()
+                .unwrap_or(0);
             serde_json::json!({
                 "table_name": String::from_utf8_lossy(row[2].as_deref().unwrap_or_default()),
                 "access_type": String::from_utf8_lossy(row[4].as_deref().unwrap_or_default()),
+                "possible_keys": possible_keys.clone(),
                 "key": row[6].as_deref().map(String::from_utf8_lossy),
-                "rows_examined_per_scan": String::from_utf8_lossy(row[9].as_deref().unwrap_or_default()).parse::<usize>().unwrap_or(0),
+                "used_key_parts": key_columns.clone(),
+                "key_length": row[7].as_deref().map(String::from_utf8_lossy),
+                "ref": row[8]
+                    .as_deref()
+                    .map(|value| vec![String::from_utf8_lossy(value)]),
+                "rows_examined_per_scan": rows_examined,
+                "rows_produced_per_join": if row[8].is_some() { 1 } else { rows_examined },
+                "filtered": String::from_utf8_lossy(row[10].as_deref().unwrap_or_default()).to_string(),
+                "using_index": row[6].is_some(),
+                "cost_info": {
+                    "read_cost": "0.25",
+                    "eval_cost": "0.10",
+                    "prefix_cost": "0.35",
+                    "data_read_per_join": (rows_examined.saturating_mul(144)).to_string(),
+                },
+                "used_columns": used_columns.clone(),
             })
         };
         let value = serde_json::json!({
             "query_block": {
                 "select_id": 1,
+                "cost_info": {
+                    "query_cost": "0.35",
+                },
                 "table": table(row),
                 "nested_loop": (rows.len() > 1).then(|| rows.iter().map(|row| serde_json::json!({ "table": table(row) })).collect::<Vec<_>>()),
             }
         });
         Ok(QueryOutcome::byte_rows(
             vec!["EXPLAIN"],
-            vec![vec![Some(serde_json::to_vec(&value)?)]],
+            vec![vec![Some(
+                serde_json::to_string_pretty(&value)?.into_bytes(),
+            )]],
         ))
     }
 
@@ -21279,6 +21363,50 @@ fn table_primary_key_columns(schema: &TableSchema) -> Vec<String> {
             .filter(|column| column.is_primary_key)
             .map(|column| column.name.clone())
             .collect()
+    })
+}
+
+fn explain_key_columns(schema: &TableSchema, key: &str) -> Vec<String> {
+    if key.eq_ignore_ascii_case("PRIMARY") {
+        return table_primary_key_columns(schema);
+    }
+    schema
+        .indexes
+        .iter()
+        .find(|index| index.name.eq_ignore_ascii_case(key))
+        .map(|index| index.columns.clone())
+        .unwrap_or_default()
+}
+
+fn explain_key_length(schema: &TableSchema, key: &str) -> Option<u32> {
+    let column = explain_key_columns(schema, key).first()?.clone();
+    let column = schema
+        .columns
+        .iter()
+        .find(|item| item.name.eq_ignore_ascii_case(&column))?;
+    Some(match &column.data_type {
+        DataType::Int => 4,
+        DataType::BigInt => 8,
+        DataType::Float => 4,
+        DataType::Double => 8,
+        DataType::Boolean => 1,
+        DataType::Varchar(length) => length.saturating_mul(4).saturating_add(2),
+        DataType::Text => 768,
+        DataType::Blob => 768,
+        DataType::Date => 3,
+        DataType::DateTime => 5,
+        DataType::Timestamp => 4,
+        DataType::Raw(value) => {
+            let upper = value.trim().to_ascii_uppercase();
+            if upper.starts_with("DECIMAL") {
+                raw_type_arguments(value)
+                    .and_then(|value| value.split(',').next()?.trim().parse::<u32>().ok())
+                    .map(|precision| precision.saturating_add(1) / 2)
+                    .unwrap_or(16)
+            } else {
+                0
+            }
+        }
     })
 }
 
@@ -34016,7 +34144,7 @@ fn mysql_collation_key_bytes(value: &[u8], collation: Option<&str>) -> Vec<u8> {
         && !collation_name.ends_with("_as_ci")
         && (collation_name.contains("_ai_") || collation_name.ends_with("_ci"));
     let mut folded = if case_insensitive {
-        value.to_uppercase()
+        value.to_lowercase()
     } else {
         value.to_string()
     };
@@ -47393,6 +47521,62 @@ mod tests {
         (temp, storage, first, second)
     }
 
+    #[tokio::test]
+    async fn rollback_does_not_leave_pending_rows_for_metadata_scan() {
+        let temp = tempfile::tempdir().expect("create rollback test directory");
+        let storage = Arc::new(StorageEngineManager::new(
+            temp.path().to_path_buf(),
+            16384,
+            "4M",
+        ));
+        storage
+            .init()
+            .await
+            .expect("initialize rollback test storage");
+        storage
+            .create_database("mydb")
+            .await
+            .expect("create rollback test database");
+        let mut backend = Backend::new(
+            storage.clone(),
+            Arc::new(ProtocolConfig::default()),
+            Arc::new(WireStats::default()),
+            1,
+        );
+        backend
+            .execute("CREATE TABLE accounts (id INT PRIMARY KEY, value INT)")
+            .await
+            .expect("create rollback test table");
+        backend
+            .execute("INSERT INTO accounts VALUES (1,10),(2,20)")
+            .await
+            .expect("insert committed rollback test rows");
+        backend
+            .execute("START TRANSACTION")
+            .await
+            .expect("start rollback test transaction");
+        backend
+            .execute("INSERT INTO accounts VALUES (3,30)")
+            .await
+            .expect("insert uncommitted rollback test row");
+        backend
+            .execute("SELECT COUNT(*) FROM accounts")
+            .await
+            .expect("read uncommitted rollback test row");
+        backend
+            .execute("ROLLBACK")
+            .await
+            .expect("rollback test transaction");
+
+        let database = storage
+            .get_database("mydb")
+            .expect("rollback test database remains available");
+        let rows = database
+            .scan_table("accounts")
+            .expect("scan rollback test table");
+        assert_eq!(rows.len(), 2);
+    }
+
     #[test]
     fn gap_lock_conflicts_follow_innodb_directional_rules() {
         assert!(lock_request_conflicts(
@@ -53162,6 +53346,39 @@ mod tests {
             .execute("INSERT INTO collation_as_ci VALUES ('á')")
             .await
             .expect("accent-sensitive collation must distinguish accented character");
+
+        backend
+            .execute(
+                "CREATE TABLE collation_ai_ci (
+                    value VARCHAR(32) COLLATE utf8mb4_0900_ai_ci
+                )",
+            )
+            .await
+            .expect("create accent-insensitive table");
+        backend
+            .execute(
+                "INSERT INTO collation_ai_ci VALUES
+                 ('resume'), ('Resume'),
+                 (CONVERT(X'72C3A973756DC3A9' USING utf8mb4))",
+            )
+            .await
+            .expect("insert UTF-8 accent variants");
+        assert_eq!(
+            query_rows(
+                &mut backend,
+                "SELECT COUNT(*) FROM collation_ai_ci WHERE value='RESUME'",
+            )
+            .await,
+            vec![vec![Some(b"3".to_vec())]]
+        );
+        assert_eq!(
+            query_rows(
+                &mut backend,
+                "SELECT COUNT(DISTINCT value) FROM collation_ai_ci",
+            )
+            .await,
+            vec![vec![Some(b"1".to_vec())]]
+        );
     }
 
     #[test]
@@ -62920,6 +63137,7 @@ mod tests {
         assert_eq!(columns.len(), 12);
         assert_eq!(rows[0][4], Some(b"const".to_vec()));
         assert_eq!(rows[0][6], Some(b"PRIMARY".to_vec()));
+        assert_eq!(rows[0][7], Some(b"8".to_vec()));
         backend
             .execute("CREATE INDEX idx_expression_name ON expression_rows(name)")
             .await
@@ -62944,6 +63162,10 @@ mod tests {
             serde_json::from_slice(rows[0][0].as_deref().unwrap()).unwrap();
         assert_eq!(plan["query_block"]["table"]["access_type"], "ref");
         assert_eq!(plan["query_block"]["table"]["key"], "idx_expression_name");
+        assert_eq!(
+            plan["query_block"]["table"]["used_key_parts"],
+            serde_json::json!(["name"])
+        );
         backend
             .execute("CREATE TABLE explain_roles (id BIGINT PRIMARY KEY, title VARCHAR(32))")
             .await
@@ -62967,7 +63189,7 @@ mod tests {
         assert_eq!(rows[1][4], Some(b"eq_ref".to_vec()));
         assert_eq!(rows[1][6], Some(b"PRIMARY".to_vec()));
         assert_eq!(rows[1][8], Some(b"e.id".to_vec()));
-        assert_eq!(rows[1][11], Some(Vec::new()));
+        assert_eq!(rows[1][11], None);
         let QueryOutcome::Rows { rows, .. } = backend
             .execute(
                 "EXPLAIN FORMAT=JSON SELECT e.id,r.title FROM expression_rows e JOIN explain_roles r ON r.id=e.id",

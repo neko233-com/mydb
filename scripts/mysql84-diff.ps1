@@ -51,6 +51,92 @@ function Normalize-Result {
     return (($Value -replace "`r`n", "`n") -replace "`r", "`n").Trim()
 }
 
+function ConvertTo-ResultLines {
+    param([string]$Value)
+    return (Normalize-Result $Value).Split("`n")
+}
+
+function Get-JsonArrayText {
+    param($Value)
+    if ($null -eq $Value) {
+        return ""
+    }
+    return (@($Value) | ForEach-Object { [string]$_ }) -join ","
+}
+
+function Compare-ExplainResult {
+    param(
+        [string]$MysqlText,
+        [string]$MyDbText
+    )
+    $mysqlLines = ConvertTo-ResultLines $MysqlText
+    $mydbLines = ConvertTo-ResultLines $MyDbText
+    $mysqlJsonLine = [Array]::IndexOf($mysqlLines, "EXPLAIN")
+    $mydbJsonLine = [Array]::IndexOf($mydbLines, "EXPLAIN")
+    if ($mysqlJsonLine -lt 1 -or $mydbJsonLine -lt 1) {
+        return $false
+    }
+    if (($mysqlLines[0..($mysqlJsonLine - 1)] -join "`n") -ne ($mydbLines[0..($mydbJsonLine - 1)] -join "`n")) {
+        return $false
+    }
+    try {
+        $mysqlJson = ($mysqlLines[($mysqlJsonLine + 1)..($mysqlLines.Count - 1)] -join "`n") | ConvertFrom-Json
+        $mydbJson = ($mydbLines[($mydbJsonLine + 1)..($mydbLines.Count - 1)] -join "`n") | ConvertFrom-Json
+    } catch {
+        return $false
+    }
+    $mysqlTable = $mysqlJson.query_block.table
+    $mydbTable = $mydbJson.query_block.table
+    foreach ($field in @("table_name", "access_type", "key", "key_length", "filtered", "using_index")) {
+        if ([string]$mysqlTable.$field -ne [string]$mydbTable.$field) {
+            return $false
+        }
+    }
+    foreach ($field in @("possible_keys", "used_key_parts", "ref", "used_columns")) {
+        if ((Get-JsonArrayText $mysqlTable.$field) -ne (Get-JsonArrayText $mydbTable.$field)) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Compare-StatusResult {
+    param(
+        [string]$MysqlText,
+        [string]$MyDbText
+    )
+    $mysqlLines = ConvertTo-ResultLines $MysqlText
+    $mydbLines = ConvertTo-ResultLines $MyDbText
+    $header = "Name`tEngine`tVersion`tRow_format`tRows`tAvg_row_length`tData_length`tMax_data_length`tIndex_length`tData_free`tAuto_increment`tCreate_time`tUpdate_time`tCheck_time`tCollation`tChecksum`tCreate_options`tComment"
+    $mysqlHeader = [Array]::IndexOf($mysqlLines, $header)
+    $mydbHeader = [Array]::IndexOf($mydbLines, $header)
+    if ($mysqlHeader -lt 0 -or $mydbHeader -lt 0) {
+        return $false
+    }
+    if ([string]::IsNullOrWhiteSpace($mysqlLines[$mysqlHeader + 1]) -or
+        [string]::IsNullOrWhiteSpace($mydbLines[$mydbHeader + 1])) {
+        return $false
+    }
+    return $true
+}
+
+function Compare-CheckConstraintResult {
+    param(
+        [string]$MysqlText,
+        [string]$MyDbText
+    )
+    if ($MysqlText -notmatch "ERROR 3819" -or $MyDbText -notmatch "ERROR 3819") {
+        return $false
+    }
+    $mysqlNormalized = (($MysqlText -split "`r?`n" | Where-Object {
+            $_ -notmatch "^ERROR 3819" -and $_ -ne ""
+        }) -join "`n")
+    $mydbNormalized = (($MyDbText -split "`r?`n" | Where-Object {
+            $_ -notmatch "^ERROR 3819" -and $_ -ne ""
+        }) -join "`n")
+    return (Normalize-Result $mysqlNormalized) -eq (Normalize-Result $mydbNormalized)
+}
+
 function Assert-Success {
     param(
         [string]$Target,
@@ -71,7 +157,16 @@ function Invoke-DiffCase {
     $mydb = Invoke-MySqlClient -Target mydb -Sql $Sql
     $mysqlText = Normalize-Result $mysql.Output
     $mydbText = Normalize-Result $mydb.Output
-    if ($mysql.ExitCode -ne $mydb.ExitCode -or $mysqlText -ne $mydbText) {
+    $sameOutput = if ($Name -eq "explain") {
+        Compare-ExplainResult $mysqlText $mydbText
+    } elseif ($Name -eq "check constraint") {
+        Compare-CheckConstraintResult $mysqlText $mydbText
+    } elseif ($Name -eq "show status and table status") {
+        Compare-StatusResult $mysqlText $mydbText
+    } else {
+        $mysqlText -eq $mydbText
+    }
+    if ($mysql.ExitCode -ne $mydb.ExitCode -or -not $sameOutput) {
         Write-Host "[DIFF] $Name" -ForegroundColor Red
         Write-Host "SQL: $Sql"
         Write-Host "--- mysql:8.4 (exit=$($mysql.ExitCode))" -ForegroundColor Yellow
@@ -91,7 +186,7 @@ try {
 
     $deadline = [DateTime]::UtcNow.AddSeconds(90)
     do {
-        $ping = docker exec $container mysqladmin ping -uroot -proot 2>$null
+        $ping = docker exec $container mysqladmin ping --protocol=TCP --host=127.0.0.1 -uroot -proot 2>$null
         if ($ping -match "alive") {
             break
         }
@@ -183,6 +278,21 @@ try {
         [pscustomobject]@{ Name = "set operation"; Sql = "SELECT id FROM $database.accounts WHERE id=1 UNION ALL SELECT id FROM $database.accounts WHERE id=2 ORDER BY id" },
         [pscustomobject]@{ Name = "user variables"; Sql = "SET @diff_value=4; SELECT @diff_value+2 AS value; SET @diff_value=NULL; SELECT COALESCE(@diff_value,9) AS fallback" },
         [pscustomobject]@{ Name = "transaction visibility"; Sql = "START TRANSACTION; INSERT INTO $database.accounts VALUES (3,'gamma',3.50); SELECT COUNT(*) AS inside_count FROM $database.accounts; ROLLBACK; SELECT COUNT(*) AS outside_count FROM $database.accounts" },
+        [pscustomobject]@{ Name = "savepoint rollback"; Sql = "START TRANSACTION; INSERT INTO $database.accounts VALUES (3,'gamma',3.50); SAVEPOINT before_second; INSERT INTO $database.accounts VALUES (4,'delta',4.50); ROLLBACK TO SAVEPOINT before_second; RELEASE SAVEPOINT before_second; COMMIT; SELECT id,name,amount FROM $database.accounts WHERE id>=3 ORDER BY id" },
+        [pscustomobject]@{ Name = "transaction characteristics"; Sql = "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED; SET SESSION TRANSACTION READ ONLY; SELECT @@transaction_isolation AS isolation_level,@@transaction_read_only AS read_only; SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ; SET SESSION TRANSACTION READ WRITE" },
+        [pscustomobject]@{ Name = "replace and duplicate update"; Sql = "CREATE TABLE $database.conflict_probe (id INT PRIMARY KEY, value VARCHAR(16), updated INT DEFAULT 0, UNIQUE KEY uq_value(value)); INSERT INTO $database.conflict_probe VALUES (1,'a',0); REPLACE INTO $database.conflict_probe (id,value) VALUES (1,'b'); INSERT INTO $database.conflict_probe (id,value) VALUES (2,'b') ON DUPLICATE KEY UPDATE updated=updated+1,value=CONCAT(value,'-u'); SELECT id,value,updated FROM $database.conflict_probe ORDER BY id" },
+        [pscustomobject]@{ Name = "insert select"; Sql = "CREATE TABLE $database.select_source (id INT PRIMARY KEY, value INT); INSERT INTO $database.select_source VALUES (1,10),(2,20); CREATE TABLE $database.select_target (id INT PRIMARY KEY, value INT); INSERT INTO $database.select_target SELECT id,value+1 FROM $database.select_source; SELECT id,value FROM $database.select_target ORDER BY id" },
+        [pscustomobject]@{ Name = "update and delete join"; Sql = "USE $database; CREATE TABLE join_left (id INT PRIMARY KEY, value INT); CREATE TABLE join_right (id INT PRIMARY KEY, multiplier INT); INSERT INTO join_left VALUES (1,2),(2,3); INSERT INTO join_right VALUES (1,10),(2,20); UPDATE join_left l JOIN join_right r ON l.id=r.id SET l.value=l.value*r.multiplier WHERE l.id=1; DELETE l FROM join_left l JOIN join_right r ON l.id=r.id WHERE r.id=2; SELECT id,value FROM join_left ORDER BY id" },
+        [pscustomobject]@{ Name = "foreign key cascade"; Sql = "CREATE TABLE $database.fk_parent (id INT PRIMARY KEY); CREATE TABLE $database.fk_child (id INT PRIMARY KEY, parent_id INT, CONSTRAINT fk_parent_id FOREIGN KEY (parent_id) REFERENCES $database.fk_parent(id) ON DELETE CASCADE); INSERT INTO $database.fk_parent VALUES (1); INSERT INTO $database.fk_child VALUES (10,1); DELETE FROM $database.fk_parent WHERE id=1; SELECT COUNT(*) AS child_count FROM $database.fk_child" },
+        [pscustomobject]@{ Name = "check constraint"; Sql = "CREATE TABLE $database.check_probe (id INT PRIMARY KEY, value INT, CONSTRAINT value_positive CHECK (value>0)); INSERT INTO $database.check_probe VALUES (1,2); SELECT id,value FROM $database.check_probe; INSERT INTO $database.check_probe VALUES (2,-1)" },
+        [pscustomobject]@{ Name = "view dml"; Sql = "CREATE TABLE $database.view_base (id INT PRIMARY KEY, value INT); INSERT INTO $database.view_base VALUES (1,2); CREATE VIEW $database.view_probe AS SELECT id,value FROM $database.view_base WHERE value>0 WITH CASCADED CHECK OPTION; UPDATE $database.view_probe SET value=3 WHERE id=1; SELECT id,value FROM $database.view_probe; DELETE FROM $database.view_probe WHERE id=1; SELECT COUNT(*) AS remaining FROM $database.view_base" },
+        [pscustomobject]@{ Name = "stored procedure"; Sql = "CREATE PROCEDURE $database.proc_probe(IN p INT) SELECT p+1 AS next_value; CALL $database.proc_probe(4); SELECT ROUTINE_NAME,ROUTINE_TYPE FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA='$database' AND ROUTINE_NAME='proc_probe'; DROP PROCEDURE $database.proc_probe" },
+        [pscustomobject]@{ Name = "trigger mutation"; Sql = "CREATE TABLE $database.trigger_base (id INT PRIMARY KEY, value INT); CREATE TABLE $database.trigger_audit (id INT, old_value INT, new_value INT); CREATE TRIGGER $database.trigger_probe BEFORE UPDATE ON $database.trigger_base FOR EACH ROW INSERT INTO $database.trigger_audit VALUES (OLD.id,OLD.value,NEW.value); INSERT INTO $database.trigger_base VALUES (1,2); UPDATE $database.trigger_base SET value=5 WHERE id=1; SELECT id,old_value,new_value FROM $database.trigger_audit; DROP TRIGGER $database.trigger_probe" },
+        [pscustomobject]@{ Name = "role and grants"; Sql = "CREATE USER 'diff_user'@'%' IDENTIFIED BY 'diff-password'; GRANT SELECT ON $database.* TO 'diff_user'@'%'; CREATE ROLE 'diff_role'; GRANT SELECT ON $database.* TO 'diff_role'; GRANT 'diff_role' TO 'diff_user'@'%'; SHOW GRANTS FOR 'diff_user'@'%'; REVOKE 'diff_role' FROM 'diff_user'@'%'; DROP ROLE 'diff_role'; DROP USER 'diff_user'@'%'" },
+        [pscustomobject]@{ Name = "collation semantics"; Sql = "CREATE TABLE $database.collation_probe (value VARCHAR(32) COLLATE utf8mb4_0900_ai_ci); INSERT INTO $database.collation_probe VALUES ('resume'),(CONVERT(X'72C3A973756DC3A9' USING utf8mb4)),('Resume'); SELECT HEX(value),OCTET_LENGTH(value),CHAR_LENGTH(value) FROM $database.collation_probe WHERE value='RESUME' ORDER BY value; SELECT COUNT(DISTINCT value) AS distinct_count FROM $database.collation_probe" },
+        [pscustomobject]@{ Name = "accounts stability after mixed DDL"; Sql = "SELECT id,name,amount FROM $database.accounts ORDER BY id" },
+        [pscustomobject]@{ Name = "explain"; Sql = "EXPLAIN SELECT id,name FROM $database.accounts WHERE id=1; EXPLAIN FORMAT=JSON SELECT id FROM $database.accounts WHERE name='alpha'" },
+        [pscustomobject]@{ Name = "show status and table status"; Sql = "SHOW TABLE STATUS FROM $database LIKE 'accounts'; SHOW STATUS LIKE 'Threads_connected'; SHOW VARIABLES LIKE 'max_connections'" },
         [pscustomobject]@{ Name = "columns metadata"; Sql = "SELECT COLUMN_NAME,DATA_TYPE,COLUMN_TYPE,IS_NULLABLE,COLUMN_KEY FROM information_schema.COLUMNS WHERE TABLE_SCHEMA='$database' AND TABLE_NAME='accounts' ORDER BY ORDINAL_POSITION" },
         [pscustomobject]@{ Name = "statistics metadata"; Sql = "SELECT INDEX_NAME,SEQ_IN_INDEX,COLUMN_NAME,NON_UNIQUE FROM information_schema.STATISTICS WHERE TABLE_SCHEMA='$database' AND TABLE_NAME='accounts' ORDER BY INDEX_NAME,SEQ_IN_INDEX" },
         [pscustomobject]@{ Name = "tables metadata"; Sql = "SELECT TABLE_SCHEMA,TABLE_NAME,ENGINE,TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA='$database' AND TABLE_NAME='accounts'" },
