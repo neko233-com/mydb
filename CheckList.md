@@ -217,8 +217,9 @@
 - [x] 2026-08-15 阶段性源码真实差分：同机 Docker `mysql:8.4` 与隔离 MyDB 对比，117/117 cases 通过；新增基础 JSON_TABLE 标量/嵌套/序号/存在性/默认与错误行为及按前置表行隐式关联 JSON_TABLE、POINT/LINESTRING/POLYGON/MULTI*/GEOMETRYCOLLECTION 空间构造器/度量/访问器/SRID 轴序/谓词，另含 JSON_SEARCH、JSON 浅层/递归通配路径、数组范围/`last` 下标、JSON_ARRAYAGG/JSON_OBJECTAGG 聚合与窗口、数组追加/插入、RFC 7396 合并、深度/键/美化、重叠、BIT 聚合、常量聚合投影、全文 TF-IDF 基础评分/布尔前缀/短语/查询扩展、停止词/短词边界、未知线程 KILL 错误、角色授权、ai_ci、EXPLAIN、状态接口、生成列 INSERT/UPDATE/UPSERT/INSERT SELECT 显式写入错误码/消息；物理 3306 服务未强制替换
 - [x] 2026-08-15 同机持久化基准（v0.1.21 发布候选，提交 7bdcb65）：MyDB 与 MySQL 8.4.11 使用相同 Docker 资源和持久化设置；性能阶段无预热、17.6/60 秒、1 次采样，单表写 582/276 ops/s、4 actor P99 10.1/92.9 ms、并发吞吐 343/153 ops/s、读 P50 290/132 μs；原始结果见 `性能报告.md`，不硬编码历史比值
 - [x] 2026-08-15 v0.1.23 索引点查优化后同机持久化基准：MyDB 与 MySQL 8.4.11 使用相同 Docker 资源和持久化设置；性能阶段无预热、22.3/60 秒、1 次采样，单表写 218/78 ops/s、4 actor P99 28.2/58.8 ms、并发吞吐 251/155 ops/s、读 P50 400/130 μs；原始结果见 `性能报告.md`，不硬编码历史比值
-- [x] 2026-08-15 v0.1.24 多列 `COUNT(DISTINCT ...)` 修复后：Rust workspace 测试、clippy、`scripts/mysql84-diff.ps1` 119/119 与完整 `scripts/docker-smoke.ps1` 均通过；Docker 使用隔离 13316/14316 端口，未触碰物理 3306/4306
+- [x] 2026-08-15 v0.1.24 多列 `COUNT(DISTINCT ...)` 阶段：Rust workspace 测试、clippy、`scripts/mysql84-diff.ps1` 119/119 与完整 `scripts/docker-smoke.ps1` 均通过；Docker 使用隔离 13316/14316 端口，未触碰物理 3306/4306
 - [x] 2026-08-15 v0.1.24 同条件持久化基准：MyDB 与 MySQL 8.4.11 使用相同 Docker 资源和持久化设置；性能阶段无预热、22.1/60 秒、1 次采样，单表写 203/78 ops/s、4 actor P99 28.7/57.3 ms、并发吞吐 330/144 ops/s、读 P50 403/132 μs；原始结果见 `性能报告.md`，不硬编码历史比值
+- [x] 2026-08-15 v0.1.25 多表达式 `GROUP_CONCAT` 阶段：Rust workspace 测试、clippy、`scripts/mysql84-diff.ps1` 120/120 与完整 `scripts/docker-smoke.ps1` 均通过；覆盖多参数 NULL 行过滤、元组 DISTINCT、ORDER BY、SEPARATOR，Docker 使用隔离 13316/14316 端口，未触碰物理 3306/4306
 - [x] 2026-08-14 Windows 隔离安装回归：管理员本地发布包安装 exit 0，生成 ACL 受限 root/admin 强密钥并创建配置/数据目录；新包仅含 server/cli/migrate/dump，不含 mydb-router
 - [x] 2026-08-14 安装包完整性回归：Linux 容器本地 tar.gz 与 Windows 本地 zip 均完成 `.sha256` 校验、强密钥配置和无 router 文件检查；远程安装路径强制下载 sidecar
 - [ ] 正式 Ubuntu 24.04 物理 linux/amd64 性能结果稳定达到目标；当前证据不足

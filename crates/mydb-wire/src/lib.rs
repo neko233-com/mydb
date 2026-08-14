@@ -45,7 +45,7 @@ use mydb_storage::{
     TriggerDefinition, TriggerEvent, TriggerTiming, UpdateValueExpression, WriteCommand,
 };
 
-pub const SERVER_VERSION: &str = "8.4.0-mydb-0.1.24";
+pub const SERVER_VERSION: &str = "8.4.0-mydb-0.1.25";
 pub const MYSQL84_DEFAULT_SQL_MODE: &str = "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION";
 /// MySQL 8.4 default `innodb_lock_wait_timeout`, in seconds.
 pub const MYSQL84_DEFAULT_INNODB_LOCK_WAIT_TIMEOUT_SECONDS: u64 = 50;
@@ -27944,7 +27944,7 @@ enum AggregateExpression {
     Count(String),
     CountDistinct(String),
     GroupConcat {
-        expression: String,
+        expressions: Vec<String>,
         distinct: bool,
         order_by: Vec<OrderByExpression>,
         separator: Vec<u8>,
@@ -36684,8 +36684,11 @@ fn parse_group_concat_aggregate(raw_argument: &str) -> Option<AggregateExpressio
         .flatten()
         .min()
         .unwrap_or(argument.len());
-    let expression = argument[..expression_end].trim();
-    if expression.is_empty() {
+    let expressions = split_csv(argument[..expression_end].trim())
+        .into_iter()
+        .map(|expression| expression.trim().to_string())
+        .collect::<Vec<_>>();
+    if expressions.is_empty() || expressions.iter().any(String::is_empty) {
         return None;
     }
     let order_by = order_position
@@ -36714,7 +36717,7 @@ fn parse_group_concat_aggregate(raw_argument: &str) -> Option<AggregateExpressio
         })
         .unwrap_or_default();
     Some(AggregateExpression::GroupConcat {
-        expression: expression.to_string(),
+        expressions,
         distinct,
         order_by,
         separator,
@@ -36817,23 +36820,33 @@ fn evaluate_aggregate(
         AggregateExpression::BitOr(expression) => evaluate_bit_aggregate(&expression, rows, '|'),
         AggregateExpression::BitXor(expression) => evaluate_bit_aggregate(&expression, rows, '^'),
         AggregateExpression::GroupConcat {
-            expression,
+            expressions,
             distinct,
             order_by,
             separator,
         } => {
-            let mut values = rows
-                .iter()
-                .map(|row| {
-                    aggregate_row_value(row, &expression)
-                        .map(|value| value.map(|value| (row, value)))
-                })
-                .collect::<anyhow::Result<Vec<_>>>()?
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>();
+            let mut values = Vec::new();
+            for row in rows {
+                let mut rendered = Vec::new();
+                let mut distinct_key = Vec::new();
+                let mut has_null = false;
+                for expression in &expressions {
+                    let Some(value) = aggregate_row_value(row, expression)? else {
+                        has_null = true;
+                        break;
+                    };
+                    let collation = collation_for_expression(Some(schema), expression);
+                    let key = mysql_collation_key_bytes(&value, collation.as_deref());
+                    distinct_key.extend_from_slice(&(key.len() as u64).to_le_bytes());
+                    distinct_key.extend_from_slice(&key);
+                    rendered.extend_from_slice(&value);
+                }
+                if !has_null {
+                    values.push((row, rendered, distinct_key));
+                }
+            }
             if !order_by.is_empty() {
-                values.sort_by(|(left, _), (right, _)| {
+                values.sort_by(|(left, _, _), (right, _, _)| {
                     for item in &order_by {
                         let left = evaluate_scalar_expression(&item.expression, left)
                             .ok()
@@ -36857,13 +36870,10 @@ fn evaluate_aggregate(
                 });
             }
             let mut seen = HashSet::new();
-            let collation = collation_for_expression(Some(schema), &expression);
             let values = values
                 .into_iter()
-                .map(|(_, value)| value)
-                .filter(|value| {
-                    !distinct || seen.insert(mysql_collation_key_bytes(value, collation.as_deref()))
-                })
+                .filter(|(_, _, distinct_key)| !distinct || seen.insert(distinct_key.clone()))
+                .map(|(_, value, _)| value)
                 .collect::<Vec<_>>();
             if values.is_empty() {
                 return Ok(None);
@@ -71591,6 +71601,28 @@ mod tests {
                     .unwrap()
             ),
             b"3"
+        );
+        assert_eq!(
+            single_value(
+                backend
+                    .execute(
+                        "SELECT GROUP_CONCAT(left_key,right_key ORDER BY left_key,right_key SEPARATOR '|') FROM distinct_pairs",
+                    )
+                    .await
+                    .unwrap()
+            ),
+            b"ax|ax|ay|bx"
+        );
+        assert_eq!(
+            single_value(
+                backend
+                    .execute(
+                        "SELECT GROUP_CONCAT(DISTINCT left_key,right_key ORDER BY left_key,right_key SEPARATOR '|') FROM distinct_pairs",
+                    )
+                    .await
+                    .unwrap()
+            ),
+            b"ax|ay|bx"
         );
         assert_eq!(
             single_value(
