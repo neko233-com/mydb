@@ -822,6 +822,15 @@ struct RoutinePrivilegeScope {
     routine: String,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum GrantAuthorizationScope<'a> {
+    Global,
+    Database(&'a str),
+    Table(&'a str, &'a str),
+    Column(&'a str, &'a str, &'a str),
+    Routine(RoutineKind, &'a str, &'a str),
+}
+
 impl RoutineKind {
     fn sql_name(self) -> &'static str {
         match self {
@@ -2936,27 +2945,6 @@ fn parse_table_privilege_scope(scope: &str) -> anyhow::Result<Option<(String, St
         anyhow::bail!("table privilege scope requires database.table");
     }
     Ok(Some((database, table)))
-}
-
-fn authorization_routine_scope(sql: &str) -> anyhow::Result<Option<RoutinePrivilegeScope>> {
-    let upper = sql.to_ascii_uppercase();
-    let (remainder, marker) = if upper.starts_with("GRANT ") {
-        (&sql["GRANT".len()..], " TO ")
-    } else if upper.starts_with("REVOKE ") {
-        (&sql["REVOKE".len()..], " FROM ")
-    } else {
-        return Ok(None);
-    };
-    let remainder = remainder.trim();
-    let upper_remainder = remainder.to_ascii_uppercase();
-    let Some(on) = upper_remainder.find(" ON ") else {
-        return Ok(None);
-    };
-    let after_on = &remainder[on + " ON ".len()..];
-    let Some(target) = after_on.to_ascii_uppercase().find(marker) else {
-        return Ok(None);
-    };
-    parse_routine_privilege_scope(after_on[..target].trim())
 }
 
 fn validate_routine_privileges(
@@ -10000,6 +9988,123 @@ impl Backend {
         )
     }
 
+    fn grant_scope_has_privilege(
+        &self,
+        scope: GrantAuthorizationScope<'_>,
+        privilege: &str,
+    ) -> bool {
+        let user = self.authenticated_username();
+        match scope {
+            GrantAuthorizationScope::Global => self.auth_has_privilege(&user, "", privilege),
+            GrantAuthorizationScope::Database(database) => {
+                self.auth_has_privilege(&user, database, privilege)
+            }
+            GrantAuthorizationScope::Table(database, table) => {
+                self.auth_has_privilege(&user, database, privilege)
+                    || self.auth_has_table_privilege(&user, database, table, privilege)
+            }
+            GrantAuthorizationScope::Column(database, table, column) => {
+                self.auth_has_privilege(&user, database, privilege)
+                    || self.auth_has_table_privilege(&user, database, table, privilege)
+                    || self.auth_has_column_privilege(&user, database, table, column, privilege)
+            }
+            GrantAuthorizationScope::Routine(kind, database, routine) => {
+                self.auth_has_routine_privilege(&user, kind, database, routine, privilege)
+            }
+        }
+    }
+
+    fn require_grant_scope_privileges(
+        &self,
+        scope: GrantAuthorizationScope<'_>,
+        privileges: &HashSet<String>,
+    ) -> anyhow::Result<()> {
+        let user = self.authenticated_username();
+        for privilege in privileges {
+            if !self.grant_scope_has_privilege(scope, privilege)
+                || !self.grant_scope_has_privilege(scope, "GRANT OPTION")
+            {
+                anyhow::bail!(
+                    "Access denied; user '{}' cannot grant or revoke {} at the requested scope",
+                    user,
+                    privilege
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn require_authorization_statement(&self, sql: &str, upper: &str) -> anyhow::Result<()> {
+        let revoke = upper.starts_with("REVOKE ");
+        let remainder = sql[if revoke { 6 } else { 5 }..].trim();
+        let upper_remainder = remainder.to_ascii_uppercase();
+        let Some(on) = upper_remainder.find(" ON ") else {
+            let user = self.authenticated_username();
+            if self.auth_has_privilege(&user, "", "GRANT OPTION") {
+                return Ok(());
+            }
+            anyhow::bail!(
+                "Access denied; user '{}' lacks GRANT OPTION for role administration",
+                user
+            );
+        };
+
+        let grant_option_only = revoke
+            && remainder[..on]
+                .to_ascii_uppercase()
+                .starts_with("GRANT OPTION FOR ");
+        let privilege_spec = if grant_option_only {
+            &remainder["GRANT OPTION FOR ".len()..on]
+        } else {
+            &remainder[..on]
+        };
+        let (listed_privileges, column_privileges) = parse_grant_privilege_spec(privilege_spec)?;
+        let after_on = &remainder[on + 4..];
+        let marker = if revoke { " FROM " } else { " TO " };
+        let target_index = after_on
+            .to_ascii_uppercase()
+            .find(marker)
+            .ok_or_else(|| anyhow::anyhow!("authorization statement requires {}", marker.trim()))?;
+
+        if let Some(scope) = parse_routine_privilege_scope(after_on[..target_index].trim())? {
+            self.require_grant_scope_privileges(
+                GrantAuthorizationScope::Routine(scope.kind, &scope.database, &scope.routine),
+                &listed_privileges,
+            )?;
+            return Ok(());
+        }
+
+        if let Some((database, table)) =
+            parse_table_privilege_scope(after_on[..target_index].trim())?
+        {
+            self.require_grant_scope_privileges(
+                GrantAuthorizationScope::Table(&database, &table),
+                &listed_privileges,
+            )?;
+            for (column, privileges) in &column_privileges {
+                self.require_grant_scope_privileges(
+                    GrantAuthorizationScope::Column(&database, &table, column),
+                    privileges,
+                )?;
+            }
+            return Ok(());
+        }
+
+        if !column_privileges.is_empty() {
+            anyhow::bail!("column privileges require a database.table scope");
+        }
+        let scope = after_on[..target_index].trim();
+        let scope = if scope == "*.*" {
+            GrantAuthorizationScope::Global
+        } else {
+            let database = scope
+                .strip_suffix(".*")
+                .ok_or_else(|| anyhow::anyhow!("only database.* and *.* scopes are supported"))?;
+            GrantAuthorizationScope::Database(database)
+        };
+        self.require_grant_scope_privileges(scope, &listed_privileges)
+    }
+
     fn require_statement_privilege(&self, sql: &str, upper: &str) -> anyhow::Result<()> {
         if upper == "KILL" || upper.starts_with("KILL ") {
             let user = self.authenticated_username();
@@ -10017,14 +10122,7 @@ impl Backend {
             return Ok(());
         }
         if upper.starts_with("GRANT ") || upper.starts_with("REVOKE ") {
-            if let Some(scope) = authorization_routine_scope(sql)? {
-                return self.require_routine_privilege(
-                    scope.kind,
-                    &scope.database,
-                    &scope.routine,
-                    "GRANT OPTION",
-                );
-            }
+            return self.require_authorization_statement(sql, upper);
         }
         // Routine operations resolve the object before authorizing.  The
         // generic table privilege fallback cannot distinguish a qualified
@@ -50798,6 +50896,106 @@ mod tests {
             backend.execute("SHOW GRANTS FOR subject").await,
             Ok(QueryOutcome::Rows { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn grant_option_cannot_delegate_beyond_owned_scope() {
+        let (_temp, _storage, mut backend, _second) = transaction_backends().await;
+        backend
+            .execute(
+                "CREATE TABLE grant_scope (id BIGINT PRIMARY KEY, name VARCHAR(32), score BIGINT)",
+            )
+            .await
+            .expect("grant scope table should be created");
+        backend
+            .execute("CREATE DATABASE otherdb")
+            .await
+            .expect("other database should be created");
+        backend
+            .execute("CREATE TABLE otherdb.other_scope (id BIGINT PRIMARY KEY)")
+            .await
+            .expect("other scope table should be created");
+        backend
+            .execute(
+                "CREATE USER db_grantor IDENTIFIED BY 'db-password', \
+                 table_grantor IDENTIFIED BY 'table-password', \
+                 column_grantor IDENTIFIED BY 'column-password', \
+                 recipient IDENTIFIED BY 'recipient-password'",
+            )
+            .await
+            .expect("grantor accounts should be created");
+        backend
+            .execute("GRANT SELECT ON mydb.* TO db_grantor WITH GRANT OPTION")
+            .await
+            .expect("database grant should be created");
+        backend
+            .execute("GRANT SELECT ON mydb.grant_scope TO table_grantor WITH GRANT OPTION")
+            .await
+            .expect("table grant should be created");
+        backend
+            .execute("GRANT SELECT (name) ON mydb.grant_scope TO column_grantor WITH GRANT OPTION")
+            .await
+            .expect("column grant should be created");
+
+        *backend.authenticated_user.lock() = Some("db_grantor".to_string());
+        backend
+            .execute("GRANT SELECT ON mydb.grant_scope TO recipient")
+            .await
+            .expect("database grantor should delegate within its database");
+        backend
+            .execute("REVOKE SELECT ON mydb.grant_scope FROM recipient")
+            .await
+            .expect("database grantor should revoke within its database");
+        assert!(!backend.config.auth_catalog.has_table_privilege(
+            "recipient",
+            "mydb",
+            "grant_scope",
+            "SELECT"
+        ));
+        backend
+            .execute("GRANT SELECT ON mydb.grant_scope TO recipient")
+            .await
+            .expect("database grantor should regrant within its database");
+        assert!(backend
+            .execute("GRANT UPDATE ON mydb.grant_scope TO recipient")
+            .await
+            .is_err());
+        assert!(backend
+            .execute("GRANT SELECT ON otherdb.* TO recipient")
+            .await
+            .is_err());
+        assert!(backend
+            .execute("GRANT SELECT ON *.* TO recipient")
+            .await
+            .is_err());
+
+        *backend.authenticated_user.lock() = Some("table_grantor".to_string());
+        backend
+            .execute("GRANT SELECT ON mydb.grant_scope TO recipient")
+            .await
+            .expect("table grantor should delegate the owned table privilege");
+        assert!(backend
+            .execute("GRANT SELECT ON mydb.* TO recipient")
+            .await
+            .is_err());
+        assert!(backend
+            .execute("GRANT SELECT ON otherdb.other_scope TO recipient")
+            .await
+            .is_err());
+
+        *backend.authenticated_user.lock() = Some("column_grantor".to_string());
+        backend
+            .execute("GRANT SELECT (name) ON mydb.grant_scope TO recipient")
+            .await
+            .expect("column grantor should delegate the owned column privilege");
+        assert!(backend
+            .execute("GRANT SELECT (id) ON mydb.grant_scope TO recipient")
+            .await
+            .is_err());
+        assert!(backend
+            .execute("GRANT SELECT ON mydb.grant_scope TO recipient")
+            .await
+            .is_err());
     }
 
     #[tokio::test]
