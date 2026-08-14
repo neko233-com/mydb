@@ -19,7 +19,7 @@ if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
 
 if (-not $SkipBuild) {
     & (Join-Path $PSScriptRoot "test-docker.ps1") `
-        -MemoryLimit $MemoryLimit -CpuLimit $CpuLimit -BuildJobs ([Math]::Min($CpuLimit, 2))
+        -MemoryLimit $MemoryLimit -CpuLimit $CpuLimit -BuildJobs 1
     if ($LASTEXITCODE -ne 0) { throw "Docker Rust gate failed" }
 }
 

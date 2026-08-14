@@ -4,7 +4,7 @@ param(
     [ValidateRange(1, 8)]
     [int]$CpuLimit = 2,
     [ValidateRange(1, 8)]
-    [int]$BuildJobs = 2,
+    [int]$BuildJobs = 1,
     [switch]$SkipReleaseBuild
 )
 

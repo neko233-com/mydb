@@ -69,7 +69,7 @@ if ($LASTEXITCODE -eq 0) {
 
 # 发布物不可覆盖；先做 Rust 质量门禁，再构建。
 Write-Info "Running Docker Rust quality gate (2 GiB limit)..."
-& (Join-Path $PSScriptRoot "test-docker.ps1") -MemoryLimit "2g" -CpuLimit 2 -BuildJobs 2
+& (Join-Path $PSScriptRoot "test-docker.ps1") -MemoryLimit "2g" -CpuLimit 2 -BuildJobs 1
 if ($LASTEXITCODE -ne 0) { Write-Error "Docker Rust quality gate failed" }
 
 # 构建 release 版本
