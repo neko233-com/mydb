@@ -597,10 +597,10 @@ bash scripts/docker-smoke.sh
 
 | 场景 | MyDB | MySQL 8.4.11 | MyDB / MySQL |
 |------|------|--------------|--------------|
-| 单表写（fsync-per-commit） | 181 ops/s | 77 ops/s | 2.36x |
-| 8 actor / 8表 写 P99 延迟 | 51.4 ms | 67.4 ms | 1.31x（低更好） |
-| 8 actor / 8表 Group Commit | 384 ops/s | 269 ops/s | 1.43x |
-| 读 P50 延迟 | 962 μs | 136 μs | - |
+| 单表写（fsync-per-commit） | 462 ops/s | 287 ops/s | 1.61x |
+| 8 actor / 8表 写 P99 延迟 | 47.7 ms | 17.5 ms | 0.37x（低更好） |
+| 8 actor / 8表 Group Commit | 1088 ops/s | 274 ops/s | 3.97x |
+| 读 P50 延迟 | 896 μs | 133 μs | - |
 
 性能优化不以关闭 WAL 持久化或弱化恢复语义换取数字。默认 250μs Group Commit 窗口优先并发吞吐，checkpoint 按 1024 个已提交请求触发；不声明未经实测证明的固定倍数。
 
