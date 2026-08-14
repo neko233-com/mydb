@@ -597,10 +597,10 @@ bash scripts/docker-smoke.sh
 
 | 场景 | MyDB | MySQL 8.4.11 | MyDB / MySQL |
 |------|------|--------------|--------------|
-| 单表写（fsync-per-commit） | 198 ops/s | 76 ops/s | 2.61x |
-| 4 actor / 4表 写 P99 延迟 | 21.5 ms | 75.2 ms | 3.50x（低更好） |
-| 4 actor / 4表 Group Commit | 194 ops/s | 151 ops/s | 1.28x |
-| 读 P50 延迟 | 365 μs | 140 μs | - |
+| 单表写（fsync-per-commit） | 207 ops/s | 78 ops/s | 2.67x |
+| 4 actor / 4表 写 P99 延迟 | 36.7 ms | 93.4 ms | 2.54x（低更好） |
+| 4 actor / 4表 Group Commit | 296 ops/s | 152 ops/s | 1.95x |
+| 读 P50 延迟 | 388 μs | 137 μs | - |
 
 性能优化不以关闭 WAL 持久化或弱化恢复语义换取数字。默认 250μs Group Commit 窗口优先并发吞吐，checkpoint 按 1024 个已提交请求触发；不声明未经实测证明的固定倍数。
 
@@ -615,7 +615,7 @@ bash scripts/docker-smoke.sh
 本版面向单机 MySQL 8.4 常用生产工作负载：3306 提供 MySQL 协议，4306 提供登录保护的 Web SQL IDE/管理 API；补齐 `GRANT OPTION` 越权委派防护、角色 `ADMIN OPTION` 授权/撤销/元数据，以及 `GRANT ALL` 后各层部分 `REVOKE` 的实际权限降级。发布不宣称复制/集群、完整 InnoDB 全部锁边界、全部冷门字符集或全部 MySQL 错误码已完成；逐项状态见 [CheckList.md](CheckList.md) 和 [SYNTAX_MATRIX.md](SYNTAX_MATRIX.md)。
 
 **本轮本地门槛（2026-08-14）：**
-- ✅ `cargo test --workspace --locked`：Docker Linux 门禁通过；wire 268（含权限委派/角色 ADMIN OPTION），其他 workspace 测试与文档测试全部通过
+- ✅ `cargo test --workspace --locked`：Docker Linux 门禁通过；wire 269（含权限委派/角色 ADMIN OPTION/ALL 部分撤销），其他 workspace 测试与文档测试全部通过
 - ✅ `cargo clippy --workspace --all-targets -- -D warnings`
 - ✅ `cargo build --release -p mydb-server -p mydb-cli -p mydb-migrate -p mydb-dump`
 - ✅ MySQL 8.4 CLI 3306 连接、`event_scheduler`/版本探测
