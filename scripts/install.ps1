@@ -209,6 +209,9 @@ function Wait-ForParentExit {
 function Update-BinariesOnly {
     Wait-ForParentExit
     $service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+    if ($null -ne $service -and $service.Status -ne "Stopped" -and -not (Test-IsAdministrator)) {
+        Stop-WithError "Administrator privileges are required to update a running MyDB service."
+    }
     $wasRunning = $null -ne $service -and $service.Status -ne "Stopped"
     try {
         if ($wasRunning) {
