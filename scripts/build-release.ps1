@@ -74,7 +74,8 @@ if ($LASTEXITCODE -ne 0) { Write-Error "Docker Rust quality gate failed" }
 
 # 构建 release 版本
 Write-Info "Building release..."
-cargo build --release -p mydb-server -p mydb-cli -p mydb-migrate -p mydb-dump
+cargo build --release -p mydb-server -p mydb-migrate -p mydb-dump
+cargo build --release -p mydb-cli --bins
 if ($LASTEXITCODE -ne 0) { Write-Error "Build failed" }
 
 # 创建打包目录

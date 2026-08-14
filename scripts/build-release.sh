@@ -68,7 +68,8 @@ MYDB_TEST_MEMORY=2g MYDB_TEST_CPUS=2 MYDB_TEST_JOBS=1 \
 
 # 构建 release 版本
 info "Building release..."
-cargo build --release -p mydb-server -p mydb-cli -p mydb-migrate -p mydb-dump
+cargo build --release -p mydb-server -p mydb-migrate -p mydb-dump
+cargo build --release -p mydb-cli --bins
 
 # 创建打包目录
 BUILD_DIR="target/release/package"

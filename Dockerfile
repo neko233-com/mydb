@@ -10,7 +10,8 @@ COPY crates ./crates
 COPY vendor ./vendor
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,id=${TARGET_CACHE_ID},target=/src/target \
-    cargo build --release -p mydb-server -p mydb-cli -p mydb-migrate -p mydb-dump && \
+    cargo build --release -p mydb-server -p mydb-migrate -p mydb-dump && \
+    cargo build --release -p mydb-cli --bins && \
     cp /src/target/release/mydb-server /tmp/mydb-server && \
     cp /src/target/release/mydb-cli /tmp/mydb-cli && \
     cp /src/target/release/mydb /tmp/mydb && \

@@ -641,7 +641,7 @@ bash scripts/docker-smoke.sh
 - ✅ MySQL `'user'@'host'` 基础账户匹配：精确主机优先于通配主机，握手按账户插件选择认证方式
 - ✅ `scripts/bench.ps1`：Docker Linux Rust gate、release build 与同条件 MySQL 8.4 持久化基准通过；性能阶段无预热、60 秒硬截止（报告见 [性能报告.md](性能报告.md)）
 - ✅ `scripts/mysql84-diff.ps1`：当前源码隔离端口与同机 Docker MySQL 8.4，116/116 差分通过；新增基础 JSON_TABLE 标量/嵌套/序号/存在性/默认与错误行为、按前置表行隐式关联 JSON_TABLE、POINT/LINESTRING/POLYGON 空间构造器/度量/访问器/SRID 轴序/谓词，以及 JSON 搜索、浅层/递归通配路径、数组范围/`last` 下标、JSON 聚合/窗口聚合、数组追加/插入、合并、深度/键/美化输出及全文相关性、布尔短语/前缀、停止词/短词边界与查询扩展覆盖
-- ✅ 本轮同条件持久化基准：单表写 MyDB/MySQL `560/262 ops/s`，4 actor P99 `10.6/15.6 ms`，并发吞吐 `1089/187 ops/s`，读 P50 `415/135 μs`；1 次样本、无预热，原始数据见 [性能报告.md](性能报告.md)
+- ✅ 本轮同条件持久化基准：单表写 MyDB/MySQL `209/75 ops/s`，4 actor P99 `43.0/77.1 ms`，并发吞吐 `267/159 ops/s`，读 P50 `264/136 μs`；1 次样本、无预热，原始数据见 [性能报告.md](性能报告.md)
 - ⏳ Ubuntu 24.04 物理性能、macOS 原生验收、宿主断电/恢复中断、大数据压力与生产安全运维验收：以 [CheckList.md](CheckList.md) 与 [性能报告.md](性能报告.md) 为准
 
 ---
