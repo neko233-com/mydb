@@ -45,7 +45,7 @@ use mydb_storage::{
     TriggerDefinition, TriggerEvent, TriggerTiming, UpdateValueExpression, WriteCommand,
 };
 
-pub const SERVER_VERSION: &str = "8.4.0-mydb-0.1.11";
+pub const SERVER_VERSION: &str = "8.4.0-mydb-0.1.12";
 pub const MYSQL84_DEFAULT_SQL_MODE: &str = "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION";
 /// MySQL 8.4 default `innodb_lock_wait_timeout`, in seconds.
 pub const MYSQL84_DEFAULT_INNODB_LOCK_WAIT_TIMEOUT_SECONDS: u64 = 50;
@@ -18728,6 +18728,10 @@ fn mysql_expression_column(name: &str, expression: &str) -> MysqlColumn {
         || upper.starts_with("JSON_INSERT(")
         || upper.starts_with("JSON_REPLACE(")
         || upper.starts_with("JSON_REMOVE(")
+        || upper.starts_with("JSON_ARRAY_APPEND(")
+        || upper.starts_with("JSON_ARRAY_INSERT(")
+        || upper.starts_with("JSON_MERGE_PATCH(")
+        || upper.starts_with("JSON_KEYS(")
         || upper.starts_with("JSON_ARRAY(")
         || upper.starts_with("JSON_OBJECT(")
     {
@@ -18737,6 +18741,7 @@ fn mysql_expression_column(name: &str, expression: &str) -> MysqlColumn {
         || upper.starts_with("JSON_CONTAINS(")
         || upper.starts_with("JSON_CONTAINS_PATH(")
         || upper.starts_with("JSON_OVERLAPS(")
+        || upper.starts_with("JSON_DEPTH(")
         || upper.starts_with("JSON_VALID(")
         || upper.starts_with("LOCATE(")
         || upper.starts_with("INSTR(")
@@ -18776,6 +18781,7 @@ fn mysql_expression_column(name: &str, expression: &str) -> MysqlColumn {
         || upper.starts_with("LTRIM(")
         || upper.starts_with("RTRIM(")
         || upper.starts_with("REPLACE(")
+        || upper.starts_with("JSON_PRETTY(")
         || upper.starts_with("CASE ")
         || expression.starts_with('\'')
         || expression.starts_with('"')
@@ -30931,6 +30937,142 @@ fn evaluate_scalar_expression(value: &str, row: &Row) -> anyhow::Result<Option<V
         };
         return Ok(Some(mysql_json_bytes(&value)?));
     }
+    if upper.starts_with("JSON_ARRAY_APPEND(") && expression.ends_with(')') {
+        let arguments = split_csv(&expression[18..expression.len() - 1]);
+        if arguments.len() < 3 || arguments.len().is_multiple_of(2) {
+            anyhow::bail!("JSON_ARRAY_APPEND requires a document and path/value pairs");
+        }
+        let Some(document) = evaluate_scalar_expression(&arguments[0], row)? else {
+            return Ok(None);
+        };
+        let mut document: serde_json::Value = serde_json::from_slice(&document)
+            .map_err(|error| anyhow::anyhow!("Invalid JSON document: {error}"))?;
+        for pair in arguments[1..].chunks_exact(2) {
+            let Some(path) = evaluate_scalar_expression(&pair[0], row)? else {
+                return Ok(None);
+            };
+            let path = String::from_utf8(path)
+                .map_err(|_| anyhow::anyhow!("JSON path must be valid UTF-8"))?;
+            let Some(target) = json_get_mut_path(&mut document, &parse_json_path(&path)?) else {
+                continue;
+            };
+            let value = evaluate_scalar_expression(&pair[1], row)?
+                .map(|value| sql_scalar_to_json(&value))
+                .unwrap_or(serde_json::Value::Null);
+            if let serde_json::Value::Array(values) = target {
+                values.push(value);
+            } else {
+                let previous = std::mem::replace(target, serde_json::Value::Null);
+                *target = serde_json::Value::Array(vec![previous, value]);
+            }
+        }
+        return Ok(Some(mysql_json_bytes(&document)?));
+    }
+    if upper.starts_with("JSON_ARRAY_INSERT(") && expression.ends_with(')') {
+        let arguments = split_csv(&expression[18..expression.len() - 1]);
+        if arguments.len() < 3 || arguments.len().is_multiple_of(2) {
+            anyhow::bail!("JSON_ARRAY_INSERT requires a document and path/value pairs");
+        }
+        let Some(document) = evaluate_scalar_expression(&arguments[0], row)? else {
+            return Ok(None);
+        };
+        let mut document: serde_json::Value = serde_json::from_slice(&document)
+            .map_err(|error| anyhow::anyhow!("Invalid JSON document: {error}"))?;
+        for pair in arguments[1..].chunks_exact(2) {
+            let Some(path) = evaluate_scalar_expression(&pair[0], row)? else {
+                return Ok(None);
+            };
+            let path = String::from_utf8(path)
+                .map_err(|_| anyhow::anyhow!("JSON path must be valid UTF-8"))?;
+            let segments = parse_json_path(&path)?;
+            let Some((JsonPathSegment::Index(index), parent_path)) = segments.split_last() else {
+                continue;
+            };
+            let Some(parent) = json_get_mut_path(&mut document, parent_path) else {
+                continue;
+            };
+            let Some(values) = parent.as_array_mut() else {
+                continue;
+            };
+            let value = evaluate_scalar_expression(&pair[1], row)?
+                .map(|value| sql_scalar_to_json(&value))
+                .unwrap_or(serde_json::Value::Null);
+            values.insert((*index).min(values.len()), value);
+        }
+        return Ok(Some(mysql_json_bytes(&document)?));
+    }
+    if upper.starts_with("JSON_MERGE_PATCH(") && expression.ends_with(')') {
+        let arguments = split_csv(&expression[17..expression.len() - 1]);
+        if arguments.len() < 2 {
+            anyhow::bail!("JSON_MERGE_PATCH requires at least two documents");
+        }
+        let Some(first) = evaluate_scalar_expression(&arguments[0], row)? else {
+            return Ok(None);
+        };
+        let mut document: serde_json::Value = serde_json::from_slice(&first)
+            .map_err(|error| anyhow::anyhow!("Invalid JSON document: {error}"))?;
+        for argument in &arguments[1..] {
+            let Some(value) = evaluate_scalar_expression(argument, row)? else {
+                return Ok(None);
+            };
+            let value: serde_json::Value = serde_json::from_slice(&value)
+                .map_err(|error| anyhow::anyhow!("Invalid JSON document: {error}"))?;
+            json_merge_patch(&mut document, value);
+        }
+        return Ok(Some(mysql_json_bytes(&document)?));
+    }
+    if upper.starts_with("JSON_DEPTH(") && expression.ends_with(')') {
+        let Some(document) =
+            evaluate_scalar_expression(&expression[11..expression.len() - 1], row)?
+        else {
+            return Ok(None);
+        };
+        let document: serde_json::Value = serde_json::from_slice(&document)
+            .map_err(|error| anyhow::anyhow!("Invalid JSON document: {error}"))?;
+        return Ok(Some(json_depth(&document).to_string().into_bytes()));
+    }
+    if upper.starts_with("JSON_KEYS(") && expression.ends_with(')') {
+        let arguments = split_csv(&expression[10..expression.len() - 1]);
+        if !matches!(arguments.len(), 1 | 2) {
+            anyhow::bail!("JSON_KEYS requires one or two arguments");
+        }
+        let Some(document) = evaluate_scalar_expression(&arguments[0], row)? else {
+            return Ok(None);
+        };
+        let document: serde_json::Value = serde_json::from_slice(&document)
+            .map_err(|error| anyhow::anyhow!("Invalid JSON document: {error}"))?;
+        let value = if let Some(path) = arguments.get(1) {
+            let Some(path) = evaluate_scalar_expression(path, row)? else {
+                return Ok(None);
+            };
+            let path = String::from_utf8(path)
+                .map_err(|_| anyhow::anyhow!("JSON path must be valid UTF-8"))?;
+            let Some(value) = json_extract_path(&document, &path)? else {
+                return Ok(None);
+            };
+            value
+        } else {
+            &document
+        };
+        let serde_json::Value::Object(object) = value else {
+            return Ok(None);
+        };
+        let keys = object
+            .keys()
+            .map(|key| serde_json::Value::String(key.clone()))
+            .collect();
+        return Ok(Some(mysql_json_bytes(&serde_json::Value::Array(keys))?));
+    }
+    if upper.starts_with("JSON_PRETTY(") && expression.ends_with(')') {
+        let Some(document) =
+            evaluate_scalar_expression(&expression[12..expression.len() - 1], row)?
+        else {
+            return Ok(None);
+        };
+        let document: serde_json::Value = serde_json::from_slice(&document)
+            .map_err(|error| anyhow::anyhow!("Invalid JSON document: {error}"))?;
+        return Ok(Some(serde_json::to_string_pretty(&document)?.into_bytes()));
+    }
     if upper.starts_with("JSON_OBJECT(") && expression.ends_with(')') {
         let arguments = split_csv(&expression[12..expression.len() - 1]);
         if !arguments.len().is_multiple_of(2) {
@@ -34000,6 +34142,54 @@ fn json_overlaps(left: &serde_json::Value, right: &serde_json::Value) -> bool {
             .iter()
             .any(|(key, value)| right.get(key).is_some_and(|other| other == value)),
         _ => left == right,
+    }
+}
+
+fn json_get_mut_path<'a>(
+    current: &'a mut serde_json::Value,
+    path: &[JsonPathSegment],
+) -> Option<&'a mut serde_json::Value> {
+    let Some((segment, remainder)) = path.split_first() else {
+        return Some(current);
+    };
+    let child = match segment {
+        JsonPathSegment::Key(key) => current.as_object_mut()?.get_mut(key),
+        JsonPathSegment::Index(index) => current.as_array_mut()?.get_mut(*index),
+    }?;
+    json_get_mut_path(child, remainder)
+}
+
+fn json_merge_patch(target: &mut serde_json::Value, patch: serde_json::Value) {
+    let serde_json::Value::Object(patch) = patch else {
+        *target = patch;
+        return;
+    };
+    if !target.is_object() {
+        *target = serde_json::Value::Object(serde_json::Map::new());
+    }
+    let target = target.as_object_mut().expect("JSON object was initialized");
+    for (key, value) in patch {
+        if value.is_null() {
+            target.remove(&key);
+        } else {
+            json_merge_patch(target.entry(key).or_insert(serde_json::Value::Null), value);
+        }
+    }
+}
+
+fn json_depth(value: &serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::Array(values) => values
+            .iter()
+            .map(json_depth)
+            .max()
+            .map_or(1, |depth| depth + 1),
+        serde_json::Value::Object(values) => values
+            .values()
+            .map(json_depth)
+            .max()
+            .map_or(1, |depth| depth + 1),
+        _ => 1,
     }
 }
 
@@ -68193,6 +68383,43 @@ mod tests {
                 Some(b"1".to_vec()),
                 Some(b"1".to_vec()),
                 Some(b"0".to_vec())
+            ]]
+        );
+
+        let QueryOutcome::Rows { rows, .. } = backend
+            .execute(
+                "SELECT JSON_ARRAY_APPEND('{\"a\":[1,2],\"s\":\"x\"}','$.a',3,'$.s','y'),
+                        JSON_ARRAY_INSERT('{\"a\":[1,2]}','$.a[0]',0,'$.a[5]',5),
+                        JSON_MERGE_PATCH('{\"a\":1,\"b\":{\"x\":2,\"y\":3}}','{\"a\":null,\"b\":{\"x\":9},\"c\":4}'),
+                        JSON_DEPTH('[1,{\"a\":[2]}]'),
+                        JSON_KEYS('{\"b\":1,\"a\":2}'),
+                        JSON_PRETTY('{\"a\":[1,{\"b\":true}],\"c\":null}')",
+            )
+            .await
+            .expect("evaluate advanced JSON functions")
+        else {
+            panic!("expected advanced JSON function row")
+        };
+        assert_eq!(
+            rows,
+            vec![vec![
+                Some(br#"{"a": [1, 2, 3], "s": ["x", "y"]}"#.to_vec()),
+                Some(br#"{"a": [0, 1, 2, 5]}"#.to_vec()),
+                Some(br#"{"b": {"x": 9, "y": 3}, "c": 4}"#.to_vec()),
+                Some(b"4".to_vec()),
+                Some(br#"["a", "b"]"#.to_vec()),
+                Some(
+                    br#"{
+  "a": [
+    1,
+    {
+      "b": true
+    }
+  ],
+  "c": null
+}"#
+                    .to_vec(),
+                )
             ]]
         );
 
