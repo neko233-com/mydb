@@ -34290,8 +34290,13 @@ fn json_extract_path_matches<'a>(
                         let Some(end) = resolve_json_array_bound(end, values.len()) else {
                             continue;
                         };
-                        for index in start..=end {
-                            next.push((format!("{parent_path}[{index}]"), &values[index]));
+                        for (index, item) in values
+                            .iter()
+                            .enumerate()
+                            .skip(start)
+                            .take(end.saturating_sub(start) + 1)
+                        {
+                            next.push((format!("{parent_path}[{index}]"), item));
                         }
                     }
                 }
