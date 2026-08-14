@@ -247,7 +247,31 @@ function Update-BinariesOnly {
     Wait-ForParentExit
     $service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
     if ($null -ne $service -and $service.Status -ne "Stopped" -and -not (Test-IsAdministrator)) {
-        Stop-WithError "Administrator privileges are required to update a running MyDB service."
+        $elevatedArguments = @(
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            "`"$PSCommandPath`"",
+            "-BinariesOnly",
+            "-PackagePath",
+            "`"$PackagePath`"",
+            "-InstallDir",
+            "`"$InstallDir`"",
+            "-ServiceName",
+            "`"$ServiceName`"",
+            "-WaitForProcessId",
+            "0",
+            "-UpdateTempRoot",
+            "`"$UpdateTempRoot`""
+        )
+        $elevated = Start-Process -FilePath "powershell.exe" -Verb RunAs -ArgumentList $elevatedArguments -Wait -PassThru -WindowStyle Hidden
+        if ($elevated.ExitCode -ne 0) {
+            Stop-WithError "Elevated MyDB update helper failed with exit code $($elevated.ExitCode)."
+        }
+        return
     }
     $wasRunning = $null -ne $service -and $service.Status -ne "Stopped"
     try {
