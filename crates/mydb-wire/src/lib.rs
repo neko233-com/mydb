@@ -45,7 +45,7 @@ use mydb_storage::{
     TriggerDefinition, TriggerEvent, TriggerTiming, UpdateValueExpression, WriteCommand,
 };
 
-pub const SERVER_VERSION: &str = "8.4.0-mydb-0.1.14";
+pub const SERVER_VERSION: &str = "8.4.0-mydb-0.1.15";
 pub const MYSQL84_DEFAULT_SQL_MODE: &str = "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION";
 /// MySQL 8.4 default `innodb_lock_wait_timeout`, in seconds.
 pub const MYSQL84_DEFAULT_INNODB_LOCK_WAIT_TIMEOUT_SECONDS: u64 = 50;
@@ -30883,6 +30883,10 @@ fn evaluate_scalar_expression(value: &str, row: &Row) -> anyhow::Result<Option<V
             .map_err(|error| anyhow::anyhow!("Invalid JSON document: {error}"))?;
         let path = String::from_utf8(path)
             .map_err(|_| anyhow::anyhow!("JSON path must be valid UTF-8"))?;
+        let path_segments = parse_json_path(&path)?;
+        if json_path_has_wildcard(&path_segments) {
+            return Ok(None);
+        }
         let Some(value) = json_extract_path(&document, &path)? else {
             return Ok(None);
         };
@@ -30930,20 +30934,24 @@ fn evaluate_scalar_expression(value: &str, row: &Row) -> anyhow::Result<Option<V
         let document: serde_json::Value = serde_json::from_slice(&document)
             .map_err(|error| anyhow::anyhow!("Invalid JSON document: {error}"))?;
         let mut matches = Vec::new();
+        let mut wildcard_path = false;
         for path in &arguments[1..] {
             let Some(path) = evaluate_scalar_expression(path, row)? else {
                 return Ok(None);
             };
             let path = String::from_utf8(path)
                 .map_err(|_| anyhow::anyhow!("JSON path must be valid UTF-8"))?;
-            if let Some(value) = json_extract_path(&document, &path)? {
-                matches.push(value.clone());
-            }
+            wildcard_path |= json_path_has_wildcard(&parse_json_path(&path)?);
+            matches.extend(
+                json_extract_path_matches(&document, &path)?
+                    .into_iter()
+                    .map(|(_, value)| value.clone()),
+            );
         }
         if matches.is_empty() {
             return Ok(None);
         }
-        let value = if arguments.len() == 2 {
+        let value = if arguments.len() == 2 && !wildcard_path {
             matches.remove(0)
         } else {
             serde_json::Value::Array(matches)
@@ -30996,8 +31004,18 @@ fn evaluate_scalar_expression(value: &str, row: &Row) -> anyhow::Result<Option<V
                     return Ok(None);
                 };
                 let path = String::from_utf8(path)?;
-                if let Some(value) = json_extract_path(&document, &path)? {
-                    json_search_collect(value, &path, &search, escape, mode == "one", &mut matches);
+                for (matched_path, value) in json_extract_path_matches(&document, &path)? {
+                    json_search_collect(
+                        value,
+                        &matched_path,
+                        &search,
+                        escape,
+                        mode == "one",
+                        &mut matches,
+                    );
+                    if mode == "one" && !matches.is_empty() {
+                        break;
+                    }
                 }
                 if mode == "one" && !matches.is_empty() {
                     break;
@@ -31030,7 +31048,9 @@ fn evaluate_scalar_expression(value: &str, row: &Row) -> anyhow::Result<Option<V
             };
             let path = String::from_utf8(path)
                 .map_err(|_| anyhow::anyhow!("JSON path must be valid UTF-8"))?;
-            let Some(target) = json_get_mut_path(&mut document, &parse_json_path(&path)?) else {
+            let segments = parse_json_path(&path)?;
+            reject_json_mutation_wildcard(&segments)?;
+            let Some(target) = json_get_mut_path(&mut document, &segments) else {
                 continue;
             };
             let value = evaluate_scalar_expression(&pair[1], row)?
@@ -31062,6 +31082,7 @@ fn evaluate_scalar_expression(value: &str, row: &Row) -> anyhow::Result<Option<V
             let path = String::from_utf8(path)
                 .map_err(|_| anyhow::anyhow!("JSON path must be valid UTF-8"))?;
             let segments = parse_json_path(&path)?;
+            reject_json_mutation_wildcard(&segments)?;
             let Some((JsonPathSegment::Index(index), parent_path)) = segments.split_last() else {
                 continue;
             };
@@ -31124,6 +31145,8 @@ fn evaluate_scalar_expression(value: &str, row: &Row) -> anyhow::Result<Option<V
             };
             let path = String::from_utf8(path)
                 .map_err(|_| anyhow::anyhow!("JSON path must be valid UTF-8"))?;
+            let segments = parse_json_path(&path)?;
+            reject_json_mutation_wildcard(&segments)?;
             let Some(value) = json_extract_path(&document, &path)? else {
                 return Ok(None);
             };
@@ -31220,9 +31243,15 @@ fn evaluate_scalar_expression(value: &str, row: &Row) -> anyhow::Result<Option<V
             };
             let path = String::from_utf8(path)
                 .map_err(|_| anyhow::anyhow!("JSON path must be valid UTF-8"))?;
-            let Some(value) = json_extract_path(&document, &path)? else {
+            let segments = parse_json_path(&path)?;
+            let wildcard = json_path_has_wildcard(&segments);
+            let values = json_extract_path_matches(&document, &path)?;
+            let Some(value) = values.first().map(|(_, value)| *value) else {
                 return Ok(None);
             };
+            if wildcard && values.len() > 1 {
+                return Ok(Some(values.len().to_string().into_bytes()));
+            }
             value
         } else {
             &document
@@ -31311,6 +31340,8 @@ fn evaluate_scalar_expression(value: &str, row: &Row) -> anyhow::Result<Option<V
             };
             let path = String::from_utf8(path)
                 .map_err(|_| anyhow::anyhow!("JSON path must be valid UTF-8"))?;
+            let segments = parse_json_path(&path)?;
+            reject_json_mutation_wildcard(&segments)?;
             let Some(value) = json_extract_path(&document, &path)? else {
                 return Ok(Some(b"0".to_vec()));
             };
@@ -31346,7 +31377,9 @@ fn evaluate_scalar_expression(value: &str, row: &Row) -> anyhow::Result<Option<V
             let value = evaluate_scalar_expression(&pair[1], row)?
                 .map(|value| sql_scalar_to_json(&value))
                 .unwrap_or(serde_json::Value::Null);
-            json_set_path(&mut document, &parse_json_path(&path)?, value)?;
+            let segments = parse_json_path(&path)?;
+            reject_json_mutation_wildcard(&segments)?;
+            json_set_path(&mut document, &segments, value)?;
         }
         return Ok(Some(mysql_json_bytes(&document)?));
     }
@@ -31366,7 +31399,9 @@ fn evaluate_scalar_expression(value: &str, row: &Row) -> anyhow::Result<Option<V
             };
             let path = String::from_utf8(path)
                 .map_err(|_| anyhow::anyhow!("JSON path must be valid UTF-8"))?;
-            json_remove_path(&mut document, &parse_json_path(&path)?)?;
+            let segments = parse_json_path(&path)?;
+            reject_json_mutation_wildcard(&segments)?;
+            json_remove_path(&mut document, &segments)?;
         }
         return Ok(Some(mysql_json_bytes(&document)?));
     }
@@ -34050,6 +34085,17 @@ fn find_scalar_arithmetic_operator(value: &str) -> Option<(usize, char)> {
 enum JsonPathSegment {
     Key(String),
     Index(usize),
+    Last(usize),
+    Range(JsonArrayBound, JsonArrayBound),
+    AnyKey,
+    AnyIndex,
+    Recursive,
+}
+
+#[derive(Debug, Clone)]
+enum JsonArrayBound {
+    Index(usize),
+    Last(usize),
 }
 
 fn parse_json_path(path: &str) -> anyhow::Result<Vec<JsonPathSegment>> {
@@ -34060,11 +34106,21 @@ fn parse_json_path(path: &str) -> anyhow::Result<Vec<JsonPathSegment>> {
     let mut segments = Vec::new();
     let mut position = 1;
     while position < bytes.len() {
+        if bytes[position] == b'*' && bytes.get(position + 1) == Some(&b'*') {
+            position += 2;
+            segments.push(JsonPathSegment::Recursive);
+            continue;
+        }
         match bytes[position] {
             b'.' => {
                 position += 1;
                 if position >= bytes.len() {
                     anyhow::bail!("Invalid JSON path '{path}'");
+                }
+                if bytes[position] == b'*' {
+                    position += 1;
+                    segments.push(JsonPathSegment::AnyKey);
+                    continue;
                 }
                 let key = if bytes[position] == b'\"' {
                     let start = position;
@@ -34100,44 +34156,238 @@ fn parse_json_path(path: &str) -> anyhow::Result<Vec<JsonPathSegment>> {
             b'[' => {
                 position += 1;
                 let start = position;
-                while position < bytes.len() && bytes[position].is_ascii_digit() {
+                while position < bytes.len() && bytes[position] != b']' {
                     position += 1;
                 }
                 if start == position || bytes.get(position) != Some(&b']') {
                     anyhow::bail!("Invalid or unsupported JSON path '{path}'");
                 }
-                let index = path[start..position].parse::<usize>()?;
+                let token = path[start..position].trim();
                 position += 1;
+                if token == "*" {
+                    segments.push(JsonPathSegment::AnyIndex);
+                    continue;
+                }
+                let token_lower = token.to_ascii_lowercase();
+                if let Some(to_position) = token_lower.find(" to ") {
+                    let start_bound = parse_json_array_bound(token[..to_position].trim(), path)?;
+                    let end_bound = parse_json_array_bound(token[to_position + 4..].trim(), path)?;
+                    segments.push(JsonPathSegment::Range(start_bound, end_bound));
+                    continue;
+                }
+                if let Some(bound) = token_lower.strip_prefix("last") {
+                    let offset = if bound.is_empty() {
+                        0
+                    } else if let Some(offset) = bound.strip_prefix('-') {
+                        offset
+                            .parse::<usize>()
+                            .map_err(|_| anyhow::anyhow!("Invalid JSON path '{path}'"))?
+                    } else {
+                        anyhow::bail!("Invalid JSON path '{path}'");
+                    };
+                    segments.push(JsonPathSegment::Last(offset));
+                    continue;
+                }
+                let index = token
+                    .parse::<usize>()
+                    .map_err(|_| anyhow::anyhow!("Invalid JSON path '{path}'"))?;
                 segments.push(JsonPathSegment::Index(index));
             }
             _ => anyhow::bail!("Invalid JSON path '{path}'"),
         }
     }
+    if matches!(segments.last(), Some(JsonPathSegment::Recursive)) {
+        anyhow::bail!("Invalid JSON path '{path}'");
+    }
     Ok(segments)
+}
+
+fn parse_json_array_bound(value: &str, path: &str) -> anyhow::Result<JsonArrayBound> {
+    let value_lower = value.to_ascii_lowercase();
+    if let Some(offset) = value_lower.strip_prefix("last") {
+        let offset = if offset.is_empty() {
+            0
+        } else if let Some(offset) = offset.strip_prefix('-') {
+            offset
+                .parse::<usize>()
+                .map_err(|_| anyhow::anyhow!("Invalid JSON path '{path}'"))?
+        } else {
+            anyhow::bail!("Invalid JSON path '{path}'");
+        };
+        return Ok(JsonArrayBound::Last(offset));
+    }
+    Ok(JsonArrayBound::Index(value.parse::<usize>().map_err(
+        |_| anyhow::anyhow!("Invalid JSON path '{path}'"),
+    )?))
 }
 
 fn json_extract_path<'a>(
     document: &'a serde_json::Value,
     path: &str,
 ) -> anyhow::Result<Option<&'a serde_json::Value>> {
-    let mut current = document;
-    for segment in parse_json_path(path)? {
-        current = match segment {
-            JsonPathSegment::Key(key) => {
-                let Some(value) = current.get(&key) else {
-                    return Ok(None);
-                };
-                value
+    Ok(json_extract_path_matches(document, path)?
+        .into_iter()
+        .next()
+        .map(|(_, value)| value))
+}
+
+fn json_extract_path_matches<'a>(
+    document: &'a serde_json::Value,
+    path: &str,
+) -> anyhow::Result<Vec<(String, &'a serde_json::Value)>> {
+    let segments = parse_json_path(path)?;
+    let wildcard = json_path_has_wildcard(&segments);
+    let mut current = vec![("$".to_string(), document)];
+    for segment in segments {
+        let mut next = Vec::new();
+        for (parent_path, value) in current {
+            match &segment {
+                JsonPathSegment::Key(key) => {
+                    if let Some(child) = value.get(key) {
+                        next.push((
+                            if wildcard {
+                                json_path_key(&parent_path, key)
+                            } else {
+                                path.to_string()
+                            },
+                            child,
+                        ));
+                    }
+                }
+                JsonPathSegment::Index(index) => {
+                    if let Some(child) = value.get(*index) {
+                        next.push((
+                            if wildcard {
+                                format!("{parent_path}[{index}]")
+                            } else {
+                                path.to_string()
+                            },
+                            child,
+                        ));
+                    }
+                }
+                JsonPathSegment::Last(offset) => {
+                    if let Some(values) = value.as_array() {
+                        if let Some(index) =
+                            resolve_json_array_bound(&JsonArrayBound::Last(*offset), values.len())
+                        {
+                            next.push((
+                                if wildcard {
+                                    format!("{parent_path}[{index}]")
+                                } else {
+                                    path.to_string()
+                                },
+                                &values[index],
+                            ));
+                        }
+                    }
+                }
+                JsonPathSegment::Range(start, end) => {
+                    if let Some(values) = value.as_array() {
+                        let Some(start) = resolve_json_array_bound(start, values.len()) else {
+                            continue;
+                        };
+                        let Some(end) = resolve_json_array_bound(end, values.len()) else {
+                            continue;
+                        };
+                        for index in start..=end {
+                            next.push((format!("{parent_path}[{index}]"), &values[index]));
+                        }
+                    }
+                }
+                JsonPathSegment::AnyKey => {
+                    if let Some(object) = value.as_object() {
+                        for (key, child) in object {
+                            next.push((json_path_key(&parent_path, key), child));
+                        }
+                    }
+                }
+                JsonPathSegment::AnyIndex => {
+                    if let Some(values) = value.as_array() {
+                        for (index, child) in values.iter().enumerate() {
+                            next.push((format!("{parent_path}[{index}]"), child));
+                        }
+                    }
+                }
+                JsonPathSegment::Recursive => {
+                    json_collect_descendants(&parent_path, value, &mut next);
+                }
             }
-            JsonPathSegment::Index(index) => {
-                let Some(value) = current.get(index) else {
-                    return Ok(None);
-                };
-                value
-            }
-        };
+        }
+        current = next;
+        if current.is_empty() {
+            break;
+        }
     }
-    Ok(Some(current))
+    Ok(current)
+}
+
+fn resolve_json_array_bound(bound: &JsonArrayBound, length: usize) -> Option<usize> {
+    match bound {
+        JsonArrayBound::Index(index) => (*index < length).then_some(*index),
+        JsonArrayBound::Last(offset) => length.checked_sub(offset.saturating_add(1)),
+    }
+}
+
+fn json_path_has_wildcard(path: &[JsonPathSegment]) -> bool {
+    path.iter().any(|segment| {
+        matches!(
+            segment,
+            JsonPathSegment::Range(_, _)
+                | JsonPathSegment::AnyKey
+                | JsonPathSegment::AnyIndex
+                | JsonPathSegment::Recursive
+        )
+    })
+}
+
+fn reject_json_mutation_wildcard(path: &[JsonPathSegment]) -> anyhow::Result<()> {
+    if json_path_has_wildcard(path) {
+        anyhow::bail!(
+            "In this situation, path expressions may not contain the * and ** tokens or an array range."
+        );
+    }
+    Ok(())
+}
+
+fn json_path_key(parent: &str, key: &str) -> String {
+    let simple_key = !key.is_empty()
+        && key.chars().enumerate().all(|(index, character)| {
+            (index == 0 && (character.is_ascii_alphabetic() || character == '_'))
+                || (index > 0 && (character.is_ascii_alphanumeric() || character == '_'))
+        });
+    if simple_key {
+        format!("{parent}.{key}")
+    } else {
+        format!(
+            "{parent}.{}",
+            serde_json::to_string(key).expect("serialize JSON key")
+        )
+    }
+}
+
+fn json_collect_descendants<'a>(
+    path: &str,
+    value: &'a serde_json::Value,
+    output: &mut Vec<(String, &'a serde_json::Value)>,
+) {
+    output.push((path.to_string(), value));
+    match value {
+        serde_json::Value::Array(values) => {
+            for (index, child) in values.iter().enumerate() {
+                json_collect_descendants(&format!("{path}[{index}]"), child, output);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for (key, child) in values {
+                json_collect_descendants(&json_path_key(path, key), child, output);
+            }
+        }
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_) => {}
+    }
 }
 
 fn sql_scalar_to_json(value: &[u8]) -> serde_json::Value {
@@ -34232,6 +34482,17 @@ fn json_get_mut_path<'a>(
     let child = match segment {
         JsonPathSegment::Key(key) => current.as_object_mut()?.get_mut(key),
         JsonPathSegment::Index(index) => current.as_array_mut()?.get_mut(*index),
+        JsonPathSegment::Last(offset) => {
+            let values = current.as_array_mut()?;
+            let index = resolve_json_array_bound(&JsonArrayBound::Last(*offset), values.len())?;
+            values.get_mut(index)
+        }
+        JsonPathSegment::Range(_, _)
+        | JsonPathSegment::AnyKey
+        | JsonPathSegment::AnyIndex
+        | JsonPathSegment::Recursive => {
+            return None;
+        }
     }?;
     json_get_mut_path(child, remainder)
 }
@@ -34454,6 +34715,25 @@ fn json_set_path(
             }
             json_set_path(&mut values[*index], remainder, value)
         }
+        JsonPathSegment::Last(offset) => {
+            let values = current
+                .as_array_mut()
+                .ok_or_else(|| anyhow::anyhow!("JSON array index is out of range"))?;
+            let Some(index) =
+                resolve_json_array_bound(&JsonArrayBound::Last(*offset), values.len())
+            else {
+                anyhow::bail!("JSON array index is out of range");
+            };
+            json_set_path(&mut values[index], remainder, value)
+        }
+        JsonPathSegment::Range(_, _)
+        | JsonPathSegment::AnyKey
+        | JsonPathSegment::AnyIndex
+        | JsonPathSegment::Recursive => {
+            anyhow::bail!(
+                "In this situation, path expressions may not contain the * and ** tokens or an array range."
+            )
+        }
     }
 }
 
@@ -34478,6 +34758,23 @@ fn json_remove_path(
                     }
                 }
             }
+            JsonPathSegment::Last(offset) => {
+                if let Some(values) = current.as_array_mut() {
+                    if let Some(index) =
+                        resolve_json_array_bound(&JsonArrayBound::Last(*offset), values.len())
+                    {
+                        values.remove(index);
+                    }
+                }
+            }
+            JsonPathSegment::Range(_, _)
+            | JsonPathSegment::AnyKey
+            | JsonPathSegment::AnyIndex
+            | JsonPathSegment::Recursive => {
+                anyhow::bail!(
+                    "In this situation, path expressions may not contain the * and ** tokens or an array range."
+                )
+            }
         }
         return Ok(());
     }
@@ -34488,6 +34785,16 @@ fn json_remove_path(
         JsonPathSegment::Index(index) => current
             .as_array_mut()
             .and_then(|values| values.get_mut(*index)),
+        JsonPathSegment::Last(offset) => current.as_array_mut().and_then(|values| {
+            resolve_json_array_bound(&JsonArrayBound::Last(*offset), values.len())
+                .and_then(|index| values.get_mut(index))
+        }),
+        JsonPathSegment::Range(_, _)
+        | JsonPathSegment::AnyKey
+        | JsonPathSegment::AnyIndex
+        | JsonPathSegment::Recursive => {
+            return Ok(());
+        }
     };
     if let Some(child) = child {
         json_remove_path(child, remainder)?;
@@ -68660,6 +68967,66 @@ mod tests {
                 Some(b"0".to_vec())
             ]]
         );
+
+        let QueryOutcome::Rows { rows, .. } = backend
+            .execute(
+                "SELECT JSON_EXTRACT('{\"a\":1,\"b\":2}','$.*'),
+                        JSON_EXTRACT('[1,2,3]','$[*]'),
+                        JSON_EXTRACT('{\"a\":{\"x\":1},\"b\":{\"x\":2}}','$.*.x'),
+                        JSON_CONTAINS_PATH('{\"a\":1}','one','$.*'),
+                        JSON_CONTAINS_PATH('{\"a\":1}','all','$.*'),
+                        JSON_LENGTH('{\"a\":[1,2],\"b\":[3]}','$.*'),
+                        JSON_LENGTH('{\"a\":[1,2],\"b\":[3]}','$.*[0]'),
+                        JSON_LENGTH('{\"a\":[1,2],\"b\":[3]}','$.*[*]'),
+                        JSON_VALUE('[1,2]','$[*]'),
+                        JSON_EXTRACT('{\"a\":1,\"x\":{\"a\":2,\"arr\":[{\"a\":3}]}}','$**.a'),
+                        JSON_EXTRACT('[1,[2,[3]]]','$**[0]'),
+                        JSON_SEARCH('{\"a\":\"root\",\"x\":{\"a\":\"nested\"}}','all','nested','\\\\','$**.a'),
+                        JSON_EXTRACT('[0,1,2,3]','$[1 to 2]'),
+                        JSON_EXTRACT('[0,1,2,3]','$[last]'),
+                        JSON_EXTRACT('[0,1,2,3]','$[last-1]'),
+                        JSON_EXTRACT('[0,1,2,3]','$[1 to last]'),
+                        JSON_LENGTH('[0,1,2,3]','$[1 to 2]'),
+                        JSON_CONTAINS_PATH('[0,1,2,3]','one','$[1 to 2]'),
+                        JSON_VALUE('[0,1,2,3]','$[1 to 2]')",
+            )
+            .await
+            .expect("evaluate JSON wildcard path functions")
+        else {
+            panic!("expected JSON wildcard path row")
+        };
+        assert_eq!(
+            rows,
+            vec![vec![
+                Some(br#"[1, 2]"#.to_vec()),
+                Some(br#"[1, 2, 3]"#.to_vec()),
+                Some(br#"[1, 2]"#.to_vec()),
+                Some(b"1".to_vec()),
+                Some(b"1".to_vec()),
+                Some(b"2".to_vec()),
+                Some(b"2".to_vec()),
+                Some(b"3".to_vec()),
+                None,
+                Some(br#"[1, 2, 3]"#.to_vec()),
+                Some(br#"[1, 2, 3]"#.to_vec()),
+                Some(br#""$.x.a""#.to_vec()),
+                Some(br#"[1, 2]"#.to_vec()),
+                Some(b"3".to_vec()),
+                Some(b"2".to_vec()),
+                Some(br#"[1, 2, 3]"#.to_vec()),
+                Some(b"2".to_vec()),
+                Some(b"1".to_vec()),
+                None
+            ]]
+        );
+        assert!(backend
+            .execute("SELECT JSON_KEYS('{\"a\":1}','$.*')")
+            .await
+            .is_err());
+        assert!(backend
+            .execute("SELECT JSON_SET('{\"a\":1}','$.*',2)")
+            .await
+            .is_err());
 
         let QueryOutcome::Rows { rows, .. } = backend
             .execute(
