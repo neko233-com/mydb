@@ -45,7 +45,7 @@ use mydb_storage::{
     TriggerDefinition, TriggerEvent, TriggerTiming, UpdateValueExpression, WriteCommand,
 };
 
-pub const SERVER_VERSION: &str = "8.4.0-mydb-0.1.13";
+pub const SERVER_VERSION: &str = "8.4.0-mydb-0.1.14";
 pub const MYSQL84_DEFAULT_SQL_MODE: &str = "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION";
 /// MySQL 8.4 default `innodb_lock_wait_timeout`, in seconds.
 pub const MYSQL84_DEFAULT_INNODB_LOCK_WAIT_TIMEOUT_SECONDS: u64 = 50;
@@ -18710,6 +18710,8 @@ fn mysql_expression_column(name: &str, expression: &str) -> MysqlColumn {
         ColumnType::MYSQL_TYPE_NEWDECIMAL
     } else if upper.starts_with("MATCH(") && upper.contains(" AGAINST ") {
         ColumnType::MYSQL_TYPE_DOUBLE
+    } else if upper.starts_with("JSON_ARRAYAGG(") || upper.starts_with("JSON_OBJECTAGG(") {
+        ColumnType::MYSQL_TYPE_JSON
     } else if !upper.starts_with("CASE ")
         && (["<=>", ">=", "<=", "<>", "!=", ">", "<", "="]
             .into_iter()
@@ -18733,6 +18735,8 @@ fn mysql_expression_column(name: &str, expression: &str) -> MysqlColumn {
         || upper.starts_with("JSON_MERGE_PATCH(")
         || upper.starts_with("JSON_KEYS(")
         || upper.starts_with("JSON_SEARCH(")
+        || upper.starts_with("JSON_ARRAYAGG(")
+        || upper.starts_with("JSON_OBJECTAGG(")
         || upper.starts_with("JSON_ARRAY(")
         || upper.starts_with("JSON_OBJECT(")
     {
@@ -27375,6 +27379,11 @@ enum AggregateExpression {
         order_by: Vec<OrderByExpression>,
         separator: Vec<u8>,
     },
+    JsonArrayAgg(String),
+    JsonObjectAgg {
+        key: String,
+        value: String,
+    },
     Sum(String),
     Avg(String),
     Max(String),
@@ -27621,6 +27630,8 @@ fn collect_innermost_aggregate_expressions(value: &str, output: &mut HashSet<Str
                 | "BIT_OR"
                 | "BIT_XOR"
                 | "GROUP_CONCAT"
+                | "JSON_ARRAYAGG"
+                | "JSON_OBJECTAGG"
         ) || !value[cursor..].starts_with('(')
         {
             continue;
@@ -27713,7 +27724,8 @@ fn parse_window_expression(value: &str, sql: &str) -> anyhow::Result<Option<Wind
         }
         "CUME_DIST" if arguments.is_empty() => WindowFunction::CumeDist,
         "PERCENT_RANK" if arguments.is_empty() => WindowFunction::PercentRank,
-        "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "BIT_AND" | "BIT_OR" | "BIT_XOR" => {
+        "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "BIT_AND" | "BIT_OR" | "BIT_XOR"
+        | "JSON_ARRAYAGG" | "JSON_OBJECTAGG" => {
             let aggregate = parse_aggregate_expression(function_expression)
                 .ok_or_else(|| anyhow::anyhow!("Invalid window aggregate"))?;
             if matches!(aggregate, AggregateExpression::CountDistinct(_)) {
@@ -34506,6 +34518,19 @@ fn parse_aggregate_expression(value: &str) -> Option<AggregateExpression> {
         )),
         "COUNT" => Some(AggregateExpression::Count(argument)),
         "GROUP_CONCAT" => parse_group_concat_aggregate(raw_argument),
+        "JSON_ARRAYAGG" if !argument.is_empty() => {
+            Some(AggregateExpression::JsonArrayAgg(argument))
+        }
+        "JSON_OBJECTAGG" => {
+            let mut arguments = split_csv(raw_argument).into_iter();
+            let key = arguments.next()?.trim().to_string();
+            let value = arguments.next()?.trim().to_string();
+            if arguments.next().is_some() || key.is_empty() || value.is_empty() {
+                None
+            } else {
+                Some(AggregateExpression::JsonObjectAgg { key, value })
+            }
+        }
         "SUM" => Some(AggregateExpression::Sum(argument)),
         "AVG" => Some(AggregateExpression::Avg(argument)),
         "MAX" => Some(AggregateExpression::Max(argument)),
@@ -34712,6 +34737,39 @@ fn evaluate_aggregate(
             }
             Ok(Some(output))
         }
+        AggregateExpression::JsonArrayAgg(expression) => {
+            if rows.is_empty() {
+                return Ok(None);
+            }
+            let values = rows
+                .iter()
+                .map(|row| {
+                    aggregate_row_value(row, &expression).map(|value| {
+                        value
+                            .map(|value| sql_scalar_to_json(&value))
+                            .unwrap_or(serde_json::Value::Null)
+                    })
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            mysql_json_bytes(&serde_json::Value::Array(values)).map(Some)
+        }
+        AggregateExpression::JsonObjectAgg { key, value } => {
+            if rows.is_empty() {
+                return Ok(None);
+            }
+            let mut object = serde_json::Map::new();
+            for row in rows {
+                let Some(key) = aggregate_row_value(row, &key)? else {
+                    anyhow::bail!("JSON documents may not contain NULL member names");
+                };
+                let key = String::from_utf8_lossy(&key).into_owned();
+                let value = aggregate_row_value(row, &value)?
+                    .map(|value| sql_scalar_to_json(&value))
+                    .unwrap_or(serde_json::Value::Null);
+                object.insert(key, value);
+            }
+            mysql_json_bytes(&serde_json::Value::Object(object)).map(Some)
+        }
         AggregateExpression::Sum(column) | AggregateExpression::Avg(column) => {
             let values = rows
                 .iter()
@@ -34840,7 +34898,9 @@ fn aggregate_numeric_exactness(
         AggregateExpression::BitAnd(_)
         | AggregateExpression::BitOr(_)
         | AggregateExpression::BitXor(_) => Some(true),
-        AggregateExpression::GroupConcat { .. } => None,
+        AggregateExpression::GroupConcat { .. }
+        | AggregateExpression::JsonArrayAgg(_)
+        | AggregateExpression::JsonObjectAgg { .. } => None,
     }
 }
 
@@ -68660,6 +68720,72 @@ mod tests {
                 Some(br#""$.b[1]""#.to_vec()),
                 Some(br#"["$.\"a.b\"", "$.plain"]"#.to_vec())
             ]]
+        );
+
+        backend
+            .execute("CREATE TABLE mysql84_json_aggregates (id INT, value JSON)")
+            .await
+            .expect("create JSON aggregate compatibility rows");
+        backend
+            .execute("INSERT INTO mysql84_json_aggregates VALUES (1,'7'),(2,'\"x\"'),(3,NULL)")
+            .await
+            .expect("insert JSON aggregate compatibility rows");
+        let QueryOutcome::Rows { rows, .. } = backend
+            .execute(
+                "SELECT JSON_ARRAYAGG(value),JSON_OBJECTAGG(id,value),JSON_ARRAYAGG(value) FROM mysql84_json_aggregates",
+            )
+            .await
+            .expect("evaluate JSON aggregate functions")
+        else {
+            panic!("expected JSON aggregate row")
+        };
+        assert_eq!(
+            rows,
+            vec![vec![
+                Some(br#"[7, "x", null]"#.to_vec()),
+                Some(br#"{"1": 7, "2": "x", "3": null}"#.to_vec()),
+                Some(br#"[7, "x", null]"#.to_vec())
+            ]]
+        );
+        let QueryOutcome::Rows { rows, .. } = backend
+            .execute(
+                "SELECT JSON_ARRAYAGG(value),JSON_OBJECTAGG(id,value) FROM mysql84_json_aggregates WHERE id>99",
+            )
+            .await
+            .expect("evaluate empty JSON aggregate functions")
+        else {
+            panic!("expected empty JSON aggregate row")
+        };
+        assert_eq!(rows, vec![vec![None, None]]);
+
+        let QueryOutcome::Rows { rows, .. } = backend
+            .execute(
+                "SELECT id,JSON_ARRAYAGG(value) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_values,JSON_OBJECTAGG(id,value) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_object FROM mysql84_json_aggregates ORDER BY id",
+            )
+            .await
+            .expect("evaluate JSON array aggregate window function")
+        else {
+            panic!("expected JSON aggregate window rows")
+        };
+        assert_eq!(
+            rows,
+            vec![
+                vec![
+                    Some(b"1".to_vec()),
+                    Some(br#"[7]"#.to_vec()),
+                    Some(br#"{"1": 7}"#.to_vec())
+                ],
+                vec![
+                    Some(b"2".to_vec()),
+                    Some(br#"[7, "x"]"#.to_vec()),
+                    Some(br#"{"1": 7, "2": "x"}"#.to_vec())
+                ],
+                vec![
+                    Some(b"3".to_vec()),
+                    Some(br#"[7, "x", null]"#.to_vec()),
+                    Some(br#"{"1": 7, "2": "x", "3": null}"#.to_vec())
+                ]
+            ]
         );
 
         let error = backend

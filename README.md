@@ -166,7 +166,7 @@ cargo build --release
 
 # 正式包只包含 server/cli/mydb/migrate/dump、配置、安装脚本和文档；
 # mydb-bench、测试结果与 target/bench 不进入发布包
-.\scripts\build-release.ps1 -Version "0.1.13"
+.\scripts\build-release.ps1 -Version "0.1.14"
 # 发布包同时生成同名 `.sha256` 校验文件；发布脚本会拒绝覆盖已存在的 GitHub Release。
 
 # 安装到系统
@@ -188,7 +188,7 @@ mydb update --check
 mydb update
 
 # 指定版本
-mydb update --version v0.1.13
+mydb update --version v0.1.14
 ```
 
 Windows 服务更新会在当前 CLI 退出后由后台 helper 完成，日志写入安装目录的 `mydb-update.log`；Linux 更新会自动处理同名 systemd 服务。
@@ -551,7 +551,7 @@ mysql -h 127.0.0.1 -P 3306 game < game.sql
 - **字符串**：CONCAT、SUBSTRING、TRIM、REPLACE、LPAD/RPAD、UPPER/LOWER、HEX/UNHEX、Base64、MD5、SHA1、SHA2、CRC32、REGEXP 等
 - **数值**：ABS、CEIL/FLOOR、ROUND、MOD、POW/SQRT、RAND、PI、三角函数、BIT_COUNT、BIT_AND、BIT_OR、BIT_XOR、CONV 等
 - **日期时间**：NOW、CURDATE、CURTIME、DATE_ADD/DATE_SUB、DATEDIFF、TIMESTAMPDIFF、DATE_FORMAT、UNIX_TIMESTAMP/FROM_UNIXTIME、CONVERT_TZ（内置 IANA 时区）、WEEK/YEARWEEK、EXTRACT 等
-- **JSON**：JSON_EXTRACT、JSON_UNQUOTE、JSON_OBJECT、JSON_ARRAY、JSON_VALID、JSON_TYPE、JSON_LENGTH、JSON_CONTAINS、JSON_CONTAINS_PATH、JSON_OVERLAPS、JSON_SET、JSON_REMOVE、JSON_ARRAY_APPEND、JSON_ARRAY_INSERT、JSON_MERGE_PATCH、JSON_DEPTH、JSON_KEYS、JSON_PRETTY
+- **JSON**：JSON_EXTRACT、JSON_UNQUOTE、JSON_OBJECT、JSON_ARRAY、JSON_VALID、JSON_TYPE、JSON_LENGTH、JSON_CONTAINS、JSON_CONTAINS_PATH、JSON_OVERLAPS、JSON_SET、JSON_REMOVE、JSON_ARRAY_APPEND、JSON_ARRAY_INSERT、JSON_MERGE_PATCH、JSON_DEPTH、JSON_KEYS、JSON_PRETTY、JSON_SEARCH、JSON_ARRAYAGG、JSON_OBJECTAGG
 - **其他**：UUID、INET_ATON/INET_NTOA、INET6_ATON/INET6_NTOA、GROUP_CONCAT、IF、CASE、NULLIF、COALESCE、CAST/CONVERT 等
 
 ### 系统表
@@ -627,9 +627,9 @@ bash scripts/docker-smoke.sh
 
 当前开发状态、已完成项、未完成项、差分证据统一维护在 [CheckList.md](CheckList.md)。只有可复现实测证明的项目才会打勾。
 
-### v0.1.13 发布候选
+### v0.1.14 发布候选
 
-本版面向单机 MySQL 8.4 常用生产工作负载：3306 提供 MySQL 协议，4306 提供登录保护的 Web SQL IDE/管理 API；补齐常用 JSON 搜索、数组追加/插入、RFC 7396 合并、深度/键枚举/美化输出，并保留全文自然语言 TF-IDF 基础相关性、布尔短语/前缀、基础查询扩展、`mydb update` 跨平台事务替换/失败回滚和非 ASCII tar 文件名校验。发布不宣称复制/集群、完整 InnoDB 全部锁边界、全部冷门字符集或全部 MySQL 错误码已完成；逐项状态见 [CheckList.md](CheckList.md) 和 [SYNTAX_MATRIX.md](SYNTAX_MATRIX.md)。
+本版面向单机 MySQL 8.4 常用生产工作负载：3306 提供 MySQL 协议，4306 提供登录保护的 Web SQL IDE/管理 API；补齐 JSON 搜索、JSON_ARRAYAGG/JSON_OBJECTAGG（含窗口聚合）、数组追加/插入、RFC 7396 合并、深度/键枚举/美化输出，并保留全文自然语言 TF-IDF 基础相关性、布尔短语/前缀、基础查询扩展、`mydb update` 跨平台事务替换/失败回滚和非 ASCII tar 文件名校验。发布不宣称复制/集群、完整 InnoDB 全部锁边界、全部冷门字符集或全部 MySQL 错误码已完成；逐项状态见 [CheckList.md](CheckList.md) 和 [SYNTAX_MATRIX.md](SYNTAX_MATRIX.md)。
 
 **本轮本地门槛（2026-08-14）：**
 - ✅ `cargo test --workspace --locked`：Docker Linux 门禁通过；wire 269（含权限委派/角色 ADMIN OPTION/ALL 部分撤销），其他 workspace 测试与文档测试全部通过
@@ -640,7 +640,7 @@ bash scripts/docker-smoke.sh
 - ✅ Connector/J 9.1.0、Node mysql2 3.23.3 已完成 3306 普通/预处理查询 smoke；Go `database/sql` + go-sql-driver/mysql 1.10.0 已完成当前 release 3306 服务的 Ping、中文、DATE、普通/预处理查询回归
 - ✅ MySQL `'user'@'host'` 基础账户匹配：精确主机优先于通配主机，握手按账户插件选择认证方式
 - ✅ `scripts/bench.ps1`：Docker Linux Rust gate、release build 与同条件 MySQL 8.4 持久化基准通过；性能阶段无预热、60 秒硬截止（报告见 [性能报告.md](性能报告.md)）
-- ✅ `scripts/mysql84-diff.ps1`：当前源码隔离端口与同机 Docker MySQL 8.4，106/106 差分通过；新增 JSON 搜索、数组追加/插入、合并、深度/键/美化输出及全文相关性、布尔短语/前缀、停止词/短词边界与查询扩展覆盖
+- ✅ `scripts/mysql84-diff.ps1`：当前源码隔离端口与同机 Docker MySQL 8.4，108/108 差分通过；新增 JSON 搜索、JSON 聚合/窗口聚合、数组追加/插入、合并、深度/键/美化输出及全文相关性、布尔短语/前缀、停止词/短词边界与查询扩展覆盖
 - ⏳ Ubuntu 24.04 物理性能、macOS 原生验收、宿主断电/恢复中断、大数据压力与生产安全运维验收：以 [CheckList.md](CheckList.md) 与 [性能报告.md](性能报告.md) 为准
 
 ---
