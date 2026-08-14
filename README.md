@@ -342,6 +342,12 @@ curl -H "Authorization: Bearer $TOKEN" \
 curl -H "Authorization: Bearer $TOKEN" \
   http://127.0.0.1:4306/api/v1/agent/slow-queries
 
+# 按 SHOW PROCESSLIST 的连接 ID 断开连接并回滚其未提交事务
+curl -fsS -X POST -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"connection_id":123}' \
+  http://127.0.0.1:4306/api/v1/connections/kill
+
 # 自然语言诊断
 curl -X POST -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \

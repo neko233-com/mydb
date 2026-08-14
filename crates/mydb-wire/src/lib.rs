@@ -29,6 +29,7 @@ use sha1::{Digest, Sha1};
 use sha2::{Sha224, Sha256, Sha384, Sha512};
 use tokio::io::AsyncWrite;
 use tokio::net::TcpStream;
+use tokio::sync::oneshot;
 use tokio_rustls::rustls::ServerConfig as RustlsServerConfig;
 use tracing::{debug, info};
 
@@ -3009,6 +3010,8 @@ pub struct WireStats {
         parking_lot::Mutex<HashMap<u32, Weak<parking_lot::RwLock<Vec<WriteCommand>>>>>,
     aborted_transactions: parking_lot::Mutex<HashSet<u32>>,
     active_sessions: parking_lot::Mutex<HashMap<u32, ActiveSession>>,
+    killed_connections: parking_lot::Mutex<HashSet<u32>>,
+    kill_senders: parking_lot::Mutex<HashMap<u32, oneshot::Sender<()>>>,
     prepared_xa: parking_lot::Mutex<HashMap<String, PreparedXaTransaction>>,
     xa_catalog_path: parking_lot::Mutex<Option<PathBuf>>,
     lock_changed: tokio::sync::Notify,
@@ -3369,7 +3372,9 @@ impl WireStats {
         self.next_connection_id.fetch_add(1, Ordering::Relaxed) + 1
     }
 
-    fn register_connection(&self, connection_id: u32, host: &str) {
+    fn register_connection(&self, connection_id: u32, host: &str) -> oneshot::Receiver<()> {
+        let (kill_sender, kill_receiver) = oneshot::channel();
+        self.killed_connections.lock().remove(&connection_id);
         self.active_sessions.lock().insert(
             connection_id,
             ActiveSession {
@@ -3382,10 +3387,30 @@ impl WireStats {
                 info: None,
             },
         );
+        self.kill_senders.lock().insert(connection_id, kill_sender);
+        kill_receiver
     }
 
     fn unregister_connection(&self, connection_id: u32) {
         self.active_sessions.lock().remove(&connection_id);
+        self.kill_senders.lock().remove(&connection_id);
+        self.killed_connections.lock().remove(&connection_id);
+    }
+
+    pub fn kill_connection(&self, connection_id: u32) -> bool {
+        if !self.active_sessions.lock().contains_key(&connection_id) {
+            return false;
+        }
+        self.killed_connections.lock().insert(connection_id);
+        self.abort_transaction_for_deadlock(connection_id);
+        if let Some(sender) = self.kill_senders.lock().remove(&connection_id) {
+            let _ = sender.send(());
+        }
+        true
+    }
+
+    fn is_connection_killed(&self, connection_id: u32) -> bool {
+        self.killed_connections.lock().contains(&connection_id)
     }
 
     fn update_connection_identity(&self, connection_id: u32, user: &str) {
@@ -4399,12 +4424,15 @@ struct ConnectionRegistration {
 }
 
 impl ConnectionRegistration {
-    fn new(stats: Arc<WireStats>, connection_id: u32, host: &str) -> Self {
-        stats.register_connection(connection_id, host);
-        Self {
-            stats,
-            connection_id,
-        }
+    fn new(stats: Arc<WireStats>, connection_id: u32, host: &str) -> (Self, oneshot::Receiver<()>) {
+        let kill_receiver = stats.register_connection(connection_id, host);
+        (
+            Self {
+                stats,
+                connection_id,
+            },
+            kill_receiver,
+        )
     }
 }
 
@@ -5235,6 +5263,9 @@ impl Backend {
     }
 
     async fn execute(&mut self, sql: &str) -> anyhow::Result<QueryOutcome> {
+        if self.stats.is_connection_killed(self.connection_id) {
+            anyhow::bail!("Query execution was interrupted");
+        }
         let normalized = normalize_sql_whitespace(sql.trim().trim_end_matches(';').trim());
         self.stats.update_connection_query(
             self.connection_id,
@@ -35090,6 +35121,12 @@ impl Backend {
     ) -> io::Result<()> {
         let started = Instant::now();
         let outcome = self.execute(query).await;
+        if self.stats.is_connection_killed(self.connection_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "connection killed by administrator",
+            ));
+        }
         self.stats
             .query_execute_micros
             .fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -35445,31 +35482,59 @@ pub async fn handle_connection(
         .map(|address| address.ip().to_string())
         .unwrap_or_else(|_| "unknown".to_string());
     let connection_id = stats.connected();
-    let _registration = ConnectionRegistration::new(stats.clone(), connection_id, &client_address);
+    let (_registration, mut kill_receiver) =
+        ConnectionRegistration::new(stats.clone(), connection_id, &client_address);
     info!("MySQL connection {} opened", connection_id);
     let mut backend = Backend::new(storage, config.clone(), stats.clone(), connection_id);
     backend.client_address = client_address;
     if config.tls_config.is_none() {
         let (reader, writer) = stream.into_split();
-        let result = AsyncMysqlIntermediary::run_on(backend, reader, writer).await;
+        let result = tokio::select! {
+            result = AsyncMysqlIntermediary::run_on(backend, reader, writer) => result,
+            _ = &mut kill_receiver => {
+                info!("MySQL connection {} killed by administrator", connection_id);
+                return Ok(());
+            }
+        };
         info!("MySQL connection {} closed", connection_id);
         return result.map_err(Into::into);
     }
     let (reader, mut writer) = stream.into_split();
     let tls_config = config.tls_config.clone();
     let options = IntermediaryOptions::default();
-    let (tls_requested, init_params) =
-        AsyncMysqlIntermediary::init_before_ssl(&mut backend, reader, &mut writer, &tls_config)
-            .await?;
+    let (tls_requested, init_params) = tokio::select! {
+        result = AsyncMysqlIntermediary::init_before_ssl(
+            &mut backend,
+            reader,
+            &mut writer,
+            &tls_config,
+        ) => result?,
+        _ = &mut kill_receiver => {
+            info!("MySQL connection {} killed by administrator", connection_id);
+            return Ok(());
+        }
+    };
     if config.require_secure_transport && !tls_requested {
         anyhow::bail!("secure transport is required for this MySQL listener");
     }
     let result = if tls_requested {
         let tls_config = tls_config
             .ok_or_else(|| anyhow::anyhow!("TLS requested without server TLS configuration"))?;
-        secure_run_with_options(backend, writer, options, tls_config, init_params).await
+        tokio::select! {
+            result = secure_run_with_options(backend, writer, options, tls_config, init_params) => result,
+            _ = &mut kill_receiver => {
+                info!("MySQL connection {} killed by administrator", connection_id);
+                return Ok(());
+            }
+        }
     } else {
-        plain_run_with_options(backend, writer, options, init_params).await
+        tokio::select! {
+            result = plain_run_with_options(backend, writer, options, init_params) => result,
+            _ = &mut kill_receiver => {
+                info!("MySQL connection {} killed by administrator", connection_id);
+                return Ok(());
+            }
+        }
     };
     info!("MySQL connection {} closed", connection_id);
     result.map_err(Into::into)
@@ -35489,7 +35554,7 @@ pub async fn execute_admin_sql(
     sql: &str,
 ) -> anyhow::Result<AdminSqlResult> {
     let connection_id = stats.connected();
-    stats.register_connection(connection_id, "local");
+    let _kill_receiver = stats.register_connection(connection_id, "local");
     let mut backend = Backend::new(storage, config, stats.clone(), connection_id);
     if let Some(database) = database.filter(|database| !database.is_empty()) {
         backend.database = database.to_string();
@@ -47643,6 +47708,30 @@ mod tests {
         assert_eq!(stats.release_all_named_locks(1), 1);
         assert_eq!(stats.named_lock_holder("b"), None);
         assert_eq!(stats.named_lock_holder("c"), Some(2));
+    }
+
+    #[test]
+    fn kill_connection_notifies_task_and_releases_locks() {
+        let stats = WireStats::default();
+        let mut kill_receiver = stats.register_connection(7, "local");
+        assert!(stats.try_acquire_locks(
+            &[LockRequest {
+                resource: "table:mydb:accounts".into(),
+                mode: LockMode::Exclusive,
+            }],
+            7,
+        ));
+        assert_eq!(stats.snapshot().active_locks, 1);
+
+        assert!(stats.kill_connection(7));
+        assert!(stats.is_connection_killed(7));
+        assert_eq!(kill_receiver.try_recv(), Ok(()));
+        assert_eq!(stats.snapshot().active_locks, 0);
+        assert!(stats.kill_connection(7));
+
+        stats.unregister_connection(7);
+        assert!(!stats.kill_connection(7));
+        assert!(!stats.is_connection_killed(7));
     }
 
     #[test]

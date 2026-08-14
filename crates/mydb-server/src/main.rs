@@ -963,12 +963,27 @@ async fn connections(
     })))
 }
 
+#[derive(Debug, Deserialize)]
+struct KillConnectionRequest {
+    connection_id: u32,
+}
+
 async fn kill_connection(
     State(state): State<AdminState>,
     headers: HeaderMap,
+    Json(request): Json<KillConnectionRequest>,
 ) -> Result<Json<Value>, StatusCode> {
     authorize(&headers, &state)?;
-    Err(StatusCode::NOT_IMPLEMENTED)
+    if request.connection_id == 0 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    if !state.wire_stats.kill_connection(request.connection_id) {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    Ok(Json(json!({
+        "connection_id": request.connection_id,
+        "killed": true,
+    })))
 }
 
 const BACKUP_FORMAT_VERSION: u32 = 1;
