@@ -45,7 +45,7 @@ use mydb_storage::{
     TriggerDefinition, TriggerEvent, TriggerTiming, UpdateValueExpression, WriteCommand,
 };
 
-pub const SERVER_VERSION: &str = "8.4.0-mydb-0.1.20";
+pub const SERVER_VERSION: &str = "8.4.0-mydb-0.1.21";
 pub const MYSQL84_DEFAULT_SQL_MODE: &str = "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION";
 /// MySQL 8.4 default `innodb_lock_wait_timeout`, in seconds.
 pub const MYSQL84_DEFAULT_INNODB_LOCK_WAIT_TIMEOUT_SECONDS: u64 = 50;
@@ -30478,6 +30478,139 @@ fn evaluate_scalar_expression(value: &str, row: &Row) -> anyhow::Result<Option<V
             .to_vec(),
         ));
     }
+    for function in ["REGEXP_INSTR", "REGEXP_SUBSTR", "REGEXP_REPLACE"] {
+        let prefix = format!("{function}(");
+        if !upper.starts_with(&prefix) || !expression.ends_with(')') {
+            continue;
+        }
+        let arguments = split_csv(&expression[prefix.len()..expression.len() - 1]);
+        let valid = match function {
+            "REGEXP_INSTR" => (2..=6).contains(&arguments.len()),
+            "REGEXP_SUBSTR" => (2..=5).contains(&arguments.len()),
+            "REGEXP_REPLACE" => (3..=6).contains(&arguments.len()),
+            _ => unreachable!(),
+        };
+        if !valid {
+            anyhow::bail!("{function} has an invalid argument count");
+        }
+        let Some(candidate) = evaluate_scalar_expression(&arguments[0], row)? else {
+            return Ok(None);
+        };
+        let Some(pattern) = evaluate_scalar_expression(&arguments[1], row)? else {
+            return Ok(None);
+        };
+        let candidate = std::str::from_utf8(&candidate)?;
+        let pattern = std::str::from_utf8(&pattern)?;
+        let position_argument = if function == "REGEXP_REPLACE" {
+            arguments.get(3)
+        } else {
+            arguments.get(2)
+        };
+        let position = evaluate_regex_integer_argument(
+            position_argument.map(String::as_str),
+            row,
+            1,
+            false,
+            "position",
+        )?;
+        let Some(position) = position else {
+            return Ok(None);
+        };
+        let occurrence_argument = if function == "REGEXP_REPLACE" {
+            arguments.get(4)
+        } else {
+            arguments.get(3)
+        };
+        let occurrence = evaluate_regex_integer_argument(
+            occurrence_argument.map(String::as_str),
+            row,
+            if function == "REGEXP_REPLACE" { 0 } else { 1 },
+            function == "REGEXP_REPLACE",
+            "occurrence",
+        )?;
+        let Some(occurrence) = occurrence else {
+            return Ok(None);
+        };
+        let return_option = if function == "REGEXP_INSTR" {
+            let value = evaluate_regex_integer_argument(
+                arguments.get(4).map(String::as_str),
+                row,
+                0,
+                true,
+                "return_option",
+            )?;
+            let Some(value) = value else {
+                return Ok(None);
+            };
+            if value > 1 {
+                anyhow::bail!("REGEXP_INSTR return_option must be 0 or 1");
+            }
+            value
+        } else {
+            0
+        };
+        let flags_argument = match function {
+            "REGEXP_INSTR" => arguments.get(5),
+            "REGEXP_SUBSTR" => arguments.get(4),
+            "REGEXP_REPLACE" => arguments.get(5),
+            _ => unreachable!(),
+        };
+        let Some(flags) = evaluate_regex_flags(flags_argument.map(String::as_str), row)? else {
+            return Ok(None);
+        };
+        let regex = cached_mysql_regex(pattern, &flags)?;
+        let position = position as usize;
+        let matches = regex_match_spans(&regex, candidate, position);
+        match function {
+            "REGEXP_INSTR" => {
+                let value = matches
+                    .get(occurrence.saturating_sub(1) as usize)
+                    .map(|(start, end)| {
+                        let offset = if return_option == 0 { *start } else { *end };
+                        offset + 1
+                    })
+                    .unwrap_or(0);
+                return Ok(Some(value.to_string().into_bytes()));
+            }
+            "REGEXP_SUBSTR" => {
+                let Some((start, end)) = matches.get(occurrence.saturating_sub(1) as usize) else {
+                    return Ok(None);
+                };
+                return Ok(Some(candidate.as_bytes()[*start..*end].to_vec()));
+            }
+            "REGEXP_REPLACE" => {
+                let Some(replacement) = evaluate_scalar_expression(&arguments[2], row)? else {
+                    return Ok(None);
+                };
+                let replacement = String::from_utf8(replacement)?;
+                let replacement = mysql_regex_replacement(&replacement);
+                let result = if occurrence == 0 {
+                    let start = regex_start_offset(candidate, position);
+                    let mut result = candidate[..start].to_string();
+                    result.push_str(&regex.replace_all(&candidate[start..], replacement.as_str()));
+                    result
+                } else {
+                    let mut result = String::with_capacity(candidate.len());
+                    let mut cursor = 0;
+                    for (index, (start, end)) in matches.iter().enumerate() {
+                        result.push_str(&candidate[cursor..*start]);
+                        if index + 1 == occurrence as usize {
+                            result.push_str(
+                                &regex.replace(&candidate[*start..*end], replacement.as_str()),
+                            );
+                        } else {
+                            result.push_str(&candidate[*start..*end]);
+                        }
+                        cursor = *end;
+                    }
+                    result.push_str(&candidate[cursor..]);
+                    result
+                };
+                return Ok(Some(result.into_bytes()));
+            }
+            _ => unreachable!(),
+        }
+    }
     if let Some(value) = evaluate_fulltext_match(expression, row, None, None)? {
         return Ok(Some(value));
     }
@@ -33125,6 +33258,85 @@ fn cached_mysql_regex(pattern: &str, flags: &str) -> anyhow::Result<Regex> {
     }
     cache.insert(key, regex.clone());
     Ok(regex)
+}
+
+fn evaluate_regex_flags(argument: Option<&str>, row: &Row) -> anyhow::Result<Option<String>> {
+    let Some(argument) = argument else {
+        return Ok(Some(String::new()));
+    };
+    let Some(value) = evaluate_scalar_expression(argument, row)? else {
+        return Ok(None);
+    };
+    let flags = String::from_utf8(value)?.to_ascii_lowercase();
+    if flags.contains('i') && flags.contains('c') {
+        anyhow::bail!("REGEXP match_type cannot contain both 'i' and 'c'");
+    }
+    Ok(Some(flags))
+}
+
+fn evaluate_regex_integer_argument(
+    argument: Option<&str>,
+    row: &Row,
+    default: i64,
+    allow_zero: bool,
+    name: &str,
+) -> anyhow::Result<Option<i64>> {
+    let Some(argument) = argument else {
+        return Ok(Some(default));
+    };
+    let Some(value) = evaluate_scalar_expression(argument, row)? else {
+        return Ok(None);
+    };
+    let value = parse_scalar_number(&value)?.round();
+    if !value.is_finite() || value < 0.0 || (!allow_zero && value == 0.0) || value > i64::MAX as f64
+    {
+        anyhow::bail!("REGEXP {name} must be a positive integer");
+    }
+    Ok(Some(value as i64))
+}
+
+fn regex_start_offset(value: &str, position: usize) -> usize {
+    let requested = position.saturating_sub(1).min(value.len());
+    if value.is_char_boundary(requested) {
+        return requested;
+    }
+    value
+        .char_indices()
+        .find(|(offset, _)| *offset > requested)
+        .map(|(offset, _)| offset)
+        .unwrap_or(value.len())
+}
+
+fn regex_match_spans(regex: &Regex, value: &str, position: usize) -> Vec<(usize, usize)> {
+    let start = regex_start_offset(value, position);
+    regex
+        .find_iter(&value[start..])
+        .map(|matched| (start + matched.start(), start + matched.end()))
+        .collect()
+}
+
+fn mysql_regex_replacement(value: &str) -> String {
+    let mut replacement = String::with_capacity(value.len());
+    let mut characters = value.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character == '\\' {
+            if let Some(next) = characters.peek().copied() {
+                if next.is_ascii_digit() {
+                    replacement.push('$');
+                    replacement.push(next);
+                    characters.next();
+                    continue;
+                }
+            }
+            replacement.push(character);
+        } else if character == '$' {
+            replacement.push('$');
+            replacement.push('$');
+        } else {
+            replacement.push(character);
+        }
+    }
+    replacement
 }
 
 fn evaluate_scalar_condition(value: &str, row: &Row) -> anyhow::Result<bool> {
@@ -67338,6 +67550,59 @@ mod tests {
             panic!("expected rows")
         };
         assert_eq!(rows, vec![vec![None]]);
+        assert_eq!(
+            single_value(
+                backend
+                    .execute("SELECT REGEXP_INSTR('abcabc','abc',1,2)")
+                    .await
+                    .unwrap()
+            ),
+            b"4"
+        );
+        assert_eq!(
+            single_value(
+                backend
+                    .execute("SELECT REGEXP_INSTR('猫a猫','猫',2,1,1)")
+                    .await
+                    .unwrap()
+            ),
+            b"8"
+        );
+        assert_eq!(
+            single_value(
+                backend
+                    .execute("SELECT REGEXP_SUBSTR('a12 b34','[0-9]+',1,2)")
+                    .await
+                    .unwrap()
+            ),
+            b"34"
+        );
+        assert_eq!(
+            single_value(
+                backend
+                    .execute("SELECT REGEXP_REPLACE('a1 a2','a[0-9]','x')")
+                    .await
+                    .unwrap()
+            ),
+            b"x x"
+        );
+        assert_eq!(
+            single_value(
+                backend
+                    .execute("SELECT REGEXP_REPLACE('a1 a2','a[0-9]','x',1,2)")
+                    .await
+                    .unwrap()
+            ),
+            b"a1 x"
+        );
+        let QueryOutcome::Rows { rows, .. } = backend
+            .execute("SELECT REGEXP_SUBSTR(NULL,'x'),REGEXP_REPLACE('abc','x',NULL)")
+            .await
+            .unwrap()
+        else {
+            panic!("expected rows")
+        };
+        assert_eq!(rows, vec![vec![None, None]]);
         backend
             .execute("CREATE TABLE expression_tags (id BIGINT PRIMARY KEY, label VARCHAR(32))")
             .await

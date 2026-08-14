@@ -166,7 +166,7 @@ cargo build --release
 
 # 正式包只包含 server/cli/mydb/migrate/dump、配置、安装脚本和文档；
 # mydb-bench、测试结果与 target/bench 不进入发布包
-.\scripts\build-release.ps1 -Version "0.1.20"
+.\scripts\build-release.ps1 -Version "0.1.21"
 # 发布包同时生成同名 `.sha256` 校验文件；发布脚本会拒绝覆盖已存在的 GitHub Release。
 
 # 安装到系统
@@ -188,7 +188,7 @@ mydb update --check
 mydb update
 
 # 指定版本
-mydb update --version v0.1.20
+mydb update --version v0.1.21
 ```
 
 Windows 服务更新会在当前 CLI 退出后由后台 helper 完成，日志写入安装目录的 `mydb-update.log`；Linux 更新会自动处理同名 systemd 服务。
@@ -548,7 +548,7 @@ mysql -h 127.0.0.1 -P 3306 game < game.sql
 
 ### 函数
 
-- **字符串**：CONCAT、SUBSTRING、TRIM、REPLACE、LPAD/RPAD、UPPER/LOWER、HEX/UNHEX、Base64、MD5、SHA1、SHA2、CRC32、REGEXP 等
+- **字符串**：CONCAT、SUBSTRING、TRIM、REPLACE、LPAD/RPAD、UPPER/LOWER、HEX/UNHEX、Base64、MD5、SHA1、SHA2、CRC32、REGEXP_LIKE/INSTR/SUBSTR/REPLACE 等
 - **数值**：ABS、CEIL/FLOOR、ROUND、MOD、POW/SQRT、RAND、PI、三角函数、BIT_COUNT、BIT_AND、BIT_OR、BIT_XOR、CONV 等
 - **日期时间**：NOW、CURDATE、CURTIME、DATE_ADD/DATE_SUB、DATEDIFF、TIMESTAMPDIFF、DATE_FORMAT、UNIX_TIMESTAMP/FROM_UNIXTIME、CONVERT_TZ（内置 IANA 时区）、WEEK/YEARWEEK、EXTRACT 等
 - **JSON**：JSON_EXTRACT、JSON_UNQUOTE、JSON_OBJECT、JSON_ARRAY、JSON_VALID、JSON_TYPE、JSON_LENGTH、JSON_CONTAINS、JSON_CONTAINS_PATH、JSON_OVERLAPS、JSON_SET、JSON_REMOVE、JSON_ARRAY_APPEND、JSON_ARRAY_INSERT、JSON_MERGE_PATCH、JSON_DEPTH、JSON_KEYS、JSON_PRETTY、JSON_SEARCH、JSON_ARRAYAGG、JSON_OBJECTAGG
@@ -614,10 +614,10 @@ bash scripts/docker-smoke.sh
 
 | 场景 | MyDB | MySQL 8.4.11 | MyDB / MySQL |
 |------|------|--------------|--------------|
-| 单表写（fsync-per-commit） | 210 ops/s | 74 ops/s | 2.85x |
-| 4 actor / 4表 写 P99 延迟 | 37.6 ms | 48.5 ms | 1.29x（低更好） |
-| 4 actor / 4表 Group Commit | 273 ops/s | 144 ops/s | 1.90x |
-| 读 P50 延迟 | 280 μs | 130 μs | - |
+| 单表写（fsync-per-commit） | 217 ops/s | 81 ops/s | 2.68x |
+| 4 actor / 4表 写 P99 延迟 | 35.4 ms | 56.0 ms | 1.58x（低更好） |
+| 4 actor / 4表 Group Commit | 246 ops/s | 154 ops/s | 1.60x |
+| 读 P50 延迟 | 404 μs | 131 μs | - |
 
 性能优化不以关闭 WAL 持久化或弱化恢复语义换取数字。默认 250μs Group Commit 窗口优先并发吞吐，checkpoint 按 1024 个已提交请求触发；不声明未经实测证明的固定倍数。
 
@@ -627,9 +627,9 @@ bash scripts/docker-smoke.sh
 
 当前开发状态、已完成项、未完成项、差分证据统一维护在 [CheckList.md](CheckList.md)。只有可复现实测证明的项目才会打勾。
 
-### v0.1.20 稳定版
+### v0.1.21 稳定版
 
-本版面向单机 MySQL 8.4 常用生产工作负载：3306 提供 MySQL 协议，4306 提供登录保护的 Web SQL IDE/管理 API；在 v0.1.19 基础上修正 `mydb update --check`：通过 GitHub Release 页面解析最新 tag，当前已是最新版本时明确报告 up to date，不依赖受限 API 配额；保留基础 POINT/LINESTRING/POLYGON/MULTI*/GEOMETRYCOLLECTION 空间构造器、度量、访问器、SRID 轴序和空间谓词，以及 JSON、全文、迁移、跨平台更新与失败回滚能力。发布不宣称复制/集群、完整 InnoDB 全部锁边界、完整 GIS/OGC 语义、全部冷门字符集或全部 MySQL 错误码已完成；显式 `LATERAL` 前缀属于额外超集能力，不作为 MySQL 8.4 差分承诺；逐项状态见 [CheckList.md](CheckList.md) 和 [SYNTAX_MATRIX.md](SYNTAX_MATRIX.md)。
+本版面向单机 MySQL 8.4 常用生产工作负载：3306 提供 MySQL 协议，4306 提供登录保护的 Web SQL IDE/管理 API；新增 `REGEXP_INSTR`、`REGEXP_SUBSTR`、`REGEXP_REPLACE` 的位置、occurrence、match_type、NULL 和 Unicode 外部行为，并保留 v0.1.20 的 `mydb update --check` 修复、空间构造器、JSON、全文、迁移、跨平台更新与失败回滚能力。发布不宣称复制/集群、完整 InnoDB 全部锁边界、完整 GIS/OGC 语义、全部冷门字符集或全部 MySQL 错误码已完成；显式 `LATERAL` 前缀属于额外超集能力，不作为 MySQL 8.4 差分承诺；逐项状态见 [CheckList.md](CheckList.md) 和 [SYNTAX_MATRIX.md](SYNTAX_MATRIX.md)。
 
 **本轮本地门槛（2026-08-15）：**
 - ✅ `cargo test --workspace --locked`：Docker Linux 门禁通过；wire 269（含权限委派/角色 ADMIN OPTION/ALL 部分撤销），其他 workspace 测试与文档测试全部通过
@@ -640,7 +640,7 @@ bash scripts/docker-smoke.sh
 - ✅ Connector/J 9.1.0、Node mysql2 3.23.3 已完成 3306 普通/预处理查询 smoke；Go `database/sql` + go-sql-driver/mysql 1.10.0 已完成当前 release 3306 服务的 Ping、中文、DATE、普通/预处理查询回归
 - ✅ MySQL `'user'@'host'` 基础账户匹配：精确主机优先于通配主机，握手按账户插件选择认证方式
 - ✅ `scripts/bench.ps1`：Docker Linux Rust gate、release build 与同条件 MySQL 8.4 持久化基准通过；性能阶段无预热、60 秒硬截止（报告见 [性能报告.md](性能报告.md)）
-- ✅ `scripts/mysql84-diff.ps1`：当前源码隔离端口与同机 Docker MySQL 8.4，117/117 差分通过；新增基础 JSON_TABLE 标量/嵌套/序号/存在性/默认与错误行为、按前置表行隐式关联 JSON_TABLE、POINT/LINESTRING/POLYGON/MULTI*/GEOMETRYCOLLECTION 空间构造器/度量/访问器/SRID 轴序/谓词，以及 JSON 搜索、浅层/递归通配路径、数组范围/`last` 下标、JSON 聚合/窗口聚合、数组追加/插入、合并、深度/键/美化输出及全文相关性、布尔短语/前缀、停止词/短词边界与查询扩展覆盖
+- ✅ `scripts/mysql84-diff.ps1`：当前源码隔离端口与同机 Docker MySQL 8.4，118/118 差分通过；新增 `REGEXP_INSTR`/`REGEXP_SUBSTR`/`REGEXP_REPLACE` 的 occurrence、return_option、NULL 和 Unicode 位置覆盖，并保留 JSON_TABLE、空间、JSON 搜索/路径/聚合、全文相关性/布尔短语/前缀/停止词/查询扩展覆盖
 - ✅ 本轮同条件持久化基准：单表写 MyDB/MySQL `210/74 ops/s`，4 actor P99 `37.6/48.5 ms`，并发吞吐 `273/144 ops/s`，读 P50 `280/130 μs`；1 次样本、无预热，原始数据见 [性能报告.md](性能报告.md)
 - ⏳ Ubuntu 24.04 物理性能、macOS 原生验收、宿主断电/恢复中断、大数据压力与生产安全运维验收：以 [CheckList.md](CheckList.md) 与 [性能报告.md](性能报告.md) 为准
 
