@@ -166,7 +166,7 @@ cargo build --release
 
 # 正式包只包含 server/cli/mydb/migrate/dump、配置、安装脚本和文档；
 # mydb-bench、测试结果与 target/bench 不进入发布包
-.\scripts\build-release.ps1 -Version "0.1.22"
+.\scripts\build-release.ps1 -Version "0.1.23"
 # 发布包同时生成同名 `.sha256` 校验文件；发布脚本会拒绝覆盖已存在的 GitHub Release。
 
 # 安装到系统
@@ -188,7 +188,7 @@ mydb update --check
 mydb update
 
 # 指定版本
-mydb update --version v0.1.22
+mydb update --version v0.1.23
 ```
 
 Windows 服务更新会在当前 CLI 退出后由后台 helper 完成；服务运行时自动请求 UAC 提权，日志写入安装目录的 `mydb-update.log`；Linux 更新会自动处理同名 systemd 服务。
@@ -627,7 +627,7 @@ bash scripts/docker-smoke.sh
 
 当前开发状态、已完成项、未完成项、差分证据统一维护在 [CheckList.md](CheckList.md)。只有可复现实测证明的项目才会打勾。
 
-### v0.1.22 稳定版
+### v0.1.23 稳定版
 
 本版面向单机 MySQL 8.4 常用生产工作负载：3306 提供 MySQL 协议，4306 提供登录保护的 Web SQL IDE/管理 API；新增 `REGEXP_INSTR`、`REGEXP_SUBSTR`、`REGEXP_REPLACE` 的位置、occurrence、match_type、NULL 和 Unicode 外部行为，并保留 v0.1.20 的 `mydb update --check` 修复、空间构造器、JSON、全文、迁移、跨平台更新与失败回滚能力。发布不宣称复制/集群、完整 InnoDB 全部锁边界、完整 GIS/OGC 语义、全部冷门字符集或全部 MySQL 错误码已完成；显式 `LATERAL` 前缀属于额外超集能力，不作为 MySQL 8.4 差分承诺；逐项状态见 [CheckList.md](CheckList.md) 和 [SYNTAX_MATRIX.md](SYNTAX_MATRIX.md)。
 
