@@ -170,13 +170,50 @@ function Install-Binaries {
         }
 
         New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
+        $sources = @{}
         foreach ($name in $Names) {
             $source = Join-Path $sourceDir $name
             if (-not (Test-Path -LiteralPath $source)) {
                 Stop-WithError "$name missing from release package $packageName"
             }
-            $target = Join-Path $InstallDir $name
-            Copy-Item -LiteralPath $source -Destination $target -Force
+            $sources[$name] = $source
+        }
+
+        $backupPaths = @{}
+        $stagedPaths = @{}
+        $replacedTargets = @()
+        try {
+            foreach ($name in $Names) {
+                $target = Join-Path $InstallDir $name
+                if (Test-Path -LiteralPath $target -PathType Leaf) {
+                    $backup = Join-Path $tempRoot "backup-$name"
+                    Copy-Item -LiteralPath $target -Destination $backup -Force
+                    $backupPaths[$target] = $backup
+                }
+            }
+            foreach ($name in $Names) {
+                $target = Join-Path $InstallDir $name
+                $staged = Join-Path $InstallDir ".mydb-update-$name"
+                if (Test-Path -LiteralPath $staged) {
+                    Remove-Item -LiteralPath $staged -Force
+                }
+                $stagedPaths[$name] = $staged
+                Copy-Item -LiteralPath $sources[$name] -Destination $staged -Force
+                Move-Item -LiteralPath $staged -Destination $target -Force
+                $replacedTargets += $target
+            }
+        } catch {
+            foreach ($target in $replacedTargets) {
+                if ($backupPaths.ContainsKey($target)) {
+                    Copy-Item -LiteralPath $backupPaths[$target] -Destination $target -Force -ErrorAction SilentlyContinue
+                } else {
+                    Remove-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue
+                }
+            }
+            foreach ($staged in $stagedPaths.Values) {
+                Remove-Item -LiteralPath $staged -Force -ErrorAction SilentlyContinue
+            }
+            throw
         }
         Write-Success "Binaries updated in $InstallDir"
     } finally {

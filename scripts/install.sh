@@ -47,6 +47,63 @@ detect_os() {
     esac
 }
 
+UPDATE_BACKUP_DIR=""
+UPDATED_NAMES=()
+
+cleanup_update_staging() {
+    local name
+    for name in "$@"; do
+        rm -f "$INSTALL_DIR/.mydb-update-${name}"
+    done
+    if [ -n "$UPDATE_BACKUP_DIR" ] && [ -d "$UPDATE_BACKUP_DIR" ]; then
+        rm -rf "$UPDATE_BACKUP_DIR"
+    fi
+    UPDATE_BACKUP_DIR=""
+    UPDATED_NAMES=()
+}
+
+rollback_updated_binaries() {
+    local name target backup
+    for name in "${UPDATED_NAMES[@]}"; do
+        target="$INSTALL_DIR/$name"
+        backup="$UPDATE_BACKUP_DIR/$name"
+        if [ -f "$backup" ]; then
+            cp -p "$backup" "$target" || warn "failed to restore $target"
+        else
+            rm -f "$target"
+        fi
+    done
+}
+
+replace_binaries_transactionally() {
+    local source_dir=$1
+    shift
+    local name source target staged
+    local -a names=("$@")
+
+    for name in "${names[@]}"; do
+        source="$source_dir/$name"
+        [ -f "$source" ] || return 1
+        target="$INSTALL_DIR/$name"
+        if [ -f "$target" ]; then
+            cp -p "$target" "$UPDATE_BACKUP_DIR/$name" || return 1
+        fi
+    done
+
+    for name in "${names[@]}"; do
+        source="$source_dir/$name"
+        target="$INSTALL_DIR/$name"
+        staged="$INSTALL_DIR/.mydb-update-$name"
+        rm -f "$staged"
+        if ! cp "$source" "$staged" || ! chmod +x "$staged" || ! mv -f "$staged" "$target"; then
+            rm -f "$staged"
+            return 1
+        fi
+        UPDATED_NAMES+=("$name")
+    done
+    return 0
+}
+
 # Download binary
 download_binary() {
     local name=$1
@@ -70,22 +127,36 @@ download_binary() {
     local archive_path="${tmp_dir}/${filename}.tar.gz"
     local checksum_path="${tmp_dir}/${filename}.tar.gz.sha256"
     if [ -n "$PACKAGE_PATH" ]; then
-        [ -f "$PACKAGE_PATH" ] || error "Local package not found: $PACKAGE_PATH"
-        cp "$PACKAGE_PATH" "$archive_path"
+        if [ ! -f "$PACKAGE_PATH" ]; then
+            warn "Local package not found: $PACKAGE_PATH"
+            return 1
+        fi
+        if ! cp "$PACKAGE_PATH" "$archive_path"; then
+            warn "failed to stage local package: $PACKAGE_PATH"
+            return 1
+        fi
         if [ -f "${PACKAGE_PATH}.sha256" ]; then
-            cp "${PACKAGE_PATH}.sha256" "$checksum_path"
+            if ! cp "${PACKAGE_PATH}.sha256" "$checksum_path"; then
+                warn "failed to stage local package checksum: ${PACKAGE_PATH}.sha256"
+                return 1
+            fi
         else
             warn "Local package has no SHA-256 sidecar: $PACKAGE_PATH"
         fi
     else
         if command -v curl &> /dev/null; then
-            curl -fsSL "$url" -o "$archive_path"
-            curl -fsSL "${url}.sha256" -o "$checksum_path"
+            if ! curl -fsSL "$url" -o "$archive_path" || ! curl -fsSL "${url}.sha256" -o "$checksum_path"; then
+                warn "download failed: $url"
+                return 1
+            fi
         elif command -v wget &> /dev/null; then
-            wget -q "$url" -O "$archive_path"
-            wget -q "${url}.sha256" -O "$checksum_path"
+            if ! wget -q "$url" -O "$archive_path" || ! wget -q "${url}.sha256" -O "$checksum_path"; then
+                warn "download failed: $url"
+                return 1
+            fi
         else
-            error "Neither curl nor wget found"
+            warn "Neither curl nor wget found"
+            return 1
         fi
     fi
 
@@ -97,12 +168,19 @@ download_binary() {
         else
             actual=$(shasum -a 256 "$archive_path" | awk '{print $1}')
         fi
-        [ "$expected" = "$actual" ] || error "SHA-256 verification failed for ${filename}.tar.gz"
+        if [ "$expected" != "$actual" ]; then
+            warn "SHA-256 verification failed for ${filename}.tar.gz"
+            return 1
+        fi
         success "SHA-256 verified: ${filename}.tar.gz"
     fi
     
     # Extract
-    tar -xzf "$archive_path" -C "$tmp_dir"
+    if ! tar -xzf "$archive_path" -C "$tmp_dir"; then
+        warn "failed to extract ${filename}.tar.gz"
+        rm -rf "$tmp_dir"
+        return 1
+    fi
     
     local source_dir="$tmp_dir"
     if [ -d "${tmp_dir}/${filename}" ]; then
@@ -111,6 +189,14 @@ download_binary() {
 
     # Move requested binaries
     mkdir -p "$INSTALL_DIR"
+    if [ "${MYDB_UPDATE_MODE:-false}" = true ] && [ "$name" = all ]; then
+        if ! replace_binaries_transactionally "$source_dir" mydb-server mydb-cli mydb mydb-migrate mydbdump; then
+            rm -rf "$tmp_dir"
+            return 1
+        fi
+        rm -rf "$tmp_dir"
+        return 0
+    fi
     case "$name" in
         server) mv "${source_dir}/mydb-server" "$INSTALL_DIR/" ;;
         cli)
@@ -160,11 +246,27 @@ update_binaries() {
         fi
     fi
 
-    download_binary all "$os" "$arch"
+    UPDATE_BACKUP_DIR=$(mktemp -d "$INSTALL_DIR/.mydb-update-backup.XXXXXX") || error "cannot create update backup directory"
+    UPDATED_NAMES=()
+    MYDB_UPDATE_MODE=true
+    if ! download_binary all "$os" "$arch"; then
+        rollback_updated_binaries
+        cleanup_update_staging mydb-server mydb-cli mydb mydb-migrate mydbdump
+        if $service_was_active; then
+            systemctl start "$SERVICE_NAME" >/dev/null 2>&1 || sudo systemctl start "$SERVICE_NAME" >/dev/null 2>&1 || true
+        fi
+        error "MyDB binary replacement failed; previous binaries were restored"
+    fi
 
     if $service_was_active; then
-        systemctl start "$SERVICE_NAME" >/dev/null 2>&1 || sudo systemctl start "$SERVICE_NAME" >/dev/null 2>&1 || error "cannot restart service $SERVICE_NAME"
+        if ! systemctl start "$SERVICE_NAME" >/dev/null 2>&1 && ! sudo systemctl start "$SERVICE_NAME" >/dev/null 2>&1; then
+            rollback_updated_binaries
+            cleanup_update_staging mydb-server mydb-cli mydb mydb-migrate mydbdump
+            systemctl start "$SERVICE_NAME" >/dev/null 2>&1 || sudo systemctl start "$SERVICE_NAME" >/dev/null 2>&1 || true
+            error "cannot restart service $SERVICE_NAME; previous binaries were restored"
+        fi
     fi
+    cleanup_update_staging mydb-server mydb-cli mydb mydb-migrate mydbdump
     if [ -n "${UPDATE_TEMP_ROOT:-}" ] && [ -d "$UPDATE_TEMP_ROOT" ]; then
         rm -rf "$UPDATE_TEMP_ROOT"
     fi

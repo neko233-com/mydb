@@ -377,7 +377,13 @@ fn find_source_dir(extract_dir: &Path, asset: ReleaseAsset) -> Result<PathBuf> {
 }
 
 fn validate_source_dir(source_dir: &Path, asset: ReleaseAsset) -> Result<PathBuf> {
-    for stem in ["mydb-server", "mydb-cli", "mydb-migrate", "mydbdump"] {
+    for stem in [
+        "mydb-server",
+        "mydb-cli",
+        "mydb",
+        "mydb-migrate",
+        "mydbdump",
+    ] {
         let path = source_dir.join(binary_name(stem));
         if !is_regular_file(&path) {
             bail!("release package is missing {}", path.display());
@@ -521,7 +527,13 @@ mod tests {
     #[test]
     fn rejects_legacy_router_and_missing_installer() {
         let temp = tempfile::tempdir().expect("package temp directory");
-        for stem in ["mydb-server", "mydb-cli", "mydb-migrate", "mydbdump"] {
+        for stem in [
+            "mydb-server",
+            "mydb-cli",
+            "mydb",
+            "mydb-migrate",
+            "mydbdump",
+        ] {
             File::create(temp.path().join(binary_name(stem))).expect("create binary fixture");
         }
         let asset = ReleaseAsset {
@@ -531,6 +543,7 @@ mod tests {
         };
         assert!(validate_source_dir(temp.path(), asset).is_err());
         fs::write(temp.path().join("install.sh"), "#!/bin/sh\n").expect("create installer");
+        assert!(validate_source_dir(temp.path(), asset).is_ok());
         File::create(temp.path().join("mydb-router")).expect("create legacy fixture");
         assert!(validate_source_dir(temp.path(), asset).is_err());
     }
