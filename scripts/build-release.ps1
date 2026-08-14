@@ -107,6 +107,10 @@ if (Test-Path "LICENSE") { Copy-Item "LICENSE" "$buildDir/" }
 
 # 打包
 Write-Info "Packaging..."
+$packagePath = "target/release/${packageName}.zip"
+if (Test-Path -LiteralPath $packagePath) {
+    Remove-Item -LiteralPath $packagePath -Force
+}
 $packageFile = "target/release/package/${packageName}.zip"
 $sevenZip = Get-Command 7z -ErrorAction SilentlyContinue
 if ($null -ne $sevenZip) {
@@ -117,7 +121,6 @@ if ($null -ne $sevenZip) {
     Compress-Archive -Path (Join-Path $buildDir '*') -DestinationPath (Join-Path (Split-Path $buildDir -Parent) "${packageName}.zip") -CompressionLevel Optimal
 }
 
-$packagePath = "target/release/${packageName}.zip"
 $packageSize = (Get-Item $packagePath).Length / 1MB
 $checksumPath = "$packagePath.sha256"
 $checksum = (Get-FileHash -LiteralPath $packagePath -Algorithm SHA256).Hash.ToLowerInvariant()
