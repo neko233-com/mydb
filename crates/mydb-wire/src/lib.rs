@@ -45,7 +45,7 @@ use mydb_storage::{
     TriggerDefinition, TriggerEvent, TriggerTiming, UpdateValueExpression, WriteCommand,
 };
 
-pub const SERVER_VERSION: &str = "8.4.0-mydb-0.1.29";
+pub const SERVER_VERSION: &str = "8.4.0-mydb-0.1.30";
 pub const MYSQL84_DEFAULT_SQL_MODE: &str = "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION";
 /// MySQL 8.4 default `innodb_lock_wait_timeout`, in seconds.
 pub const MYSQL84_DEFAULT_INNODB_LOCK_WAIT_TIMEOUT_SECONDS: u64 = 50;
@@ -358,6 +358,33 @@ impl SqlWarning {
             message: message.into(),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct RevokeOptions {
+    if_exists: bool,
+    ignore_unknown_user: bool,
+}
+
+fn parse_revoke_options(sql: &str) -> anyhow::Result<(&str, RevokeOptions)> {
+    if !sql.to_ascii_uppercase().starts_with("REVOKE ") {
+        anyhow::bail!("not a REVOKE statement");
+    }
+    let mut body = sql["REVOKE ".len()..].trim();
+    let mut options = RevokeOptions::default();
+    if body.to_ascii_uppercase().starts_with("IF EXISTS ") {
+        options.if_exists = true;
+        body = body["IF EXISTS ".len()..].trim();
+    }
+    const IGNORE_UNKNOWN_USER: &str = " IGNORE UNKNOWN USER";
+    if body.to_ascii_uppercase().ends_with(IGNORE_UNKNOWN_USER) {
+        options.ignore_unknown_user = true;
+        body = body[..body.len() - IGNORE_UNKNOWN_USER.len()].trim_end();
+    }
+    if body.is_empty() {
+        anyhow::bail!("REVOKE requires a privilege or role");
+    }
+    Ok((body, options))
 }
 
 struct DecodedLoadData {
@@ -1791,6 +1818,43 @@ impl AuthCatalog {
         })
     }
 
+    fn revoke_targets_with_options<F>(
+        &self,
+        principals: &[String],
+        options: RevokeOptions,
+        missing_grant: F,
+    ) -> anyhow::Result<(Vec<String>, Vec<SqlWarning>)>
+    where
+        F: Fn(&AuthCatalogData, &str) -> Option<(u16, String)>,
+    {
+        let principals = normalize_auth_names(principals)?;
+        let data = self.data.read();
+        let mut targets = Vec::with_capacity(principals.len());
+        let mut warnings = Vec::new();
+        for principal in principals {
+            let known = data.users.contains_key(&principal) || data.roles.contains_key(&principal);
+            if !known {
+                if !options.ignore_unknown_user {
+                    anyhow::bail!("Unknown user or role '{}'", principal);
+                }
+                let (account, _) = mysql_account_parts(&principal);
+                warnings.push(SqlWarning::warning(
+                    3162,
+                    format!("Authorization ID {account} does not exist."),
+                ));
+                continue;
+            }
+            if options.if_exists {
+                if let Some((code, message)) = missing_grant(&data, &principal) {
+                    warnings.push(SqlWarning::warning(code, message));
+                    continue;
+                }
+            }
+            targets.push(principal);
+        }
+        Ok((targets, warnings))
+    }
+
     fn revoke_table_privileges(
         &self,
         principals: &[String],
@@ -1856,6 +1920,49 @@ impl AuthCatalog {
             }
             Ok(())
         })
+    }
+
+    fn revoke_table_privileges_with_options(
+        &self,
+        principals: &[String],
+        database: &str,
+        table: &str,
+        privileges: &HashSet<String>,
+        options: RevokeOptions,
+    ) -> anyhow::Result<Vec<SqlWarning>> {
+        let database = database.to_ascii_lowercase();
+        let table = table.to_ascii_lowercase();
+        let (targets, warnings) = self.revoke_targets_with_options(
+            principals,
+            options,
+            |data, principal| {
+                let current = data
+                    .users
+                    .get(principal)
+                    .map(|entry| &entry.table_privileges)
+                    .or_else(|| data.roles.get(principal).map(|entry| &entry.table_privileges));
+                let has_grant = current
+                    .and_then(|grants| grants.get(&database))
+                    .and_then(|tables| tables.get(&table))
+                    .is_some_and(|grant| can_revoke_privilege_set(grant, privileges));
+                if has_grant {
+                    None
+                } else {
+                    let (account, host) = mysql_account_parts(principal);
+                    Some((
+                        1147,
+                        format!(
+                            "There is no such grant defined for user '{}' on host '{}' on table '{}'",
+                            account, host, table
+                        ),
+                    ))
+                }
+            },
+        )?;
+        if !targets.is_empty() {
+            self.revoke_table_privileges(&targets, &database, &table, privileges)?;
+        }
+        Ok(warnings)
     }
 
     fn grant_column_privileges(
@@ -1987,6 +2094,55 @@ impl AuthCatalog {
         })
     }
 
+    fn revoke_column_privileges_with_options(
+        &self,
+        principals: &[String],
+        database: &str,
+        table: &str,
+        columns: &HashMap<String, HashSet<String>>,
+        options: RevokeOptions,
+    ) -> anyhow::Result<Vec<SqlWarning>> {
+        let database = database.to_ascii_lowercase();
+        let table = table.to_ascii_lowercase();
+        let (targets, warnings) = self.revoke_targets_with_options(
+            principals,
+            options,
+            |data, principal| {
+                let current = data
+                    .users
+                    .get(principal)
+                    .map(|entry| &entry.column_privileges)
+                    .or_else(|| data.roles.get(principal).map(|entry| &entry.column_privileges));
+                let has_grant = current
+                    .and_then(|grants| grants.get(&database))
+                    .and_then(|tables| tables.get(&table))
+                    .is_some_and(|existing| {
+                        columns.iter().all(|(column, revoked)| {
+                            existing.get(&column.to_ascii_lowercase()).is_some_and(
+                                |current| can_revoke_privilege_set(current, revoked),
+                            )
+                        })
+                    });
+                if has_grant {
+                    None
+                } else {
+                    let (account, host) = mysql_account_parts(principal);
+                    Some((
+                        1147,
+                        format!(
+                            "There is no such grant defined for user '{}' on host '{}' on table '{}'",
+                            account, host, table
+                        ),
+                    ))
+                }
+            },
+        )?;
+        if !targets.is_empty() {
+            self.revoke_column_privileges(&targets, &database, &table, columns)?;
+        }
+        Ok(warnings)
+    }
+
     fn revoke_privileges(
         &self,
         principals: &[String],
@@ -2046,6 +2202,57 @@ impl AuthCatalog {
         })
     }
 
+    fn revoke_privileges_with_options(
+        &self,
+        principals: &[String],
+        database: Option<&str>,
+        privileges: &HashSet<String>,
+        options: RevokeOptions,
+    ) -> anyhow::Result<Vec<SqlWarning>> {
+        let database = database.map(str::to_ascii_lowercase);
+        let (targets, warnings) =
+            self.revoke_targets_with_options(principals, options, |data, principal| {
+                let has_grant = if let Some(database) = database.as_deref() {
+                    data.users
+                        .get(principal)
+                        .map(|entry| &entry.database_privileges)
+                        .or_else(|| {
+                            data.roles
+                                .get(principal)
+                                .map(|entry| &entry.database_privileges)
+                        })
+                        .and_then(|grants| grants.get(database))
+                        .is_some_and(|grant| can_revoke_privilege_set(grant, privileges))
+                } else {
+                    data.users
+                        .get(principal)
+                        .map(|entry| &entry.global_privileges)
+                        .or_else(|| {
+                            data.roles
+                                .get(principal)
+                                .map(|entry| &entry.global_privileges)
+                        })
+                        .is_some_and(|grant| can_revoke_privilege_set(grant, privileges))
+                };
+                if has_grant {
+                    None
+                } else {
+                    let (account, host) = mysql_account_parts(principal);
+                    Some((
+                        1141,
+                        format!(
+                            "There is no such grant defined for user '{}' on host '{}'",
+                            account, host
+                        ),
+                    ))
+                }
+            })?;
+        if !targets.is_empty() {
+            self.revoke_privileges(&targets, database.as_deref(), privileges)?;
+        }
+        Ok(warnings)
+    }
+
     fn revoke_all_privileges(&self, principals: &[String]) -> anyhow::Result<()> {
         let principals = normalize_auth_names(principals)?;
         self.mutate(|data| {
@@ -2075,6 +2282,51 @@ impl AuthCatalog {
             }
             Ok(())
         })
+    }
+
+    fn revoke_all_privileges_with_options(
+        &self,
+        principals: &[String],
+        options: RevokeOptions,
+    ) -> anyhow::Result<Vec<SqlWarning>> {
+        let (targets, warnings) =
+            self.revoke_targets_with_options(principals, options, |data, principal| {
+                let has_grant = if let Some(entry) = data.users.get(principal) {
+                    auth_entry_has_direct_privileges(
+                        &entry.global_privileges,
+                        &entry.database_privileges,
+                        &entry.table_privileges,
+                        &entry.column_privileges,
+                        &entry.routine_privileges,
+                    )
+                } else if let Some(entry) = data.roles.get(principal) {
+                    auth_entry_has_direct_privileges(
+                        &entry.global_privileges,
+                        &entry.database_privileges,
+                        &entry.table_privileges,
+                        &entry.column_privileges,
+                        &entry.routine_privileges,
+                    )
+                } else {
+                    false
+                };
+                if has_grant {
+                    None
+                } else {
+                    let (account, host) = mysql_account_parts(principal);
+                    Some((
+                        1141,
+                        format!(
+                            "There is no such grant defined for user '{}' on host '{}'",
+                            account, host
+                        ),
+                    ))
+                }
+            })?;
+        if !targets.is_empty() {
+            self.revoke_all_privileges(&targets)?;
+        }
+        Ok(warnings)
     }
 
     fn grant_routine_privileges(
@@ -2167,6 +2419,51 @@ impl AuthCatalog {
             }
             Ok(())
         })
+    }
+
+    fn revoke_routine_privileges_with_options(
+        &self,
+        principals: &[String],
+        kind: RoutineKind,
+        database: &str,
+        routine: &str,
+        privileges: &HashSet<String>,
+        options: RevokeOptions,
+    ) -> anyhow::Result<Vec<SqlWarning>> {
+        let database = database.to_ascii_lowercase();
+        let routine = routine.to_ascii_lowercase();
+        let (targets, warnings) = self.revoke_targets_with_options(
+            principals,
+            options,
+            |data, principal| {
+                let current = data
+                    .users
+                    .get(principal)
+                    .map(|entry| &entry.routine_privileges)
+                    .or_else(|| data.roles.get(principal).map(|entry| &entry.routine_privileges));
+                let has_grant = current
+                    .map(|grants| kind.grants(grants))
+                    .and_then(|grants| grants.get(&database))
+                    .and_then(|routines| routines.get(&routine))
+                    .is_some_and(|grant| can_revoke_privilege_set(grant, privileges));
+                if has_grant {
+                    None
+                } else {
+                    let (account, host) = mysql_account_parts(principal);
+                    Some((
+                        1403,
+                        format!(
+                            "There is no such grant defined for user '{}' on host '{}' on routine '{}'",
+                            account, host, routine
+                        ),
+                    ))
+                }
+            },
+        )?;
+        if !targets.is_empty() {
+            self.revoke_routine_privileges(&targets, kind, &database, &routine, privileges)?;
+        }
+        Ok(warnings)
     }
 
     fn drop_users(&self, users: &[String], if_exists: bool) -> anyhow::Result<()> {
@@ -2426,6 +2723,78 @@ impl AuthCatalog {
             }
             Ok(())
         })
+    }
+
+    fn revoke_roles_with_options(
+        &self,
+        roles: &[String],
+        principals: &[String],
+        admin_option_only: bool,
+        options: RevokeOptions,
+    ) -> anyhow::Result<Vec<SqlWarning>> {
+        let roles = normalize_auth_names(roles)?;
+        let principals = normalize_auth_names(principals)?;
+        let data = self.data.read();
+        let mut known_roles = Vec::with_capacity(roles.len());
+        let mut known_principals = Vec::with_capacity(principals.len());
+        let mut warnings = Vec::new();
+        for role in roles {
+            if !data.roles.contains_key(&role) {
+                if !options.ignore_unknown_user {
+                    anyhow::bail!("Unknown role '{}'", role);
+                }
+                let (account, host) = mysql_account_parts(&role);
+                warnings.push(SqlWarning::warning(
+                    3523,
+                    format!("Unknown authorization ID `{account}`@`{host}`"),
+                ));
+            } else {
+                known_roles.push(role);
+            }
+        }
+        for principal in principals {
+            let known = data.users.contains_key(&principal) || data.roles.contains_key(&principal);
+            if !known {
+                if !options.ignore_unknown_user {
+                    anyhow::bail!("Unknown user or role '{}'", principal);
+                }
+                let (account, _) = mysql_account_parts(&principal);
+                warnings.push(SqlWarning::warning(
+                    3162,
+                    format!("Authorization ID {account} does not exist."),
+                ));
+            } else {
+                known_principals.push(principal);
+            }
+        }
+        if options.if_exists {
+            for principal in &known_principals {
+                let (granted_roles, admin_roles) = if let Some(user) = data.users.get(principal) {
+                    (&user.roles, &user.admin_roles)
+                } else {
+                    let role = data.roles.get(principal).expect("known principal");
+                    (&role.roles, &role.admin_roles)
+                };
+                for role in &known_roles {
+                    let assigned = if admin_option_only {
+                        admin_roles.contains(role)
+                    } else {
+                        granted_roles.contains(role) || admin_roles.contains(role)
+                    };
+                    if !assigned {
+                        warnings.push(SqlWarning::warning(
+                            1141,
+                            format!("Role '{}' was not granted to '{}'", role, principal),
+                        ));
+                    }
+                }
+            }
+        }
+        drop(data);
+        if !known_roles.is_empty() && !known_principals.is_empty() {
+            self.revoke_roles(&known_roles, &known_principals, admin_option_only)?;
+        }
+        Ok(warnings)
     }
 }
 
@@ -2720,6 +3089,33 @@ fn can_revoke_privilege_set(current: &HashSet<String>, revoked: &HashSet<String>
     } else {
         revoked.iter().any(|privilege| current.contains(privilege))
     }
+}
+
+fn auth_entry_has_direct_privileges(
+    global: &HashSet<String>,
+    databases: &HashMap<String, HashSet<String>>,
+    tables: &AuthTablePrivileges,
+    columns: &AuthColumnPrivileges,
+    routines: &AuthRoutinePrivileges,
+) -> bool {
+    !global.is_empty()
+        || databases.values().any(|privileges| !privileges.is_empty())
+        || tables
+            .values()
+            .any(|database| database.values().any(|privileges| !privileges.is_empty()))
+        || columns.values().any(|database| {
+            database
+                .values()
+                .any(|table| table.values().any(|privileges| !privileges.is_empty()))
+        })
+        || routines
+            .functions
+            .values()
+            .any(|database| database.values().any(|privileges| !privileges.is_empty()))
+        || routines
+            .procedures
+            .values()
+            .any(|database| database.values().any(|privileges| !privileges.is_empty()))
 }
 
 fn revoke_privilege_set(current: &mut HashSet<String>, revoked: &HashSet<String>) {
@@ -10537,7 +10933,11 @@ impl Backend {
 
     fn require_authorization_statement(&self, sql: &str, upper: &str) -> anyhow::Result<()> {
         let revoke = upper.starts_with("REVOKE ");
-        let remainder = sql[if revoke { 6 } else { 5 }..].trim();
+        let remainder = if revoke {
+            parse_revoke_options(sql)?.0
+        } else {
+            sql[5..].trim()
+        };
         let upper_remainder = remainder.to_ascii_uppercase();
         let Some(on) = upper_remainder.find(" ON ") else {
             let user = self.authenticated_username();
@@ -11271,7 +11671,7 @@ impl Backend {
             })
     }
 
-    fn execute_auth_statement(&self, sql: &str) -> anyhow::Result<QueryOutcome> {
+    fn execute_auth_statement(&mut self, sql: &str) -> anyhow::Result<QueryOutcome> {
         self.ensure_transaction_writable()?;
         let upper = sql.to_ascii_uppercase();
         if upper.starts_with("SET DEFAULT ROLE ") {
@@ -11427,7 +11827,11 @@ impl Backend {
             return Ok(QueryOutcome::ok(0));
         }
         let revoke = upper.starts_with("REVOKE ");
-        let remainder = sql[if revoke { 6 } else { 5 }..].trim();
+        let (remainder, revoke_options) = if revoke {
+            parse_revoke_options(sql)?
+        } else {
+            (sql[5..].trim(), RevokeOptions::default())
+        };
         let upper_remainder = remainder.to_ascii_uppercase();
         if let Some(on) = upper_remainder.find(" ON ") {
             let grant_option_only = revoke
@@ -11470,13 +11874,18 @@ impl Backend {
                 }
                 validate_routine_privileges(scope.kind, &listed_privileges)?;
                 if revoke {
-                    self.config.auth_catalog.revoke_routine_privileges(
-                        &principals,
-                        scope.kind,
-                        &scope.database,
-                        &scope.routine,
-                        &privileges,
-                    )?;
+                    let warnings = self
+                        .config
+                        .auth_catalog
+                        .revoke_routine_privileges_with_options(
+                            &principals,
+                            scope.kind,
+                            &scope.database,
+                            &scope.routine,
+                            &privileges,
+                            revoke_options,
+                        )?;
+                    self.extend_warnings(warnings);
                 } else {
                     if with_grant_option {
                         privileges.insert("GRANT OPTION".to_string());
@@ -11494,20 +11903,30 @@ impl Backend {
             if let Some((database, table)) = parse_table_privilege_scope(scope)? {
                 if revoke {
                     if !privileges.is_empty() {
-                        self.config.auth_catalog.revoke_table_privileges(
-                            &principals,
-                            &database,
-                            &table,
-                            &privileges,
-                        )?;
+                        let warnings = self
+                            .config
+                            .auth_catalog
+                            .revoke_table_privileges_with_options(
+                                &principals,
+                                &database,
+                                &table,
+                                &privileges,
+                                revoke_options,
+                            )?;
+                        self.extend_warnings(warnings);
                     }
                     if !column_privileges.is_empty() {
-                        self.config.auth_catalog.revoke_column_privileges(
-                            &principals,
-                            &database,
-                            &table,
-                            &column_privileges,
-                        )?;
+                        let warnings = self
+                            .config
+                            .auth_catalog
+                            .revoke_column_privileges_with_options(
+                                &principals,
+                                &database,
+                                &table,
+                                &column_privileges,
+                                revoke_options,
+                            )?;
+                        self.extend_warnings(warnings);
                     }
                 } else {
                     if with_grant_option {
@@ -11546,9 +11965,13 @@ impl Backend {
                 })?)
             };
             if revoke {
-                self.config
-                    .auth_catalog
-                    .revoke_privileges(&principals, database, &privileges)?;
+                let warnings = self.config.auth_catalog.revoke_privileges_with_options(
+                    &principals,
+                    database,
+                    &privileges,
+                    revoke_options,
+                )?;
+                self.extend_warnings(warnings);
             } else {
                 if with_grant_option {
                     privileges.insert("GRANT OPTION".to_string());
@@ -11573,15 +11996,19 @@ impl Backend {
                 {
                     let principals = split_csv(remainder[target_index + marker.len()..].trim());
                     if privileges.contains("ALL") && privileges.contains("GRANT OPTION") {
-                        self.config
+                        let warnings = self
+                            .config
                             .auth_catalog
-                            .revoke_all_privileges(&principals)?;
+                            .revoke_all_privileges_with_options(&principals, revoke_options)?;
+                        self.extend_warnings(warnings);
                     } else {
-                        self.config.auth_catalog.revoke_privileges(
+                        let warnings = self.config.auth_catalog.revoke_privileges_with_options(
                             &principals,
                             None,
                             &privileges,
+                            revoke_options,
                         )?;
+                        self.extend_warnings(warnings);
                     }
                     return Ok(QueryOutcome::ok(0));
                 }
@@ -11610,9 +12037,13 @@ impl Backend {
         };
         let principals = split_csv(principal_clause);
         if revoke {
-            self.config
-                .auth_catalog
-                .revoke_roles(&roles, &principals, admin_option_only)?;
+            let warnings = self.config.auth_catalog.revoke_roles_with_options(
+                &roles,
+                &principals,
+                admin_option_only,
+                revoke_options,
+            )?;
+            self.extend_warnings(warnings);
         } else {
             self.config
                 .auth_catalog
@@ -54966,6 +55397,80 @@ mod tests {
             mysql_error_kind(&error.to_string()),
             ErrorKind::ER_NONEXISTING_PROC_GRANT
         );
+    }
+
+    #[tokio::test]
+    async fn revoke_options_demote_missing_grants_and_unknown_accounts() {
+        let (_temp, _storage, mut backend, _second) = transaction_backends().await;
+        backend
+            .execute("CREATE USER revoke_options_user IDENTIFIED BY 'revoke-options-password'")
+            .await
+            .expect("create revoke options user");
+        backend
+            .execute("CREATE TABLE mydb.revoke_options (id BIGINT PRIMARY KEY)")
+            .await
+            .expect("create revoke options table");
+
+        backend
+            .execute("REVOKE IF EXISTS SELECT ON mydb.revoke_options FROM revoke_options_user")
+            .await
+            .expect("IF EXISTS should demote a missing table grant");
+        let warnings = query_rows(&mut backend, "SHOW WARNINGS").await;
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0][0].as_deref(), Some(b"Warning".as_slice()));
+        assert_eq!(warnings[0][1].as_deref(), Some(b"1147".as_slice()));
+        assert_eq!(
+            single_value(
+                backend
+                    .execute("SHOW COUNT(*) WARNINGS")
+                    .await
+                    .expect("warning count result"),
+            ),
+            b"1"
+        );
+
+        backend
+            .execute("GRANT SELECT ON mydb.revoke_options TO revoke_options_user")
+            .await
+            .expect("grant table privilege");
+        backend
+            .execute("REVOKE IF EXISTS SELECT ON mydb.revoke_options FROM revoke_options_user")
+            .await
+            .expect("IF EXISTS should revoke an existing table grant");
+        assert!(query_rows(&mut backend, "SHOW WARNINGS").await.is_empty());
+
+        backend
+            .execute(
+                "REVOKE SELECT ON mydb.revoke_options FROM missing_revoke_user \
+                 IGNORE UNKNOWN USER",
+            )
+            .await
+            .expect("IGNORE UNKNOWN USER should make an unknown target a warning");
+        let warnings = query_rows(&mut backend, "SHOW WARNINGS").await;
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0][1].as_deref(), Some(b"3162".as_slice()));
+
+        backend
+            .execute(
+                "REVOKE IF EXISTS missing_revoke_role FROM revoke_options_user \
+                 IGNORE UNKNOWN USER",
+            )
+            .await
+            .expect("role options should accept unknown roles");
+        let warnings = query_rows(&mut backend, "SHOW WARNINGS").await;
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0][1].as_deref(), Some(b"3162".as_slice()));
+
+        backend
+            .execute(
+                "REVOKE IF EXISTS ALL PRIVILEGES, GRANT OPTION \
+                 FROM missing_revoke_user_2 IGNORE UNKNOWN USER",
+            )
+            .await
+            .expect("full revoke should accept an unknown target");
+        let warnings = query_rows(&mut backend, "SHOW WARNINGS").await;
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0][1].as_deref(), Some(b"3162".as_slice()));
     }
 
     #[tokio::test]
