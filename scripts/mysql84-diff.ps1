@@ -10,6 +10,7 @@ param(
 $ErrorActionPreference = "Stop"
 $container = "mydb-mysql-84-diff"
 $database = "mydb_diff84_$([guid]::NewGuid().ToString('N'))"
+$scopedRevokeUser = "scoped_revoke_$([guid]::NewGuid().ToString('N').Substring(0, 8))"
 
 function Invoke-MySqlClient {
     param(
@@ -312,6 +313,7 @@ try {
         [pscustomobject]@{ Name = "stored procedure"; Sql = "CREATE PROCEDURE $database.proc_probe(IN p INT) SELECT p+1 AS next_value; CALL $database.proc_probe(4); SELECT ROUTINE_NAME,ROUTINE_TYPE FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA='$database' AND ROUTINE_NAME='proc_probe'; DROP PROCEDURE $database.proc_probe" },
         [pscustomobject]@{ Name = "trigger mutation"; Sql = "CREATE TABLE $database.trigger_base (id INT PRIMARY KEY, value INT); CREATE TABLE $database.trigger_audit (id INT, old_value INT, new_value INT); CREATE TRIGGER $database.trigger_probe BEFORE UPDATE ON $database.trigger_base FOR EACH ROW INSERT INTO $database.trigger_audit VALUES (OLD.id,OLD.value,NEW.value); INSERT INTO $database.trigger_base VALUES (1,2); UPDATE $database.trigger_base SET value=5 WHERE id=1; SELECT id,old_value,new_value FROM $database.trigger_audit; DROP TRIGGER $database.trigger_probe" },
         [pscustomobject]@{ Name = "role and grants"; Sql = "CREATE USER 'diff_user'@'%' IDENTIFIED BY 'diff-password'; GRANT SELECT ON $database.* TO 'diff_user'@'%'; CREATE ROLE 'diff_role'; GRANT SELECT ON $database.* TO 'diff_role'; GRANT 'diff_role' TO 'diff_user'@'%'; SHOW GRANTS FOR 'diff_user'@'%'; REVOKE 'diff_role' FROM 'diff_user'@'%'; DROP ROLE 'diff_role'; DROP USER 'diff_user'@'%'" },
+        [pscustomobject]@{ Name = "scoped revoke isolation"; Sql = "CREATE USER '$scopedRevokeUser' IDENTIFIED BY 'scoped-password'; GRANT SELECT ON *.* TO '$scopedRevokeUser'; REVOKE SELECT ON $database.* FROM '$scopedRevokeUser'; SHOW GRANTS FOR '$scopedRevokeUser'; REVOKE SELECT ON *.* FROM '$scopedRevokeUser'; SHOW GRANTS FOR '$scopedRevokeUser'; DROP USER '$scopedRevokeUser'" },
         [pscustomobject]@{ Name = "collation semantics"; Sql = "CREATE TABLE $database.collation_probe (value VARCHAR(32) COLLATE utf8mb4_0900_ai_ci); INSERT INTO $database.collation_probe VALUES ('resume'),(CONVERT(X'72C3A973756DC3A9' USING utf8mb4)),('Resume'); SELECT HEX(value),OCTET_LENGTH(value),CHAR_LENGTH(value) FROM $database.collation_probe WHERE value='RESUME' ORDER BY value; SELECT COUNT(DISTINCT value) AS distinct_count FROM $database.collation_probe" },
         [pscustomobject]@{ Name = "multi-column count distinct"; Sql = "CREATE TABLE $database.distinct_pairs (left_key VARCHAR(8), right_key VARCHAR(8)); INSERT INTO $database.distinct_pairs VALUES ('a','x'),('a','x'),('a','y'),('b','x'),('a',NULL); SELECT COUNT(DISTINCT left_key,right_key) AS pair_count,COUNT(DISTINCT left_key,UPPER(right_key)) AS expression_pair_count FROM $database.distinct_pairs" },
         [pscustomobject]@{ Name = "accounts stability after mixed DDL"; Sql = "SELECT id,name,amount FROM $database.accounts ORDER BY id" },

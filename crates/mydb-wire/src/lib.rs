@@ -45,7 +45,7 @@ use mydb_storage::{
     TriggerDefinition, TriggerEvent, TriggerTiming, UpdateValueExpression, WriteCommand,
 };
 
-pub const SERVER_VERSION: &str = "8.4.0-mydb-0.1.27";
+pub const SERVER_VERSION: &str = "8.4.0-mydb-0.1.28";
 pub const MYSQL84_DEFAULT_SQL_MODE: &str = "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION";
 /// MySQL 8.4 default `innodb_lock_wait_timeout`, in seconds.
 pub const MYSQL84_DEFAULT_INNODB_LOCK_WAIT_TIMEOUT_SECONDS: u64 = 50;
@@ -979,7 +979,10 @@ impl AuthCatalog {
                     password_sha1: password_sha1_hex(bootstrap_password),
                     password_sha256: password_sha256_hex(bootstrap_password),
                     plugin: default_authentication_plugin(),
-                    global_privileges: HashSet::from(["ALL".to_string()]),
+                    global_privileges: HashSet::from([
+                        "ALL".to_string(),
+                        "GRANT OPTION".to_string(),
+                    ]),
                     database_privileges: HashMap::new(),
                     table_privileges: AuthTablePrivileges::default(),
                     column_privileges: AuthColumnPrivileges::default(),
@@ -1000,9 +1003,18 @@ impl AuthCatalog {
             .users
             .get(&bootstrap_user)
             .is_some_and(|user| user.password_sha256.is_empty());
-        if needs_bootstrap_sha256 {
+        let needs_bootstrap_grant_option = data.users.get(&bootstrap_user).is_some_and(|user| {
+            user.global_privileges.contains("ALL")
+                && !user.global_privileges.contains("GRANT OPTION")
+        });
+        if needs_bootstrap_sha256 || needs_bootstrap_grant_option {
             if let Some(user) = data.users.get_mut(&bootstrap_user) {
-                user.password_sha256 = password_sha256_hex(bootstrap_password);
+                if needs_bootstrap_sha256 {
+                    user.password_sha256 = password_sha256_hex(bootstrap_password);
+                }
+                if needs_bootstrap_grant_option {
+                    user.global_privileges.insert("GRANT OPTION".to_string());
+                }
             }
             write_auth_catalog(&path, &data)?;
         }
@@ -1021,7 +1033,7 @@ impl AuthCatalog {
                 password_sha1: password_sha1_hex(bootstrap_password),
                 password_sha256: password_sha256_hex(bootstrap_password),
                 plugin: default_authentication_plugin(),
-                global_privileges: HashSet::from(["ALL".to_string()]),
+                global_privileges: HashSet::from(["ALL".to_string(), "GRANT OPTION".to_string()]),
                 database_privileges: HashMap::new(),
                 table_privileges: AuthTablePrivileges::default(),
                 column_privileges: AuthColumnPrivileges::default(),
@@ -1795,6 +1807,31 @@ impl AuthCatalog {
                     anyhow::bail!("Unknown user or role '{}'", principal);
                 }
             }
+            for principal in &principals {
+                let has_grant = if let Some(user) = data.users.get(principal) {
+                    user.table_privileges
+                        .get(&database)
+                        .and_then(|tables| tables.get(&table))
+                        .is_some_and(|current| can_revoke_privilege_set(current, privileges))
+                } else {
+                    data.roles
+                        .get(principal)
+                        .expect("principal was checked above")
+                        .table_privileges
+                        .get(&database)
+                        .and_then(|tables| tables.get(&table))
+                        .is_some_and(|current| can_revoke_privilege_set(current, privileges))
+                };
+                if !has_grant {
+                    let (user, host) = mysql_account_parts(principal);
+                    anyhow::bail!(
+                        "There is no such grant defined for user '{}' on host '{}' on table '{}'",
+                        user,
+                        host,
+                        table
+                    );
+                }
+            }
             for principal in principals {
                 let grants = if let Some(user) = data.users.get_mut(&principal) {
                     &mut user.table_privileges
@@ -1879,6 +1916,44 @@ impl AuthCatalog {
                     anyhow::bail!("Unknown user or role '{}'", principal);
                 }
             }
+            for principal in &principals {
+                let has_grant =
+                    if let Some(user) = data.users.get(principal) {
+                        user.column_privileges
+                            .get(&database)
+                            .and_then(|tables| tables.get(&table))
+                            .is_some_and(|current| {
+                                columns.iter().all(|(column, revoked)| {
+                                    current.get(&column.to_ascii_lowercase()).is_some_and(
+                                        |existing| can_revoke_privilege_set(existing, revoked),
+                                    )
+                                })
+                            })
+                    } else {
+                        data.roles
+                            .get(principal)
+                            .expect("principal was checked above")
+                            .column_privileges
+                            .get(&database)
+                            .and_then(|tables| tables.get(&table))
+                            .is_some_and(|current| {
+                                columns.iter().all(|(column, revoked)| {
+                                    current.get(&column.to_ascii_lowercase()).is_some_and(
+                                        |existing| can_revoke_privilege_set(existing, revoked),
+                                    )
+                                })
+                            })
+                    };
+                if !has_grant {
+                    let (user, host) = mysql_account_parts(principal);
+                    anyhow::bail!(
+                        "There is no such grant defined for user '{}' on host '{}' on table '{}'",
+                        user,
+                        host,
+                        table
+                    );
+                }
+            }
             for principal in principals {
                 let grants = if let Some(user) = data.users.get_mut(&principal) {
                     &mut user.column_privileges
@@ -1927,22 +2002,45 @@ impl AuthCatalog {
                 }
             }
             for principal in principals {
-                let target = if let Some(user) = data.users.get_mut(&principal) {
-                    database
-                        .as_ref()
-                        .and_then(|database| user.database_privileges.get_mut(database))
-                        .unwrap_or(&mut user.global_privileges)
+                if let Some(user) = data.users.get_mut(&principal) {
+                    if let Some(database) = database.as_deref() {
+                        if !revoke_database_privilege_set(
+                            &mut user.database_privileges,
+                            database,
+                            privileges,
+                        ) {
+                            let (user, host) = mysql_account_parts(&principal);
+                            anyhow::bail!(
+                                "There is no such grant defined for user '{}' on host '{}'",
+                                user,
+                                host
+                            );
+                        }
+                    } else {
+                        revoke_privilege_set(&mut user.global_privileges, privileges);
+                    }
                 } else {
                     let role = data
                         .roles
                         .get_mut(&principal)
                         .expect("principal was checked above");
-                    database
-                        .as_ref()
-                        .and_then(|database| role.database_privileges.get_mut(database))
-                        .unwrap_or(&mut role.global_privileges)
-                };
-                revoke_privilege_set(target, privileges);
+                    if let Some(database) = database.as_deref() {
+                        if !revoke_database_privilege_set(
+                            &mut role.database_privileges,
+                            database,
+                            privileges,
+                        ) {
+                            let (user, host) = mysql_account_parts(&principal);
+                            anyhow::bail!(
+                                "There is no such grant defined for user '{}' on host '{}'",
+                                user,
+                                host
+                            );
+                        }
+                    } else {
+                        revoke_privilege_set(&mut role.global_privileges, privileges);
+                    }
+                }
             }
             Ok(())
         })
@@ -1996,6 +2094,32 @@ impl AuthCatalog {
             for principal in &principals {
                 if !data.users.contains_key(principal) && !data.roles.contains_key(principal) {
                     anyhow::bail!("Unknown user or role '{}'", principal);
+                }
+            }
+            for principal in &principals {
+                let has_grant = if let Some(user) = data.users.get(principal) {
+                    kind.grants(&user.routine_privileges)
+                        .get(&database)
+                        .and_then(|routines| routines.get(&routine))
+                        .is_some_and(|current| can_revoke_privilege_set(current, privileges))
+                } else {
+                    let role = data
+                        .roles
+                        .get(principal)
+                        .expect("principal was checked above");
+                    kind.grants(&role.routine_privileges)
+                        .get(&database)
+                        .and_then(|routines| routines.get(&routine))
+                        .is_some_and(|current| can_revoke_privilege_set(current, privileges))
+                };
+                if !has_grant {
+                    let (user, host) = mysql_account_parts(principal);
+                    anyhow::bail!(
+                        "There is no such grant defined for user '{}' on host '{}' on routine '{}'",
+                        user,
+                        host,
+                        routine
+                    );
                 }
             }
             for principal in principals {
@@ -2531,7 +2655,8 @@ fn verify_caching_sha2_password_sha256(hash: &str, salt: &[u8], response: &[u8])
 }
 
 fn privilege_set_allows(set: &HashSet<String>, privilege: &str) -> bool {
-    set.contains("ALL") || set.contains(&privilege.to_ascii_uppercase())
+    let privilege = privilege.to_ascii_uppercase();
+    set.contains(&privilege) || (privilege != "GRANT OPTION" && set.contains("ALL"))
 }
 
 const ALL_AUTH_PRIVILEGES: &[&str] = &[
@@ -2547,7 +2672,6 @@ const ALL_AUTH_PRIVILEGES: &[&str] = &[
     "CREATE ROUTINE",
     "ALTER ROUTINE",
     "CREATE USER",
-    "GRANT OPTION",
     "FILE",
     "PROCESS",
     "RELOAD",
@@ -2557,7 +2681,21 @@ const ALL_AUTH_PRIVILEGES: &[&str] = &[
     "EVENT",
 ];
 
+fn can_revoke_privilege_set(current: &HashSet<String>, revoked: &HashSet<String>) -> bool {
+    if (revoked.len() == 1 && revoked.contains("GRANT OPTION")) || revoked.contains("ALL") {
+        !current.is_empty()
+    } else if current.contains("ALL") {
+        revoked.iter().any(|privilege| privilege != "GRANT OPTION")
+    } else {
+        revoked.iter().any(|privilege| current.contains(privilege))
+    }
+}
+
 fn revoke_privilege_set(current: &mut HashSet<String>, revoked: &HashSet<String>) {
+    if revoked.len() == 1 && revoked.contains("GRANT OPTION") {
+        current.remove("GRANT OPTION");
+        return;
+    }
     if revoked.contains("ALL") {
         current.clear();
         return;
@@ -2573,6 +2711,27 @@ fn revoke_privilege_set(current: &mut HashSet<String>, revoked: &HashSet<String>
     for privilege in revoked {
         current.remove(privilege);
     }
+}
+
+fn revoke_database_privilege_set(
+    current: &mut HashMap<String, HashSet<String>>,
+    database: &str,
+    revoked: &HashSet<String>,
+) -> bool {
+    let Some(existing) = current.get(database) else {
+        return false;
+    };
+    if !can_revoke_privilege_set(existing, revoked) {
+        return false;
+    }
+    let remove_database = current.get_mut(database).is_some_and(|privileges| {
+        revoke_privilege_set(privileges, revoked);
+        privileges.is_empty()
+    });
+    if remove_database {
+        current.remove(database);
+    }
+    true
 }
 
 fn role_has_privilege(
@@ -10304,11 +10463,27 @@ impl Backend {
             if !self.grant_scope_has_privilege(scope, privilege)
                 || !self.grant_scope_has_privilege(scope, "GRANT OPTION")
             {
-                anyhow::bail!(
-                    "Access denied; user '{}' cannot grant or revoke {} at the requested scope",
-                    user,
-                    privilege
-                );
+                let (account, host) = mysql_account_parts(&user);
+                let message = match scope {
+                    GrantAuthorizationScope::Global => format!(
+                        "Access denied for user '{}'@'{}' (using password: YES)",
+                        account, host
+                    ),
+                    GrantAuthorizationScope::Database(database) => format!(
+                        "Access denied for user '{}'@'{}' to database '{}'",
+                        account, host, database
+                    ),
+                    GrantAuthorizationScope::Table(_, table)
+                    | GrantAuthorizationScope::Column(_, table, _) => format!(
+                        "GRANT command denied to user '{}'@'{}' for table '{}'",
+                        account, host, table
+                    ),
+                    GrantAuthorizationScope::Routine(_, _, routine) => format!(
+                        "GRANT command denied to user '{}'@'{}' for routine '{}'",
+                        account, host, routine
+                    ),
+                };
+                anyhow::bail!("{message}");
             }
         }
         Ok(())
@@ -25173,7 +25348,9 @@ fn auth_privilege_set(privileges: &HashSet<String>) -> Vec<String> {
 
 fn auth_privilege_enabled(privileges: &HashSet<String>, privilege: &str) -> bool {
     privileges.contains(privilege)
-        || (privileges.contains("ALL") && SUPPORTED_AUTH_PRIVILEGES.contains(&privilege))
+        || (privilege != "GRANT OPTION"
+            && privileges.contains("ALL")
+            && SUPPORTED_AUTH_PRIVILEGES.contains(&privilege))
 }
 
 fn auth_grantable(privileges: &HashSet<String>) -> &'static str {
@@ -39020,6 +39197,31 @@ fn mysql_error_kind(message: &str) -> ErrorKind {
         ErrorKind::ER_QUERY_INTERRUPTED
     } else if message.starts_with("Unknown thread id:") {
         ErrorKind::ER_NO_SUCH_THREAD
+    } else if message.starts_with("Access denied for user '")
+        && message.ends_with(" (using password: YES)")
+    {
+        ErrorKind::ER_ACCESS_DENIED_ERROR
+    } else if message.starts_with("Access denied for user '") && message.contains(" to database '")
+    {
+        ErrorKind::ER_DBACCESS_DENIED_ERROR
+    } else if message.starts_with("GRANT command denied to user '")
+        && message.contains(" for table '")
+    {
+        ErrorKind::ER_TABLEACCESS_DENIED_ERROR
+    } else if message.starts_with("GRANT command denied to user '")
+        && message.contains(" for routine '")
+    {
+        ErrorKind::ER_PROCACCESS_DENIED_ERROR
+    } else if message.starts_with("There is no such grant defined for user '")
+        && message.contains(" on table '")
+    {
+        ErrorKind::ER_NONEXISTING_TABLE_GRANT
+    } else if message.starts_with("There is no such grant defined for user '")
+        && message.contains(" on routine '")
+    {
+        ErrorKind::ER_NONEXISTING_PROC_GRANT
+    } else if message.starts_with("There is no such grant defined for user '") {
+        ErrorKind::ER_NONEXISTING_GRANT
     } else if message.starts_with("You are not owner of thread") {
         ErrorKind::ER_KILL_DENIED_ERROR
     } else if message == READ_ONLY_TRANSACTION_ERROR {
@@ -54452,6 +54654,167 @@ mod tests {
             "revoke_proc",
             "ALTER ROUTINE"
         ));
+    }
+
+    #[tokio::test]
+    async fn scoped_revoke_never_falls_back_to_global_privileges() {
+        let (_temp, _storage, mut backend, _second) = transaction_backends().await;
+        backend
+            .execute("CREATE USER scoped_revoke IDENTIFIED BY 'scoped-password'")
+            .await
+            .expect("create scoped revoke user");
+        backend
+            .execute("GRANT SELECT ON *.* TO scoped_revoke")
+            .await
+            .expect("grant global select");
+
+        let error = backend
+            .execute("REVOKE SELECT ON mydb.* FROM scoped_revoke")
+            .await
+            .expect_err("revoking an absent database grant must return MySQL 1141");
+        assert!(
+            error.to_string().contains("There is no such grant defined"),
+            "{error:#}"
+        );
+        assert_eq!(
+            mysql_error_kind(&error.to_string()),
+            ErrorKind::ER_NONEXISTING_GRANT
+        );
+        assert!(backend
+            .config
+            .auth_catalog
+            .has_privilege("scoped_revoke", "mydb", "SELECT"));
+
+        backend
+            .execute("GRANT INSERT ON mydb.* TO scoped_revoke")
+            .await
+            .expect("grant database insert");
+        backend
+            .execute("REVOKE INSERT ON mydb.* FROM scoped_revoke")
+            .await
+            .expect("revoke database insert");
+        assert!(!backend
+            .config
+            .auth_catalog
+            .has_privilege("scoped_revoke", "mydb", "INSERT"));
+        assert!(backend
+            .config
+            .auth_catalog
+            .has_privilege("scoped_revoke", "mydb", "SELECT"));
+
+        backend
+            .execute("REVOKE SELECT ON *.* FROM scoped_revoke")
+            .await
+            .expect("revoke global select");
+        assert!(!backend
+            .config
+            .auth_catalog
+            .has_privilege("scoped_revoke", "mydb", "SELECT"));
+    }
+
+    #[tokio::test]
+    async fn grant_all_does_not_implicitly_grant_grant_option() {
+        let (_temp, _storage, mut backend, _second) = transaction_backends().await;
+        backend
+            .execute(
+                "CREATE USER all_holder IDENTIFIED BY 'all-password', \
+                 recipient IDENTIFIED BY 'recipient-password'",
+            )
+            .await
+            .expect("create grant test users");
+        backend
+            .execute("GRANT ALL ON *.* TO all_holder")
+            .await
+            .expect("grant all without delegation");
+        backend
+            .execute("REVOKE GRANT OPTION ON *.* FROM all_holder")
+            .await
+            .expect("revoking absent grant option is a no-op");
+        assert!(!backend
+            .config
+            .auth_catalog
+            .has_privilege("all_holder", "mydb", "GRANT OPTION"));
+
+        *backend.authenticated_user.lock() = Some("all_holder".to_string());
+        let error = backend
+            .execute("GRANT SELECT ON mydb.* TO recipient")
+            .await
+            .expect_err("GRANT ALL without WITH GRANT OPTION must not delegate");
+        assert_eq!(
+            mysql_error_kind(&error.to_string()),
+            ErrorKind::ER_DBACCESS_DENIED_ERROR
+        );
+
+        *backend.authenticated_user.lock() = Some("root".to_string());
+        backend
+            .execute("GRANT ALL ON *.* TO all_holder WITH GRANT OPTION")
+            .await
+            .expect("explicit grant option");
+        assert!(backend
+            .config
+            .auth_catalog
+            .has_privilege("all_holder", "mydb", "GRANT OPTION"));
+        backend
+            .execute("REVOKE GRANT OPTION ON *.* FROM all_holder")
+            .await
+            .expect("revoke explicit grant option");
+        assert!(!backend
+            .config
+            .auth_catalog
+            .has_privilege("all_holder", "mydb", "GRANT OPTION"));
+        backend
+            .execute("GRANT ALL ON *.* TO all_holder WITH GRANT OPTION")
+            .await
+            .expect("restore explicit grant option");
+        *backend.authenticated_user.lock() = Some("all_holder".to_string());
+        backend
+            .execute("GRANT SELECT ON mydb.* TO recipient")
+            .await
+            .expect("explicit grant option must permit delegation");
+    }
+
+    #[tokio::test]
+    async fn revoke_missing_table_column_and_routine_grants_return_mysql_errors() {
+        let (_temp, _storage, mut backend, _second) = transaction_backends().await;
+        backend
+            .execute("CREATE USER missing_revoke IDENTIFIED BY 'missing-password'")
+            .await
+            .expect("create missing grant user");
+        backend
+            .execute("CREATE TABLE mydb.revoke_missing (id BIGINT PRIMARY KEY, name TEXT)")
+            .await
+            .expect("create revoke table");
+        backend
+            .execute("CREATE PROCEDURE mydb.revoke_missing_proc() SELECT 1")
+            .await
+            .expect("create revoke procedure");
+
+        let error = backend
+            .execute("REVOKE SELECT ON mydb.revoke_missing FROM missing_revoke")
+            .await
+            .expect_err("missing table grant must fail");
+        assert_eq!(
+            mysql_error_kind(&error.to_string()),
+            ErrorKind::ER_NONEXISTING_TABLE_GRANT
+        );
+
+        let error = backend
+            .execute("REVOKE SELECT (name) ON mydb.revoke_missing FROM missing_revoke")
+            .await
+            .expect_err("missing column grant must fail");
+        assert_eq!(
+            mysql_error_kind(&error.to_string()),
+            ErrorKind::ER_NONEXISTING_TABLE_GRANT
+        );
+
+        let error = backend
+            .execute("REVOKE EXECUTE ON PROCEDURE mydb.revoke_missing_proc FROM missing_revoke")
+            .await
+            .expect_err("missing routine grant must fail");
+        assert_eq!(
+            mysql_error_kind(&error.to_string()),
+            ErrorKind::ER_NONEXISTING_PROC_GRANT
+        );
     }
 
     #[tokio::test]
