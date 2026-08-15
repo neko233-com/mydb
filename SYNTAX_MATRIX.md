@@ -117,8 +117,8 @@
 | `RENAME USER old TO new` | ✅ Verified | 本轮新增（`AuthCatalog::rename_user`） |
 | `SET PASSWORD [FOR user] = '...'` | ✅ Verified | 本轮新增，路由到 `alter_user_passwords` |
 | `SHOW GRANTS` | ✅ Verified | |
-| `partial_revokes` / schema 级全局权限撤销 | ✅ Verified | 默认关闭；支持 `SET GLOBAL`、`SET PERSIST[_ONLY]`、直接库授权优先、授权者限制继承、`SHOW GRANTS` 与 `mysql.user.User_attributes`；MySQL 8.4 差分 127/127 |
-| 表级 / 列级权限（`tables_priv`/`columns_priv`） | 🟡 Partial | 表级与 `GRANT SELECT/INSERT/UPDATE/REFERENCES (列)` 已持久化、角色继承、`SHOW GRANTS`/虚拟表展示；复杂 JOIN 的每个基表及 JOIN/WHERE/GROUP/HAVING/ORDER 投影列级 SELECT、JOIN UPDATE/DELETE 的逐目标表/逐读取列授权、`INSERT ... SELECT` 目标写列/来源读列授权、`ON DUPLICATE KEY UPDATE` 的 INSERT/UPDATE/既有行 SELECT 与 `VALUES(col)` 入参边界已验证；全局/库/表/列/例程授权委托现按被授予权限与同级或更宽范围 `GRANT OPTION` 校验，`GRANT ALL` 不隐式包含 `GRANT OPTION`，缺失库/表/列/例程授权分别返回 MySQL 1141/1147/1403，角色委托按 `ADMIN OPTION` 校验并支持 `REVOKE ADMIN OPTION FOR`；跨库/越权委托已回归；完整授权撤销矩阵仍待补齐 |
+| `partial_revokes` / schema 级全局权限撤销 | ✅ Verified | 默认关闭；支持 `SET GLOBAL`、`SET PERSIST[_ONLY]`、直接库授权优先、授权者限制继承、`SHOW GRANTS` 与 `mysql.user.User_attributes`；MySQL 8.4 差分 131/131 |
+| 表级 / 列级权限（`tables_priv`/`columns_priv`） | 🟡 Partial | 表级与 `GRANT SELECT/INSERT/UPDATE/REFERENCES (列)` 已持久化、角色继承、`SHOW GRANTS`/虚拟表展示；复杂 JOIN 的每个基表及 JOIN/WHERE/GROUP/HAVING/ORDER 投影列级 SELECT、JOIN UPDATE/DELETE 的逐目标表/逐读取列授权、`INSERT ... SELECT` 目标写列/来源读列授权、`ON DUPLICATE KEY UPDATE` 的 INSERT/UPDATE/既有行 SELECT 与 `VALUES(col)` 入参边界已验证；全局/库/表/列/例程授权委托现按被授予权限与同级或更宽范围 `GRANT OPTION` 校验，`GRANT ALL` 不隐式包含 `GRANT OPTION`，缺失库/表/列/例程授权分别返回 MySQL 1141/1147/1403，作用域多权限 REVOKE 要求列出的权限全部存在；角色委托按 `ADMIN OPTION` 校验并支持 `REVOKE ADMIN OPTION FOR`；跨库/越权委托已回归；完整授权撤销矩阵仍待补齐 |
 | `mysql.user` / `mysql.db` / `mysql.role_edges` / `mysql.roles_mapping` 虚拟表 | ✅ Verified | 真实填充；兼容 MySQL 与 MariaDB/GoLand 角色元数据查询 |
 | `mysql.global_grants` / `default_roles` / `tables_priv` / `columns_priv` / `procs_priv` / `func` 虚拟表 | ✅ Verified | `procs_priv` 反映用户/角色的例程权限；动态全局权限未实现，`global_grants` 故意为空 |
 | 审计日志 | ✅ Verified | `AuditLog` 轮转 worker + metrics |

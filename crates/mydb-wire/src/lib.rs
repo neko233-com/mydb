@@ -45,7 +45,7 @@ use mydb_storage::{
     TriggerDefinition, TriggerEvent, TriggerTiming, UpdateValueExpression, WriteCommand,
 };
 
-pub const SERVER_VERSION: &str = "8.4.0-mydb-0.1.32";
+pub const SERVER_VERSION: &str = "8.4.0-mydb-0.1.33";
 pub const MYSQL84_DEFAULT_SQL_MODE: &str = "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION";
 /// MySQL 8.4 default `innodb_lock_wait_timeout`, in seconds.
 pub const MYSQL84_DEFAULT_INNODB_LOCK_WAIT_TIMEOUT_SECONDS: u64 = 50;
@@ -2021,7 +2021,7 @@ impl AuthCatalog {
                     user.table_privileges
                         .get(&database)
                         .and_then(|tables| tables.get(&table))
-                        .is_some_and(|current| can_revoke_privilege_set(current, privileges))
+                        .is_some_and(|current| can_revoke_scoped_privilege_set(current, privileges))
                 } else {
                     data.roles
                         .get(principal)
@@ -2029,7 +2029,7 @@ impl AuthCatalog {
                         .table_privileges
                         .get(&database)
                         .and_then(|tables| tables.get(&table))
-                        .is_some_and(|current| can_revoke_privilege_set(current, privileges))
+                        .is_some_and(|current| can_revoke_scoped_privilege_set(current, privileges))
                 };
                 if !has_grant {
                     let (user, host) = mysql_account_parts(principal);
@@ -2089,7 +2089,7 @@ impl AuthCatalog {
                 let has_grant = current
                     .and_then(|grants| grants.get(&database))
                     .and_then(|tables| tables.get(&table))
-                    .is_some_and(|grant| can_revoke_privilege_set(grant, privileges));
+                    .is_some_and(|grant| can_revoke_scoped_privilege_set(grant, privileges));
                 if has_grant {
                     None
                 } else {
@@ -2169,33 +2169,36 @@ impl AuthCatalog {
                 }
             }
             for principal in &principals {
-                let has_grant =
-                    if let Some(user) = data.users.get(principal) {
-                        user.column_privileges
-                            .get(&database)
-                            .and_then(|tables| tables.get(&table))
-                            .is_some_and(|current| {
-                                columns.iter().all(|(column, revoked)| {
-                                    current.get(&column.to_ascii_lowercase()).is_some_and(
-                                        |existing| can_revoke_privilege_set(existing, revoked),
-                                    )
-                                })
+                let has_grant = if let Some(user) = data.users.get(principal) {
+                    user.column_privileges
+                        .get(&database)
+                        .and_then(|tables| tables.get(&table))
+                        .is_some_and(|current| {
+                            columns.iter().all(|(column, revoked)| {
+                                current
+                                    .get(&column.to_ascii_lowercase())
+                                    .is_some_and(|existing| {
+                                        can_revoke_scoped_privilege_set(existing, revoked)
+                                    })
                             })
-                    } else {
-                        data.roles
-                            .get(principal)
-                            .expect("principal was checked above")
-                            .column_privileges
-                            .get(&database)
-                            .and_then(|tables| tables.get(&table))
-                            .is_some_and(|current| {
-                                columns.iter().all(|(column, revoked)| {
-                                    current.get(&column.to_ascii_lowercase()).is_some_and(
-                                        |existing| can_revoke_privilege_set(existing, revoked),
-                                    )
-                                })
+                        })
+                } else {
+                    data.roles
+                        .get(principal)
+                        .expect("principal was checked above")
+                        .column_privileges
+                        .get(&database)
+                        .and_then(|tables| tables.get(&table))
+                        .is_some_and(|current| {
+                            columns.iter().all(|(column, revoked)| {
+                                current
+                                    .get(&column.to_ascii_lowercase())
+                                    .is_some_and(|existing| {
+                                        can_revoke_scoped_privilege_set(existing, revoked)
+                                    })
                             })
-                    };
+                        })
+                };
                 if !has_grant {
                     let (user, host) = mysql_account_parts(principal);
                     anyhow::bail!(
@@ -2264,7 +2267,7 @@ impl AuthCatalog {
                     .is_some_and(|existing| {
                         columns.iter().all(|(column, revoked)| {
                             existing.get(&column.to_ascii_lowercase()).is_some_and(
-                                |current| can_revoke_privilege_set(current, revoked),
+                                |current| can_revoke_scoped_privilege_set(current, revoked),
                             )
                         })
                     });
@@ -2392,7 +2395,7 @@ impl AuthCatalog {
                                 .map(|entry| &entry.database_privileges)
                         })
                         .and_then(|grants| grants.get(database))
-                        .is_some_and(|grant| can_revoke_privilege_set(grant, privileges));
+                        .is_some_and(|grant| can_revoke_scoped_privilege_set(grant, privileges));
                     let partial = partial_revokes_enabled
                         && data
                             .users
@@ -2572,7 +2575,7 @@ impl AuthCatalog {
                     kind.grants(&user.routine_privileges)
                         .get(&database)
                         .and_then(|routines| routines.get(&routine))
-                        .is_some_and(|current| can_revoke_privilege_set(current, privileges))
+                        .is_some_and(|current| can_revoke_scoped_privilege_set(current, privileges))
                 } else {
                     let role = data
                         .roles
@@ -2581,7 +2584,7 @@ impl AuthCatalog {
                     kind.grants(&role.routine_privileges)
                         .get(&database)
                         .and_then(|routines| routines.get(&routine))
-                        .is_some_and(|current| can_revoke_privilege_set(current, privileges))
+                        .is_some_and(|current| can_revoke_scoped_privilege_set(current, privileges))
                 };
                 if !has_grant {
                     let (user, host) = mysql_account_parts(principal);
@@ -2633,7 +2636,7 @@ impl AuthCatalog {
                     .map(|grants| kind.grants(grants))
                     .and_then(|grants| grants.get(&database))
                     .and_then(|routines| routines.get(&routine))
-                    .is_some_and(|grant| can_revoke_privilege_set(grant, privileges));
+                    .is_some_and(|grant| can_revoke_scoped_privilege_set(grant, privileges));
                 if has_grant {
                     None
                 } else {
@@ -3371,6 +3374,19 @@ fn can_revoke_privilege_set(current: &HashSet<String>, revoked: &HashSet<String>
     }
 }
 
+fn can_revoke_scoped_privilege_set(current: &HashSet<String>, revoked: &HashSet<String>) -> bool {
+    if revoked.contains("ALL") {
+        return !current.is_empty();
+    }
+    let mut requested = revoked
+        .iter()
+        .filter(|privilege| privilege.as_str() != "GRANT OPTION");
+    if requested.clone().next().is_none() {
+        return !current.is_empty();
+    }
+    requested.all(|privilege| privilege_set_allows(current, privilege))
+}
+
 fn auth_entry_has_direct_privileges(
     global: &HashSet<String>,
     restrictions: &AuthPrivilegeRestrictions,
@@ -3535,7 +3551,7 @@ fn revoke_database_privilege_set(
     let Some(existing) = current.get(database) else {
         return false;
     };
-    if !can_revoke_privilege_set(existing, revoked) {
+    if !can_revoke_scoped_privilege_set(existing, revoked) {
         return false;
     }
     let remove_database = current.get_mut(database).is_some_and(|privileges| {
@@ -56251,6 +56267,96 @@ mod tests {
             mysql_error_kind(&error.to_string()),
             ErrorKind::ER_NONEXISTING_PROC_GRANT
         );
+    }
+
+    #[tokio::test]
+    async fn scoped_revoke_requires_each_listed_privilege() {
+        let (_temp, _storage, mut backend, _second) = transaction_backends().await;
+        backend
+            .execute("CREATE USER scoped_revoke_matrix IDENTIFIED BY 'matrix-password'")
+            .await
+            .expect("create scoped revoke user");
+        backend
+            .execute(
+                "CREATE TABLE mydb.scoped_revoke_matrix (id BIGINT PRIMARY KEY, left_value INT, right_value INT)",
+            )
+            .await
+            .expect("create scoped revoke table");
+        backend
+            .execute("CREATE PROCEDURE mydb.scoped_revoke_matrix_proc() SELECT 1")
+            .await
+            .expect("create scoped revoke procedure");
+
+        backend
+            .execute("GRANT SELECT ON mydb.scoped_revoke_matrix TO scoped_revoke_matrix")
+            .await
+            .expect("grant table SELECT");
+        let error = backend
+            .execute("REVOKE SELECT, INSERT ON mydb.scoped_revoke_matrix FROM scoped_revoke_matrix")
+            .await
+            .expect_err("scoped table revoke must require every listed privilege");
+        assert_eq!(
+            mysql_error_kind(&error.to_string()),
+            ErrorKind::ER_NONEXISTING_TABLE_GRANT
+        );
+        assert!(backend.config.auth_catalog.has_table_privilege(
+            "scoped_revoke_matrix",
+            "mydb",
+            "scoped_revoke_matrix",
+            "SELECT"
+        ));
+
+        backend
+            .execute(
+                "GRANT SELECT (left_value), INSERT (right_value) ON mydb.scoped_revoke_matrix TO scoped_revoke_matrix",
+            )
+            .await
+            .expect("grant column privileges");
+        let error = backend
+            .execute(
+                "REVOKE SELECT (left_value), UPDATE (left_value) ON mydb.scoped_revoke_matrix FROM scoped_revoke_matrix",
+            )
+            .await
+            .expect_err("scoped column revoke must require every listed privilege");
+        assert_eq!(
+            mysql_error_kind(&error.to_string()),
+            ErrorKind::ER_NONEXISTING_TABLE_GRANT
+        );
+
+        backend
+            .execute(
+                "GRANT EXECUTE ON PROCEDURE mydb.scoped_revoke_matrix_proc TO scoped_revoke_matrix",
+            )
+            .await
+            .expect("grant routine privilege");
+        let error = backend
+            .execute(
+                "REVOKE EXECUTE, ALTER ROUTINE ON PROCEDURE mydb.scoped_revoke_matrix_proc FROM scoped_revoke_matrix",
+            )
+            .await
+            .expect_err("scoped routine revoke must require every listed privilege");
+        assert_eq!(
+            mysql_error_kind(&error.to_string()),
+            ErrorKind::ER_NONEXISTING_PROC_GRANT
+        );
+
+        backend
+            .execute("GRANT SELECT ON mydb.* TO scoped_revoke_matrix")
+            .await
+            .expect("grant database SELECT");
+        let error = backend
+            .execute("REVOKE SELECT, INSERT ON mydb.* FROM scoped_revoke_matrix")
+            .await
+            .expect_err("scoped database revoke must require every listed privilege");
+        assert_eq!(
+            mysql_error_kind(&error.to_string()),
+            ErrorKind::ER_NONEXISTING_GRANT
+        );
+        assert!(backend.config.auth_catalog.has_privilege(
+            "scoped_revoke_matrix",
+            "mydb",
+            "SELECT"
+        ));
     }
 
     #[tokio::test]

@@ -229,6 +229,7 @@
 - [x] 2026-08-15 v0.1.30 同条件持久化基准（提交 `6d53572`）：MyDB 与 MySQL 8.4.11 使用相同 Docker 资源和持久化设置；性能阶段无预热、22.3/60 秒、1 次采样，单表写 209/76 ops/s、4 actor P99 45.5/55.3 ms、并发吞吐 335/142 ops/s、读 P50 283/145 μs；精确命令 `pwsh -File scripts/bench.ps1` 通过，原始结果见 `性能报告.md`
 - [x] 2026-08-15 v0.1.31 `partial_revokes`：补齐默认关闭、`SET GLOBAL`/`SET PERSIST[_ONLY]`、库级全局权限撤销、直接库授权优先、全局撤销清理、授权者限制继承、全局权限边界、`SHOW GRANTS` 与 `mysql.user.User_attributes`；Rust wire 277 测试通过，`scripts/mysql84-diff.ps1` 126/126 通过
 - [x] 2026-08-15 v0.1.32 鉴权元数据阶段：`SHOW DATABASES`/`SHOW SCHEMAS` 与 `information_schema.SCHEMATA` 按账号权限/激活角色过滤，Rust wire 277 测试通过，`scripts/mysql84-diff.ps1` 127/127 通过
+- [x] 2026-08-15 v0.1.33 作用域多权限撤销：库/表/列/例程 `REVOKE` 要求列出的权限全部存在，Rust wire 278 测试通过，`scripts/mysql84-diff.ps1` 131/131 通过
 - [x] 2026-08-15 v0.1.32 同条件持久化基准（提交 `37af36d`）：MyDB 与 MySQL 8.4.11 使用相同 Docker 资源和持久化设置；性能阶段无预热、22.8/60 秒、1 次采样，单表写 206/74 ops/s、4 actor P99 37.5/67.6 ms、并发吞吐 279/140 ops/s、读 P50 265/129 μs；原始结果见 `性能报告.md`
 - [x] 2026-08-15 v0.1.29 同条件持久化基准（提交 `9531f70`）：MyDB 与 MySQL 8.4.11 使用相同 Docker 资源和持久化设置；性能阶段无预热、22.4/60 秒、1 次采样，单表写 216/79 ops/s、4 actor P99 31.7/55.3 ms、并发吞吐 272/148 ops/s、读 P50 401/140 μs；精确命令 `pwsh -File scripts/bench.ps1` 通过，原始结果见 `性能报告.md`
 - [x] 2026-08-15 v0.1.28 同条件持久化基准（提交 `c49d2b7`）：MyDB 与 MySQL 8.4.11 使用相同 Docker 资源和持久化设置；性能阶段无预热、22.2/60 秒、1 次采样，单表写 202/69 ops/s、4 actor P99 36.8/62.6 ms、并发吞吐 328/151 ops/s、读 P50 384/145 μs；精确命令 `pwsh -File scripts/bench.ps1` 通过，原始结果见 `性能报告.md`
