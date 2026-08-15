@@ -166,7 +166,7 @@ cargo build --release
 
 # 正式包只包含 server/cli/mydb/migrate/dump、配置、安装脚本和文档；
 # mydb-bench、测试结果与 target/bench 不进入发布包
-.\scripts\build-release.ps1 -Version "0.1.33"
+.\scripts\build-release.ps1 -Version "0.1.34"
 # 发布包同时生成同名 `.sha256` 校验文件；发布脚本会拒绝覆盖已存在的 GitHub Release。
 
 # 安装到系统
@@ -627,22 +627,23 @@ bash scripts/docker-smoke.sh
 
 当前开发状态、已完成项、未完成项、差分证据统一维护在 [CheckList.md](CheckList.md)。只有可复现实测证明的项目才会打勾。
 
-### v0.1.33 稳定版
+### v0.1.34 稳定版
 
-本版面向单机 MySQL 8.4 常用生产工作负载：3306 提供 MySQL 协议，4306 提供登录保护的 Web SQL IDE/管理 API；在 v0.1.32 基础上补齐库/表/列/例程作用域多权限 `REVOKE` 的完整存在性校验，并保留 `SHOW DATABASES`/`SHOW SCHEMAS`、`information_schema.SCHEMATA` 权限过滤、`partial_revokes`、`SHOW GRANTS`/`mysql.user.User_attributes` 展示与 `SET GLOBAL/PERSIST` 语义。发布不宣称复制/集群、完整 InnoDB 全部锁边界、完整 GIS/OGC 语义、全部冷门字符集或全部 MySQL 错误码已完成；显式 `LATERAL` 前缀属于额外超集能力，不作为 MySQL 8.4 差分承诺；逐项状态见 [CheckList.md](CheckList.md) 和 [SYNTAX_MATRIX.md](SYNTAX_MATRIX.md)。
+本版面向单机 MySQL 8.4 常用生产工作负载：3306 提供 MySQL 协议，4306 提供登录保护的 Web SQL IDE/管理 API；在 v0.1.33 基础上修复 Web Schema Explorer 的硬编码库树，改为按当前账号动态读取 `SHOW DATABASES` 与 `information_schema.TABLES`，支持空库、表列检查器和刷新清理，并保留库/表/列/例程作用域多权限 `REVOKE`、`SHOW DATABASES`/`SHOW SCHEMAS`、`information_schema.SCHEMATA` 权限过滤、`partial_revokes`、`SHOW GRANTS`/`mysql.user.User_attributes` 展示与 `SET GLOBAL/PERSIST` 语义。发布不宣称复制/集群、完整 InnoDB 全部锁边界、完整 GIS/OGC 语义、全部冷门字符集或全部 MySQL 错误码已完成；显式 `LATERAL` 前缀属于额外超集能力，不作为 MySQL 8.4 差分承诺；逐项状态见 [CheckList.md](CheckList.md) 和 [SYNTAX_MATRIX.md](SYNTAX_MATRIX.md)。
 
 **本轮本地门槛（2026-08-15）：**
 - ✅ `cargo test --workspace --locked`：Docker Linux 门禁通过；wire 278（含嵌套聚合、授权撤销作用域、作用域多权限 REVOKE 完整性、`GRANT ALL`/`GRANT OPTION`、REVOKE warning/NOOP、`partial_revokes`、schema 可见性与 MySQL 错误码），其他 workspace 测试与文档测试全部通过
 - ✅ `cargo clippy --workspace --all-targets -- -D warnings`
 - ✅ `cargo build --release -p mydb-server -p mydb-cli -p mydb-migrate -p mydb-dump`
-- ✅ `mydb update --check`：GitHub Release 页面解析最新 tag、资产下载、SHA-256 校验和包结构验证通过；当前版本明确报告 up to date；更新仅替换二进制并保留配置/数据/密钥
+- ✅ `mydb update --check`：GitHub Release 页面解析最新 tag、资产下载、SHA-256 校验和包结构验证通过；v0.1.31→v0.1.33 实际更新链路通过，当前版本明确报告 up to date；更新仅替换二进制并保留配置/数据/密钥
 - ✅ MySQL 8.4 CLI 3306 连接、`event_scheduler`/版本探测
 - ✅ Connector/J 9.1.0、Node mysql2 3.23.3 已完成 3306 普通/预处理查询 smoke；Go `database/sql` + go-sql-driver/mysql 1.10.0 已完成当前 release 3306 服务的 Ping、中文、DATE、普通/预处理查询回归
 - ✅ MySQL `'user'@'host'` 基础账户匹配：精确主机优先于通配主机，握手按账户插件选择认证方式
 - ✅ `scripts/bench.ps1`：Docker Linux Rust gate、release build 与同条件 MySQL 8.4 持久化基准通过；性能阶段无预热、60 秒硬截止（报告见 [性能报告.md](性能报告.md)）
 - ✅ `scripts/mysql84-diff.ps1`：当前源码隔离端口与同机 Docker MySQL 8.4，131/131 差分通过；覆盖 `SHOW DATABASES` 系统 schema 输出、`partial_revokes` 默认关闭、1141/1147/1403、schema 限制、继承、`SHOW GRANTS`、`User_attributes`、`SET GLOBAL/PERSIST`，作用域多权限 REVOKE 完整性，以及正则、JSON_TABLE、空间、全文等覆盖
 - ✅ v0.1.33 授权兼容回归：库/表/列/例程作用域 `REVOKE` 要求列出的权限全部存在；`SHOW DATABASES` 与 `information_schema.SCHEMATA` 按全局/库/表/列/例程权限和激活角色过滤，Rust 回归已覆盖
-- ✅ v0.1.33 同条件持久化基准：无预热、22.6/60 秒、1 次采样；单表写 208/78 ops/s、4 actor P99 35.9/83.8 ms、并发吞吐 279/144 ops/s、读 P50 286/130 μs；源码提交 `d657350`，原始结果见 [性能报告.md](性能报告.md)
+- ✅ v0.1.34 Web 回归：登录后 Schema Explorer 按权限动态展示 schema/table，创建、刷新、删除、表列检查器通过浏览器验证；控制台无 warning/error，Rust server 回归 15/15
+- ✅ v0.1.34 同条件持久化基准：无预热、23.6/60 秒、1 次采样；单表写 207/78 ops/s、4 actor P99 32.9/64.3 ms、并发吞吐 193/151 ops/s、读 P50 405/129 μs；源码提交 `b566964`，原始结果见 [性能报告.md](性能报告.md)
 - ⏳ Ubuntu 24.04 物理性能、macOS 原生验收、宿主断电/恢复中断、大数据压力与生产安全运维验收：以 [CheckList.md](CheckList.md) 与 [性能报告.md](性能报告.md) 为准
 
 ---

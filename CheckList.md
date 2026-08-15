@@ -231,6 +231,8 @@
 - [x] 2026-08-15 v0.1.32 鉴权元数据阶段：`SHOW DATABASES`/`SHOW SCHEMAS` 与 `information_schema.SCHEMATA` 按账号权限/激活角色过滤，Rust wire 277 测试通过，`scripts/mysql84-diff.ps1` 127/127 通过
 - [x] 2026-08-15 v0.1.33 作用域多权限撤销：库/表/列/例程 `REVOKE` 要求列出的权限全部存在，Rust wire 278 测试通过，`scripts/mysql84-diff.ps1` 131/131 通过
 - [x] 2026-08-15 v0.1.33 同条件持久化基准（提交 `d657350`）：MyDB 与 MySQL 8.4.11 使用相同 Docker 资源和持久化设置；性能阶段无预热、22.6/60 秒、1 次采样，单表写 208/78 ops/s、4 actor P99 35.9/83.8 ms、并发吞吐 279/144 ops/s、读 P50 286/130 μs；原始结果见 `性能报告.md`
+- [x] 2026-08-15 v0.1.34 Web SQL IDE Schema Explorer：移除硬编码 `mydb`/固定系统库，按 `SHOW DATABASES` 与 `information_schema.TABLES` 动态展示权限可见 schema/table，支持空库、刷新清理和表列检查器；浏览器回归无 warning/error，Rust server 15/15
+- [x] 2026-08-15 v0.1.34 同条件持久化基准（提交 `b566964`）：MyDB 与 MySQL 8.4.11 使用相同 Docker 资源和持久化设置；性能阶段无预热、23.6/60 秒、1 次采样，单表写 207/78 ops/s、4 actor P99 32.9/64.3 ms、并发吞吐 193/151 ops/s、读 P50 405/129 μs；原始结果见 `性能报告.md`
 - [x] 2026-08-15 v0.1.32 同条件持久化基准（提交 `37af36d`）：MyDB 与 MySQL 8.4.11 使用相同 Docker 资源和持久化设置；性能阶段无预热、22.8/60 秒、1 次采样，单表写 206/74 ops/s、4 actor P99 37.5/67.6 ms、并发吞吐 279/140 ops/s、读 P50 265/129 μs；原始结果见 `性能报告.md`
 - [x] 2026-08-15 v0.1.29 同条件持久化基准（提交 `9531f70`）：MyDB 与 MySQL 8.4.11 使用相同 Docker 资源和持久化设置；性能阶段无预热、22.4/60 秒、1 次采样，单表写 216/79 ops/s、4 actor P99 31.7/55.3 ms、并发吞吐 272/148 ops/s、读 P50 401/140 μs；精确命令 `pwsh -File scripts/bench.ps1` 通过，原始结果见 `性能报告.md`
 - [x] 2026-08-15 v0.1.28 同条件持久化基准（提交 `c49d2b7`）：MyDB 与 MySQL 8.4.11 使用相同 Docker 资源和持久化设置；性能阶段无预热、22.2/60 秒、1 次采样，单表写 202/69 ops/s、4 actor P99 36.8/62.6 ms、并发吞吐 328/151 ops/s、读 P50 384/145 μs；精确命令 `pwsh -File scripts/bench.ps1` 通过，原始结果见 `性能报告.md`
