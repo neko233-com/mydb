@@ -45,7 +45,7 @@ use mydb_storage::{
     TriggerDefinition, TriggerEvent, TriggerTiming, UpdateValueExpression, WriteCommand,
 };
 
-pub const SERVER_VERSION: &str = "8.4.0-mydb-0.1.28";
+pub const SERVER_VERSION: &str = "8.4.0-mydb-0.1.29";
 pub const MYSQL84_DEFAULT_SQL_MODE: &str = "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION";
 /// MySQL 8.4 default `innodb_lock_wait_timeout`, in seconds.
 pub const MYSQL84_DEFAULT_INNODB_LOCK_WAIT_TIMEOUT_SECONDS: u64 = 50;
@@ -2040,6 +2040,37 @@ impl AuthCatalog {
                     } else {
                         revoke_privilege_set(&mut role.global_privileges, privileges);
                     }
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn revoke_all_privileges(&self, principals: &[String]) -> anyhow::Result<()> {
+        let principals = normalize_auth_names(principals)?;
+        self.mutate(|data| {
+            for principal in &principals {
+                if !data.users.contains_key(principal) && !data.roles.contains_key(principal) {
+                    anyhow::bail!("Unknown user or role '{}'", principal);
+                }
+            }
+            for principal in principals {
+                if let Some(user) = data.users.get_mut(&principal) {
+                    user.global_privileges.clear();
+                    user.database_privileges.clear();
+                    user.table_privileges.clear();
+                    user.column_privileges.clear();
+                    user.routine_privileges = AuthRoutinePrivileges::default();
+                } else {
+                    let role = data
+                        .roles
+                        .get_mut(&principal)
+                        .expect("principal was checked above");
+                    role.global_privileges.clear();
+                    role.database_privileges.clear();
+                    role.table_privileges.clear();
+                    role.column_privileges.clear();
+                    role.routine_privileges = AuthRoutinePrivileges::default();
                 }
             }
             Ok(())
@@ -10489,6 +10520,21 @@ impl Backend {
         Ok(())
     }
 
+    fn require_revoke_all_privileges(&self) -> anyhow::Result<()> {
+        let user = self.authenticated_username();
+        if self.auth_has_privilege(&user, "", "CREATE USER")
+            || self.auth_has_privilege(&user, "", "UPDATE")
+        {
+            return Ok(());
+        }
+        let (account, host) = mysql_account_parts(&user);
+        anyhow::bail!(
+            "Access denied for user '{}'@'{}' (using password: YES)",
+            account,
+            host
+        )
+    }
+
     fn require_authorization_statement(&self, sql: &str, upper: &str) -> anyhow::Result<()> {
         let revoke = upper.starts_with("REVOKE ");
         let remainder = sql[if revoke { 6 } else { 5 }..].trim();
@@ -10499,6 +10545,24 @@ impl Backend {
             let Some(target_index) = upper_remainder.find(marker) else {
                 anyhow::bail!("authorization statement requires {}", marker.trim());
             };
+            if revoke {
+                let privilege_spec = remainder[..target_index].trim();
+                if let Ok((privileges, columns)) = parse_grant_privilege_spec(privilege_spec) {
+                    if columns.is_empty()
+                        && privileges
+                            .iter()
+                            .any(|privilege| matches!(privilege.as_str(), "ALL" | "GRANT OPTION"))
+                    {
+                        if privileges.contains("ALL") && privileges.contains("GRANT OPTION") {
+                            return self.require_revoke_all_privileges();
+                        }
+                        return self.require_grant_scope_privileges(
+                            GrantAuthorizationScope::Global,
+                            &privileges,
+                        );
+                    }
+                }
+            }
             let role_spec = if revoke && upper_remainder.starts_with("ADMIN OPTION FOR ") {
                 &remainder["ADMIN OPTION FOR ".len()..target_index]
             } else {
@@ -11499,6 +11563,30 @@ impl Backend {
         let target_index = upper_remainder
             .find(marker)
             .ok_or_else(|| anyhow::anyhow!("authorization statement requires {}", marker.trim()))?;
+        if revoke {
+            let privilege_spec = remainder[..target_index].trim();
+            if let Ok((privileges, columns)) = parse_grant_privilege_spec(privilege_spec) {
+                if columns.is_empty()
+                    && privileges
+                        .iter()
+                        .any(|privilege| matches!(privilege.as_str(), "ALL" | "GRANT OPTION"))
+                {
+                    let principals = split_csv(remainder[target_index + marker.len()..].trim());
+                    if privileges.contains("ALL") && privileges.contains("GRANT OPTION") {
+                        self.config
+                            .auth_catalog
+                            .revoke_all_privileges(&principals)?;
+                    } else {
+                        self.config.auth_catalog.revoke_privileges(
+                            &principals,
+                            None,
+                            &privileges,
+                        )?;
+                    }
+                    return Ok(QueryOutcome::ok(0));
+                }
+            }
+        }
         let role_clause = remainder[..target_index].trim();
         let admin_option_only = revoke
             && role_clause
@@ -54723,6 +54811,22 @@ mod tests {
             .await
             .expect("create grant test users");
         backend
+            .execute("CREATE TABLE mydb.revoke_all_scope (id BIGINT PRIMARY KEY)")
+            .await
+            .expect("create global revoke table");
+        backend
+            .execute("CREATE PROCEDURE mydb.revoke_all_proc() SELECT 1")
+            .await
+            .expect("create global revoke procedure");
+        backend
+            .execute("GRANT INSERT ON mydb.revoke_all_scope TO all_holder")
+            .await
+            .expect("grant table privilege for global revoke");
+        backend
+            .execute("GRANT EXECUTE ON PROCEDURE mydb.revoke_all_proc TO all_holder")
+            .await
+            .expect("grant routine privilege for global revoke");
+        backend
             .execute("GRANT ALL ON *.* TO all_holder")
             .await
             .expect("grant all without delegation");
@@ -54771,6 +54875,53 @@ mod tests {
             .execute("GRANT SELECT ON mydb.* TO recipient")
             .await
             .expect("explicit grant option must permit delegation");
+        *backend.authenticated_user.lock() = Some("root".to_string());
+        backend
+            .execute("REVOKE ALL PRIVILEGES, GRANT OPTION FROM all_holder")
+            .await
+            .expect("global revoke without ON must clear all privileges");
+        assert!(!backend
+            .config
+            .auth_catalog
+            .has_privilege("all_holder", "mydb", "SELECT"));
+        assert!(!backend
+            .config
+            .auth_catalog
+            .has_privilege("all_holder", "mydb", "GRANT OPTION"));
+        assert!(!backend.config.auth_catalog.has_table_privilege(
+            "all_holder",
+            "mydb",
+            "revoke_all_scope",
+            "INSERT"
+        ));
+        assert!(!backend.config.auth_catalog.has_routine_privilege(
+            "all_holder",
+            RoutineKind::Procedure,
+            "mydb",
+            "revoke_all_proc",
+            "EXECUTE"
+        ));
+        backend
+            .execute("CREATE USER account_manager IDENTIFIED BY 'manager-password'")
+            .await
+            .expect("create account manager");
+        backend
+            .execute("GRANT CREATE USER ON *.* TO account_manager")
+            .await
+            .expect("grant account management privilege");
+        backend
+            .execute("GRANT SELECT ON *.* TO recipient")
+            .await
+            .expect("grant recipient privilege");
+        *backend.authenticated_user.lock() = Some("account_manager".to_string());
+        backend
+            .execute("REVOKE ALL PRIVILEGES, GRANT OPTION FROM recipient")
+            .await
+            .expect("CREATE USER privilege should authorize global revoke");
+        assert!(!backend
+            .config
+            .auth_catalog
+            .has_privilege("recipient", "mydb", "SELECT"));
     }
 
     #[tokio::test]

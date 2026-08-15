@@ -1360,7 +1360,7 @@ dependencies = [
 
 [[package]]
 name = "mydb-bench"
-version = "0.1.28"
+version = "0.1.29"
 dependencies = [
  "anyhow",
  "clap",
@@ -1371,7 +1371,7 @@ dependencies = [
 
 [[package]]
 name = "mydb-cli"
-version = "0.1.28"
+version = "0.1.29"
 dependencies = [
  "anyhow",
  "clap",
@@ -1390,7 +1390,7 @@ dependencies = [
 
 [[package]]
 name = "mydb-config"
-version = "0.1.28"
+version = "0.1.29"
 dependencies = [
  "anyhow",
  "dirs",
@@ -1406,7 +1406,7 @@ dependencies = [
 
 [[package]]
 name = "mydb-dump"
-version = "0.1.28"
+version = "0.1.29"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1420,7 +1420,7 @@ dependencies = [
 
 [[package]]
 name = "mydb-migrate"
-version = "0.1.28"
+version = "0.1.29"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1433,7 +1433,7 @@ dependencies = [
 
 [[package]]
 name = "mydb-parser"
-version = "0.1.28"
+version = "0.1.29"
 dependencies = [
  "anyhow",
  "clap",
@@ -1444,7 +1444,7 @@ dependencies = [
 
 [[package]]
 name = "mydb-server"
-version = "0.1.28"
+version = "0.1.29"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1473,7 +1473,7 @@ dependencies = [
 
 [[package]]
 name = "mydb-storage"
-version = "0.1.28"
+version = "0.1.29"
 dependencies = [
  "anyhow",
  "bincode",
@@ -1492,7 +1492,7 @@ dependencies = [
 
 [[package]]
 name = "mydb-transaction"
-version = "0.1.28"
+version = "0.1.29"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1507,7 +1507,7 @@ dependencies = [
 
 [[package]]
 name = "mydb-wal"
-version = "0.1.28"
+version = "0.1.29"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1519,7 +1519,7 @@ dependencies = [
 
 [[package]]
 name = "mydb-wire"
-version = "0.1.28"
+version = "0.1.29"
 dependencies = [
  "anyhow",
  "async-trait",
