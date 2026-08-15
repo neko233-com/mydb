@@ -45,7 +45,7 @@ use mydb_storage::{
     TriggerDefinition, TriggerEvent, TriggerTiming, UpdateValueExpression, WriteCommand,
 };
 
-pub const SERVER_VERSION: &str = "8.4.0-mydb-0.1.31";
+pub const SERVER_VERSION: &str = "8.4.0-mydb-0.1.32";
 pub const MYSQL84_DEFAULT_SQL_MODE: &str = "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION";
 /// MySQL 8.4 default `innodb_lock_wait_timeout`, in seconds.
 pub const MYSQL84_DEFAULT_INNODB_LOCK_WAIT_TIMEOUT_SECONDS: u64 = 50;
@@ -1246,6 +1246,33 @@ impl AuthCatalog {
             || user.roles.iter().any(|role| {
                 role_has_privilege(&data, role, &database, privilege, &mut HashSet::new())
             })
+    }
+
+    fn has_any_database_privilege_with_roles(
+        &self,
+        user: &str,
+        database: &str,
+        active_roles: &HashSet<String>,
+    ) -> bool {
+        let data = self.data.read();
+        let Some(user_key) = resolve_auth_user_key(&data.users, user) else {
+            return false;
+        };
+        let Some(user) = data.users.get(&user_key) else {
+            return false;
+        };
+        let database = database.to_ascii_lowercase();
+        auth_entry_has_any_database_privilege(
+            &user.global_privileges,
+            &user.privilege_restrictions,
+            &database,
+            &user.database_privileges,
+            &user.table_privileges,
+            &user.column_privileges,
+            &user.routine_privileges,
+        ) || active_roles.iter().any(|role| {
+            role_has_any_database_privilege(&data, role, &database, &mut HashSet::new())
+        })
     }
 
     fn has_table_privilege(
@@ -3257,6 +3284,45 @@ fn global_privilege_allows(
             .is_some_and(|restricted| privilege_set_allows(restricted, privilege))
 }
 
+fn privilege_set_has_database_access(privileges: &HashSet<String>) -> bool {
+    privileges
+        .iter()
+        .any(|privilege| privilege != "GRANT OPTION")
+}
+
+fn auth_entry_has_any_database_privilege(
+    global: &HashSet<String>,
+    restrictions: &AuthPrivilegeRestrictions,
+    database: &str,
+    databases: &HashMap<String, HashSet<String>>,
+    tables: &AuthTablePrivileges,
+    columns: &AuthColumnPrivileges,
+    routines: &AuthRoutinePrivileges,
+) -> bool {
+    global.iter().any(|privilege| {
+        privilege != "GRANT OPTION"
+            && global_privilege_allows(global, restrictions, database, privilege)
+    }) || databases
+        .get(database)
+        .is_some_and(privilege_set_has_database_access)
+        || tables
+            .get(database)
+            .is_some_and(|tables| tables.values().any(privilege_set_has_database_access))
+        || columns.get(database).is_some_and(|tables| {
+            tables
+                .values()
+                .any(|columns| columns.values().any(privilege_set_has_database_access))
+        })
+        || routines
+            .functions
+            .get(database)
+            .is_some_and(|routines| routines.values().any(privilege_set_has_database_access))
+        || routines
+            .procedures
+            .get(database)
+            .is_some_and(|routines| routines.values().any(privilege_set_has_database_access))
+}
+
 const ALL_AUTH_PRIVILEGES: &[&str] = &[
     "SELECT",
     "INSERT",
@@ -3508,6 +3574,32 @@ fn role_has_privilege(
             .roles
             .iter()
             .any(|nested| role_has_privilege(data, nested, database, privilege, visited))
+}
+
+fn role_has_any_database_privilege(
+    data: &AuthCatalogData,
+    role_name: &str,
+    database: &str,
+    visited: &mut HashSet<String>,
+) -> bool {
+    if !visited.insert(role_name.to_string()) {
+        return false;
+    }
+    let Some(role) = data.roles.get(role_name) else {
+        return false;
+    };
+    auth_entry_has_any_database_privilege(
+        &role.global_privileges,
+        &role.privilege_restrictions,
+        database,
+        &role.database_privileges,
+        &role.table_privileges,
+        &role.column_privileges,
+        &role.routine_privileges,
+    ) || role
+        .roles
+        .iter()
+        .any(|nested| role_has_any_database_privilege(data, nested, database, visited))
 }
 
 fn role_has_table_privilege(
@@ -9128,10 +9220,34 @@ impl Backend {
         }
         if let Some(filter) = parse_show_command_filter(sql, "DATABASES") {
             let filter = filter?;
-            let mut names = vec!["information_schema".to_string(), "mysql".to_string()];
+            let user = self.authenticated_username();
+            let active_roles = self.active_role_set();
+            let can_view_all = self.config.auth_catalog.has_privilege_with_roles(
+                &user,
+                "",
+                "SHOW DATABASES",
+                &active_roles,
+            );
+            let mut names = vec![
+                "information_schema".to_string(),
+                "mysql".to_string(),
+                "performance_schema".to_string(),
+                "sys".to_string(),
+            ];
             names.extend(self.storage.list_databases());
             names.sort();
             names.dedup();
+            names.retain(|name| {
+                can_view_all
+                    || matches!(
+                        name.as_str(),
+                        "information_schema" | "performance_schema" | "sys"
+                    )
+                    || self
+                        .config
+                        .auth_catalog
+                        .has_any_database_privilege_with_roles(&user, name, &active_roles)
+            });
             let columns = vec!["Database".to_string()];
             let rows = names
                 .into_iter()
@@ -24594,12 +24710,21 @@ fn information_schema_virtual_tables(
     viewer: &str,
     active_roles: &HashSet<String>,
 ) -> anyhow::Result<HashMap<String, VirtualTable>> {
-    let mut schemata_rows = vec![
-        information_schema_schemata_row("information_schema"),
-        information_schema_schemata_row("mysql"),
-        information_schema_schemata_row("performance_schema"),
-        information_schema_schemata_row("sys"),
-    ];
+    let can_view_all =
+        auth_catalog.has_privilege_with_roles(viewer, "", "SHOW DATABASES", active_roles);
+    let schema_visible = |database: &str| {
+        can_view_all
+            || matches!(
+                database,
+                "information_schema" | "performance_schema" | "sys"
+            )
+            || auth_catalog.has_any_database_privilege_with_roles(viewer, database, active_roles)
+    };
+    let mut schemata_rows = ["information_schema", "mysql", "performance_schema", "sys"]
+        .into_iter()
+        .filter(|database| schema_visible(database))
+        .map(information_schema_schemata_row)
+        .collect::<Vec<_>>();
     let mut tables_rows = Vec::new();
     let mut columns_rows = Vec::new();
     let mut statistics_rows = Vec::new();
@@ -24628,6 +24753,9 @@ fn information_schema_virtual_tables(
     databases.sort();
     databases.dedup();
     for database_name in databases {
+        if !schema_visible(&database_name) {
+            continue;
+        }
         schemata_rows.push(information_schema_schemata_row(&database_name));
         let Some(database) = storage.get_database(&database_name) else {
             continue;
@@ -55839,6 +55967,55 @@ mod tests {
             .execute("SET GLOBAL partial_revokes = OFF")
             .await
             .expect("disable partial revokes after clearing restrictions");
+    }
+
+    #[tokio::test]
+    async fn show_databases_hides_schemas_without_privileges() {
+        let (_temp, _storage, mut backend, _second) = transaction_backends().await;
+        backend
+            .execute("CREATE DATABASE visible_schema")
+            .await
+            .expect("create visible schema");
+        backend
+            .execute("CREATE DATABASE hidden_schema")
+            .await
+            .expect("create hidden schema");
+        backend
+            .execute("CREATE USER schema_reader IDENTIFIED BY 'schema-password'")
+            .await
+            .expect("create schema reader");
+        backend
+            .execute("GRANT SELECT ON visible_schema.* TO schema_reader")
+            .await
+            .expect("grant visible schema");
+
+        *backend.authenticated_user.lock() = Some("schema_reader".to_string());
+        let visible = query_rows(&mut backend, "SHOW DATABASES").await;
+        let visible = visible
+            .into_iter()
+            .filter_map(|mut row| row.pop().flatten())
+            .map(|value| String::from_utf8(value).expect("database name is utf8"))
+            .collect::<Vec<_>>();
+        assert!(visible.iter().any(|name| name == "information_schema"));
+        assert!(visible.iter().any(|name| name == "performance_schema"));
+        assert!(visible.iter().any(|name| name == "sys"));
+        assert!(visible.iter().any(|name| name == "visible_schema"));
+        assert!(!visible.iter().any(|name| name == "hidden_schema"));
+        assert!(!visible.iter().any(|name| name == "mysql"));
+
+        let schemata = query_rows(
+            &mut backend,
+            "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA ORDER BY SCHEMA_NAME",
+        )
+        .await;
+        let schemata = schemata
+            .into_iter()
+            .filter_map(|mut row| row.pop().flatten())
+            .map(|value| String::from_utf8(value).expect("schema name is utf8"))
+            .collect::<Vec<_>>();
+        assert!(schemata.iter().any(|name| name == "visible_schema"));
+        assert!(!schemata.iter().any(|name| name == "hidden_schema"));
+        assert!(!schemata.iter().any(|name| name == "mysql"));
     }
 
     #[tokio::test]

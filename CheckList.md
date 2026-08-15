@@ -86,7 +86,7 @@
 - [x] SHOW TABLES/FULL TABLES 与 information_schema 不暴露临时隐藏物理名；SHOW CREATE/COLUMNS/DESCRIBE 使用连接逻辑名
 - [x] SHOW INDEX/INDEXES/KEYS：主键和二级索引逐列元数据、基数、可空性、跨库语法及临时逻辑名
 - [x] SHOW TABLE STATUS：FROM/IN、LIKE、WHERE Name 等值过滤；引擎、实际行数、近似数据长度、AUTO_INCREMENT 与视图状态
-- [x] information_schema 只读虚拟表：SCHEMATA/TABLES/COLUMNS/STATISTICS/PARTITIONS/TABLE_CONSTRAINTS/KEY_COLUMN_USAGE/CHECK_CONSTRAINTS/APPLICABLE_ROLES，多行投影、过滤、排序、分组和跨表 JOIN；系统库自身 TABLES/COLUMNS 元数据可自描述，表级 RANGE/LIST/HASH/KEY 分区、常用表达式分区函数及重启后的分区元数据已回归
+- [x] information_schema 只读虚拟表：SCHEMATA/TABLES/COLUMNS/STATISTICS/PARTITIONS/TABLE_CONSTRAINTS/KEY_COLUMN_USAGE/CHECK_CONSTRAINTS/APPLICABLE_ROLES，多行投影、过滤、排序、分组和跨表 JOIN；SCHEMATA 与 `SHOW DATABASES` 按全局/库/表/列/例程权限及激活角色隐藏无权 schema；系统库自身 TABLES/COLUMNS 元数据可自描述，表级 RANGE/LIST/HASH/KEY 分区、常用表达式分区函数及重启后的分区元数据已回归
 - [x] mydbdump/mydb-migrate/ORM 风格元数据查询：表/列枚举、COALESCE 引擎、复合索引 GROUP_CONCAT、PK/UNIQUE/FK/CHECK 和临时物理名隐藏
 - [x] REFERENTIAL_CONSTRAINTS 与 VIEWS：引用唯一键、UPDATE/DELETE 规则、目标表、视图定义/安全类型/只读状态
 - [x] ROUTINES/PARAMETERS 真实存储过程元数据；`information_schema.PARAMETERS` 覆盖 MySQL 8.4 的类型长度、数值/时间精度、字符集/排序规则、DTD 与 ROUTINE_TYPE 字段；EVENTS 真实持久化并由 event scheduler 调度，未实现事件时 ORM 探测返回 0 行
@@ -228,7 +228,7 @@
 - [x] 2026-08-15 v0.1.30 鉴权 warning 扩展：补齐 `REVOKE IF EXISTS`、`IGNORE UNKNOWN USER`、未知角色 3523 及库/表/例程撤销 warning/NOOP 语义；Rust wire 274 测试通过，`scripts/mysql84-diff.ps1` 125/125 通过，隔离 Docker 端口 13316/14306，未触碰物理 3306/4306
 - [x] 2026-08-15 v0.1.30 同条件持久化基准（提交 `6d53572`）：MyDB 与 MySQL 8.4.11 使用相同 Docker 资源和持久化设置；性能阶段无预热、22.3/60 秒、1 次采样，单表写 209/76 ops/s、4 actor P99 45.5/55.3 ms、并发吞吐 335/142 ops/s、读 P50 283/145 μs；精确命令 `pwsh -File scripts/bench.ps1` 通过，原始结果见 `性能报告.md`
 - [x] 2026-08-15 v0.1.31 `partial_revokes`：补齐默认关闭、`SET GLOBAL`/`SET PERSIST[_ONLY]`、库级全局权限撤销、直接库授权优先、全局撤销清理、授权者限制继承、全局权限边界、`SHOW GRANTS` 与 `mysql.user.User_attributes`；Rust wire 277 测试通过，`scripts/mysql84-diff.ps1` 126/126 通过
-- [x] 2026-08-15 v0.1.31 同条件持久化基准（提交 `db21f7d`）：MyDB 与 MySQL 8.4.11 使用相同 Docker 资源和持久化设置；性能阶段无预热、21.8/60 秒、1 次采样，单表写 222/81 ops/s、4 actor P99 39.6/56.3 ms、并发吞吐 296/153 ops/s、读 P50 404/131 μs；原始结果见 `性能报告.md`
+- [x] 2026-08-15 v0.1.32 鉴权元数据阶段：`SHOW DATABASES`/`SHOW SCHEMAS` 与 `information_schema.SCHEMATA` 按账号权限/激活角色过滤，Rust wire 277 测试通过，`scripts/mysql84-diff.ps1` 127/127 通过
 - [x] 2026-08-15 v0.1.29 同条件持久化基准（提交 `9531f70`）：MyDB 与 MySQL 8.4.11 使用相同 Docker 资源和持久化设置；性能阶段无预热、22.4/60 秒、1 次采样，单表写 216/79 ops/s、4 actor P99 31.7/55.3 ms、并发吞吐 272/148 ops/s、读 P50 401/140 μs；精确命令 `pwsh -File scripts/bench.ps1` 通过，原始结果见 `性能报告.md`
 - [x] 2026-08-15 v0.1.28 同条件持久化基准（提交 `c49d2b7`）：MyDB 与 MySQL 8.4.11 使用相同 Docker 资源和持久化设置；性能阶段无预热、22.2/60 秒、1 次采样，单表写 202/69 ops/s、4 actor P99 36.8/62.6 ms、并发吞吐 328/151 ops/s、读 P50 384/145 μs；精确命令 `pwsh -File scripts/bench.ps1` 通过，原始结果见 `性能报告.md`
 - [x] 2026-08-15 v0.1.27 同条件持久化基准：MyDB 与 MySQL 8.4.11 使用相同 Docker 资源和持久化设置；性能阶段无预热、15.1/60 秒、1 次采样，单表写 212/77 ops/s、4 actor P99 26.1/43.1 ms、并发吞吐 1148/571 ops/s、读 P50 396/140 μs；原始结果见 `性能报告.md`，不硬编码历史比值

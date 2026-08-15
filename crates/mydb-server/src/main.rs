@@ -286,11 +286,6 @@ async fn run_server(args: Args, config: mydb_config::ServerConfig) -> Result<()>
     // Initialize storage (load databases, replay WAL)
     storage.init().await?;
 
-    // Create default "mydb" database if it doesn't exist
-    if storage.get_database("mydb").is_none() {
-        storage.create_database("mydb").await?;
-    }
-
     // Authentication is configured before accepting connections. Never log secrets.
     info!(
         "MySQL authentication configured for user '{}'",
@@ -470,7 +465,7 @@ fn protocol_config_for(config: &mydb_config::ServerConfig) -> Result<mydb_wire::
         default_sql_mode: mydb_wire::MYSQL84_DEFAULT_SQL_MODE.to_string(),
         // MySQL leaves the session schema unset when the handshake omits
         // CLIENT_CONNECT_WITH_DB. The client must issue USE or provide a DSN
-        // database; keep the built-in mydb schema without selecting it.
+        // database.
         default_database: String::new(),
         slow_query_threshold_ms: config.agent.slow_query_threshold_ms,
         max_slow_queries: config.agent.max_slow_queries,

@@ -31,7 +31,7 @@
 | `CREATE SCHEMA ...` | ✅ Verified | 同 CREATE DATABASE |
 | `DROP DATABASE [IF EXISTS] name` | ✅ Verified | |
 | `ALTER DATABASE [name] ... CHARACTER SET/COLLATE/UPGRADE DATA DIRECTORY NAME/READ ONLY/ENCRYPTION` | 🔵 Compatible-noop | 本轮新增；单机默认 utf8mb4，选项接受为 no-op |
-| `SHOW DATABASES` / `SHOW SCHEMAS` | ✅ Verified | |
+| `SHOW DATABASES` / `SHOW SCHEMAS` | ✅ Verified | 按 `SHOW DATABASES` 全局权限或账号/激活角色在目标 schema 的任一有效权限过滤；`information_schema.SCHEMATA` 同步过滤 |
 | `SHOW CREATE DATABASE` | ✅ Verified | |
 
 ### 1.2 表 / 列 / 索引
@@ -117,7 +117,7 @@
 | `RENAME USER old TO new` | ✅ Verified | 本轮新增（`AuthCatalog::rename_user`） |
 | `SET PASSWORD [FOR user] = '...'` | ✅ Verified | 本轮新增，路由到 `alter_user_passwords` |
 | `SHOW GRANTS` | ✅ Verified | |
-| `partial_revokes` / schema 级全局权限撤销 | ✅ Verified | 默认关闭；支持 `SET GLOBAL`、`SET PERSIST[_ONLY]`、直接库授权优先、授权者限制继承、`SHOW GRANTS` 与 `mysql.user.User_attributes`；MySQL 8.4 差分 126/126 |
+| `partial_revokes` / schema 级全局权限撤销 | ✅ Verified | 默认关闭；支持 `SET GLOBAL`、`SET PERSIST[_ONLY]`、直接库授权优先、授权者限制继承、`SHOW GRANTS` 与 `mysql.user.User_attributes`；MySQL 8.4 差分 127/127 |
 | 表级 / 列级权限（`tables_priv`/`columns_priv`） | 🟡 Partial | 表级与 `GRANT SELECT/INSERT/UPDATE/REFERENCES (列)` 已持久化、角色继承、`SHOW GRANTS`/虚拟表展示；复杂 JOIN 的每个基表及 JOIN/WHERE/GROUP/HAVING/ORDER 投影列级 SELECT、JOIN UPDATE/DELETE 的逐目标表/逐读取列授权、`INSERT ... SELECT` 目标写列/来源读列授权、`ON DUPLICATE KEY UPDATE` 的 INSERT/UPDATE/既有行 SELECT 与 `VALUES(col)` 入参边界已验证；全局/库/表/列/例程授权委托现按被授予权限与同级或更宽范围 `GRANT OPTION` 校验，`GRANT ALL` 不隐式包含 `GRANT OPTION`，缺失库/表/列/例程授权分别返回 MySQL 1141/1147/1403，角色委托按 `ADMIN OPTION` 校验并支持 `REVOKE ADMIN OPTION FOR`；跨库/越权委托已回归；完整授权撤销矩阵仍待补齐 |
 | `mysql.user` / `mysql.db` / `mysql.role_edges` / `mysql.roles_mapping` 虚拟表 | ✅ Verified | 真实填充；兼容 MySQL 与 MariaDB/GoLand 角色元数据查询 |
 | `mysql.global_grants` / `default_roles` / `tables_priv` / `columns_priv` / `procs_priv` / `func` 虚拟表 | ✅ Verified | `procs_priv` 反映用户/角色的例程权限；动态全局权限未实现，`global_grants` 故意为空 |
@@ -130,7 +130,7 @@
 
 | 库 | 状态 | 备注 |
 |----|------|------|
-| `information_schema` | ✅ Verified | 虚拟表：SCHEMATA/TABLES/COLUMNS/STATISTICS/PARTITIONS/TABLE_CONSTRAINTS/KEY_COLUMN_USAGE/CHECK_CONSTRAINTS/REFERENTIAL_CONSTRAINTS/VIEWS/TRIGGERS/ROUTINES/PARAMETERS/EVENTS/APPLICABLE_ROLES/CHARACTER_SETS/COLLATIONS/ENGINES/USER_PRIVILEGES/SCHEMA_PRIVILEGES/TABLE_PRIVILEGES/COLUMN_PRIVILEGES 等；系统库自身 TABLES/COLUMNS 元数据可自描述，PARAMETERS 已覆盖 MySQL 8.4 类型长度、精度、字符集/排序规则、DTD、ROUTINE_TYPE |
+| `information_schema` | ✅ Verified | 虚拟表：SCHEMATA/TABLES/COLUMNS/STATISTICS/PARTITIONS/TABLE_CONSTRAINTS/KEY_COLUMN_USAGE/CHECK_CONSTRAINTS/REFERENTIAL_CONSTRAINTS/VIEWS/TRIGGERS/ROUTINES/PARAMETERS/EVENTS/APPLICABLE_ROLES/CHARACTER_SETS/COLLATIONS/ENGINES/USER_PRIVILEGES/SCHEMA_PRIVILEGES/TABLE_PRIVILEGES/COLUMN_PRIVILEGES 等；SCHEMATA 与业务 schema 元数据按账号/激活角色权限过滤；系统库自身 TABLES/COLUMNS 元数据可自描述，PARAMETERS 已覆盖 MySQL 8.4 类型长度、精度、字符集/排序规则、DTD、ROUTINE_TYPE |
 | `mysql` | ✅ Verified | user/db/role_edges/roles_mapping 真实填充；global_grants/default_roles/tables_priv/columns_priv/procs_priv/func 为虚拟表，其中 procs_priv 动态反映例程授权 |
 | `performance_schema` | ✅ Verified | 本轮新增虚拟表：GLOBAL_STATUS/SESSION_STATUS/GLOBAL_VARIABLES/SESSION_VARIABLES/PROCESSLIST/STATUS_BY_HOST/USER/THREAD/EVENTS_STATEMENTS_SUMMARY_BY_DIGEST/MUTEX_INSTANCES/FILE_INSTANCES/EVENTS_WAITS_SUMMARY_GLOBAL_BY_EVENT_NAME |
 | `sys` | ✅ Verified | 本轮新增虚拟视图：processlist/x$processlist/metrics/x$metrics/session/x$session/statement_analysis/x$statement_analysis/sys_config/host_summary/user_summary/schema_table_statistics |
