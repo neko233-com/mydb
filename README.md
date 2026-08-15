@@ -641,7 +641,7 @@ bash scripts/docker-smoke.sh
 - ✅ MySQL `'user'@'host'` 基础账户匹配：精确主机优先于通配主机，握手按账户插件选择认证方式
 - ✅ `scripts/bench.ps1`：Docker Linux Rust gate、release build 与同条件 MySQL 8.4 持久化基准通过；性能阶段无预热、60 秒硬截止（报告见 [性能报告.md](性能报告.md)）
 - ✅ `scripts/mysql84-diff.ps1`：当前源码隔离端口与同机 Docker MySQL 8.4，123/123 差分通过；新增库级 `REVOKE` 作用域隔离，并保留 `group_concat_max_len`、嵌套聚合、多表达式 `GROUP_CONCAT`、多列/表达式 `COUNT(DISTINCT ...)`、正则、JSON_TABLE、空间、JSON 搜索/路径/聚合、全文相关性/布尔短语/前缀/停止词/查询扩展覆盖
-- ✅ 本轮同条件持久化基准（v0.1.28）：单表写 MyDB/MySQL `217/78 ops/s`，4 actor P99 `37.2/49.7 ms`，并发吞吐 `277/151 ops/s`，读 P50 `379/125 μs`；1 次样本、无预热、性能阶段 22.3 秒，原始数据见 [性能报告.md](性能报告.md)
+- ✅ 本轮同条件持久化基准（v0.1.28，提交 `c49d2b7`）：单表写 MyDB/MySQL `202/69 ops/s`，4 actor P99 `36.8/62.6 ms`，并发吞吐 `328/151 ops/s`，读 P50 `384/145 μs`；1 次样本、无预热、性能阶段 22.2 秒，原始数据见 [性能报告.md](性能报告.md)
 - ⏳ Ubuntu 24.04 物理性能、macOS 原生验收、宿主断电/恢复中断、大数据压力与生产安全运维验收：以 [CheckList.md](CheckList.md) 与 [性能报告.md](性能报告.md) 为准
 
 ---
