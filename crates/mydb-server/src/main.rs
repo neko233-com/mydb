@@ -2508,6 +2508,15 @@ mod tests {
     }
 
     #[test]
+    fn admin_schema_explorer_is_metadata_driven() {
+        let html = include_str!("admin.html");
+        assert!(html.contains("SHOW DATABASES"));
+        assert!(html.contains("information_schema.TABLES"));
+        assert!(html.contains("clearInspector"));
+        assert!(!html.contains("<summary>◉ mydb</summary>"));
+    }
+
+    #[test]
     fn runtime_worker_count_honors_explicit_configuration() {
         assert_eq!(runtime_worker_threads(1), 1);
         assert_eq!(runtime_worker_threads(8), 8);
