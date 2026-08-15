@@ -642,7 +642,7 @@ bash scripts/docker-smoke.sh
 - ✅ `scripts/bench.ps1`：Docker Linux Rust gate、release build 与同条件 MySQL 8.4 持久化基准通过；性能阶段无预热、60 秒硬截止（报告见 [性能报告.md](性能报告.md)）
 - ✅ `scripts/mysql84-diff.ps1`：当前源码隔离端口与同机 Docker MySQL 8.4，127/127 差分通过；新增 `SHOW DATABASES` 系统 schema 输出，保留 `partial_revokes` 默认关闭、1141、schema 限制、继承、`SHOW GRANTS`、`User_attributes`、`SET GLOBAL/PERSIST`，以及 `REVOKE IF EXISTS`、`IGNORE UNKNOWN USER`、正则、JSON_TABLE、空间、全文等覆盖
 - ✅ v0.1.32 授权兼容回归：`SHOW DATABASES` 与 `information_schema.SCHEMATA` 按全局/库/表/列/例程权限和激活角色过滤；无权限账号不再看到业务库或 `mysql`，Rust 回归已覆盖
-- ✅ v0.1.32 同条件持久化基准：无预热、21.9/60 秒、1 次采样；单表写 214/79 ops/s、4 actor P99 41.9/56.1 ms、并发吞吐 311/150 ops/s、读 P50 278/125 μs；源码提交 `9b2ebc9`，原始结果见 [性能报告.md](性能报告.md)
+- ✅ v0.1.32 同条件持久化基准：无预热、22.8/60 秒、1 次采样；单表写 206/74 ops/s、4 actor P99 37.5/67.6 ms、并发吞吐 279/140 ops/s、读 P50 265/129 μs；源码提交 `37af36d`，原始结果见 [性能报告.md](性能报告.md)
 - ⏳ Ubuntu 24.04 物理性能、macOS 原生验收、宿主断电/恢复中断、大数据压力与生产安全运维验收：以 [CheckList.md](CheckList.md) 与 [性能报告.md](性能报告.md) 为准
 
 ---
