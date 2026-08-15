@@ -55459,7 +55459,7 @@ mod tests {
             .expect("role options should accept unknown roles");
         let warnings = query_rows(&mut backend, "SHOW WARNINGS").await;
         assert_eq!(warnings.len(), 1);
-        assert_eq!(warnings[0][1].as_deref(), Some(b"3162".as_slice()));
+        assert_eq!(warnings[0][1].as_deref(), Some(b"3523".as_slice()));
 
         backend
             .execute(
