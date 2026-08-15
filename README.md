@@ -614,10 +614,10 @@ bash scripts/docker-smoke.sh
 
 | 场景 | MyDB | MySQL 8.4.11 | MyDB / MySQL |
 |------|------|--------------|--------------|
-| 单表写（fsync-per-commit） | 216 ops/s | 79 ops/s | 2.71x |
-| 4 actor / 4表 写 P99 延迟 | 31.7 ms | 55.3 ms | 1.74x（低更好） |
-| 4 actor / 4表 Group Commit | 272 ops/s | 148 ops/s | 1.84x |
-| 读 P50 延迟 | 401 μs | 140 μs | - |
+| 单表写（fsync-per-commit） | 209 ops/s | 76 ops/s | 2.75x |
+| 4 actor / 4表 写 P99 延迟 | 45.5 ms | 55.3 ms | 1.21x（低更好） |
+| 4 actor / 4表 Group Commit | 335 ops/s | 142 ops/s | 2.36x |
+| 读 P50 延迟 | 283 μs | 145 μs | - |
 
 性能优化不以关闭 WAL 持久化或弱化恢复语义换取数字。默认 250μs Group Commit 窗口优先并发吞吐，checkpoint 按 1024 个已提交请求触发；不声明未经实测证明的固定倍数。
 
@@ -641,7 +641,7 @@ bash scripts/docker-smoke.sh
 - ✅ MySQL `'user'@'host'` 基础账户匹配：精确主机优先于通配主机，握手按账户插件选择认证方式
 - ✅ `scripts/bench.ps1`：Docker Linux Rust gate、release build 与同条件 MySQL 8.4 持久化基准通过；性能阶段无预热、60 秒硬截止（报告见 [性能报告.md](性能报告.md)）
 - ✅ `scripts/mysql84-diff.ps1`：当前源码隔离端口与同机 Docker MySQL 8.4，125/125 差分通过；新增 `REVOKE IF EXISTS`、`IGNORE UNKNOWN USER` 及 1147/3162/3523 warning，保留无 `ON` 全量 `REVOKE`、库级撤销隔离、`group_concat_max_len`、嵌套聚合、多表达式 `GROUP_CONCAT`、多列/表达式 `COUNT(DISTINCT ...)`、正则、JSON_TABLE、空间、JSON 搜索/路径/聚合、全文相关性/布尔短语/前缀/停止词/查询扩展覆盖
-- ⏳ v0.1.30 同条件持久化基准：待精确 `pwsh -File scripts/bench.ps1` 生成最终数据
+- ✅ v0.1.30 同条件持久化基准：无预热、22.3/60 秒、1 次采样；单表写 209/76 ops/s、4 actor P99 45.5/55.3 ms、并发吞吐 335/142 ops/s、读 P50 283/145 μs；提交 `6d53572`，原始结果见 [性能报告.md](性能报告.md)
 - ⏳ Ubuntu 24.04 物理性能、macOS 原生验收、宿主断电/恢复中断、大数据压力与生产安全运维验收：以 [CheckList.md](CheckList.md) 与 [性能报告.md](性能报告.md) 为准
 
 ---
