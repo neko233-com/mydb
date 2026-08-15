@@ -5,7 +5,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -45,7 +45,7 @@ use mydb_storage::{
     TriggerDefinition, TriggerEvent, TriggerTiming, UpdateValueExpression, WriteCommand,
 };
 
-pub const SERVER_VERSION: &str = "8.4.0-mydb-0.1.30";
+pub const SERVER_VERSION: &str = "8.4.0-mydb-0.1.31";
 pub const MYSQL84_DEFAULT_SQL_MODE: &str = "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION";
 /// MySQL 8.4 default `innodb_lock_wait_timeout`, in seconds.
 pub const MYSQL84_DEFAULT_INNODB_LOCK_WAIT_TIMEOUT_SECONDS: u64 = 50;
@@ -778,6 +778,8 @@ struct AuthUser {
     #[serde(default = "default_authentication_plugin")]
     plugin: String,
     global_privileges: HashSet<String>,
+    #[serde(default)]
+    privilege_restrictions: AuthPrivilegeRestrictions,
     database_privileges: HashMap<String, HashSet<String>>,
     #[serde(default)]
     table_privileges: AuthTablePrivileges,
@@ -814,6 +816,8 @@ enum DefaultRoleSelection {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct AuthRole {
     global_privileges: HashSet<String>,
+    #[serde(default)]
+    privilege_restrictions: AuthPrivilegeRestrictions,
     database_privileges: HashMap<String, HashSet<String>>,
     #[serde(default)]
     table_privileges: AuthTablePrivileges,
@@ -830,6 +834,11 @@ struct AuthRole {
 /// Table grants use database/table keys so legacy auth JSON remains readable
 /// while `GRANT ... ON db.table` can be enforced without broad database grants.
 type AuthTablePrivileges = HashMap<String, HashMap<String, HashSet<String>>>;
+
+/// Partial revokes restrict global privileges for selected schemas.  The
+/// durable shape mirrors MySQL's `User_attributes.Restrictions` payload while
+/// keeping the hot authorization path as a lowercase map lookup.
+type AuthPrivilegeRestrictions = HashMap<String, HashSet<String>>;
 
 /// Column grants use database/table/column keys so MySQL's column-level
 /// `GRANT SELECT (column)` and `GRANT UPDATE (column)` survive restarts.
@@ -958,6 +967,8 @@ impl AuthRoutinePrivileges {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct AuthCatalogData {
     format_version: u32,
+    #[serde(default)]
+    partial_revokes: bool,
     users: HashMap<String, AuthUser>,
     roles: HashMap<String, AuthRole>,
 }
@@ -970,6 +981,7 @@ pub struct AuthCatalog {
     path: Option<PathBuf>,
     data: parking_lot::RwLock<AuthCatalogData>,
     failures: parking_lot::Mutex<HashMap<String, AuthFailureState>>,
+    partial_revokes_runtime: AtomicBool,
 }
 
 #[derive(Debug, Clone)]
@@ -1010,6 +1022,7 @@ impl AuthCatalog {
                         "ALL".to_string(),
                         "GRANT OPTION".to_string(),
                     ]),
+                    privilege_restrictions: AuthPrivilegeRestrictions::default(),
                     database_privileges: HashMap::new(),
                     table_privileges: AuthTablePrivileges::default(),
                     column_privileges: AuthColumnPrivileges::default(),
@@ -1045,10 +1058,12 @@ impl AuthCatalog {
             }
             write_auth_catalog(&path, &data)?;
         }
+        let partial_revokes = data.partial_revokes;
         Ok(Self {
             path: Some(path),
             data: parking_lot::RwLock::new(data),
             failures: parking_lot::Mutex::new(HashMap::new()),
+            partial_revokes_runtime: AtomicBool::new(partial_revokes),
         })
     }
 
@@ -1061,6 +1076,7 @@ impl AuthCatalog {
                 password_sha256: password_sha256_hex(bootstrap_password),
                 plugin: default_authentication_plugin(),
                 global_privileges: HashSet::from(["ALL".to_string(), "GRANT OPTION".to_string()]),
+                privilege_restrictions: AuthPrivilegeRestrictions::default(),
                 database_privileges: HashMap::new(),
                 table_privileges: AuthTablePrivileges::default(),
                 column_privileges: AuthColumnPrivileges::default(),
@@ -1074,11 +1090,68 @@ impl AuthCatalog {
             path: None,
             data: parking_lot::RwLock::new(AuthCatalogData {
                 format_version: 1,
+                partial_revokes: false,
                 users,
                 roles: HashMap::new(),
             }),
             failures: parking_lot::Mutex::new(HashMap::new()),
+            partial_revokes_runtime: AtomicBool::new(false),
         }
+    }
+
+    fn partial_revokes_enabled(&self) -> bool {
+        self.partial_revokes_runtime.load(Ordering::Acquire)
+    }
+
+    fn set_partial_revokes_runtime(&self, enabled: bool) {
+        self.partial_revokes_runtime
+            .store(enabled, Ordering::Release);
+    }
+
+    fn has_privilege_restrictions(&self) -> bool {
+        let data = self.data.read();
+        data.users
+            .values()
+            .any(|user| !user.privilege_restrictions.is_empty())
+            || data
+                .roles
+                .values()
+                .any(|role| !role.privilege_restrictions.is_empty())
+    }
+
+    fn persist_partial_revokes(&self, enabled: bool) -> anyhow::Result<()> {
+        if !enabled && self.has_privilege_restrictions() {
+            anyhow::bail!("partial_revokes cannot be disabled while privilege restrictions exist");
+        }
+        self.mutate(|data| {
+            data.partial_revokes = enabled;
+            Ok(())
+        })?;
+        self.set_partial_revokes_runtime(enabled);
+        Ok(())
+    }
+
+    fn persist_partial_revokes_only(&self, enabled: bool) -> anyhow::Result<()> {
+        if !enabled && self.has_privilege_restrictions() {
+            anyhow::bail!("partial_revokes cannot be disabled while privilege restrictions exist");
+        }
+        self.mutate(|data| {
+            data.partial_revokes = enabled;
+            Ok(())
+        })
+    }
+
+    fn principal_restrictions(&self, principal: &str) -> AuthPrivilegeRestrictions {
+        let data = self.data.read();
+        data.users
+            .get(&normalize_auth_name(principal))
+            .map(|user| user.privilege_restrictions.clone())
+            .or_else(|| {
+                data.roles
+                    .get(&normalize_auth_name(principal))
+                    .map(|role| role.privilege_restrictions.clone())
+            })
+            .unwrap_or_default()
     }
 
     pub fn verify_password(&self, user: &str, password: &str) -> Option<String> {
@@ -1161,11 +1234,15 @@ impl AuthCatalog {
             return false;
         };
         let database = database.to_ascii_lowercase();
-        privilege_set_allows(&user.global_privileges, privilege)
-            || user
-                .database_privileges
-                .get(&database)
-                .is_some_and(|set| privilege_set_allows(set, privilege))
+        global_privilege_allows(
+            &user.global_privileges,
+            &user.privilege_restrictions,
+            &database,
+            privilege,
+        ) || user
+            .database_privileges
+            .get(&database)
+            .is_some_and(|set| privilege_set_allows(set, privilege))
             || user.roles.iter().any(|role| {
                 role_has_privilege(&data, role, &database, privilege, &mut HashSet::new())
             })
@@ -1246,11 +1323,15 @@ impl AuthCatalog {
             return false;
         };
         let database = database.to_ascii_lowercase();
-        privilege_set_allows(&user.global_privileges, privilege)
-            || user
-                .database_privileges
-                .get(&database)
-                .is_some_and(|set| privilege_set_allows(set, privilege))
+        global_privilege_allows(
+            &user.global_privileges,
+            &user.privilege_restrictions,
+            &database,
+            privilege,
+        ) || user
+            .database_privileges
+            .get(&database)
+            .is_some_and(|set| privilege_set_allows(set, privilege))
             || user
                 .routine_privileges
                 .has(kind, &database, routine, privilege)
@@ -1374,11 +1455,15 @@ impl AuthCatalog {
             return false;
         };
         let database = database.to_ascii_lowercase();
-        privilege_set_allows(&user.global_privileges, privilege)
-            || user
-                .database_privileges
-                .get(&database)
-                .is_some_and(|set| privilege_set_allows(set, privilege))
+        global_privilege_allows(
+            &user.global_privileges,
+            &user.privilege_restrictions,
+            &database,
+            privilege,
+        ) || user
+            .database_privileges
+            .get(&database)
+            .is_some_and(|set| privilege_set_allows(set, privilege))
             || active_roles.iter().any(|role| {
                 role_has_privilege(&data, role, &database, privilege, &mut HashSet::new())
             })
@@ -1471,11 +1556,15 @@ impl AuthCatalog {
             return false;
         };
         let database = database.to_ascii_lowercase();
-        privilege_set_allows(&user.global_privileges, privilege)
-            || user
-                .database_privileges
-                .get(&database)
-                .is_some_and(|set| privilege_set_allows(set, privilege))
+        global_privilege_allows(
+            &user.global_privileges,
+            &user.privilege_restrictions,
+            &database,
+            privilege,
+        ) || user
+            .database_privileges
+            .get(&database)
+            .is_some_and(|set| privilege_set_allows(set, privilege))
             || user
                 .routine_privileges
                 .has(kind, &database, routine, privilege)
@@ -1543,6 +1632,7 @@ impl AuthCatalog {
                         password_sha256: password_sha256_hex(&password),
                         plugin,
                         global_privileges: HashSet::new(),
+                        privilege_restrictions: AuthPrivilegeRestrictions::default(),
                         database_privileges: HashMap::new(),
                         table_privileges: AuthTablePrivileges::default(),
                         column_privileges: AuthColumnPrivileges::default(),
@@ -1599,6 +1689,7 @@ impl AuthCatalog {
                         password_sha256: password_sha256_hex(password),
                         plugin: plugin.clone(),
                         global_privileges: HashSet::new(),
+                        privilege_restrictions: AuthPrivilegeRestrictions::default(),
                         database_privileges: HashMap::new(),
                         table_privileges: AuthTablePrivileges::default(),
                         column_privileges: AuthColumnPrivileges::default(),
@@ -1733,11 +1824,12 @@ impl AuthCatalog {
         })
     }
 
-    fn grant_privileges(
+    fn grant_privileges_with_inherited_restrictions(
         &self,
         principals: &[String],
         database: Option<&str>,
         privileges: HashSet<String>,
+        inherited_restrictions: &AuthPrivilegeRestrictions,
     ) -> anyhow::Result<()> {
         let principals = normalize_auth_names(principals)?;
         let database = database.map(str::to_ascii_lowercase);
@@ -1749,30 +1841,56 @@ impl AuthCatalog {
             }
             for principal in principals {
                 if let Some(user) = data.users.get_mut(&principal) {
-                    let target = database
-                        .as_ref()
-                        .map(|database| {
-                            user.database_privileges
-                                .entry(database.clone())
-                                .or_default()
-                        })
-                        .unwrap_or(&mut user.global_privileges);
-                    target.extend(privileges.iter().cloned());
+                    let global_before = user.global_privileges.clone();
+                    if let Some(database) = database.as_ref() {
+                        user.database_privileges
+                            .entry(database.clone())
+                            .or_default()
+                            .extend(privileges.iter().cloned());
+                    } else {
+                        user.global_privileges.extend(privileges.iter().cloned());
+                    }
+                    clear_partial_restrictions_for_grant(
+                        &mut user.privilege_restrictions,
+                        database.as_deref(),
+                        &privileges,
+                    );
+                    if database.is_none() {
+                        apply_inherited_global_restrictions(
+                            &global_before,
+                            &mut user.privilege_restrictions,
+                            &privileges,
+                            inherited_restrictions,
+                        );
+                    }
                     continue;
                 }
                 let role = data
                     .roles
                     .get_mut(&principal)
                     .expect("principal was checked above");
-                let target = database
-                    .as_ref()
-                    .map(|database| {
-                        role.database_privileges
-                            .entry(database.clone())
-                            .or_default()
-                    })
-                    .unwrap_or(&mut role.global_privileges);
-                target.extend(privileges.iter().cloned());
+                let global_before = role.global_privileges.clone();
+                if let Some(database) = database.as_ref() {
+                    role.database_privileges
+                        .entry(database.clone())
+                        .or_default()
+                        .extend(privileges.iter().cloned());
+                } else {
+                    role.global_privileges.extend(privileges.iter().cloned());
+                }
+                clear_partial_restrictions_for_grant(
+                    &mut role.privilege_restrictions,
+                    database.as_deref(),
+                    &privileges,
+                );
+                if database.is_none() {
+                    apply_inherited_global_restrictions(
+                        &global_before,
+                        &mut role.privilege_restrictions,
+                        &privileges,
+                        inherited_restrictions,
+                    );
+                }
             }
             Ok(())
         })
@@ -2151,6 +2269,7 @@ impl AuthCatalog {
     ) -> anyhow::Result<()> {
         let principals = normalize_auth_names(principals)?;
         let database = database.map(str::to_ascii_lowercase);
+        let partial_revokes_enabled = database.is_some() && self.partial_revokes_enabled();
         self.mutate(|data| {
             for principal in &principals {
                 if !data.users.contains_key(principal) && !data.roles.contains_key(principal) {
@@ -2165,6 +2284,16 @@ impl AuthCatalog {
                             database,
                             privileges,
                         ) {
+                            if partial_revokes_enabled
+                                && apply_partial_restriction(
+                                    &user.global_privileges,
+                                    &mut user.privilege_restrictions,
+                                    database,
+                                    privileges,
+                                )
+                            {
+                                continue;
+                            }
                             let (user, host) = mysql_account_parts(&principal);
                             anyhow::bail!(
                                 "There is no such grant defined for user '{}' on host '{}'",
@@ -2174,6 +2303,7 @@ impl AuthCatalog {
                         }
                     } else {
                         revoke_privilege_set(&mut user.global_privileges, privileges);
+                        clear_partial_restrictions(&mut user.privilege_restrictions, privileges);
                     }
                 } else {
                     let role = data
@@ -2186,6 +2316,16 @@ impl AuthCatalog {
                             database,
                             privileges,
                         ) {
+                            if partial_revokes_enabled
+                                && apply_partial_restriction(
+                                    &role.global_privileges,
+                                    &mut role.privilege_restrictions,
+                                    database,
+                                    privileges,
+                                )
+                            {
+                                continue;
+                            }
                             let (user, host) = mysql_account_parts(&principal);
                             anyhow::bail!(
                                 "There is no such grant defined for user '{}' on host '{}'",
@@ -2195,6 +2335,7 @@ impl AuthCatalog {
                         }
                     } else {
                         revoke_privilege_set(&mut role.global_privileges, privileges);
+                        clear_partial_restrictions(&mut role.privilege_restrictions, privileges);
                     }
                 }
             }
@@ -2210,10 +2351,12 @@ impl AuthCatalog {
         options: RevokeOptions,
     ) -> anyhow::Result<Vec<SqlWarning>> {
         let database = database.map(str::to_ascii_lowercase);
+        let partial_revokes_enabled = database.is_some() && self.partial_revokes_enabled();
         let (targets, warnings) =
             self.revoke_targets_with_options(principals, options, |data, principal| {
                 let has_grant = if let Some(database) = database.as_deref() {
-                    data.users
+                    let direct = data
+                        .users
                         .get(principal)
                         .map(|entry| &entry.database_privileges)
                         .or_else(|| {
@@ -2222,7 +2365,21 @@ impl AuthCatalog {
                                 .map(|entry| &entry.database_privileges)
                         })
                         .and_then(|grants| grants.get(database))
-                        .is_some_and(|grant| can_revoke_privilege_set(grant, privileges))
+                        .is_some_and(|grant| can_revoke_privilege_set(grant, privileges));
+                    let partial = partial_revokes_enabled
+                        && data
+                            .users
+                            .get(principal)
+                            .map(|entry| {
+                                partial_revoke_possible(&entry.global_privileges, privileges)
+                            })
+                            .or_else(|| {
+                                data.roles.get(principal).map(|entry| {
+                                    partial_revoke_possible(&entry.global_privileges, privileges)
+                                })
+                            })
+                            .unwrap_or(false);
+                    direct || partial
                 } else {
                     data.users
                         .get(principal)
@@ -2264,6 +2421,7 @@ impl AuthCatalog {
             for principal in principals {
                 if let Some(user) = data.users.get_mut(&principal) {
                     user.global_privileges.clear();
+                    user.privilege_restrictions.clear();
                     user.database_privileges.clear();
                     user.table_privileges.clear();
                     user.column_privileges.clear();
@@ -2274,6 +2432,7 @@ impl AuthCatalog {
                         .get_mut(&principal)
                         .expect("principal was checked above");
                     role.global_privileges.clear();
+                    role.privilege_restrictions.clear();
                     role.database_privileges.clear();
                     role.table_privileges.clear();
                     role.column_privileges.clear();
@@ -2294,6 +2453,7 @@ impl AuthCatalog {
                 let has_grant = if let Some(entry) = data.users.get(principal) {
                     auth_entry_has_direct_privileges(
                         &entry.global_privileges,
+                        &entry.privilege_restrictions,
                         &entry.database_privileges,
                         &entry.table_privileges,
                         &entry.column_privileges,
@@ -2302,6 +2462,7 @@ impl AuthCatalog {
                 } else if let Some(entry) = data.roles.get(principal) {
                     auth_entry_has_direct_privileges(
                         &entry.global_privileges,
+                        &entry.privilege_restrictions,
                         &entry.database_privileges,
                         &entry.table_privileges,
                         &entry.column_privileges,
@@ -2546,30 +2707,40 @@ impl AuthCatalog {
     fn show_grants(&self, principal: &str, using_roles: &[String]) -> anyhow::Result<Vec<String>> {
         let principal = normalize_auth_name(principal);
         let data = self.data.read();
-        let (mut global, mut databases, mut tables, mut columns, mut routines, roles, admin_roles) =
-            if let Some(user) = data.users.get(&principal) {
-                (
-                    user.global_privileges.clone(),
-                    user.database_privileges.clone(),
-                    user.table_privileges.clone(),
-                    user.column_privileges.clone(),
-                    user.routine_privileges.clone(),
-                    user.roles.clone(),
-                    user.admin_roles.clone(),
-                )
-            } else if let Some(role) = data.roles.get(&principal) {
-                (
-                    role.global_privileges.clone(),
-                    role.database_privileges.clone(),
-                    role.table_privileges.clone(),
-                    role.column_privileges.clone(),
-                    role.routine_privileges.clone(),
-                    role.roles.clone(),
-                    role.admin_roles.clone(),
-                )
-            } else {
-                anyhow::bail!("Unknown user or role '{}'", principal);
-            };
+        let (
+            mut global,
+            restrictions,
+            mut databases,
+            mut tables,
+            mut columns,
+            mut routines,
+            roles,
+            admin_roles,
+        ) = if let Some(user) = data.users.get(&principal) {
+            (
+                user.global_privileges.clone(),
+                user.privilege_restrictions.clone(),
+                user.database_privileges.clone(),
+                user.table_privileges.clone(),
+                user.column_privileges.clone(),
+                user.routine_privileges.clone(),
+                user.roles.clone(),
+                user.admin_roles.clone(),
+            )
+        } else if let Some(role) = data.roles.get(&principal) {
+            (
+                role.global_privileges.clone(),
+                role.privilege_restrictions.clone(),
+                role.database_privileges.clone(),
+                role.table_privileges.clone(),
+                role.column_privileges.clone(),
+                role.routine_privileges.clone(),
+                role.roles.clone(),
+                role.admin_roles.clone(),
+            )
+        } else {
+            anyhow::bail!("Unknown user or role '{}'", principal);
+        };
         for role in using_roles.iter().map(|role| normalize_auth_name(role)) {
             if !roles.contains(&role) {
                 anyhow::bail!("Role '{}' is not granted to '{}'", role, principal);
@@ -2596,6 +2767,18 @@ impl AuthCatalog {
                 render_privileges(&global),
                 subject
             ));
+        }
+        let mut restrictions = restrictions.into_iter().collect::<Vec<_>>();
+        restrictions.sort_by(|left, right| left.0.cmp(&right.0));
+        for (database, privileges) in restrictions {
+            if !privileges.is_empty() {
+                grants.push(format!(
+                    "REVOKE {} ON `{}`.* FROM {}",
+                    render_privileges(&privileges),
+                    database.replace('`', "``"),
+                    subject
+                ));
+            }
         }
         let mut databases = databases.into_iter().collect::<Vec<_>>();
         databases.sort_by(|left, right| left.0.cmp(&right.0));
@@ -3059,6 +3242,21 @@ fn privilege_set_allows(set: &HashSet<String>, privilege: &str) -> bool {
     set.contains(&privilege) || (privilege != "GRANT OPTION" && set.contains("ALL"))
 }
 
+fn global_privilege_allows(
+    global: &HashSet<String>,
+    restrictions: &AuthPrivilegeRestrictions,
+    database: &str,
+    privilege: &str,
+) -> bool {
+    if !privilege_set_allows(global, privilege) {
+        return false;
+    }
+    database.is_empty()
+        || !restrictions
+            .get(&database.to_ascii_lowercase())
+            .is_some_and(|restricted| privilege_set_allows(restricted, privilege))
+}
+
 const ALL_AUTH_PRIVILEGES: &[&str] = &[
     "SELECT",
     "INSERT",
@@ -3081,6 +3279,22 @@ const ALL_AUTH_PRIVILEGES: &[&str] = &[
     "EVENT",
 ];
 
+const PARTIAL_REVOKABLE_PRIVILEGES: &[&str] = &[
+    "SELECT",
+    "INSERT",
+    "UPDATE",
+    "DELETE",
+    "CREATE",
+    "DROP",
+    "ALTER",
+    "INDEX",
+    "EXECUTE",
+    "CREATE ROUTINE",
+    "ALTER ROUTINE",
+    "LOCK TABLES",
+    "EVENT",
+];
+
 fn can_revoke_privilege_set(current: &HashSet<String>, revoked: &HashSet<String>) -> bool {
     if (revoked.len() == 1 && revoked.contains("GRANT OPTION")) || revoked.contains("ALL") {
         !current.is_empty()
@@ -3093,12 +3307,14 @@ fn can_revoke_privilege_set(current: &HashSet<String>, revoked: &HashSet<String>
 
 fn auth_entry_has_direct_privileges(
     global: &HashSet<String>,
+    restrictions: &AuthPrivilegeRestrictions,
     databases: &HashMap<String, HashSet<String>>,
     tables: &AuthTablePrivileges,
     columns: &AuthColumnPrivileges,
     routines: &AuthRoutinePrivileges,
 ) -> bool {
     !global.is_empty()
+        || !restrictions.is_empty()
         || databases.values().any(|privileges| !privileges.is_empty())
         || tables
             .values()
@@ -3116,6 +3332,111 @@ fn auth_entry_has_direct_privileges(
             .procedures
             .values()
             .any(|database| database.values().any(|privileges| !privileges.is_empty()))
+}
+
+fn expanded_partial_revoke_privileges(revoked: &HashSet<String>) -> HashSet<String> {
+    if revoked.contains("ALL") {
+        PARTIAL_REVOKABLE_PRIVILEGES
+            .iter()
+            .map(|privilege| (*privilege).to_string())
+            .collect()
+    } else {
+        revoked
+            .iter()
+            .filter(|privilege| PARTIAL_REVOKABLE_PRIVILEGES.contains(&privilege.as_str()))
+            .cloned()
+            .collect()
+    }
+}
+
+fn apply_inherited_global_restrictions(
+    global_before: &HashSet<String>,
+    restrictions: &mut AuthPrivilegeRestrictions,
+    granted: &HashSet<String>,
+    inherited: &AuthPrivilegeRestrictions,
+) {
+    let granted = expanded_partial_revoke_privileges(granted);
+    for privilege in granted {
+        if privilege_set_allows(global_before, &privilege) {
+            continue;
+        }
+        let mut inherited_here = false;
+        for (database, restricted) in inherited {
+            if privilege_set_allows(restricted, &privilege) {
+                restrictions
+                    .entry(database.clone())
+                    .or_default()
+                    .insert(privilege.clone());
+                inherited_here = true;
+            }
+        }
+        if !inherited_here {
+            for restricted in restrictions.values_mut() {
+                restricted.remove(&privilege);
+            }
+        }
+    }
+    restrictions.retain(|_, privileges| !privileges.is_empty());
+}
+
+fn partial_revoke_possible(global: &HashSet<String>, revoked: &HashSet<String>) -> bool {
+    expanded_partial_revoke_privileges(revoked)
+        .iter()
+        .any(|privilege| privilege_set_allows(global, privilege))
+}
+
+fn apply_partial_restriction(
+    global: &HashSet<String>,
+    restrictions: &mut AuthPrivilegeRestrictions,
+    database: &str,
+    revoked: &HashSet<String>,
+) -> bool {
+    let restricted = expanded_partial_revoke_privileges(revoked)
+        .into_iter()
+        .filter(|privilege| privilege_set_allows(global, privilege))
+        .collect::<HashSet<_>>();
+    if restricted.is_empty() {
+        return false;
+    }
+    restrictions
+        .entry(database.to_ascii_lowercase())
+        .or_default()
+        .extend(restricted);
+    true
+}
+
+fn clear_partial_restrictions(
+    restrictions: &mut AuthPrivilegeRestrictions,
+    revoked: &HashSet<String>,
+) {
+    if revoked.contains("ALL") {
+        restrictions.clear();
+        return;
+    }
+    for restricted in restrictions.values_mut() {
+        for privilege in revoked {
+            restricted.remove(privilege);
+        }
+    }
+    restrictions.retain(|_, privileges| !privileges.is_empty());
+}
+
+fn clear_partial_restrictions_for_grant(
+    restrictions: &mut AuthPrivilegeRestrictions,
+    database: Option<&str>,
+    granted: &HashSet<String>,
+) {
+    let granted = expanded_partial_revoke_privileges(granted);
+    if let Some(database) = database {
+        if let Some(restricted) = restrictions.get_mut(&database.to_ascii_lowercase()) {
+            restricted.retain(|privilege| !granted.contains(privilege));
+        }
+    } else {
+        for restricted in restrictions.values_mut() {
+            restricted.retain(|privilege| !granted.contains(privilege));
+        }
+    }
+    restrictions.retain(|_, privileges| !privileges.is_empty());
 }
 
 fn revoke_privilege_set(current: &mut HashSet<String>, revoked: &HashSet<String>) {
@@ -3174,11 +3495,15 @@ fn role_has_privilege(
     let Some(role) = data.roles.get(role_name) else {
         return false;
     };
-    privilege_set_allows(&role.global_privileges, privilege)
-        || role
-            .database_privileges
-            .get(database)
-            .is_some_and(|set| privilege_set_allows(set, privilege))
+    global_privilege_allows(
+        &role.global_privileges,
+        &role.privilege_restrictions,
+        database,
+        privilege,
+    ) || role
+        .database_privileges
+        .get(database)
+        .is_some_and(|set| privilege_set_allows(set, privilege))
         || role
             .roles
             .iter()
@@ -3203,7 +3528,12 @@ fn role_has_table_privilege(
         .get(database)
         .and_then(|tables| tables.get(table))
         .is_some_and(|set| privilege_set_allows(set, privilege))
-        || privilege_set_allows(&role.global_privileges, privilege)
+        || global_privilege_allows(
+            &role.global_privileges,
+            &role.privilege_restrictions,
+            database,
+            privilege,
+        )
         || role
             .database_privileges
             .get(database)
@@ -3233,7 +3563,12 @@ fn role_has_column_privilege(
         .and_then(|tables| tables.get(table))
         .and_then(|columns| columns.get(column))
         .is_some_and(|set| privilege_set_allows(set, privilege))
-        || privilege_set_allows(&role.global_privileges, privilege)
+        || global_privilege_allows(
+            &role.global_privileges,
+            &role.privilege_restrictions,
+            database,
+            privilege,
+        )
         || role
             .database_privileges
             .get(database)
@@ -3263,11 +3598,15 @@ fn role_has_routine_privilege(
     let Some(role) = data.roles.get(role_name) else {
         return false;
     };
-    privilege_set_allows(&role.global_privileges, privilege)
-        || role
-            .database_privileges
-            .get(database)
-            .is_some_and(|set| privilege_set_allows(set, privilege))
+    global_privilege_allows(
+        &role.global_privileges,
+        &role.privilege_restrictions,
+        database,
+        privilege,
+    ) || role
+        .database_privileges
+        .get(database)
+        .is_some_and(|set| privilege_set_allows(set, privilege))
         || role
             .routine_privileges
             .has(kind, database, routine, privilege)
@@ -3433,8 +3772,52 @@ fn grant_role_to_principal(
 }
 
 fn render_privileges(privileges: &HashSet<String>) -> String {
+    const DISPLAY_ORDER: &[&str] = &[
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE",
+        "CREATE",
+        "DROP",
+        "RELOAD",
+        "SHUTDOWN",
+        "PROCESS",
+        "FILE",
+        "GRANT OPTION",
+        "REFERENCES",
+        "INDEX",
+        "ALTER",
+        "SHOW DATABASES",
+        "SUPER",
+        "CREATE TEMPORARY TABLES",
+        "LOCK TABLES",
+        "EXECUTE",
+        "REPLICATION SLAVE",
+        "REPLICATION CLIENT",
+        "CREATE VIEW",
+        "SHOW VIEW",
+        "CREATE ROUTINE",
+        "ALTER ROUTINE",
+        "CREATE USER",
+        "EVENT",
+        "TRIGGER",
+        "CREATE TABLESPACE",
+        "CREATE ROLE",
+        "DROP ROLE",
+        "APPLICATION_PASSWORD_ADMIN",
+        "CONNECTION_ADMIN",
+        "SET_USER_ID",
+    ];
     let mut privileges = privileges.iter().cloned().collect::<Vec<_>>();
-    privileges.sort();
+    privileges.sort_by_key(|privilege| {
+        (
+            DISPLAY_ORDER
+                .iter()
+                .position(|known| known.eq_ignore_ascii_case(privilege))
+                .unwrap_or(DISPLAY_ORDER.len()),
+            privilege.to_ascii_uppercase(),
+        )
+    });
     privileges.join(", ")
 }
 
@@ -6739,6 +7122,14 @@ impl Backend {
                 }
                 .to_vec(),
             ),
+            "partial_revokes" => Some(
+                if self.config.auth_catalog.partial_revokes_enabled() {
+                    b"1"
+                } else {
+                    b"0"
+                }
+                .to_vec(),
+            ),
             "old_passwords" => Some(b"0".to_vec()),
             // MySQL 8.4 exposes this policy during IDE metadata discovery.
             "authentication_policy" => Some(b"*,,".to_vec()),
@@ -6878,6 +7269,7 @@ impl Backend {
                     | "group_concat_max_len"
                     | "cte_max_recursion_depth"
                     | "activate_all_roles_on_login"
+                    | "partial_revokes"
                     | "innodb_lock_wait_timeout"
             )
         {
@@ -6899,6 +7291,29 @@ impl Backend {
                 }
                 self.stats
                     .set_activate_all_roles_on_login(mysql_truthy(value.as_deref()));
+            }
+            "partial_revokes" => {
+                if variable_scope != SystemVariableScope::Global {
+                    anyhow::bail!("Variable 'partial_revokes' is a GLOBAL variable");
+                }
+                let user = self.authenticated_username();
+                if !self.auth_has_privilege(&user, "", "SYSTEM_VARIABLES_ADMIN")
+                    && !self.auth_has_privilege(&user, "", "SUPER")
+                {
+                    anyhow::bail!(
+                        "Access denied; user '{}' lacks SYSTEM_VARIABLES_ADMIN privilege",
+                        user
+                    );
+                }
+                let enabled = mysql_truthy(value.as_deref());
+                if !enabled && self.config.auth_catalog.has_privilege_restrictions() {
+                    anyhow::bail!(
+                        "partial_revokes cannot be disabled while privilege restrictions exist"
+                    );
+                }
+                self.config
+                    .auth_catalog
+                    .set_partial_revokes_runtime(enabled);
             }
             "event_scheduler" => {
                 if variable_scope != SystemVariableScope::Global {
@@ -7107,7 +7522,15 @@ impl Backend {
     }
 
     async fn execute_set_statement(&mut self, sql: &str) -> anyhow::Result<QueryOutcome> {
-        let body = sql["SET ".len()..].trim();
+        let raw_body = sql["SET ".len()..].trim();
+        let raw_upper = raw_body.to_ascii_uppercase();
+        let (persist, persist_only, body) = if raw_upper.starts_with("PERSIST_ONLY ") {
+            (false, true, raw_body["PERSIST_ONLY ".len()..].trim())
+        } else if raw_upper.starts_with("PERSIST ") {
+            (true, false, raw_body["PERSIST ".len()..].trim())
+        } else {
+            (false, false, raw_body)
+        };
         let upper = body.to_ascii_uppercase();
         if sql.to_ascii_uppercase().starts_with("SET PASSWORD") {
             let (user, password) = parse_set_password(&sql["SET PASSWORD".len()..])?;
@@ -7192,7 +7615,27 @@ impl Backend {
                 }
                 self.user_variables.insert(name, value);
             } else {
-                self.set_system_variable(target, value).await?;
+                let (_, variable_name) = parse_system_variable_reference(target);
+                if (persist || persist_only) && variable_name == "partial_revokes" {
+                    let target_upper = target.to_ascii_uppercase();
+                    if target_upper.starts_with("SESSION.")
+                        || target_upper.starts_with("@@SESSION.")
+                    {
+                        anyhow::bail!("Variable 'partial_revokes' is a GLOBAL variable");
+                    }
+                    let enabled = mysql_truthy(value.as_deref());
+                    if persist_only {
+                        self.config
+                            .auth_catalog
+                            .persist_partial_revokes_only(enabled)?;
+                    } else {
+                        self.set_system_variable("GLOBAL.partial_revokes", value.clone())
+                            .await?;
+                        self.config.auth_catalog.persist_partial_revokes(enabled)?;
+                    }
+                } else {
+                    self.set_system_variable(target, value).await?;
+                }
             }
         }
         Ok(QueryOutcome::ok(0))
@@ -11976,9 +12419,21 @@ impl Backend {
                 if with_grant_option {
                     privileges.insert("GRANT OPTION".to_string());
                 }
+                let inherited_restrictions = if database.is_none() {
+                    self.config
+                        .auth_catalog
+                        .principal_restrictions(&self.authenticated_username())
+                } else {
+                    AuthPrivilegeRestrictions::default()
+                };
                 self.config
                     .auth_catalog
-                    .grant_privileges(&principals, database, privileges)?;
+                    .grant_privileges_with_inherited_restrictions(
+                        &principals,
+                        database,
+                        privileges,
+                        &inherited_restrictions,
+                    )?;
             }
             return Ok(QueryOutcome::ok(0));
         }
@@ -25697,6 +26152,7 @@ fn append_information_schema_virtual_metadata(
 struct AuthPrincipalMetadata {
     principal: String,
     global_privileges: HashSet<String>,
+    privilege_restrictions: AuthPrivilegeRestrictions,
     database_privileges: HashMap<String, HashSet<String>>,
     table_privileges: AuthTablePrivileges,
     roles: HashSet<String>,
@@ -25797,6 +26253,7 @@ fn auth_catalog_metadata_principals(
         .map(|(principal, user)| AuthPrincipalMetadata {
             principal: principal.clone(),
             global_privileges: user.global_privileges.clone(),
+            privilege_restrictions: user.privilege_restrictions.clone(),
             database_privileges: user.database_privileges.clone(),
             table_privileges: user.table_privileges.clone(),
             roles: user.roles.clone(),
@@ -25814,6 +26271,7 @@ fn auth_catalog_metadata_principals(
                 .map(|(principal, role)| AuthPrincipalMetadata {
                     principal: principal.clone(),
                     global_privileges: role.global_privileges.clone(),
+                    privilege_restrictions: role.privilege_restrictions.clone(),
                     database_privileges: role.database_privileges.clone(),
                     table_privileges: role.table_privileges.clone(),
                     roles: role.roles.clone(),
@@ -26253,6 +26711,27 @@ fn information_schema_applicable_roles_rows(
     rows
 }
 
+fn auth_user_attributes(restrictions: &AuthPrivilegeRestrictions) -> Option<Vec<u8>> {
+    if restrictions.is_empty() {
+        return None;
+    }
+    let mut entries = restrictions.iter().collect::<Vec<_>>();
+    entries.sort_by(|left, right| left.0.cmp(right.0));
+    let entries = entries
+        .into_iter()
+        .map(|(database, privileges)| {
+            let mut privileges = privileges.iter().cloned().collect::<Vec<_>>();
+            privileges.sort();
+            let database = serde_json::to_string(database).ok()?;
+            let privileges = serde_json::to_string(&privileges).ok()?;
+            Some(format!(
+                r#"{{"Database": {database}, "Privileges": {privileges}}}"#
+            ))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(format!(r#"{{"Restrictions": [{}]}}"#, entries.join(", ")).into_bytes())
+}
+
 fn mysql_virtual_tables(auth_catalog: &AuthCatalog, viewer: &str) -> HashMap<String, VirtualTable> {
     let principals = auth_catalog_metadata_principals(auth_catalog, viewer);
     let mut user_rows = Vec::new();
@@ -26311,7 +26790,7 @@ fn mysql_virtual_tables(auth_catalog: &AuthCatalog, viewer: &str) -> HashMap<Str
             None,
             None,
             None,
-            None,
+            auth_user_attributes(&principal.privilege_restrictions),
         ]);
         user_rows.push(row);
 
@@ -53652,10 +54131,11 @@ mod tests {
             .create_roles(&["analyst".to_string()], false)
             .unwrap();
         catalog
-            .grant_privileges(
+            .grant_privileges_with_inherited_restrictions(
                 &["game_writer".to_string()],
                 Some("game"),
                 HashSet::from(["INSERT".to_string(), "UPDATE".to_string()]),
+                &AuthPrivilegeRestrictions::default(),
             )
             .unwrap();
         catalog
@@ -53738,7 +54218,7 @@ mod tests {
             .unwrap()
             .iter()
             .any(|grant| {
-                grant.contains("ALTER ROUTINE, EXECUTE ON FUNCTION `mydb`.`increment`")
+                grant.contains("EXECUTE, ALTER ROUTINE ON FUNCTION `mydb`.`increment`")
             }));
     }
 
@@ -53867,7 +54347,7 @@ mod tests {
         };
         assert!(rendered
             .iter()
-            .any(|grant| grant.contains("INSERT, SELECT")));
+            .any(|grant| grant.contains("SELECT, INSERT")));
         assert!(rendered.iter().any(|grant| grant.contains("analyst")));
         let current = backend
             .execute("SHOW GRANTS FOR CURRENT_USER()")
@@ -54923,7 +55403,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(all_grants
             .iter()
-            .any(|grant| { grant.contains("INSERT, SELECT, UPDATE ON `mydb`.*") }));
+            .any(|grant| { grant.contains("SELECT, INSERT, UPDATE ON `mydb`.*") }));
 
         let error = backend
             .execute("SHOW GRANTS FOR subject USING unassigned")
@@ -55229,6 +55709,203 @@ mod tests {
             .config
             .auth_catalog
             .has_privilege("scoped_revoke", "mydb", "SELECT"));
+    }
+
+    #[tokio::test]
+    async fn partial_revokes_match_mysql_schema_restriction_semantics() {
+        let (_temp, _storage, mut backend, _second) = transaction_backends().await;
+        backend
+            .execute("CREATE USER partial_user IDENTIFIED BY 'partial-password'")
+            .await
+            .expect("create partial revoke user");
+        assert_eq!(
+            single_value(
+                backend
+                    .execute("SELECT @@GLOBAL.partial_revokes")
+                    .await
+                    .expect("read partial_revokes")
+            ),
+            b"0"
+        );
+        backend
+            .execute("GRANT SELECT, INSERT, UPDATE ON *.* TO partial_user")
+            .await
+            .expect("grant global privileges");
+
+        let error = backend
+            .execute("REVOKE INSERT ON mydb.* FROM partial_user")
+            .await
+            .expect_err("partial revoke must be disabled by default");
+        assert_eq!(
+            mysql_error_kind(&error.to_string()),
+            ErrorKind::ER_NONEXISTING_GRANT
+        );
+
+        backend
+            .execute("SET GLOBAL partial_revokes = ON")
+            .await
+            .expect("enable partial revokes");
+        backend
+            .execute("GRANT FILE ON *.* TO partial_user")
+            .await
+            .expect("grant global-only privilege");
+        let error = backend
+            .execute("REVOKE FILE ON mydb.* FROM partial_user")
+            .await
+            .expect_err("global-only privileges cannot be partially revoked");
+        assert_eq!(
+            mysql_error_kind(&error.to_string()),
+            ErrorKind::ER_NONEXISTING_GRANT
+        );
+        backend
+            .execute("REVOKE FILE ON *.* FROM partial_user")
+            .await
+            .expect("revoke global-only privilege globally");
+        backend
+            .execute("REVOKE INSERT ON mydb.* FROM partial_user")
+            .await
+            .expect("revoke global INSERT from one schema");
+        assert!(!backend
+            .config
+            .auth_catalog
+            .has_privilege("partial_user", "mydb", "INSERT"));
+        assert!(backend
+            .config
+            .auth_catalog
+            .has_privilege("partial_user", "otherdb", "INSERT"));
+        assert!(backend
+            .config
+            .auth_catalog
+            .has_privilege("partial_user", "mydb", "SELECT"));
+
+        let grants = query_rows(&mut backend, "SHOW GRANTS FOR partial_user")
+            .await
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|value| String::from_utf8(value).expect("show grants is utf8"))
+            .collect::<Vec<_>>();
+        assert!(grants.iter().any(|grant| {
+            grant.contains("GRANT SELECT, INSERT, UPDATE ON *.*")
+                && grant.contains("`partial_user`@`%`")
+        }));
+        assert!(grants
+            .iter()
+            .any(|grant| { grant.contains("REVOKE INSERT ON `mydb`.* FROM `partial_user`@`%`") }));
+        let attributes = single_value(
+            backend
+                .execute("SELECT User_attributes FROM mysql.user WHERE User = 'partial_user'")
+                .await
+                .expect("read persisted partial restriction"),
+        );
+        let attributes = String::from_utf8(attributes).expect("user attributes are utf8");
+        assert!(attributes.contains("\"Database\": \"mydb\""));
+        assert!(attributes.contains("\"INSERT\""));
+
+        backend
+            .execute("GRANT INSERT ON mydb.* TO partial_user")
+            .await
+            .expect("direct schema grant clears the restriction");
+        assert!(backend
+            .config
+            .auth_catalog
+            .has_privilege("partial_user", "mydb", "INSERT"));
+        backend
+            .execute("REVOKE INSERT ON mydb.* FROM partial_user")
+            .await
+            .expect("first revoke removes the direct schema grant");
+        assert!(backend
+            .config
+            .auth_catalog
+            .has_privilege("partial_user", "mydb", "INSERT"));
+        backend
+            .execute("REVOKE INSERT ON mydb.* FROM partial_user")
+            .await
+            .expect("second revoke creates the schema restriction");
+        assert!(!backend
+            .config
+            .auth_catalog
+            .has_privilege("partial_user", "mydb", "INSERT"));
+
+        backend
+            .execute("REVOKE INSERT ON *.* FROM partial_user")
+            .await
+            .expect("global revoke clears the restriction");
+        assert!(!backend
+            .config
+            .auth_catalog
+            .has_privilege("partial_user", "mydb", "INSERT"));
+        backend
+            .execute("SET GLOBAL partial_revokes = OFF")
+            .await
+            .expect("disable partial revokes after clearing restrictions");
+    }
+
+    #[tokio::test]
+    async fn partial_revokes_are_inherited_by_global_grants() {
+        let (_temp, _storage, mut backend, _second) = transaction_backends().await;
+        backend
+            .execute(
+                "CREATE USER restricted_grantor IDENTIFIED BY 'grantor-password', \
+                 inherited_recipient IDENTIFIED BY 'recipient-password'",
+            )
+            .await
+            .expect("create grantor and recipient");
+        backend
+            .execute("SET PERSIST_ONLY partial_revokes = ON")
+            .await
+            .expect("persist partial revoke policy without changing runtime");
+        assert_eq!(
+            single_value(
+                backend
+                    .execute("SELECT @@GLOBAL.partial_revokes")
+                    .await
+                    .expect("read unchanged runtime policy")
+            ),
+            b"0"
+        );
+        backend
+            .execute("SET PERSIST partial_revokes = ON")
+            .await
+            .expect("persist and enable partial revoke policy");
+        backend
+            .execute("GRANT SELECT ON *.* TO restricted_grantor WITH GRANT OPTION")
+            .await
+            .expect("grant global privilege to grantor");
+        backend
+            .execute("REVOKE SELECT ON mydb.* FROM restricted_grantor")
+            .await
+            .expect("restrict grantor to other schemas");
+
+        *backend.authenticated_user.lock() = Some("restricted_grantor".to_string());
+        backend
+            .execute("GRANT SELECT ON *.* TO inherited_recipient")
+            .await
+            .expect("grantor should delegate its restricted global privilege");
+        assert!(!backend.config.auth_catalog.has_privilege(
+            "inherited_recipient",
+            "mydb",
+            "SELECT"
+        ));
+        assert!(backend.config.auth_catalog.has_privilege(
+            "inherited_recipient",
+            "otherdb",
+            "SELECT"
+        ));
+
+        *backend.authenticated_user.lock() = Some("root".to_string());
+        backend
+            .execute("REVOKE SELECT ON *.* FROM restricted_grantor")
+            .await
+            .expect("global revoke should clear grantor restriction");
+        backend
+            .execute("REVOKE SELECT ON *.* FROM inherited_recipient")
+            .await
+            .expect("global revoke should clear inherited recipient grant");
+        backend
+            .execute("SET GLOBAL partial_revokes = OFF")
+            .await
+            .expect("disable partial revokes after cleanup");
     }
 
     #[tokio::test]
