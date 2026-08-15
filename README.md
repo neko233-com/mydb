@@ -632,7 +632,7 @@ bash scripts/docker-smoke.sh
 本版面向单机 MySQL 8.4 常用生产工作负载：3306 提供 MySQL 协议，4306 提供登录保护的 Web SQL IDE/管理 API；在 v0.1.31 基础上补齐 `SHOW DATABASES`/`SHOW SCHEMAS` 与 `information_schema.SCHEMATA` 的权限过滤，并保留 `partial_revokes`、schema 级全局权限撤销、`SHOW GRANTS`/`mysql.user.User_attributes` 展示与 `SET GLOBAL/PERSIST` 语义。发布不宣称复制/集群、完整 InnoDB 全部锁边界、完整 GIS/OGC 语义、全部冷门字符集或全部 MySQL 错误码已完成；显式 `LATERAL` 前缀属于额外超集能力，不作为 MySQL 8.4 差分承诺；逐项状态见 [CheckList.md](CheckList.md) 和 [SYNTAX_MATRIX.md](SYNTAX_MATRIX.md)。
 
 **本轮本地门槛（2026-08-15）：**
-- ✅ `cargo test --workspace --locked`：Docker Linux 门禁通过；wire 277（含嵌套聚合、授权撤销作用域、`GRANT ALL`/`GRANT OPTION`、REVOKE warning/NOOP、`partial_revokes` 继承/全局权限边界与 MySQL 错误码），其他 workspace 测试与文档测试全部通过
+- ✅ `cargo test --workspace --locked`：Docker Linux 门禁通过；wire 277（含嵌套聚合、授权撤销作用域、`GRANT ALL`/`GRANT OPTION`、REVOKE warning/NOOP、`partial_revokes`、schema 可见性与 MySQL 错误码），其他 workspace 测试与文档测试全部通过
 - ✅ `cargo clippy --workspace --all-targets -- -D warnings`
 - ✅ `cargo build --release -p mydb-server -p mydb-cli -p mydb-migrate -p mydb-dump`
 - ✅ `mydb update --check`：GitHub Release 页面解析最新 tag、资产下载、SHA-256 校验和包结构验证通过；当前版本明确报告 up to date；更新仅替换二进制并保留配置/数据/密钥
@@ -642,7 +642,7 @@ bash scripts/docker-smoke.sh
 - ✅ `scripts/bench.ps1`：Docker Linux Rust gate、release build 与同条件 MySQL 8.4 持久化基准通过；性能阶段无预热、60 秒硬截止（报告见 [性能报告.md](性能报告.md)）
 - ✅ `scripts/mysql84-diff.ps1`：当前源码隔离端口与同机 Docker MySQL 8.4，127/127 差分通过；新增 `SHOW DATABASES` 系统 schema 输出，保留 `partial_revokes` 默认关闭、1141、schema 限制、继承、`SHOW GRANTS`、`User_attributes`、`SET GLOBAL/PERSIST`，以及 `REVOKE IF EXISTS`、`IGNORE UNKNOWN USER`、正则、JSON_TABLE、空间、全文等覆盖
 - ✅ v0.1.32 授权兼容回归：`SHOW DATABASES` 与 `information_schema.SCHEMATA` 按全局/库/表/列/例程权限和激活角色过滤；无权限账号不再看到业务库或 `mysql`，Rust 回归已覆盖
-- ✅ v0.1.31 同条件持久化基准：无预热、21.8/60 秒、1 次采样；单表写 222/81 ops/s、4 actor P99 39.6/56.3 ms、并发吞吐 296/153 ops/s、读 P50 404/131 μs；提交 `db21f7d`，原始结果见 [性能报告.md](性能报告.md)
+- ✅ v0.1.32 同条件持久化基准：无预热、21.9/60 秒、1 次采样；单表写 214/79 ops/s、4 actor P99 41.9/56.1 ms、并发吞吐 311/150 ops/s、读 P50 278/125 μs；源码提交 `9b2ebc9`，原始结果见 [性能报告.md](性能报告.md)
 - ⏳ Ubuntu 24.04 物理性能、macOS 原生验收、宿主断电/恢复中断、大数据压力与生产安全运维验收：以 [CheckList.md](CheckList.md) 与 [性能报告.md](性能报告.md) 为准
 
 ---
