@@ -668,6 +668,7 @@ bash scripts/docker-smoke.sh
 - ✅ 2026-08-17 generated 列 DDL 回归：`ALTER TABLE ADD/MODIFY/CHANGE COLUMN ... AS (...) STORED/VIRTUAL` 保留表达式与模式，已有行重算，`SHOW CREATE TABLE` 和 Rust 重启元数据路径通过
 - ✅ 2026-08-17 SQL 调试：慢/错误 SELECT 记录稳定 ID、字面量归一化 digest、执行/计划阶段耗时、结果状态/行数和可解析 `EXPLAIN FORMAT=JSON`；Agent `/api/v1/agent/sql` 返回静态风险建议与同权限 JSON 计划，调试路径不执行原 SQL
 - ✅ 2026-08-17 Linux Docker Rust 门禁：隔离容器 1 CPU/2 GiB 通过 fmt、workspace Clippy 与 workspace 全量测试；构建卷已清理
+- ✅ 2026-08-17 Windows 当前源码打包：5 个 release 二进制构建成功，本地 zip 解包完整性与 SHA-256 校验通过；未上传 GitHub
 - ⏳ Ubuntu 24.04 物理性能、macOS 原生验收、大数据压力与生产安全运维验收；宿主真实断电不在开发机执行，单机等价逻辑用 Docker 故障模型覆盖；以 [CheckList.md](CheckList.md) 与 [性能报告.md](性能报告.md) 为准
 
 ---
