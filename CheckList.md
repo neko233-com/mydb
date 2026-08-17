@@ -33,6 +33,7 @@
 - [x] 恢复中断边界：模拟页已持久化但 `Applied` 未写入时进程消失；真实重启重新 replay 后无重复行且补写一个 `Applied`
 - [x] 2026-08-17 Docker 低资源故障注入脚本：`scripts/docker-fault-injection.ps1` 通过 SIGKILL 掉电模型、只读数据目录、8 MiB tmpfs ENOSPC、恢复 replay 中二次 SIGKILL；独立 named volume/network、无宿主目录挂载、无 3306/4306 发布，160 条 WAL 事务恢复后行数/SUM 精确一致
 - [x] 2026-08-17 generated 列 DDL 回归：`ALTER TABLE ADD/MODIFY/CHANGE COLUMN ... AS (...) STORED/VIRTUAL` 的表达式、类型和模式持久化，`SHOW CREATE TABLE`、已有行重算和 Rust 重启元数据路径通过
+- [x] 2026-08-17 Linux Docker Rust 门禁：隔离容器 1 CPU/2 GiB 通过 fmt、workspace Clippy、workspace 全量测试（279 wire、63 storage、17 server）；1 CPU/768 MiB 仅因 Clippy 编译内存 OOM，不是测试失败；构建卷已清理
 - [ ] 完整故障注入矩阵：宿主断电、磁盘满、只读盘、WAL 中段/页损坏、恢复中再次中断
 - [ ] 长时间压力、磁盘空间回收、碎片整理及多 TB 数据验证
 
