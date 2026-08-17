@@ -34,7 +34,15 @@ pub struct InitWriter<'a, W> {
 impl<'a, W: 'a + AsyncWrite + Unpin> InitWriter<'a, W> {
     /// Tell client that database context has been changed
     pub async fn ok(self) -> io::Result<()> {
-        writers::write_ok_packet(self.writer, self.client_capabilities, OkResponse::default()).await
+        writers::write_ok_packet(
+            self.writer,
+            self.client_capabilities,
+            OkResponse {
+                status_flags: StatusFlags::SERVER_STATUS_AUTOCOMMIT,
+                ..Default::default()
+            },
+        )
+        .await
     }
 
     /// Tell client that there was a problem changing the database context.
@@ -139,9 +147,9 @@ impl<'a, W: AsyncWrite + Unpin> QueryResultWriter<'a, W> {
     }
 
     async fn finalize(&mut self, more_exists: bool) -> io::Result<()> {
-        let mut status = StatusFlags::empty();
+        let mut status = StatusFlags::SERVER_STATUS_AUTOCOMMIT;
         if more_exists {
-            status.set(StatusFlags::SERVER_MORE_RESULTS_EXISTS, true);
+            status.insert(StatusFlags::SERVER_MORE_RESULTS_EXISTS);
         }
         match self.last_end.take() {
             None => Ok(()),
@@ -164,7 +172,7 @@ impl<'a, W: AsyncWrite + Unpin> QueryResultWriter<'a, W> {
     /// See [`RowWriter`](struct.RowWriter.html).
     pub async fn start(mut self, columns: &'a [Column]) -> io::Result<RowWriter<'a, W>> {
         self.finalize(true).await?;
-        RowWriter::new(self, columns, StatusFlags::empty()).await
+        RowWriter::new(self, columns, StatusFlags::SERVER_STATUS_AUTOCOMMIT).await
     }
 
     /// Start the special result set carrying prepared CALL OUT/INOUT parameters.
@@ -173,7 +181,9 @@ impl<'a, W: AsyncWrite + Unpin> QueryResultWriter<'a, W> {
         RowWriter::new(
             self,
             columns,
-            StatusFlags::SERVER_PS_OUT_PARAMS | StatusFlags::SERVER_MORE_RESULTS_EXISTS,
+            StatusFlags::SERVER_PS_OUT_PARAMS
+                | StatusFlags::SERVER_MORE_RESULTS_EXISTS
+                | StatusFlags::SERVER_STATUS_AUTOCOMMIT,
         )
         .await
     }
@@ -420,6 +430,7 @@ impl<'a, W: AsyncWrite + Unpin + 'a> RowWriter<'a, W> {
                 // response to no column query is always an OK packet
                 let resp = OkResponse {
                     info: extra_info.to_string(),
+                    status_flags: StatusFlags::SERVER_STATUS_AUTOCOMMIT,
                     ..Default::default()
                 };
                 self.result.as_mut().unwrap().last_end = Some(Finalizer::Ok(resp));
@@ -427,10 +438,11 @@ impl<'a, W: AsyncWrite + Unpin + 'a> RowWriter<'a, W> {
                 .client_capabilities
                 .contains(CapabilityFlags::CLIENT_DEPRECATE_EOF)
             {
-                // response to no column query is always an OK packet
+                // response to no column query is always an OK packet (EOF-like OK with 0xfe header)
                 let resp = OkResponse {
                     info: extra_info.to_string(),
                     header: 0xfe,
+                    status_flags: StatusFlags::SERVER_STATUS_AUTOCOMMIT,
                     ..Default::default()
                 };
                 self.result.as_mut().unwrap().last_end = Some(Finalizer::Ok(resp));
@@ -512,6 +524,7 @@ mod tests {
             let columns = [Column {
                 table: String::new(),
                 column: "value".to_string(),
+                collen: 0,
                 coltype: ColumnType::MYSQL_TYPE_VAR_STRING,
                 colflags: ColumnFlags::empty(),
             }];
@@ -563,6 +576,7 @@ mod tests {
             let columns = [Column {
                 table: String::new(),
                 column: "p_output".to_string(),
+                collen: 0,
                 coltype: ColumnType::MYSQL_TYPE_VAR_STRING,
                 colflags: ColumnFlags::empty(),
             }];

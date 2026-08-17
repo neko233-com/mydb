@@ -10,9 +10,11 @@ COPY crates ./crates
 COPY vendor ./vendor
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,id=${TARGET_CACHE_ID},target=/src/target \
-    cargo build --release -p mydb-server -p mydb-cli -p mydb-migrate -p mydb-dump && \
+    cargo build --release -p mydb-server -p mydb-migrate -p mydb-dump && \
+    cargo build --release -p mydb-cli --bins && \
     cp /src/target/release/mydb-server /tmp/mydb-server && \
     cp /src/target/release/mydb-cli /tmp/mydb-cli && \
+    cp /src/target/release/mydb /tmp/mydb && \
     cp /src/target/release/mydb-migrate /tmp/mydb-migrate && \
     cp /src/target/release/mydbdump /tmp/mydbdump
 
@@ -27,6 +29,7 @@ RUN groupadd --system --gid 10001 mydb && \
 
 COPY --from=builder /tmp/mydb-server /usr/local/bin/mydb-server
 COPY --from=builder /tmp/mydb-cli /usr/local/bin/mydb-cli
+COPY --from=builder /tmp/mydb /usr/local/bin/mydb
 COPY --from=builder /tmp/mydb-migrate /usr/local/bin/mydb-migrate
 COPY --from=builder /tmp/mydbdump /usr/local/bin/mydbdump
 COPY configs/docker.yaml /etc/mydb/config.yaml

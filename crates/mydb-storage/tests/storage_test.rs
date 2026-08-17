@@ -43,6 +43,7 @@ async fn test_database_operations() {
                 nullable: false,
                 default: None,
                 is_primary_key: true,
+                generated: None,
             },
             mydb_storage::Column {
                 name: "name".to_string(),
@@ -50,6 +51,7 @@ async fn test_database_operations() {
                 nullable: false,
                 default: None,
                 is_primary_key: false,
+                generated: None,
             },
         ],
         primary_key: Some(vec!["id".to_string()]),
@@ -140,6 +142,7 @@ async fn test_insert_and_scan_rows() {
             nullable: false,
             default: None,
             is_primary_key: true,
+            generated: None,
         }],
         primary_key: Some(vec!["id".to_string()]),
         indexes: vec![],
@@ -182,6 +185,7 @@ async fn test_db233_batch_upsert_and_insert_ignore() {
                 nullable: false,
                 default: None,
                 is_primary_key: true,
+                generated: None,
             },
             mydb_storage::Column {
                 name: "name".into(),
@@ -189,6 +193,7 @@ async fn test_db233_batch_upsert_and_insert_ignore() {
                 nullable: false,
                 default: None,
                 is_primary_key: false,
+                generated: None,
             },
             mydb_storage::Column {
                 name: "level".into(),
@@ -196,6 +201,7 @@ async fn test_db233_batch_upsert_and_insert_ignore() {
                 nullable: false,
                 default: None,
                 is_primary_key: false,
+                generated: None,
             },
         ],
         primary_key: Some(vec!["playerId".into()]),
@@ -268,6 +274,7 @@ async fn test_auto_increment_returns_id_and_recovers_sequence() {
                         nullable: false,
                         default: None,
                         is_primary_key: true,
+                        generated: None,
                     },
                     mydb_storage::Column {
                         name: "name".into(),
@@ -275,6 +282,7 @@ async fn test_auto_increment_returns_id_and_recovers_sequence() {
                         nullable: false,
                         default: None,
                         is_primary_key: false,
+                        generated: None,
                     },
                 ],
                 primary_key: Some(vec!["id".into()]),
@@ -335,6 +343,7 @@ async fn test_indexed_equality_lookup_is_rebuilt_after_restart() {
                 nullable: false,
                 default: None,
                 is_primary_key: false,
+                generated: None,
             },
             mydb_storage::Column {
                 name: "seq".into(),
@@ -342,6 +351,7 @@ async fn test_indexed_equality_lookup_is_rebuilt_after_restart() {
                 nullable: false,
                 default: None,
                 is_primary_key: false,
+                generated: None,
             },
         ],
         primary_key: Some(vec!["actor_id".into(), "seq".into()]),
@@ -443,6 +453,7 @@ async fn test_copy_on_write_rewrite_rolls_back_or_commits_at_schema_boundary() {
                     nullable: false,
                     default: None,
                     is_primary_key: true,
+                    generated: None,
                 },
                 mydb_storage::Column {
                     name: "score".into(),
@@ -450,6 +461,7 @@ async fn test_copy_on_write_rewrite_rolls_back_or_commits_at_schema_boundary() {
                     nullable: false,
                     default: None,
                     is_primary_key: false,
+                    generated: None,
                 },
             ],
             primary_key: Some(vec!["id".into()]),
@@ -540,6 +552,7 @@ async fn test_copy_on_write_drop_rolls_back_or_commits_at_schema_boundary() {
                 nullable: false,
                 default: None,
                 is_primary_key: true,
+                generated: None,
             }],
             primary_key: Some(vec!["id".into()]),
             indexes: vec![],
@@ -615,6 +628,7 @@ async fn test_actor_batch_rejects_duplicate_primary_key_atomically() {
             nullable: false,
             default: None,
             is_primary_key: true,
+            generated: None,
         }],
         primary_key: Some(vec!["id".to_string()]),
         indexes: vec![],
@@ -671,6 +685,7 @@ async fn test_actor_batch_packs_rows_into_shared_pages() {
                     nullable: false,
                     default: None,
                     is_primary_key: true,
+                    generated: None,
                 }],
                 primary_key: Some(vec!["id".into()]),
                 indexes: vec![],
@@ -695,6 +710,7 @@ async fn test_actor_batch_packs_rows_into_shared_pages() {
         })
         .collect();
     manager.execute_batch(commands).await.unwrap();
+    manager.flush_consistent().await.unwrap();
 
     assert_eq!(manager.scan_table("game", "events").unwrap().len(), 100);
     let page_files = std::fs::read_dir(tmp.path().join("game/events"))
@@ -717,6 +733,7 @@ async fn test_drop_and_recreate_table_removes_old_rows() {
             nullable: false,
             default: None,
             is_primary_key: true,
+            generated: None,
         }],
         primary_key: Some(vec!["id".into()]),
         indexes: vec![],
@@ -774,6 +791,7 @@ async fn test_storage_cleanup_only_removes_unreferenced_page_directories() {
             nullable: false,
             default: None,
             is_primary_key: true,
+            generated: None,
         }],
         primary_key: Some(vec!["id".into()]),
         indexes: vec![],
@@ -800,6 +818,7 @@ async fn test_storage_cleanup_only_removes_unreferenced_page_directories() {
         })
         .await
         .unwrap();
+    manager.flush_consistent().await.unwrap();
 
     let database = manager.get_database("game").unwrap();
     database.tables.write().remove("orphaned");
@@ -838,6 +857,7 @@ async fn test_unique_index_is_enforced_atomically_and_allows_multiple_nulls() {
                         nullable: false,
                         default: None,
                         is_primary_key: true,
+                        generated: None,
                     },
                     mydb_storage::Column {
                         name: "email".into(),
@@ -845,6 +865,7 @@ async fn test_unique_index_is_enforced_atomically_and_allows_multiple_nulls() {
                         nullable: true,
                         default: None,
                         is_primary_key: false,
+                        generated: None,
                     },
                 ],
                 primary_key: Some(vec!["id".into()]),
@@ -852,6 +873,7 @@ async fn test_unique_index_is_enforced_atomically_and_allows_multiple_nulls() {
                     name: "email_unique".into(),
                     columns: vec!["email".into()],
                     unique: true,
+                    kind: mydb_storage::IndexKind::BTree,
                 }],
                 triggers: Vec::new(),
                 next_page_number: 0,

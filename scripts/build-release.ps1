@@ -11,6 +11,9 @@
     
 .PARAMETER Tag
     Git tag，如 v0.1.0（可选，默认为 v<version>）
+
+.PARAMETER ConfirmPublish
+    允许进入 GitHub 发布阶段；即使提供此开关仍必须交互输入 PUBLISH <tag>
     
 .EXAMPLE
     .\build-release.ps1 -Version "0.1.0"
@@ -21,7 +24,9 @@ param(
     [Parameter(Mandatory=$true)]
     [string]$Version,
     
-    [string]$Tag = "v$Version"
+    [string]$Tag = "v$Version",
+
+    [switch]$ConfirmPublish
 )
 
 $ErrorActionPreference = "Stop"
@@ -38,14 +43,16 @@ if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
 }
 
 # 检查 gh 是否登录
-try {
-    gh auth status 2>&1 | Out-Null
-} catch {
+gh auth status 2>&1 | Out-Null
+if ($LASTEXITCODE -ne 0) {
     Write-Error "gh not logged in. Run: gh auth login"
 }
 
 # 获取架构
-$arch = [System.Environment]::GetEnvironmentVariable("PROCESSOR_ARCHITECTURE")
+$arch = [System.Environment]::GetEnvironmentVariable("PROCESSOR_ARCHITEW6432")
+if ([string]::IsNullOrWhiteSpace($arch)) {
+    $arch = [System.Environment]::GetEnvironmentVariable("PROCESSOR_ARCHITECTURE")
+}
 switch ($arch) {
     "AMD64" { $arch = "x86_64" }
     "ARM64" { $arch = "aarch64" }
@@ -59,23 +66,33 @@ Write-Info "Building for: $platform"
 Write-Info "Version: $Version"
 Write-Info "Tag: $Tag"
 
-# 清理旧的构建
-Write-Info "Cleaning old builds..."
-cargo clean --release 2>$null
+# 发布物不可覆盖；提前失败，避免无意义地重建本地包。
+$existingRelease = gh release view $Tag 2>&1
+if ($LASTEXITCODE -eq 0) {
+    Write-Error "Release $Tag already exists. Refusing to delete or replace it."
+}
+
+# 发布物不可覆盖；先做 Rust 质量门禁，再构建。
+Write-Info "Running Docker Rust quality gate (2 GiB limit)..."
+& (Join-Path $PSScriptRoot "test-docker.ps1") -MemoryLimit "2g" -CpuLimit 2 -BuildJobs 1
+if ($LASTEXITCODE -ne 0) { Write-Error "Docker Rust quality gate failed" }
 
 # 构建 release 版本
 Write-Info "Building release..."
-cargo build --release -p mydb-server -p mydb-cli -p mydb-migrate -p mydb-dump
+cargo build --release -p mydb-server -p mydb-migrate -p mydb-dump
+cargo build --release -p mydb-cli --bins
 if ($LASTEXITCODE -ne 0) { Write-Error "Build failed" }
 
 # 创建打包目录
 $buildDir = "target/release/package"
+# 仅清理明确的打包目录；保留 Cargo release 缓存，避免测试/增量构建拖慢后续打包。
 if (Test-Path $buildDir) { Remove-Item -Recurse -Force $buildDir }
 New-Item -ItemType Directory -Path $buildDir -Force | Out-Null
 
 # 复制二进制文件
 Copy-Item "target/release/mydb-server.exe" "$buildDir/"
 Copy-Item "target/release/mydb-cli.exe" "$buildDir/"
+Copy-Item "target/release/mydb.exe" "$buildDir/"
 Copy-Item "target/release/mydb-migrate.exe" "$buildDir/"
 Copy-Item "target/release/mydbdump.exe" "$buildDir/"
 
@@ -85,29 +102,47 @@ Copy-Item "configs/default.yaml" "$buildDir/config.yaml.example"
 # 复制安装脚本
 Copy-Item "scripts/install.sh" "$buildDir/"
 Copy-Item "scripts/install.ps1" "$buildDir/"
+Copy-Item "scripts/install-silent.vbs" "$buildDir/"
 
 # 复制文档
 Copy-Item "README.md" "$buildDir/"
+Copy-Item "CheckList.md" "$buildDir/"
+Copy-Item "SYNTAX_MATRIX.md" "$buildDir/"
+Copy-Item "性能报告.md" "$buildDir/"
 if (Test-Path "LICENSE") { Copy-Item "LICENSE" "$buildDir/" }
 
 # 打包
 Write-Info "Packaging..."
-$packageFile = "target/release/package/${packageName}.zip"
-
-Push-Location $buildDir
-7z a "../${packageName}.zip" .
-Pop-Location
-
 $packagePath = "target/release/${packageName}.zip"
+if (Test-Path -LiteralPath $packagePath) {
+    Remove-Item -LiteralPath $packagePath -Force
+}
+$packageFile = "target/release/package/${packageName}.zip"
+$sevenZip = Get-Command 7z -ErrorAction SilentlyContinue
+if ($null -ne $sevenZip) {
+    Push-Location $buildDir
+    & $sevenZip.Source a "../${packageName}.zip" .
+    Pop-Location
+} else {
+    Compress-Archive -Path (Join-Path $buildDir '*') -DestinationPath (Join-Path (Split-Path $buildDir -Parent) "${packageName}.zip") -CompressionLevel Optimal
+}
+
 $packageSize = (Get-Item $packagePath).Length / 1MB
+$checksumPath = "$packagePath.sha256"
+$checksum = (Get-FileHash -LiteralPath $packagePath -Algorithm SHA256).Hash.ToLowerInvariant()
+"$checksum  $packageName.zip" | Set-Content -LiteralPath $checksumPath -Encoding ASCII -NoNewline
 
 Write-Success "Package created: $packagePath ($([math]::Round($packageSize, 2)) MB)"
+Write-Success "Checksum created: $checksumPath"
 
-# 检查 tag 是否已存在
-$existingRelease = gh release view $Tag 2>&1
-if ($LASTEXITCODE -eq 0) {
-    Write-Warn "Release $Tag already exists. Deleting..."
-    gh release delete $Tag -y
+# 发布是不可逆的外部写操作。默认只完成构建和打包，必须由人工显式确认两次。
+if (-not $ConfirmPublish) {
+    Write-Warn "Package is ready; GitHub release was NOT created. Re-run with -ConfirmPublish and type PUBLISH $Tag to publish."
+    exit 0
+}
+$confirmation = Read-Host "Type PUBLISH $Tag to create the immutable GitHub release"
+if ($confirmation -cne "PUBLISH $Tag") {
+    Write-Error "Release confirmation did not match; no GitHub tag or assets were created."
 }
 
 # 创建 release
@@ -115,6 +150,7 @@ Write-Info "Creating GitHub release: $Tag"
 gh release create $Tag `
     --title "MyDB $Version" `
     --notes "MyDB $Version - MySQL 8.x compatible database" `
-    $packagePath
+    $packagePath `
+    $checksumPath
 
 Write-Success "Release created: https://github.com/neko233-com/mydb/releases/tag/$Tag"

@@ -7,6 +7,7 @@ use crc32fast::Hasher;
 use tracing::{debug, info, warn};
 
 use super::record::WalRecord;
+use super::writer::is_zero_filled_tail;
 
 // WAL file header
 const WAL_MAGIC: &[u8; 4] = b"WAL1";
@@ -20,7 +21,10 @@ struct WalFileInfo {
 }
 
 impl WalReader {
-    /// Open WAL directory for reading
+    /// Open WAL directory for reading. The directory may hold `wal_*.log`
+    /// files directly (single-stream or one shard), or contain `shard_*`
+    /// subdirectories each holding their own `wal_*.log` (the sharded layout).
+    /// Both are merged so backup/PITR and recovery see one unified stream.
     pub fn open(dir: PathBuf) -> Result<Self> {
         let mut files = Vec::new();
 
@@ -29,6 +33,29 @@ impl WalReader {
                 let entry = entry?;
                 let path = entry.path();
                 let name = path.file_name().unwrap_or_default().to_string_lossy();
+
+                if path.is_dir() {
+                    if name.starts_with("shard_") {
+                        if let Ok(sub) = fs::read_dir(&path) {
+                            for shard_entry in sub.flatten() {
+                                let shard_path = shard_entry.path();
+                                let shard_name =
+                                    shard_path.file_name().unwrap_or_default().to_string_lossy();
+                                if shard_name.starts_with("wal_") && shard_name.ends_with(".log") {
+                                    if let Ok(index) =
+                                        shard_name[4..shard_name.len() - 4].parse::<u32>()
+                                    {
+                                        files.push(WalFileInfo {
+                                            index,
+                                            path: shard_path,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
 
                 if name.starts_with("wal_") && name.ends_with(".log") {
                     let index_str = &name[4..name.len() - 4];
@@ -123,6 +150,15 @@ impl WalReader {
                 }
                 break;
             }
+            if lsn_buf == [0; 8] && len_buf == [0; 4] {
+                if is_zero_filled_tail(&mut file, record_offset, file_len)? {
+                    break;
+                }
+                anyhow::bail!(
+                    "WAL corruption at offset {}: zero record header before nonzero bytes",
+                    record_offset
+                );
+            }
 
             let payload_len = u32::from_le_bytes(len_buf) as usize;
             let remaining = file_len.saturating_sub(file.stream_position()?);
@@ -153,7 +189,11 @@ impl WalReader {
             let actual_crc = hasher.finalize();
 
             if actual_crc != expected_crc {
-                if strict || file.stream_position()? < file_len {
+                let record_end = file.stream_position()?;
+                if strict
+                    || (record_end < file_len
+                        && !is_zero_filled_tail(&mut file, record_end, file_len)?)
+                {
                     anyhow::bail!("WAL CRC mismatch at lsn={}", u64::from_le_bytes(lsn_buf));
                 }
                 warn!(
@@ -289,19 +329,23 @@ mod tests {
 
         let torn = tempfile::tempdir().unwrap();
         let torn_path = torn.path().join("wal_000000.log");
+        let logical_end;
         {
             let mut wal = WalWriter::open(torn.path().into(), None).unwrap();
             let mut record = WalRecord::new(0, WalRecordType::Insert, 1, "test", vec![1]);
+            logical_end = 8 + 16 + record.payload_len() as u64;
             wal.append(&mut record).unwrap();
             wal.sync().unwrap();
         }
         {
-            use std::io::Write;
+            use std::io::{Seek, SeekFrom, Write};
 
             let mut file = std::fs::OpenOptions::new()
-                .append(true)
+                .read(true)
+                .write(true)
                 .open(torn_path)
                 .unwrap();
+            file.seek(SeekFrom::Start(logical_end)).unwrap();
             file.write_all(&[2, 0, 0]).unwrap();
             file.sync_all().unwrap();
         }

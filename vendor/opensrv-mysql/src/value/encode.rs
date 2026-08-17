@@ -12,9 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::fmt;
 use std::io::{self, Write};
+use std::time::Duration;
 
 use byteorder::{LittleEndian, WriteBytesExt};
+use chrono::{self, Datelike, NaiveDate, NaiveDateTime, Timelike};
 
 use crate::myc;
 use crate::myc::constants::{ColumnFlags, ColumnType};
@@ -44,7 +47,6 @@ macro_rules! mysql_text_trivial {
     };
 }
 
-use std::fmt;
 fn bad<V: fmt::Debug>(v: V, c: &Column) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
@@ -428,7 +430,6 @@ where
     }
 }
 
-use chrono::{self, Datelike, NaiveDate, NaiveDateTime, Timelike};
 impl ToMysqlValue for NaiveDate {
     fn to_mysql_text<W: Write>(&self, w: &mut W) -> io::Result<()> {
         w.write_lenenc_str(
@@ -511,7 +512,6 @@ impl ToMysqlValue for NaiveDateTime {
     }
 }
 
-use std::time::Duration;
 impl ToMysqlValue for Duration {
     fn to_mysql_text<W: Write>(&self, w: &mut W) -> io::Result<()> {
         let s = self.as_secs();

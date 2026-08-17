@@ -13,8 +13,10 @@
 // limitations under the License.
 
 use std::io;
+use std::time::Duration;
 
 use byteorder::{LittleEndian, ReadBytesExt};
+use chrono::{NaiveDate, NaiveDateTime};
 
 use crate::myc::constants::ColumnType;
 use crate::myc::io::ReadMysqlExt;
@@ -216,7 +218,6 @@ impl<'a> From<Value<'a>> for &'a str {
     }
 }
 
-use chrono::{NaiveDate, NaiveDateTime};
 impl<'a> From<Value<'a>> for NaiveDate {
     fn from(val: Value<'a>) -> Self {
         if let ValueInner::Date(mut v) = val.0 {
@@ -313,8 +314,6 @@ pub fn to_naive_datetime(val: Value) -> Result<NaiveDateTime, io::Error> {
         )
     })
 }
-
-use std::time::Duration;
 
 impl<'a> From<Value<'a>> for Duration {
     fn from(val: Value<'a>) -> Self {

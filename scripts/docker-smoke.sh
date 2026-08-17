@@ -344,7 +344,7 @@ deadlock_state=$(docker run --rm --network "${project}_default" mysql:8.0 \
   mysql --protocol=TCP --host=mydb --port=3306 --user=root --password=root \
   --batch --skip-column-names --execute="USE smoke; SELECT id,value FROM deadlock_probe ORDER BY id;")
 test "$deadlock_state" = $'1\t101\n2\t102'
-curl --fail --silent "http://${smoke_host}:14316/metrics" | grep -Eq 'mydb_deadlocks_total [1-9]'
+curl --fail --silent -H "Authorization: Bearer root" "http://${smoke_host}:14316/metrics" | grep -Eq 'mydb_deadlocks_total [1-9]'
 
 docker run --rm --network "${project}_default" mysql:8.0 \
   mysql --protocol=TCP --host=mydb --port=3306 --user=root --password=root \
@@ -465,7 +465,7 @@ ordered_mutation_state=$(docker run --rm --network "${project}_default" mysql:8.
   mysql --protocol=TCP --host=mydb --port=3306 --user=root --password=root \
   --batch --skip-column-names --execute="USE smoke; CREATE TABLE mutation_queue (id BIGINT PRIMARY KEY, value BIGINT); INSERT INTO mutation_queue VALUES (1,1),(2,2),(3,3),(4,4); UPDATE mutation_queue SET value=value+10 ORDER BY id DESC LIMIT 2; DELETE FROM mutation_queue ORDER BY value ASC LIMIT 1; UPDATE mutation_queue SET id=id+10 ORDER BY id DESC; SELECT id,value FROM mutation_queue ORDER BY id; CREATE TABLE duplicate_events (value BIGINT, note VARCHAR(10)); INSERT INTO duplicate_events VALUES (1,'a'),(1,'a'),(1,'a'); UPDATE duplicate_events SET value=9 WHERE value=1 LIMIT 1; DELETE FROM duplicate_events WHERE value=1 LIMIT 1; SELECT value,COUNT(*) FROM duplicate_events GROUP BY value ORDER BY value;")
 test "$ordered_mutation_state" = $'12\t2\n13\t13\n14\t14\n1\t1\n9\t1'
-metrics=$(curl --fail --silent "http://${smoke_host}:14316/metrics")
+metrics=$(curl --fail --silent -H "Authorization: Bearer root" "http://${smoke_host}:14316/metrics")
 grep -q "mydb_up 1" <<<"$metrics"
 grep -Eq "mydb_row_lock_acquires_total [1-9]" <<<"$metrics"
 grep -Eq "mydb_wal_sync_microseconds_total [1-9]" <<<"$metrics"
@@ -495,7 +495,7 @@ incremental_id=$(sed -n 's/.*"id":"\([^"]*\)".*/\1/p' <<<"$incremental_json")
 test -n "$incremental_id"
 curl --fail --silent -X POST -H "Authorization: Bearer root" \
   -H "Content-Type: application/json" \
-  -d "{\"id\":\"$incremental_id\",\"point_in_time\":\"$point_in_time\"}" \
+  -d "{\"id\":\"$incremental_id\",\"point_in_time\":\"$point_in_time\",\"confirmation\":\"RESTORE_BACKUP:$incremental_id\"}" \
   "http://${smoke_host}:14316/api/v1/backup/restore" | grep -q '"restart_required":true'
 docker compose -p "$project" restart mydb
 deadline=$((SECONDS + 120))

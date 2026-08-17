@@ -45,6 +45,9 @@ pub struct ServerSection {
 pub struct HttpSection {
     #[serde(default = "default_http_port")]
     pub port: u16,
+    /// Bind address for the Web SQL IDE and management API. The default is
+    /// all interfaces so a fresh native install is reachable from the LAN;
+    /// firewall and TLS policy remain deployment responsibilities.
     #[serde(default = "default_http_host")]
     pub host: String,
     #[serde(default = "default_admin_username")]
@@ -67,9 +70,16 @@ pub struct StorageSection {
     pub log_file_size: String,
     #[serde(default = "default_page_size")]
     pub page_size: u32,
-    /// Maximum time a write actor waits for more requests before one WAL fsync.
+    /// Maximum time a write group waits for more requests before one WAL fsync.
     #[serde(default = "default_group_commit_window_us")]
     pub group_commit_window_us: u64,
+    /// Number of independent commit shards (Leader/Follower groups, each with
+    /// its own WAL and fsync). `0` selects the platform default: one shard on
+    /// Windows and logical CPU count on other platforms. More shards can be
+    /// requested explicitly. The storage engine contains no actor/mailbox
+    /// model; each shard is driven on the caller's task.
+    #[serde(default)]
+    pub shard_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -170,7 +180,7 @@ fn default_http_port() -> u16 {
     4306
 }
 fn default_http_host() -> String {
-    "127.0.0.1".to_string()
+    "0.0.0.0".to_string()
 }
 fn default_admin_username() -> String {
     "root".to_string()
@@ -210,7 +220,7 @@ fn default_sort_buffer_size() -> String {
     "4M".to_string()
 }
 fn default_authentication() -> String {
-    "mysql_native_password".to_string()
+    "caching_sha2_password".to_string()
 }
 fn default_root_username() -> String {
     "root".to_string()
@@ -280,6 +290,7 @@ impl Default for StorageSection {
             log_file_size: default_log_file_size(),
             page_size: default_page_size(),
             group_commit_window_us: default_group_commit_window_us(),
+            shard_count: 0,
         }
     }
 }
@@ -378,6 +389,9 @@ impl ServerConfig {
         }
         if let Ok(value) = std::env::var("MYDB_GROUP_COMMIT_WINDOW_US") {
             self.storage.group_commit_window_us = value.parse()?;
+        }
+        if let Ok(value) = std::env::var("MYDB_SHARD_COUNT") {
+            self.storage.shard_count = value.parse()?;
         }
         if let Some(value) = secret_from_env("MYDB_ROOT_PASSWORD")? {
             self.security.default_password = value;
@@ -494,5 +508,16 @@ mod tests {
         assert!(config.security.enforce_strong_passwords);
         assert_eq!(config.character_set.server, "utf8mb4");
         assert!(!config.security.local_infile);
+        assert_eq!(config.server.host, "0.0.0.0");
+        assert_eq!(config.http.host, "0.0.0.0");
+    }
+
+    #[test]
+    fn fresh_config_binds_mysql_and_http_to_the_lan() {
+        let config = ServerConfig::default();
+        assert_eq!(config.server.host, "0.0.0.0");
+        assert_eq!(config.server.port, 3306);
+        assert_eq!(config.http.host, "0.0.0.0");
+        assert_eq!(config.http.port, 4306);
     }
 }

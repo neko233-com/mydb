@@ -1,12 +1,12 @@
 # MyDB 落地验收清单
 
-> 规则：只有当前源码和可复现实测能证明的项目才打勾。宽泛目标不能由局部 smoke 代替。最后更新：2026-07-17。
+> 规则：只有当前源码和可复现实测能证明的项目才打勾。宽泛目标不能由局部 smoke 代替。最后更新：2026-08-17。
 
-> **范围边界（设计决定）**：MyDB 定位为**替代 SQLite 的单机高性能数据库**，以 MySQL 形式与语法暴露接口。以下**非单机能力明确不支持**，不计入本清单、不视为缺失：binlog 复制拓扑 / GTID、读写分离、Group Replication / Galera、分布式 XA 两阶段协调、跨节点一致性。单机版本地 XA（`XA START/COMMIT` 映射为会话内事务）与复制 SHOW 表面（空结果）作为兼容 no-op 保留。完整判定见 [`SYNTAX_MATRIX.md`](SYNTAX_MATRIX.md) 的“❌ 明确不支持”分类。
+> **范围边界（当前验收口径）**：MyDB 目标是替代 MySQL 8.x 的单机部署，以 MySQL 协议、SQL、事务和可见外部行为为验收面。单机客户端直接连接 3306；复制拓扑、Group Replication / Galera、分布式 XA 两阶段协调仍不宣称已实现。完整 InnoDB 语义必须逐项通过本清单，不能由名称别名代替。
 
 ## 最终发布门槛
 
-- [ ] MySQL 8 单机全部 DML、事务、错误码和可见外部行为完成兼容矩阵并逐项通过差分
+- [ ] MySQL 8.4 单机全部 DML、事务、错误码和可见外部行为完成兼容矩阵并逐项通过差分
 - [ ] 稳定性、崩溃恢复、断线重连和故障注入覆盖生产边界
 - [ ] Ubuntu 24.04、linux/amd64、双方相同 `ENGINE=InnoDB`、I/O/CPU/内存同限、总计不超过 60 秒的正式性能验收完成
 - [ ] 写吞吐和延迟稳定达到 10x；若客观无法达到，保留原始数据并明确实际结果
@@ -17,8 +17,10 @@
 ## 内核与存储
 
 - [x] `InnoDB` 映射到自研持久化 Neko233 引擎，`MEMORY` 保持独立非事务语义
-- [x] 单写 Actor FIFO、事务批次、group commit、CRC WAL、断尾截断、checkpoint 与恢复
-- [x] 同 Actor/主键顺序写、并发计数更新和 UPSERT 不丢写
+- [x] 持久 row-id：新写入稳定分配，旧数据启动迁移补齐，替换/重启保持行身份；row 编码保留 legacy 解码路径
+- [x] MVCC 基础：事务 ID、commit 序号、RR/SERIALIZABLE 固定读视图、RC 语句读视图、删除可见历史版本及旧版本清理基础
+- [x] Leader/Follower FIFO、事务批次、group commit、CRC WAL、断尾截断、checkpoint 与恢复
+- [x] 同主键顺序写、并发计数更新和 UPSERT 不丢写
 - [x] 主键/唯一索引、AUTO_INCREMENT、NULL/空字节/BLOB 持久化
 - [x] 存储目录感知与只清理未引用 page generation；测试证明不会删除正在引用的数据
 - [x] Prometheus 暴露 prepare/WAL sync/apply/checkpoint/锁/错误等指标
@@ -29,18 +31,30 @@
 - [x] Docker ENOSPC 故障注入：独立 8 MiB tmpfs 数据目录上大 WAL 写返回 MySQL 1105，服务存活且失败事务零行
 - [x] Docker 页损坏故障注入：篡改持久化 `pages.dat` 已校验数据字节；启动安全拒绝并报告页校验损坏，不静默少读数据
 - [x] 恢复中断边界：模拟页已持久化但 `Applied` 未写入时进程消失；真实重启重新 replay 后无重复行且补写一个 `Applied`
+- [x] 2026-08-17 Docker 低资源故障注入脚本：`scripts/docker-fault-injection.ps1` 通过 SIGKILL 掉电模型、只读数据目录、8 MiB tmpfs ENOSPC、恢复 replay 中二次 SIGKILL；独立 named volume/network、无宿主目录挂载、无 3306/4306 发布，160 条 WAL 事务恢复后行数/SUM 精确一致
+- [x] 2026-08-17 generated 列 DDL 回归：`ALTER TABLE ADD/MODIFY/CHANGE COLUMN ... AS (...) STORED/VIRTUAL` 的表达式、类型和模式持久化，`SHOW CREATE TABLE`、已有行重算和 Rust 重启元数据路径通过
+- [x] 2026-08-17 Linux Docker Rust 门禁：隔离容器 1 CPU/2 GiB 通过 fmt、workspace Clippy、workspace 全量测试（279 wire、63 storage、17 server）；1 CPU/768 MiB 仅因 Clippy 编译内存 OOM，不是测试失败；构建卷已清理
+- [x] 2026-08-17 Windows 当前源码打包：server/cli/mydb/migrate/mydbdump 五个 release 二进制构建成功，本地 zip 解包 12 项完整性与 SHA-256 校验通过；v0.1.35 发布包按同一源码生成
+- [x] 2026-08-17 v0.1.36 发布修复：MySQL 握手、`VERSION()`、`@@version` 从 Cargo 包版本生成，避免发布包仍报告旧版本；Rust wire 回归覆盖版本一致性
+- [x] 2026-08-17 隔离 Docker MySQL 8.4 差异回归：`scripts/mysql84-diff.ps1` 131/131 通过，MyDB 使用 13316、MySQL 使用 13307，未占用宿主 3306/4306
+- [x] 2026-08-17 LAN 默认监听回归：原生默认/生产/安装模板统一为 MySQL `0.0.0.0:3306`、Web `0.0.0.0:4306`；Rust config/server 测试与 Windows 3306/4306 防火墙模板通过
+- [x] 2026-08-17 发布保护：Windows/Linux 发布脚本默认只生成候选包；未显式开关且未人工输入 `PUBLISH <tag>` 时不创建 GitHub tag/release
+- [x] 2026-08-17 最终候选性能门禁：`pwsh -File scripts/bench.ps1` 通过；无预热、11.3/60 秒、1 次采样，单表写 555/241 ops/s、4 actor P99 17.2/20.5 ms、并发吞吐 1176/562 ops/s
+- [x] 2026-08-17 macOS arm64 发布路径：新增仅手动触发的 `macos-14` 原生 Apple Silicon workflow，构建 Mach-O arm64 并只上传到指定已有 Release
 - [ ] 完整故障注入矩阵：宿主断电、磁盘满、只读盘、WAL 中段/页损坏、恢复中再次中断
 - [ ] 长时间压力、磁盘空间回收、碎片整理及多 TB 数据验证
 
 ## MySQL 协议与 DML
 
-- [x] MySQL text/binary prepared wire protocol，可用官方 MySQL 8 CLI 和 db233-go 原 SQL 连接
+- [x] MySQL text/binary prepared wire protocol，可用官方 MySQL 8 CLI 和 db233-go 原 SQL 连接；真实 TCP 回归覆盖基表列类型元数据、`UNSIGNED`、INT/DATE/BLOB 参数及 binary result row
+- [x] MySQL 8.4.10 CLI 连接探测：`SELECT @@version_comment LIMIT 1` 后的 `SELECT $$` 语法探针按 1064 返回，3306 可继续执行用户 SQL
 - [x] 常用数据库/表/列/索引 DDL、schema-qualified DML、真实 MySQL 8 dump 导入
 - [x] `CREATE TABLE [IF NOT EXISTS] ... LIKE ...`：跨 schema 复制列、默认值、自增属性、主键/唯一/普通索引、CHECK 和引擎；不复制行、外键及当前自增计数
+- [x] 表/列 `COMMENT`：CREATE/ALTER TABLE、SHOW FULL COLUMNS、SHOW TABLE STATUS、information_schema.tables/columns、SHOW CREATE TABLE 已回归；复杂 `MODIFY COLUMN` 组合仍待补
 - [x] INSERT/REPLACE/INSERT IGNORE/ON DUPLICATE KEY UPDATE/AUTO_INCREMENT；支持 MySQL `INSERT/REPLACE ... SET col=expr`、`VALUES(DEFAULT, scalar_expr)`、`DEFAULT(col)`、`INSERT ... () VALUES ()`/`VALUES ()` 默认行，以及普通/无主键/JOIN UPDATE 和 UPSERT 的 `col=DEFAULT/DEFAULT(col)`；覆盖事务回滚、1364、affected rows 及冲突尝试自增留洞
 - [x] MySQL 8.0.19+ `INSERT ... VALUES/SET ... AS new [(alias,...)] ON DUPLICATE KEY UPDATE`：支持 `new.col`、`new.alias`、无限定列别名、表限定旧行值，以及 IF/CASE/CONCAT/COALESCE/GREATEST/LEAST/组合算术等常用冲突标量表达式；赋值严格左到右，覆盖事务回滚、changed-row affected rows 及自增留洞
 - [x] UPDATE/UPSERT affected rows 按 MySQL 默认 changed rows 计算：literal/scalar/expression/JOIN/无主键/事务路径覆盖；no-op 在排他锁后判定，不写 WAL、不 fsync、不重写表，duplicate UPSERT 不返回伪 insert id
-- [x] INSERT/REPLACE ... SELECT，含 IGNORE/ON DUPLICATE、源表共享锁与事务回滚
+- [x] INSERT/REPLACE ... SELECT，含 IGNORE/ON DUPLICATE、REPEATABLE READ/SERIALIZABLE 源表共享 next-key 锁、READ COMMITTED 一致读及事务回滚
 - [x] `TRUNCATE TABLE`：DDL 隐式提交、affected rows 0、空表仍重置 AUTO_INCREMENT、外键 1701、子表及 FOREIGN_KEY_CHECKS=0 语义
 - [x] SELECT/UPDATE/DELETE、ORDER BY、LIMIT/OFFSET、DISTINCT、常用谓词与聚合
 - [x] 普通表、派生表、JOIN、GROUP BY、UNION/INTERSECT/EXCEPT 的多列/表达式 ORDER BY、别名和序号
@@ -51,7 +65,7 @@
 - [x] TIMESTAMP/DATETIME ON UPDATE CURRENT_TIMESTAMP/NOW（含 fsp）：按 changed row 刷新、批量逐行精确、显式赋值覆盖、no-op 不刷新，覆盖 literal/scalar/expression/UPSERT/JOIN/事务/重启，WAL 前固化时间
 - [x] 分析型常用 SQL：DATE_FORMAT/TIMESTAMPDIFF/日期组成提取，GROUP BY 表达式/别名/序号，COUNT(DISTINCT CASE...)、SUM(CASE...)、聚合结果嵌套 ROUND/CONCAT；注册 cohort、次日留存率、DAU、每日收入用例通过
 - [x] 任意表数链式 INNER/LEFT/RIGHT/CROSS JOIN
-- [x] JOIN ON 列对列等值/非等值/NULL-safe、括号 AND/OR、多列 USING
+- [x] JOIN ON 列对列等值/非等值/NULL-safe、常量与常用标量函数/算术表达式、括号 AND/OR、多列 USING；锁定读对非索引表达式使用安全表级回退
 - [x] NATURAL INNER/LEFT/RIGHT 的公共列匹配、COALESCE 和 `SELECT *` 列序
 - [x] 非相关及复合布尔相关 EXISTS/NOT EXISTS、IN/NOT IN、标量子查询比较
 - [x] 标量子查询多行返回 MySQL 错误 1242，相关 NOT IN 覆盖 NULL 三值语义
@@ -62,9 +76,10 @@
 - [x] 常用递归 CTE：anchor + UNION DISTINCT/ALL、数字序列、树形递归 JOIN、1000 层保护
 - [x] 窗口 ROW_NUMBER/RANK/DENSE_RANK/LAG/LEAD/FIRST/LAST/NTH/NTILE/CUME_DIST/PERCENT_RANK、聚合窗口、命名 WINDOW、分组后窗口、ROWS 与常用 RANGE frame
 - [x] 常用 JSON_EXTRACT/JSON_UNQUOTE 和标量 IS NULL
-- [x] 游戏 profile 常用 JSON CRUD：JSON_OBJECT/ARRAY/VALID/TYPE/LENGTH/CONTAINS/SET/REMOVE，覆盖 INSERT/SELECT/WHERE/UPDATE/UPSERT 和事务回滚
-- [x] 持久化只读 VIEW：CREATE/CREATE OR REPLACE/DROP/SHOW CREATE/SHOW FULL TABLES；显式列名、普通/JOIN/聚合视图、外层过滤、DDL 隐式提交、重启恢复和禁止写视图
-- [x] CREATE TABLE [IF NOT EXISTS] ... AS SELECT：普通/JOIN/聚合/视图来源、结果列类型推导、DDL 隐式提交、建表与首批数据同一 Actor/WAL 原子组、重启恢复
+- [x] 正则函数：`REGEXP_LIKE`、`REGEXP_INSTR`、`REGEXP_SUBSTR`、`REGEXP_REPLACE` 基础 match_type、位置、occurrence、return_option、NULL 与 Unicode 语义；Rust 回归与 MySQL 8.4 差分覆盖
+- [x] 游戏 profile 常用 JSON CRUD：JSON_OBJECT/ARRAY/VALID/TYPE/LENGTH/CONTAINS/CONTAINS_PATH/OVERLAPS/SET/REMOVE，覆盖 INSERT/SELECT/WHERE/UPDATE/UPSERT 和事务回滚；另有 JSON_ARRAY_APPEND/ARRAY_INSERT/MERGE_PATCH/DEPTH/KEYS/PRETTY 的 Rust 回归与 MySQL 8.4 差分
+- [x] VIEW：CREATE/CREATE OR REPLACE/DROP/SHOW CREATE/SHOW FULL TABLES；复杂 JOIN/聚合/表达式视图只读，单基表直接列投影支持 INSERT/UPDATE/DELETE 与 LOCAL/CASCADED CHECK OPTION；DDL 隐式提交、重启恢复
+- [x] CREATE TABLE [IF NOT EXISTS] ... AS SELECT：普通/JOIN/聚合/视图来源、结果列类型推导、DDL 隐式提交、建表与首批数据同一 WAL 原子组、重启恢复
 - [x] RENAME TABLE 多项及 ALTER TABLE RENAME TO/AS：原子 schema+数据镜像，保留普通表、无主键重复行、AUTO_INCREMENT、视图定义、DDL 隐式提交和重启恢复
 - [x] 单条 ALTER TABLE 多操作：组合 ADD/DROP/MODIFY COLUMN、ADD/DROP INDEX/UNIQUE KEY，接受 ALGORITHM/LOCK 提示；整批预校验、失败零变更、同一 WAL 原子组、DDL 隐式提交和重启恢复
 - [x] ALTER TABLE 列演进：ADD/MODIFY ... FIRST|AFTER、CHANGE COLUMN、RENAME COLUMN；保持旧行字段值、列顺序、主键/自增和索引引用，使用 COW 行重写并可重启恢复
@@ -81,10 +96,10 @@
 - [x] SHOW TABLES/FULL TABLES 与 information_schema 不暴露临时隐藏物理名；SHOW CREATE/COLUMNS/DESCRIBE 使用连接逻辑名
 - [x] SHOW INDEX/INDEXES/KEYS：主键和二级索引逐列元数据、基数、可空性、跨库语法及临时逻辑名
 - [x] SHOW TABLE STATUS：FROM/IN、LIKE、WHERE Name 等值过滤；引擎、实际行数、近似数据长度、AUTO_INCREMENT 与视图状态
-- [x] information_schema 只读虚拟表：SCHEMATA/TABLES/COLUMNS/STATISTICS/TABLE_CONSTRAINTS/KEY_COLUMN_USAGE/CHECK_CONSTRAINTS，多行投影、过滤、排序、分组和跨表 JOIN
+- [x] information_schema 只读虚拟表：SCHEMATA/TABLES/COLUMNS/STATISTICS/PARTITIONS/TABLE_CONSTRAINTS/KEY_COLUMN_USAGE/CHECK_CONSTRAINTS/APPLICABLE_ROLES，多行投影、过滤、排序、分组和跨表 JOIN；SCHEMATA 与 `SHOW DATABASES` 按全局/库/表/列/例程权限及激活角色隐藏无权 schema；系统库自身 TABLES/COLUMNS 元数据可自描述，表级 RANGE/LIST/HASH/KEY 分区、常用表达式分区函数及重启后的分区元数据已回归
 - [x] mydbdump/mydb-migrate/ORM 风格元数据查询：表/列枚举、COALESCE 引擎、复合索引 GROUP_CONCAT、PK/UNIQUE/FK/CHECK 和临时物理名隐藏
 - [x] REFERENTIAL_CONSTRAINTS 与 VIEWS：引用唯一键、UPDATE/DELETE 规则、目标表、视图定义/安全类型/只读状态
-- [x] ROUTINES/PARAMETERS 真实存储过程元数据；EVENTS 保持结构化空表，未实现事件时 ORM 探测返回 0 行
+- [x] ROUTINES/PARAMETERS 真实存储过程元数据；`information_schema.PARAMETERS` 覆盖 MySQL 8.4 的类型长度、数值/时间精度、字符集/排序规则、DTD 与 ROUTINE_TYPE 字段；EVENTS 真实持久化并由 event scheduler 调度，未实现事件时 ORM 探测返回 0 行
 - [x] SHOW TABLES/COLUMNS/INDEX/TABLE STATUS 的 FROM/IN、LIKE、复合 WHERE 条件
 - [x] BEFORE INSERT Trigger：CREATE/DROP/SHOW/SHOW CREATE/information_schema，SET NEW 多赋值、表达式、普通/多行/IGNORE/REPLACE/UPSERT/INSERT SELECT/LOAD 路径、事务/重启/WAL/表改名/删除
 - [x] AFTER INSERT Trigger：BEGIN/END 多条跨表 INSERT、NEW 二进制安全绑定、目标 Trigger 链、全写集预锁、同批事务/WAL、回滚原子性与递归环/深度保护
@@ -114,30 +129,40 @@
 - [x] Diagnostics 多 condition/容量：按产生顺序保存 LOAD DATA 等多 warning，主错误追加在已有 warning 后；`max_error_count` 默认 1024、支持 0..65535/DEFAULT，仅限制 SHOW/GET 可保存 condition，`warning_count/error_count` 保留真实总数并可高于上限；越界 GET 在容量允许时追加 1758，容量已满时只增加总数；`sql_notes=OFF` 不记录 Note，两个 count 变量只读
 - [x] Trigger schema 新字段保持旧字段编码顺序；旧二进制 WAL 使用 legacy TableSchema/WriteCommand 解码回退
 - [x] FUNCTION 对象（独立 `RoutineKind::Function`，表达式内调用，`DETERMINISTIC`/`CONTAINS SQL`/`SQL SECURITY` 解析并持久化）与 EVENT（真实后台定时器调度，`information_schema.events` 实际填充 24 列——**纠正旧备注“结构化空表”**）完整边缘行为
-- [ ] Trigger/Procedure 局部变量完整字符集/排序规则字段及其余 `sql_mode` 进入 warning；主 condition 的 MySQL 非保证排序差分、所有冷门语句清理细节、routine 权限及 handler 所有边缘条件——**Deferred**：单机兼容定位下非常规路径，列于 SYNTAX_MATRIX §1.3/§6
-- [x] 常用 CHECK、命名/复合外键 RESTRICT/CASCADE/SET NULL 及 MySQL 错误码
+- [ ] Trigger/Procedure 局部变量完整字符集/排序规则字段；已落地显式 `CHARACTER SET`/`COLLATE` 的绑定、比较、`LIKE`、CASE/IF、DML、`COLLATION()`/`CHARSET()`，并以 MySQL 8.4.11 `latin1_bin` 差分验证；例程默认数据库字符集、完整字符集转码、全部排序规则权重、主 condition 的 MySQL 非保证排序差分、所有冷门语句清理细节、routine 权限及 handler 所有边缘条件仍 **Deferred**，列于 SYNTAX_MATRIX §1.3/§6。Routine 保存并恢复定义时 `sql_mode` 已验证；MySQL 对调用方与 routine 模式切换本身不要求额外 warning。
+- [x] 常用 CHECK、命名/复合外键 RESTRICT/CASCADE/SET NULL 及 MySQL 错误码；外键写入检查对被引用父记录建立共享锁，子表 INSERT/UPDATE 不再锁整组关联表
 - [x] 单目标及多目标 UPDATE ... JOIN；DELETE alias-list FROM ... JOIN 与 DELETE FROM alias-list USING ...，主键级锁定物化、事务/WAL/约束路径一致
 - [x] 无主键 JOIN UPDATE/DELETE：表锁内使用物理行序号区分完全重复行，顺序表达式观察前序目标变更，整表镜像 WAL 幂等重放
 - [x] `LOAD DATA LOCAL INFILE` MySQL 文件传输协议及安全目录内服务端 `INFILE`；字段/行分隔、包围、转义、IGNORE 行、列/用户变量映射、SET 表达式转换、常用字符集转码、BLOB 原字节、1261/1262/1062 warning、strict 1261/1262/1300 原子失败、事务回滚与 affected rows
 - [x] 有主键单表的 CASE/函数化 UPDATE SET/WHERE 与 DELETE WHERE，含左到右赋值、ORDER/LIMIT 和事务回滚
-- [ ] 复杂互递归 CTE、CYCLE 语义——**Deferred**（SYNTAX_MATRIX §2）
-- [x] 完整表达式/函数/类型转换/时区语义；**排序规则比较语义 Deferred**：当前 `compare_row_value` 对非数值走裸字节（退化为 `*_bin`），`_general_ci`/`_ai_ci` 大小写/口音不敏感尚未接入比较与索引键（SYNTAX_MATRIX §6）
-- [ ] 完整复杂 HAVING 子查询、排序规则与 ONLY_FULL_GROUP_BY 函数依赖规则——**Deferred**（SYNTAX_MATRIX §2）
-- [x] 冷门 DDL/DML 兼容表面：`ANALYZE`/`OPTIMIZE`/`CHECK`/`REPAIR`/`CHECKSUM TABLE`（MySQL 形态结果集）、`FLUSH`/`CACHE INDEX`（no-op）、`ALTER DATABASE ... CHARACTER SET/COLLATE/UPGRADE DATA DIRECTORY NAME/READ ONLY/ENCRYPTION`、`RENAME USER`、`SET PASSWORD`、`CREATE/ALTER DATABASE` 选项；`LOAD DATA PARTITION`、完整冷门字符集与 `sql_mode` warning/error 组合矩阵仍 **Deferred**（SYNTAX_MATRIX §7/§6）
+- [x] 递归 CTE 前向引用/互递归拒绝、`cte_max_recursion_depth` 的 SESSION/GLOBAL 默认传播、递归成员禁止聚合/窗口/GROUP BY/ORDER BY/DISTINCT；MySQL 8.4 不支持 `CYCLE`，保持明确拒绝（SYNTAX_MATRIX §2）
+- [x] 完整表达式/函数/类型转换/时区语义；**排序规则比较语义 Partial**：SQL 文本相等/范围/LIKE、写入校验、唯一键与索引候选路径已接入列级 `COLLATE`；`PAD SPACE`/`NO PAD`、字符串 `_bin` 与 BLOB/BINARY 字节语义边界已统一到比较/唯一键/GROUP/JOIN 路径，`SHOW FULL COLUMNS` 与 `information_schema.COLUMNS/TABLES` 返回列/表元数据；accent/locale 完整权重与冷门字符集仍 Deferred（SYNTAX_MATRIX §6）
+- [x] HAVING 常用聚合条件、未关联标量子查询/`IN (SELECT ...)`、按分组外层行绑定的关联标量子查询，以及 `AND` 组合的关联 `EXISTS`；更复杂的关联谓词树与排序规则完整权重——**Deferred**（显式 `ONLY_FULL_GROUP_BY` 与主键/非空唯一键函数依赖已验证；SYNTAX_MATRIX §2/§6）
+- [x] 冷门 DDL/DML 兼容表面：`ANALYZE`/`OPTIMIZE`/`CHECK`/`REPAIR`/`CHECKSUM TABLE`（MySQL 形态结果集）、`FLUSH`/`CACHE INDEX`（no-op）、`ALTER DATABASE ... CHARACTER SET/COLLATE/UPGRADE DATA DIRECTORY NAME/READ ONLY/ENCRYPTION`、`RENAME USER`、`SET PASSWORD`、`CREATE/ALTER DATABASE` 选项；`LOAD DATA PARTITION (p0,...)` 已按逻辑分区逐行校验并原子拒绝错分区行，完整冷门字符集与 `sql_mode` warning/error 组合矩阵仍 **Deferred**（SYNTAX_MATRIX §7/§6）
 - [x] 触发器、存储过程与函数、事件完整语义（创建/持久化/调用/元数据/错误传播/事务原子性）
-- [ ] 可更新视图、`WITH CHECK OPTION` 完整约束——**Deferred**：视图按 MySQL 只读语义实现，单机定位不开放可更新视图（SYNTAX_MATRIX §1.2）
-- [x] MySQL 系统库：`information_schema`（~21 表）、`mysql`（user/db/role_edges 真实，global_grants/tables_priv/columns_priv/procs_priv/func 虚拟表）、`performance_schema`（12 表）、`sys`（12 视图）全部可查询；权限/角色/审计（全局/库级强制，表/列级暂不强制——**Deferred**）；复制协议表面 `SHOW MASTER/BINARY LOG STATUS`、`SHOW BINARY LOGS`、`SHOW REPLICAS`、`SHOW REPLICA STATUS`、`XA START/BEGIN/END/PREPARE/COMMIT/ROLLBACK/RECOVER` 返回 MySQL 形态结果，真正 binlog 复制拓扑/GTID/两阶段 XA 外部协调 **Deferred**（SYNTAX_MATRIX §5/§8/§3）
+- [x] 可更新视图、`WITH CHECK OPTION`：单基表直接列投影、主键可见、LOCAL/CASCADED 检查和 DML 回归已验证；复杂 JOIN/聚合/表达式、视图套视图仍 **Deferred**（SYNTAX_MATRIX §1.2）
+- [x] MySQL 系统库：`information_schema`（含 `PARTITIONS`/`APPLICABLE_ROLES` 等虚拟表，TABLES/COLUMNS 自描述）、`mysql`（user/db/role_edges/roles_mapping 真实，global_grants/tables_priv/columns_priv/func 虚拟表，`procs_priv` 动态反映例程授权）、`performance_schema`（12 表）、`sys`（12 视图）全部可查询；权限/角色/审计（全局/库级、表级及列级简单 DML 强制，复杂 JOIN 的每个基表及 JOIN/WHERE/GROUP/HAVING/ORDER 投影列级 SELECT 已回归，JOIN UPDATE/DELETE 的逐目标表/逐读取列权限、`INSERT ... SELECT` 的目标写列/来源读列权限、`ON DUPLICATE KEY UPDATE` 的 INSERT/UPDATE/既有行 SELECT 与 `VALUES(col)` 入参边界已回归，`tables_priv`/`columns_priv`/`TABLE_PRIVILEGES`/`COLUMN_PRIVILEGES` 动态展示；全局/库/表/列/例程授权委托会校验被授予权限与同级或更宽范围的 `GRANT OPTION`，`GRANT ALL` 不隐式获得 `GRANT OPTION`，角色委托校验 `ADMIN OPTION`，库级不存在授权返回 1141，表/列级返回 1147，例程级返回 1403，跨库/越权委托及 `REVOKE ADMIN OPTION FOR` 已回归，完整授权撤销矩阵仍 Deferred）；复制协议表面 `SHOW MASTER/BINARY LOG STATUS`、`SHOW BINARY LOGS`、`SHOW REPLICAS`、`SHOW REPLICA STATUS`、本地 XA `START/BEGIN/END/PREPARE/COMMIT/ROLLBACK/RECOVER`（跨连接 prepared 分支、锁保留、one-phase）返回 MySQL 形态结果，真正 binlog 复制拓扑/GTID/分布式 XA 外部协调 **Deferred**（SYNTAX_MATRIX §5/§8/§3）
 
 ## 事务、锁与连接
 
 - [x] BEGIN/COMMIT/ROLLBACK、autocommit、DDL 隐式提交、事务内读己写
-- [x] SAVEPOINT/ROLLBACK TO/RELEASE、重名覆盖、MySQL 1305、自增回滚留洞
-- [x] READ UNCOMMITTED/READ COMMITTED/REPEATABLE READ/SERIALIZABLE 常用可见性
-- [x] IS/IX/S/X、主键/唯一键行锁、SELECT FOR UPDATE/FOR SHARE、LOCK IN SHARE MODE、NOWAIT 原子获取与 MySQL 3572、主键队列 ORDER BY/LIMIT SKIP LOCKED、wait-for graph 死锁检测、1213/40001 及受害者整事务回滚、锁等待超时
+- [x] SAVEPOINT/ROLLBACK TO/RELEASE、重名覆盖、MySQL 1305、自增回滚留洞；回滚到保存点保留既有行/间隙锁，并释放保存点后基础主键 INSERT 的隐式记录/索引锁
+- [x] READ UNCOMMITTED/READ COMMITTED/REPEATABLE READ/SERIALIZABLE 常用可见性；SERIALIZABLE 普通 SELECT 在 autocommit=0 下获取并持有共享记录/范围锁，回归已覆盖
+- [x] IS/IX/S/X、主键/唯一键行锁、SELECT FOR UPDATE/FOR SHARE、LOCK IN SHARE MODE、NOWAIT 原子获取与 MySQL 3572、主键队列 ORDER BY/LIMIT SKIP LOCKED、方向性 gap/insert-intention 冲突、wait-for graph 死锁检测、按事务权重且同权优先当前等待者的 1213/40001 及受害者整事务回滚、锁等待超时
 - [x] 断线自动回滚并释放锁；服务重启后客户端可重连和继续新事务
 - [x] 事务语句级 CHECK/FK 预校验、级联立即可见、回滚不落 WAL
-- [ ] MySQL InnoDB 完整 next-key/gap/意向锁、无主键/复杂 JOIN 的逐行 SKIP LOCKED、多方环与基于回滚成本的受害者选择一致性
-- [ ] 全部隔离级别 anomaly、XA、SAVEPOINT 后锁精确释放、锁升级和大事务边界矩阵
+- [x] 主键及单列二级索引的等值/范围锁：资源化 next-key/gap 区间、空隙 INSERT 阻塞、共享 gap 锁阻塞 insert-intention、DECIMAL/大整数索引范围精确数值排序、事务锁等待与回滚回归；自动提交锁定读语句结束释放、`autocommit=0` 保持至 COMMIT、JOIN 最终命中行记录锁、SERIALIZABLE 普通 SELECT 共享锁、UPDATE 二级索引旧/新键锁已回归
+- [x] READ COMMITTED 锁定读与 UPDATE/DELETE 只锁命中记录、不锁普通 gap；RR/SERIALIZABLE 保留范围锁；主键 gap 插入回归
+- [x] 二级索引插入意向锁：同一非唯一索引值的不同记录可并发插入，但仍受 next-key/gap X 锁阻塞
+- [x] 复合索引全等值与左前缀范围记录/间隙锁；单列字符索引范围按列排序规则而非数值解析比较；无主键表使用稳定行内容+重复序号的隐藏行锁支持基础 `SKIP LOCKED`
+- [x] 基础 MDL：普通读持有 statement-duration metadata shared，DML 持有兼容的 metadata intention，DDL 通过 metadata X 锁等待并参与超时/死锁路径
+- [x] 单机 MySQL TCP 入口：JDBC/Go/Node.js/JetBrains/VS Code/dbx/mysql CLI 直接连接 3306，共用同一协议路径
+- [x] MySQL 账户 host 选择基础语义：`'user'@'host'` 精确主机优先于 `%`/`_` 通配和 IPv4 掩码匹配；握手按实际账户选择 `mysql_native_password` / `caching_sha2_password`
+- [x] 基础 JOIN `SKIP LOCKED`：先完成 JOIN/WHERE，再按最终组合原子尝试锁定各基表行；锁等待行被跳过，最终 JOIN 过滤掉的基表行不被误锁
+- [x] JOIN 锁定读的最终基表行集合统一排序后一次获取，反向 JOIN 顺序不再造成锁获取顺序差异
+- [x] JOIN 锁定读的列对列等值/非等值谓词：按最终命中组合为各端点建立索引点/范围锁，反向比较符同步处理；无索引端点使用表级安全回退，并覆盖匹配范围 INSERT 阻塞回归
+- [ ] MySQL InnoDB 完整 next-key/gap/意向锁、多方环与基于回滚成本的受害者选择一致性；当前已实现基础范围锁、死锁图与按事务写集+持有锁数量选择 victim，并验证简单重复键 INSERT 的 duplicate-record S、ON DUPLICATE 唯一二级键 X/非唯一二级键 insert intention、非唯一二级索引等值 SELECT/UPDATE 与 JOIN 锁定读的前置 next-key gap、INSERT SELECT 在 RC 与 RR/SERIALIZABLE 下的源表锁差异、外键子写入的新父键共享记录锁、父键变更/删除对匹配子记录和 FK 范围的定向锁；复杂 JOIN/隐式锁边界仍待补齐
+- [ ] 全部隔离级别 anomaly、锁升级和大事务边界矩阵；当前本地 XA 已支持跨连接 prepared 分支、RECOVER、持久 catalog 重载、one-phase、锁转移与提交/回滚，并用同一 durable WAL 的 XA commit marker 处理“数据已提交而 catalog 删除前崩溃”的幂等恢复；无主键/复杂 UPSERT/REPLACE 隐式锁边界及更大故障注入矩阵仍待补齐
 
 ## 迁移与备份
 
@@ -145,18 +170,19 @@
 - [x] 真实 MySQL 8.0.45 dump、循环外键 dump 和 hex BLOB 原样导入
 - [x] 独立 `crates/mydb-dump` / `mydbdump` CLI
 - [x] 一致性全量、LSN 增量、校验、恢复和 PITR HTTP/CLI 链路
-- [x] 备份使用 Actor 边界快照，不锁业务表
+- [x] 备份使用组提交边界快照，不锁业务表
 - [ ] 大数据量迁移的断点续传、限速、在线增量追平与切流回滚演练
 - [ ] 与 mysqldump/mysqlpump/mysqlbinlog 复杂对象及全部选项的兼容矩阵
 
 ## Agent HTTP 与运维
 
 - [x] Agent HTTP 默认开启，提供 health、自然语言诊断、slow SQL、锁/WAL/checkpoint 状态
+- [x] slow SQL 基础排查：慢/错误 SELECT 自动附带可解析的 `EXPLAIN FORMAT=JSON`、稳定 ID/字面量归一化 digest、结果状态/行数、执行与计划阶段耗时；`GET /api/v1/agent/slow-queries` 支持 limit/database/digest 过滤；`POST /api/v1/agent/sql` 返回静态建议与同权限 JSON 执行计划；不执行用户 SQL，不把调试请求写入业务数据
 - [x] HTTP 全量/增量备份、PITR 恢复 staging 和重启安装
 - [x] 原生 CLI 可访问 Agent API，Prometheus `/metrics` 默认可用
 - [x] 管理端口与 SQL 端口分离，支持 bearer/admin 密码
-- [ ] 完整生产鉴权、TLS、密钥轮换、权限审计与危险操作审批
-- [ ] slow SQL 执行计划、索引建议、跨时间段根因分析和告警集成
+- [ ] 完整生产鉴权、TLS、密钥轮换、权限审计与危险操作审批；当前已落地强密码/TLS 配置校验、HTTP 登录失败限流、管理 API 审计，以及备份删除/恢复的 ID 绑定显式确认；密钥轮换持久化、细粒度管理角色和审批留痕仍待补齐
+- [ ] slow SQL 跨时间段根因分析、完整索引建议、采样/告警集成；基础 JSON 执行计划与静态建议已完成
 
 ## 安装、Docker 与平台
 
@@ -169,23 +195,62 @@
 - [x] CI 配置 Windows/Linux/macOS 原生 Rust 编译测试，Ubuntu 24.04 Docker smoke
 - [ ] 当前最终提交在真实 macOS Docker Desktop 上完成 smoke
 - [ ] Windows 安装脚本、Linux systemd、macOS launchctl 在干净真实机器端到端通过
-- [ ] 发布产物签名、校验和、升级/降级和卸载流程验证
+- [x] Windows/Bash 发布脚本为压缩包生成并上传 SHA-256 sidecar；签名、透明密钥和升级/降级演练仍待完成
+- [x] `mydb update` / `mydb-cli update` 基础跨平台在线更新：v0.1.18→v0.1.19 Release 资产下载、SHA-256 校验、五个二进制事务替换、配置/密钥保留、Windows helper、Linux Debian CLI 更新和 Linux 安装脚本注入失败回滚均已验证；v0.1.20 修正 `--check` 通过 Release 页面解析最新 tag 并识别当前版本；v0.1.22 的 Windows 服务更新 helper 在服务运行且 CLI 非管理员时自动请求 UAC；真实 Windows 服务/Linux systemd 切换、签名、升级/降级仍待补齐
+- [ ] 发布产物签名、升级/降级和卸载流程验证
 
 ## 当前可复现证据
 
-- [x] `cargo test --workspace`：204 项通过
-- [x] `cargo test -p mydb-wire`：133 项通过（含 IANA 命名时区、大小写名称、上海/纽约、DST 跳时/回拨、连接隔离、动态默认值、事务及函数比较投影，会话 time_zone 固定偏移/SYSTEM、连接隔离、SET 左到右、NOW/SYSDATE、UNIX 微秒往返、动态默认值、ON UPDATE、事务，CONVERT_TZ 固定偏移、UTC/GMT/SYSTEM、跨日、微秒、无效时区、WHERE/UPDATE/事务，NOW/CURRENT_TIMESTAMP/local/UTC/UNIX 的语句开始快照、SYSDATE 调用时刻、跨 SLEEP 与批量 UPDATE 一致性，UTC_DATE/UTC_TIME/UTC_TIMESTAMP、LOCALTIME/LOCALTIMESTAMP、CURTIME/CURRENT_TIME 的 UTC/local、fsp、DML 和事务，ADDDATE/SUBDATE/TIMESTAMP/TIMESTAMPADD 的别名、天数简写、SQL_TSI_、月末、微秒和排期 DML/事务，GET_FORMAT/STR_TO_DATE/TIME_FORMAT 的官方格式、月名/微秒差异、文本导入 DML/事务，EXTRACT 基础/复合单位、函数内 FROM 顶层解析、事件分区 DML/事务，TO_DAYS/FROM_DAYS/TO_SECONDS 与 PERIOD_ADD/PERIOD_DIFF 的 year-0 日序、紧凑数字日期、归档/赛季 DML/事务，WEEK/WEEKOFYEAR/YEARWEEK 的 0–7 模式、ISO 跨年、注册周 cohort DML/事务，ADDTIME/SUBTIME/MAKETIME 的跨日 DATETIME、负时长、微秒、游戏冷却 DML/事务，TIME/MICROSECOND/TIME_TO_SEC/SEC_TO_TIME/TIMEDIFF 的负时长、跨天、微秒、DATETIME 差值及 DML/事务，DAYOFYEAR/WEEKDAY/QUARTER/DAYNAME/MONTHNAME/LAST_DAY/MAKEDATE 的闰年、跨年、月末结算 DML/事务，CONV/BIT_COUNT 的 64 位进制、显式二进制位计数、权限掩码 DML/事务，PI/角度/三角函数的定义域、游戏向量 DML/事务，MD5/SHA/SHA1/SHA2/CRC32 的文本/二进制迁移摘要、DML/事务和 CHECK 关键字边界，UUID v1/二进制 swap/校验、IPv4/IPv6 二进制往返与 DML/事务，BIN/OCT/HEX/UNHEX/Base64/FORMAT 的迁移编码、换行/空白、locale、DML/事务回滚，字符串工具函数 UTF-8/二进制/DML/64MiB 内存边界、FIND_IN_SET/FIELD/ELT/MAKE_SET/EXPORT_SET 的 SELECT/WHERE/UPDATE/回滚、存储程序 TIME/DATETIME/TIMESTAMP FSP 舍入/截断/进位与调用者-例程 SQL_MODE 边界、Trigger/Procedure/参数 ENUM/SET 成员与数字索引/位掩码转换、PROCEDURE CREATED/LAST_ALTERED/SQL_MODE 快照与恢复、diagnostics 多 condition/max_error_count/sql_notes、连接顶层 GET DIAGNOSTICS 真实驱动与 prepared 1295、Prepared CALL OUT/INOUT 声明类型 Binary Wire、PROCEDURE/CALL 多结果集/游标/condition handler/diagnostics/ALTER characteristics、Trigger 复合控制流与常用局部变量类型转换、连接级临时表、SQL_CALC_FOUND_ROWS、会话写后状态、日期/自动更新时间、用户/系统变量、协议/SQL prepared、注册留存、DAU、收入、数学、文本、JSON CRUD、视图及 ALTER 演进重启）
-- [x] `cargo test -p mydb-storage -p mydb-wire`：173 项通过（23 个 storage 单元测试、17 个 storage 集成测试、133 个 wire 测试）
-- [x] 最新并发回归：`cargo test -p mydb-storage` 32 个单元测试、17 个集成测试通过；`cargo test -p mydb-wire` 140 项通过；并发不同表 INSERT/UPDATE/UPSERT 合并为一个 WAL fsync，物理 apply 保持 Actor 顺序；真实 Actor group 重启后双表数据完整且无重复
+- [x] `cargo test --workspace --locked -- --test-threads=1`：通过（wire 269 个单测、storage 61 个单测、17 个集成测、WAL 18 个单测及其余 workspace 测试）
+- [x] `cargo test -p mydb-storage -p mydb-wire --locked`：通过（wire 269 个单测、storage 61 个单测）
+- [x] 最新并发回归：持久 row-id、MVCC 读视图、删除历史版本、精确 DECIMAL/大整数索引范围、方向性 gap/insert-intention、基础 MDL 与已有并发写回归通过；并发不同表写入保持 FIFO/WAL 组提交语义
 - [x] vendored `opensrv-mysql`：110 项通过，覆盖自定义错误码/SQLSTATE、多结果 SERVER_MORE_RESULTS_EXISTS、握手多结果能力和 Prepared CALL SERVER_PS_OUT_PARAMS 状态位
 - [x] `cargo clippy --workspace --all-targets -- -D warnings`：通过
 - [x] MySQL 8.0.45/8.0.46 差分：真实 dump、changed-row affected counts/no-op UPSERT insert id、INSERT/REPLACE SET、INSERT VALUES 默认行/表达式/DEFAULT(col)/1364、UPDATE/UPSERT/JOIN DEFAULT、MySQL 8 行/列别名 UPSERT、复杂冲突标量表达式和左到右赋值、CREATE TABLE LIKE、TRUNCATE 隐式提交/自增/FK 1701、LOAD DATA 用户变量/SET/latin1/BLOB/1261/1262/1062 warning/strict 1261/1262/1300 原子失败、FOR SHARE/NOWAIT 3572/主键队列 SKIP LOCKED/双事务死锁 1213、FK/CHECK/事务/SAVEPOINT、JOIN/NATURAL/USING、有键/无键重复行单/多目标 JOIN UPDATE/DELETE、相关/派生/CTE 子查询、set operators、多列 GROUP BY、窗口、多列/表达式 ORDER BY、常用 CASE/字符串/数值/CAST 投影/WHERE/UPDATE/DELETE
+- [x] 本轮 SQL 回归：JOIN ON 常量/算术/常用标量函数；分组 HAVING 未关联标量子查询及 `IN (SELECT ...)`；锁定读非索引 JOIN 表达式安全回退
 - [x] `scripts/docker-smoke.ps1`：通过，含 changed-row affected counts/no-op WAL avoidance、INSERT/REPLACE SET、INSERT VALUES 默认行/表达式/1364、UPDATE/UPSERT/JOIN DEFAULT、MySQL 8 行/列别名 UPSERT、复杂冲突标量表达式/左到右赋值、SIGKILL committed/uncommitted 恢复、WAL 坏尾精确截断、CREATE TABLE LIKE、TRUNCATE 自增/FK、双连接 FOR SHARE/NOWAIT/SKIP LOCKED/死锁受害者回滚、真实 `LOAD DATA LOCAL INFILE` 协议、字符集/warning/strict error 诊断、语句原子性及 `secure_file_priv` 边界
+- [x] `scripts/docker-fault-injection.ps1`：低资源 Docker（0.5 CPU、512 MiB）通过掉电/只读/ENOSPC/恢复中断四场景；源码镜像构建限制 0.5 CPU、768 MiB，结束自动清理 fixture
 - [x] `NO_BUILD=1 bash scripts/docker-smoke.sh`：通过（当前脚本与 PowerShell 同覆盖）
 - [x] Windows Docker Desktop Ubuntu 24.04 开发基准门禁：20 秒预算、1 轮、同为 `ENGINE=InnoDB`、20 MB/s/500 IOPS、fsync-on-commit；2026-07-20 最新原始样本 `target/io-bench-desktop-header-check/` 为 MyDB 2262.9 ops/s、MySQL 8.0.46 3318.4 ops/s、0.682x，MyDB 写 P99 40.5 ms、MySQL 495.9 ms。仅证明限速工具链与回归数据，不作为正式性能结论
-- [x] 2026-07-20 8 表/4 CPU 限速单轮：`target/io-bench-current-multitable-windowed/`，MyDB 1802.7 ops/s、MySQL 3417.4 ops/s、0.527x；WAL 305 次 fsync 覆盖 821 请求（2.69 请求/组），比无窗口专用 Actor 的 2.17 请求/组提升。单轮仅作回归证据，不作为正式性能结论
+- [x] 2026-07-20 8 表/4 CPU 限速单轮：`target/io-bench-current-multitable-windowed/`，MyDB 1802.7 ops/s、MySQL 3417.4 ops/s、0.527x；WAL 305 次 fsync 覆盖 821 请求（2.69 请求/组），比无窗口专用写线程的 2.17 请求/组提升。单轮仅作回归证据，不作为正式性能结论
 - [x] 2026-07-20 8 表/4 CPU 限速 3 轮：`target/io-bench-multitable-async-audit-3r/`，MyDB 7017.2 ops/s、MySQL 7315.1 ops/s、0.959x；WAL 269 次 fsync 覆盖 1641 请求（6.10 请求/组）。异步批量审计移出 SQL 临界路径；读主导样本 `target/io-bench-read-async-audit/` 读 P50 为 210 us。开发机 Docker 回归证据，不代表物理生产硬件验收
 - [x] db233-go `go test -count=1 ./...`：通过且仓库无改动
 - [x] 默认 MyDB 容器：healthy、`unless-stopped`、0.5 CPU、512 MiB
-- [x] 本机 MySQL80：仍为 Running/Automatic，符合“最终验收前不得卸载”
+- [x] MySQL Connector/J 9.1.0：当前 release 服务 3306 4/4 通过，含无默认库、认证、CRUD、UTF-8、DataGrip/IDEA 常用连接属性，以及 typed prepared metadata/DATE/BLOB binary row 回归；覆盖 JDBC 路径
+- [x] Go `database/sql` `github.com/go-sql-driver/mysql` v1.10.0：当前 release 服务 3306 回归通过 Ping、建库/建表、中文、DATE、普通查询与预处理查询
+- [x] MySQL 8.4 真实差分基线：`scripts/mysql84-diff.ps1` 同机 Docker MySQL 8.4（Windows `lower_case_table_names=1` 基线）与隔离 MyDB 逐结果集比较，上一阶段共 117 项通过；JSON 成本与 InnoDB 物理估算字段按语义/结构校验，不硬比引擎估算值
+- [x] Node.js `mysql2` v3.23.3：当前 release 服务 3306 通过普通查询与预处理查询；覆盖 VS Code JavaScript/TypeScript 连接路径
+- [x] 2026-08-15 REGEXP 差分阶段：`REGEXP_INSTR`、`REGEXP_SUBSTR`、`REGEXP_REPLACE` 的位置/occurrence/return_option/NULL/Unicode 与 MySQL 8.4 对齐，该阶段总差分 118/118
+- [x] 2026-08-15 JSON 聚合/路径差分阶段：`JSON_ARRAYAGG`/`JSON_OBJECTAGG` SQL NULL、JSON 值、空集合、重复 key 覆盖及窗口累计聚合，JSON `.*`/`[*]`/`**`、数组范围、`last` 动态下标与基础/按前置表行隐式关联的 `JSON_TABLE`（标量、嵌套、序号、存在性、默认/错误行为）与 MySQL 8.4 对齐；该阶段 `scripts/mysql84-diff.ps1` 为 117/117 cases
+- [x] Windows 当前构建：`MyDBServer` Automatic 服务停止/启动循环通过；监听 `0.0.0.0:3306`，LAN 地址连接成功，防火墙入站规则启用
+- [x] Windows 物理服务现状：`MyDBServer` Automatic、Running；3306 返回 `8.4.0-mydb-0.1.0` 与 `event_scheduler=ON`；本轮最新 release 已在隔离 13306 完成同等差分
+- [ ] Windows 物理服务已切换到本轮最新 release：当前 shell 无法重启 LocalSystem `MyDBServer`，3306/4306 仍保持稳定开发实例；本轮最新源码已在隔离 13306 完成验证，待有权限窗口切换 3306
+- [x] 本机全量切流：9 个业务库迁移并重启校验；`sakila.staff` 超大 BLOB 通过 16KB 页外溢存储保留；MySQL80 服务、程序、进程和数据目录已卸载清理，SQL 备份保留在 `C:\Server\mydb\mysql-backup-20260811\all-databases.sql`
+- [x] 2026-08-15 阶段性源码真实差分：同机 Docker `mysql:8.4` 与隔离 MyDB 对比，117/117 cases 通过；新增基础 JSON_TABLE 标量/嵌套/序号/存在性/默认与错误行为及按前置表行隐式关联 JSON_TABLE、POINT/LINESTRING/POLYGON/MULTI*/GEOMETRYCOLLECTION 空间构造器/度量/访问器/SRID 轴序/谓词，另含 JSON_SEARCH、JSON 浅层/递归通配路径、数组范围/`last` 下标、JSON_ARRAYAGG/JSON_OBJECTAGG 聚合与窗口、数组追加/插入、RFC 7396 合并、深度/键/美化、重叠、BIT 聚合、常量聚合投影、全文 TF-IDF 基础评分/布尔前缀/短语/查询扩展、停止词/短词边界、未知线程 KILL 错误、角色授权、ai_ci、EXPLAIN、状态接口、生成列 INSERT/UPDATE/UPSERT/INSERT SELECT 显式写入错误码/消息；物理 3306 服务未强制替换
+- [x] 2026-08-15 同机持久化基准（v0.1.21 发布候选，提交 7bdcb65）：MyDB 与 MySQL 8.4.11 使用相同 Docker 资源和持久化设置；性能阶段无预热、17.6/60 秒、1 次采样，单表写 582/276 ops/s、4 actor P99 10.1/92.9 ms、并发吞吐 343/153 ops/s、读 P50 290/132 μs；原始结果见 `性能报告.md`，不硬编码历史比值
+- [x] 2026-08-15 v0.1.23 索引点查优化后同机持久化基准：MyDB 与 MySQL 8.4.11 使用相同 Docker 资源和持久化设置；性能阶段无预热、22.3/60 秒、1 次采样，单表写 218/78 ops/s、4 actor P99 28.2/58.8 ms、并发吞吐 251/155 ops/s、读 P50 400/130 μs；原始结果见 `性能报告.md`，不硬编码历史比值
+- [x] 2026-08-15 v0.1.24 多列 `COUNT(DISTINCT ...)` 阶段：Rust workspace 测试、clippy、`scripts/mysql84-diff.ps1` 119/119 与完整 `scripts/docker-smoke.ps1` 均通过；Docker 使用隔离 13316/14316 端口，未触碰物理 3306/4306
+- [x] 2026-08-15 v0.1.24 同条件持久化基准：MyDB 与 MySQL 8.4.11 使用相同 Docker 资源和持久化设置；性能阶段无预热、22.1/60 秒、1 次采样，单表写 203/78 ops/s、4 actor P99 28.7/57.3 ms、并发吞吐 330/144 ops/s、读 P50 403/132 μs；原始结果见 `性能报告.md`，不硬编码历史比值
+- [x] 2026-08-15 v0.1.25 多表达式 `GROUP_CONCAT` 阶段：Rust workspace 测试、clippy、`scripts/mysql84-diff.ps1` 120/120 与完整 `scripts/docker-smoke.ps1` 均通过；覆盖多参数 NULL 行过滤、元组 DISTINCT、ORDER BY、SEPARATOR，Docker 使用隔离 13316/14316 端口，未触碰物理 3306/4306
+- [x] 2026-08-15 v0.1.25 同条件持久化基准：MyDB 与 MySQL 8.4.11 使用相同 Docker 资源和持久化设置；性能阶段无预热、21.8/60 秒、1 次采样，单表写 218/80 ops/s、4 actor P99 26.2/70.4 ms、并发吞吐 316/155 ops/s、读 P50 311/126 μs；原始结果见 `性能报告.md`，不硬编码历史比值
+- [x] 2026-08-15 v0.1.26 `group_concat_max_len` 阶段：Rust wire 270 测试通过；覆盖 SESSION/GLOBAL 读取与写入、DEFAULT、4 字节下限、UTF-8 字符边界、分组原始 row-id 警告行号和 1260 警告；`scripts/mysql84-diff.ps1` 121/121 通过，隔离 Docker 端口 13316/14316，未触碰物理 3306/4306
+- [x] 2026-08-15 v0.1.27 嵌套聚合阶段：修复 `COUNT(*)+1` 被误识别为顶层聚合，以及无 `FROM`、单表 `FROM`、JOIN 投影中的 `CONCAT`/`COALESCE`/`HEX(GROUP_CONCAT(...))` 聚合组合；Rust wire 270 测试通过，`scripts/mysql84-diff.ps1` 122/122 通过，隔离 Docker 端口 13316/14316，未触碰物理 3306/4306
+- [x] 2026-08-15 v0.1.28 鉴权撤销阶段：修复库级 `REVOKE` 错误回退全局权限、`GRANT ALL` 错误包含 `GRANT OPTION`，补齐表/列/例程不存在授权的 1147/1403 以及授权失败的 1044/1045/1142/1370 映射；Rust wire 273 测试通过，`scripts/mysql84-diff.ps1` 123/123 通过，隔离 Docker 端口 13316/14316，未触碰物理 3306/4306
+- [x] 2026-08-15 v0.1.29 鉴权撤销扩展：补齐 `REVOKE ALL PRIVILEGES, GRANT OPTION FROM user` 无 `ON` 语法，原子清除全局/库/表/列/例程权限，并允许 `CREATE USER`/`UPDATE` 管理权限执行；Rust wire 273 测试通过，`scripts/mysql84-diff.ps1` 124/124 通过，隔离 Docker 端口 13316/14306，未触碰物理 3306/4306
+- [x] 2026-08-15 v0.1.30 鉴权 warning 扩展：补齐 `REVOKE IF EXISTS`、`IGNORE UNKNOWN USER`、未知角色 3523 及库/表/例程撤销 warning/NOOP 语义；Rust wire 274 测试通过，`scripts/mysql84-diff.ps1` 125/125 通过，隔离 Docker 端口 13316/14306，未触碰物理 3306/4306
+- [x] 2026-08-15 v0.1.30 同条件持久化基准（提交 `6d53572`）：MyDB 与 MySQL 8.4.11 使用相同 Docker 资源和持久化设置；性能阶段无预热、22.3/60 秒、1 次采样，单表写 209/76 ops/s、4 actor P99 45.5/55.3 ms、并发吞吐 335/142 ops/s、读 P50 283/145 μs；精确命令 `pwsh -File scripts/bench.ps1` 通过，原始结果见 `性能报告.md`
+- [x] 2026-08-15 v0.1.31 `partial_revokes`：补齐默认关闭、`SET GLOBAL`/`SET PERSIST[_ONLY]`、库级全局权限撤销、直接库授权优先、全局撤销清理、授权者限制继承、全局权限边界、`SHOW GRANTS` 与 `mysql.user.User_attributes`；Rust wire 277 测试通过，`scripts/mysql84-diff.ps1` 126/126 通过
+- [x] 2026-08-15 v0.1.32 鉴权元数据阶段：`SHOW DATABASES`/`SHOW SCHEMAS` 与 `information_schema.SCHEMATA` 按账号权限/激活角色过滤，Rust wire 277 测试通过，`scripts/mysql84-diff.ps1` 127/127 通过
+- [x] 2026-08-15 v0.1.33 作用域多权限撤销：库/表/列/例程 `REVOKE` 要求列出的权限全部存在，Rust wire 278 测试通过，`scripts/mysql84-diff.ps1` 131/131 通过
+- [x] 2026-08-15 v0.1.33 同条件持久化基准（提交 `d657350`）：MyDB 与 MySQL 8.4.11 使用相同 Docker 资源和持久化设置；性能阶段无预热、22.6/60 秒、1 次采样，单表写 208/78 ops/s、4 actor P99 35.9/83.8 ms、并发吞吐 279/144 ops/s、读 P50 286/130 μs；原始结果见 `性能报告.md`
+- [x] 2026-08-15 v0.1.34 Web SQL IDE Schema Explorer：移除硬编码 `mydb`/固定系统库，按 `SHOW DATABASES` 与 `information_schema.TABLES` 动态展示权限可见 schema/table，支持空库、刷新清理和表列检查器；浏览器回归无 warning/error，Rust server 15/15
+- [x] 2026-08-15 v0.1.34 同条件持久化基准（提交 `b566964`）：MyDB 与 MySQL 8.4.11 使用相同 Docker 资源和持久化设置；性能阶段无预热、23.6/60 秒、1 次采样，单表写 207/78 ops/s、4 actor P99 32.9/64.3 ms、并发吞吐 193/151 ops/s、读 P50 405/129 μs；原始结果见 `性能报告.md`
+- [x] 2026-08-17 v0.1.35 发布前同条件持久化基准（提交 `6f9174b`）：MyDB 与 MySQL 8.4.11 使用相同 Docker 资源和持久化设置；性能阶段无预热、22.9/60 秒、1 次采样，单表写 179/78 ops/s、4 actor P99 23.1/60.6 ms、并发吞吐 302/150 ops/s、读 P50 340/137 μs；原始结果见 `性能报告.md`
+- [x] 2026-08-15 v0.1.32 同条件持久化基准（提交 `37af36d`）：MyDB 与 MySQL 8.4.11 使用相同 Docker 资源和持久化设置；性能阶段无预热、22.8/60 秒、1 次采样，单表写 206/74 ops/s、4 actor P99 37.5/67.6 ms、并发吞吐 279/140 ops/s、读 P50 265/129 μs；原始结果见 `性能报告.md`
+- [x] 2026-08-15 v0.1.29 同条件持久化基准（提交 `9531f70`）：MyDB 与 MySQL 8.4.11 使用相同 Docker 资源和持久化设置；性能阶段无预热、22.4/60 秒、1 次采样，单表写 216/79 ops/s、4 actor P99 31.7/55.3 ms、并发吞吐 272/148 ops/s、读 P50 401/140 μs；精确命令 `pwsh -File scripts/bench.ps1` 通过，原始结果见 `性能报告.md`
+- [x] 2026-08-15 v0.1.28 同条件持久化基准（提交 `c49d2b7`）：MyDB 与 MySQL 8.4.11 使用相同 Docker 资源和持久化设置；性能阶段无预热、22.2/60 秒、1 次采样，单表写 202/69 ops/s、4 actor P99 36.8/62.6 ms、并发吞吐 328/151 ops/s、读 P50 384/145 μs；精确命令 `pwsh -File scripts/bench.ps1` 通过，原始结果见 `性能报告.md`
+- [x] 2026-08-15 v0.1.27 同条件持久化基准：MyDB 与 MySQL 8.4.11 使用相同 Docker 资源和持久化设置；性能阶段无预热、15.1/60 秒、1 次采样，单表写 212/77 ops/s、4 actor P99 26.1/43.1 ms、并发吞吐 1148/571 ops/s、读 P50 396/140 μs；原始结果见 `性能报告.md`，不硬编码历史比值
+- [x] 2026-08-15 v0.1.26 同条件持久化基准：MyDB 与 MySQL 8.4.11 使用相同 Docker 资源和持久化设置；性能阶段无预热、21.7/60 秒、1 次采样，单表写 221/79 ops/s、4 actor P99 35.6/68.9 ms、并发吞吐 336/151 ops/s、读 P50 279/128 μs；原始结果见 `性能报告.md`，不硬编码历史比值
+- [x] 2026-08-14 Windows 隔离安装回归：管理员本地发布包安装 exit 0，生成 ACL 受限 root/admin 强密钥并创建配置/数据目录；新包仅含 server/cli/migrate/dump，不含 mydb-router
+- [x] 2026-08-14 安装包完整性回归：Linux 容器本地 tar.gz 与 Windows 本地 zip 均完成 `.sha256` 校验、强密钥配置和无 router 文件检查；远程安装路径强制下载 sidecar
 - [ ] 正式 Ubuntu 24.04 物理 linux/amd64 性能结果稳定达到目标；当前证据不足

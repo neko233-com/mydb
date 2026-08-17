@@ -100,6 +100,14 @@ pub fn client_handshake(i: &[u8], after_tls: bool) -> nom::IResult<&[u8], Client
                 (i, &b""[..])
             };
 
+        let mut i = i;
+        if capabilities.contains(CapabilityFlags::CLIENT_CONNECT_ATTRS) && !i.is_empty() {
+            if let Ok((remaining, attrs_len)) = read_length_encoded_number(i) {
+                let take_len = std::cmp::min(attrs_len as usize, remaining.len());
+                i = &remaining[take_len..];
+            }
+        }
+
         Ok((
             i,
             ClientHandshake {
@@ -205,13 +213,37 @@ pub fn send_long_data(i: &[u8]) -> nom::IResult<&[u8], Command<'_>> {
     ))
 }
 
-pub fn parse(i: &[u8]) -> nom::IResult<&[u8], Command<'_>> {
+/// When `CLIENT_QUERY_ATTRIBUTES` is negotiated, a `COM_QUERY` packet carries a
+/// `parameter_count` length-encoded integer immediately after the command byte.
+/// For the common text-protocol query this is `0`, after which the actual SQL
+/// follows directly. Without stripping this prefix the server would treat the
+/// `parameter_count` byte as part of the statement and emit a response the
+/// client cannot parse (e.g. "Malformed packet").
+fn strip_query_attributes(i: &[u8], capabilities: CapabilityFlags) -> &[u8] {
+    if !capabilities.contains(CapabilityFlags::CLIENT_QUERY_ATTRIBUTES) {
+        return i;
+    }
+    match read_length_encoded_number(i) {
+        Ok((rest, count)) if count == 0 => rest,
+        // Non-zero parameter count means inline bound parameters, which this
+        // text-protocol path does not support. Leave the payload untouched so
+        // the statement is rejected gracefully rather than panicking.
+        _ => i,
+    }
+}
+
+pub fn parse(i: &[u8], client_capabilities: CapabilityFlags) -> nom::IResult<&[u8], Command<'_>> {
     use nom::bytes::complete::tag;
     use nom::combinator::{map, rest};
     use nom::sequence::preceded;
     nom::branch::alt((
         map(
-            preceded(tag(&[CommandByte::COM_QUERY as u8]), rest),
+            preceded(
+                tag(&[CommandByte::COM_QUERY as u8]),
+                nom::combinator::map(rest, |i: &[u8]| {
+                    strip_query_attributes(i, client_capabilities)
+                }),
+            ),
             Command::Query,
         ),
         map(

@@ -1,5 +1,11 @@
 # Dependencies
 target/
+target2/
+.compat-target/
+.jdbc_repro/
+data-verify/
+build_output.txt
+build.ps1
 
 # IDE
 .vscode/

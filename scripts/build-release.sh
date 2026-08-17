@@ -6,6 +6,7 @@ set -euo pipefail
 
 VERSION="${1:-}"
 TAG="${2:-}"
+CONFIRM_PUBLISH="${3:-}"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -20,7 +21,7 @@ error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 
 # 检查参数
 if [ -z "$VERSION" ]; then
-    echo "Usage: $0 <version> [tag]"
+    echo "Usage: $0 <version> [tag] [--confirm-publish]"
     echo "Example: $0 0.1.0 v0.1.0"
     exit 1
 fi
@@ -56,16 +57,24 @@ info "Building for: $PLATFORM"
 info "Version: $VERSION"
 info "Tag: $TAG"
 
-# 清理旧的构建
-info "Cleaning old builds..."
-cargo clean --release 2>/dev/null || true
+# Fail before rebuilding if the immutable release already exists.
+if gh release view "$TAG" &> /dev/null; then
+    error "Release $TAG already exists. Refusing to delete or replace it."
+fi
+
+# A release is immutable. Run the same Rust gates required before pushing.
+info "Running Docker Rust quality gate (2 GiB limit)..."
+MYDB_TEST_MEMORY=2g MYDB_TEST_CPUS=2 MYDB_TEST_JOBS=1 \
+    "$PWD/scripts/test-docker.sh"
 
 # 构建 release 版本
 info "Building release..."
-cargo build --release -p mydb-server -p mydb-cli -p mydb-migrate -p mydb-dump
+cargo build --release -p mydb-server -p mydb-migrate -p mydb-dump
+cargo build --release -p mydb-cli --bins
 
 # 创建打包目录
 BUILD_DIR="target/release/package"
+# 仅清理明确的打包目录；保留 Cargo release 缓存，避免测试/增量构建拖慢后续打包。
 rm -rf "$BUILD_DIR"
 mkdir -p "$BUILD_DIR"
 
@@ -73,11 +82,13 @@ mkdir -p "$BUILD_DIR"
 if [ "$OS" = "windows" ]; then
     cp target/release/mydb-server.exe "$BUILD_DIR/"
     cp target/release/mydb-cli.exe "$BUILD_DIR/"
+    cp target/release/mydb.exe "$BUILD_DIR/"
     cp target/release/mydb-migrate.exe "$BUILD_DIR/"
     cp target/release/mydbdump.exe "$BUILD_DIR/"
 else
     cp target/release/mydb-server "$BUILD_DIR/"
     cp target/release/mydb-cli "$BUILD_DIR/"
+    cp target/release/mydb "$BUILD_DIR/"
     cp target/release/mydb-migrate "$BUILD_DIR/"
     cp target/release/mydbdump "$BUILD_DIR/"
 fi
@@ -88,9 +99,13 @@ cp configs/default.yaml "$BUILD_DIR/config.yaml.example"
 # 复制安装脚本
 cp scripts/install.sh "$BUILD_DIR/"
 cp scripts/install.ps1 "$BUILD_DIR/"
+cp scripts/install-silent.vbs "$BUILD_DIR/"
 
 # 复制文档
 cp README.md "$BUILD_DIR/"
+cp CheckList.md "$BUILD_DIR/"
+cp SYNTAX_MATRIX.md "$BUILD_DIR/"
+cp 性能报告.md "$BUILD_DIR/"
 cp LICENSE "$BUILD_DIR/" 2>/dev/null || true
 
 # 打包
@@ -107,15 +122,27 @@ fi
 
 cd ../..
 
-PACKAGE_PATH="target/release/${PACKAGE_NAME}.tar.gz"
+PACKAGE_PATH="target/release/${PACKAGE_FILE#../}"
 PACKAGE_SIZE=$(du -h "$PACKAGE_PATH" | cut -f1)
+CHECKSUM_PATH="${PACKAGE_PATH}.sha256"
+if command -v sha256sum >/dev/null 2>&1; then
+    CHECKSUM=$(sha256sum "$PACKAGE_PATH" | awk '{print $1}')
+else
+    CHECKSUM=$(shasum -a 256 "$PACKAGE_PATH" | awk '{print $1}')
+fi
+printf '%s  %s\n' "$CHECKSUM" "$(basename "$PACKAGE_PATH")" > "$CHECKSUM_PATH"
 
 success "Package created: $PACKAGE_PATH ($PACKAGE_SIZE)"
+success "Checksum created: $CHECKSUM_PATH"
 
-# 检查 tag 是否已存在
-if gh release view "$TAG" &> /dev/null; then
-    warn "Release $TAG already exists. Deleting..."
-    gh release delete "$TAG" -y
+# 发布是不可逆的外部写操作。默认只完成构建和打包，必须由人工显式确认两次。
+if [ "$CONFIRM_PUBLISH" != "--confirm-publish" ]; then
+    warn "Package is ready; GitHub release was NOT created. Re-run with --confirm-publish and type PUBLISH $TAG to publish."
+    exit 0
+fi
+read -r -p "Type PUBLISH $TAG to create the immutable GitHub release: " CONFIRMATION
+if [ "$CONFIRMATION" != "PUBLISH $TAG" ]; then
+    error "Release confirmation did not match; no GitHub tag or assets were created."
 fi
 
 # 创建 release
@@ -123,6 +150,7 @@ info "Creating GitHub release: $TAG"
 gh release create "$TAG" \
     --title "MyDB $VERSION" \
     --notes "MyDB $VERSION - MySQL 8.x compatible database" \
-    "$PACKAGE_PATH"
+    "$PACKAGE_PATH" \
+    "$CHECKSUM_PATH"
 
 success "Release created: https://github.com/neko233-com/mydb/releases/tag/$TAG"

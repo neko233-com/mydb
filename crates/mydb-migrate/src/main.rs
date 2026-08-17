@@ -93,6 +93,9 @@ fn main() -> Result<()> {
     target
         .query_drop(format!("USE {}", quote_ident(&args.database)))
         .context("select target database")?;
+    target
+        .query_drop("SET SESSION FOREIGN_KEY_CHECKS=0")
+        .context("disable target foreign key checks during migration")?;
 
     let source_tables = list_source_tables(&mut source, &args.database)?;
     let tables = choose_tables(source_tables, &args.tables)?;
@@ -160,7 +163,13 @@ fn main() -> Result<()> {
             "ROLLBACK"
         });
     }
+    if migration_result.is_err() {
+        let _ = target.query_drop("SET SESSION FOREIGN_KEY_CHECKS=1");
+    }
     migration_result?;
+    target
+        .query_drop("SET SESSION FOREIGN_KEY_CHECKS=1")
+        .context("restore target foreign key checks")?;
 
     let report = MigrationReport {
         database: args.database,

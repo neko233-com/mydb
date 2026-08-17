@@ -2,10 +2,10 @@
 
 ## 核心定位
 
-**替代 SQLite 的单机高性能数据库，但以 MySQL 的形式与语法暴露接口，追求超高性能。**
+**替代 MySQL 8.4 单机部署的高性能数据库，以 MySQL 的协议与语法暴露接口。**
 
-- 对业务：直接用 MySQL 协议、客户端、DDL/DML 与事务，无需改写 SQL；可作为 SQLite 的高性能、可联网替代。
-- 对内：Rust 实现的 Neko233 引擎（Actor 顺序写、group commit、WAL、copy-on-write），目标在同资源、同持久化级别下显著高于 MySQL/SQLite。
+- 对业务：直接用 MySQL 协议、客户端、DDL/DML 与事务，无需改写 SQL；可作为 MySQL 8.4 的单机替代。
+- 对内：Rust 实现的 Neko233 引擎（Leader/Follower 组提交、group commit、WAL、copy-on-write），目标在同资源、同持久化级别下不低于 MySQL 8.4。
 - **非单机能力明确不支持（设计决定）**：binlog 复制拓扑 / GTID、读写分离、Group Replication / Galera、分布式 XA 两阶段协调、跨节点一致性。单机版本地 XA 与复制 SHOW 表面作为兼容 no-op 保留。
 - 专为游戏行业写多读少、低交互延迟、低资源常驻场景优化。
 
@@ -252,7 +252,7 @@ memory:
 - [x] HTTP API 框架
 - [x] 认证与授权
 - [x] 配置热重载
-- [x] 备份管理接口（actor 屏障全量、CRC/LSN 增量、父链校验、RFC3339 PITR、重启前安全恢复）
+- [x] 备份管理接口（组提交屏障全量、CRC/LSN 增量、父链校验、RFC3339 PITR、重启前安全恢复）
 - [x] 内存监控接口
 
 ### Phase 4: Agent 支持

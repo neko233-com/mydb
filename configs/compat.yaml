@@ -1,0 +1,71 @@
+# MyDB 兼容模式配置
+# 用于与本机 MySQL 同时运行，使用非默认端口 13308
+# 启动方式：mydb-server --config configs/compat.yaml
+# JDBC URL: jdbc:mysql://127.0.0.1:13308
+# mysql cli: mysql -h 127.0.0.1 -P 13308 -u root -proot
+
+server:
+  host: "0.0.0.0"
+  port: 13308
+  max_connections: 1000
+  thread_count: 0
+  connect_timeout: 10
+  interactive_timeout: 28800
+
+http:
+  port: 14308
+  host: "127.0.0.1"
+  admin_username: "root"
+  admin_password: "root"
+  enabled: true
+
+storage:
+  # Windows 默认数据目录；Linux/macOS 请改为 ~/.mydb 或自定义路径
+  data_dir: "./data-compat"
+  engine: "neko233"
+  buffer_pool_size: "800M"
+  log_file_size: "256M"
+  page_size: 16384
+  group_commit_window_us: 250
+
+memory:
+  max_memory: "1G"
+  query_cache_size: "64M"
+  sort_buffer_size: "4M"
+
+security:
+  default_username: "root"
+  default_password: "root"
+  # 仅使用 mysql_native_password，最大兼容各种 GUI/CLI/JDBC 客户端
+  authentication: "mysql_native_password"
+  # 兼容模式不强制 TLS，JDBC/IDEA/Navicat 等可直接 useSSL=false 连接
+  require_secure_transport: false
+  tls_cert: null
+  tls_key: null
+  password_lifetime: 0
+  # 兼容模式使用弱密码策略，方便开发调试
+  enforce_strong_passwords: false
+  local_infile: true
+  secure_file_priv: null
+  max_load_data_size: 1073741824
+
+backup:
+  backup_dir: "./data-compat/backups"
+  auto_backup_interval: 0
+  max_backups: 10
+
+logging:
+  level: "info"
+  file: ""
+  max_size: "100M"
+  max_files: 10
+
+character_set:
+  server: "utf8mb4"
+  connection: "utf8mb4"
+  results: "utf8mb4"
+
+agent:
+  enabled: true
+  slow_query_threshold_ms: 100
+  max_slow_queries: 1024

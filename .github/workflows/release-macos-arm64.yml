@@ -1,0 +1,64 @@
+name: Build macOS arm64 release asset
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing GitHub Release tag to receive the asset
+        required: true
+        default: v0.1.36
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    # macos-14 is the Apple Silicon hosted runner. Building here produces a
+    # native Mach-O arm64 binary instead of an unverified cross-compiled file.
+    runs-on: macos-14
+    steps:
+      - name: Check out the requested release source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binaries
+        run: |
+          cargo build --release --locked \
+            -p mydb-server -p mydb-cli -p mydb-migrate -p mydb-dump
+
+      - name: Package and checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_dir="target/release/package-macos-aarch64"
+          mkdir -p "$package_dir"
+          cp target/release/mydb-server \
+             target/release/mydb-cli \
+             target/release/mydb \
+             target/release/mydb-migrate \
+             target/release/mydbdump "$package_dir/"
+          cp configs/default.yaml "$package_dir/config.yaml.example"
+          cp scripts/install.sh scripts/install.ps1 scripts/install-silent.vbs \
+             README.md CheckList.md SYNTAX_MATRIX.md 性能报告.md LICENSE "$package_dir/"
+          tar -czf target/release/mydb-macos-aarch64.tar.gz \
+            -C "$package_dir" .
+          shasum -a 256 target/release/mydb-macos-aarch64.tar.gz \
+            | awk '{print $1 "  mydb-macos-aarch64.tar.gz"}' \
+            > target/release/mydb-macos-aarch64.tar.gz.sha256
+          file target/release/package-macos-aarch64/mydb-server
+          test "$(uname -m)" = "arm64"
+
+      - name: Upload to the existing release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release view "$TAG" >/dev/null
+          gh release upload "$TAG" \
+            target/release/mydb-macos-aarch64.tar.gz \
+            target/release/mydb-macos-aarch64.tar.gz.sha256

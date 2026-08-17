@@ -44,7 +44,7 @@ $mysqlContainer = "mysql80-io-desktop"
 $mydbVolume = "mydb-io-desktop-data"
 $mysqlVolume = "mysql80-io-desktop-data"
 $mydbPort = 13316
-$mysqlPort = 13306
+$mysqlPort = 13307
 $mydbHttpPort = 14316
 
 function Assert-Exit([string]$message) {

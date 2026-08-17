@@ -6,6 +6,8 @@ use mysql::{prelude::Queryable, Conn, Opts, OptsBuilder, Value as MysqlValue};
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+mod update;
+
 #[derive(Subcommand, Debug)]
 enum CliCommand {
     /// Native Agent diagnostics over the local management API
@@ -17,6 +19,9 @@ enum CliCommand {
         #[arg(long, action = clap::ArgAction::SetTrue)]
         help: bool,
     },
+
+    /// Download, verify, and install the newest MyDB release.
+    Update(update::UpdateOptions),
 }
 
 #[derive(Subcommand, Debug)]
@@ -108,28 +113,36 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    if let Some(CliCommand::Agent { command, help }) = &args.command {
-        if *help || command.is_none() {
-            let mut root = Args::command();
-            root.find_subcommand_mut("agent")
-                .expect("agent subcommand is defined")
-                .print_help()?;
-            println!();
+    match &args.command {
+        Some(CliCommand::Agent { command, help }) => {
+            if *help || command.is_none() {
+                let mut root = Args::command();
+                root.find_subcommand_mut("agent")
+                    .expect("agent subcommand is defined")
+                    .print_help()?;
+                println!();
+                return Ok(());
+            }
+            let admin_password = args
+                .admin_password
+                .as_deref()
+                .or(args.password.as_deref())
+                .unwrap_or("root");
+            run_agent_command(
+                &args.host,
+                args.http_port,
+                &args.user,
+                admin_password,
+                command.as_ref().expect("checked above"),
+            )
+            .await?;
             return Ok(());
         }
-        let admin_password = args
-            .admin_password
-            .as_deref()
-            .or(args.password.as_deref())
-            .unwrap_or("root");
-        run_agent_command(
-            &args.host,
-            args.http_port,
-            admin_password,
-            command.as_ref().expect("checked above"),
-        )
-        .await?;
-        return Ok(());
+        Some(CliCommand::Update(options)) => {
+            update::run(options)?;
+            return Ok(());
+        }
+        None => {}
     }
 
     let password = match args.password.clone() {
@@ -419,6 +432,7 @@ fn split_sql(script: &str) -> Result<(Vec<String>, String)> {
 async fn run_agent_command(
     host: &str,
     port: u16,
+    username: &str,
     password: &str,
     command: &AgentCommand,
 ) -> Result<()> {
@@ -437,7 +451,8 @@ async fn run_agent_command(
         ),
         AgentCommand::Optimize { sql } => ("POST", "/api/v1/agent/sql", Some(json!({"sql": sql}))),
     };
-    let response = agent_http_request(host, port, password, method, path, body.as_ref()).await?;
+    let response =
+        agent_http_request(host, port, username, password, method, path, body.as_ref()).await?;
     println!("{}", serde_json::to_string_pretty(&response)?);
     Ok(())
 }
@@ -445,7 +460,32 @@ async fn run_agent_command(
 async fn agent_http_request(
     host: &str,
     port: u16,
+    username: &str,
     password: &str,
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+) -> Result<Value> {
+    let login = agent_http_request_with_token(
+        host,
+        port,
+        None,
+        "POST",
+        "/api/v1/auth/login",
+        Some(&json!({"username": username, "password": password})),
+    )
+    .await?;
+    let token = login
+        .get("token")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("Auth API returned no session token"))?;
+    agent_http_request_with_token(host, port, Some(token), method, path, body).await
+}
+
+async fn agent_http_request_with_token(
+    host: &str,
+    port: u16,
+    token: Option<&str>,
     method: &str,
     path: &str,
     body: Option<&Value>,
@@ -457,8 +497,11 @@ async fn agent_http_request(
     let mut stream = tokio::net::TcpStream::connect((host, port))
         .await
         .with_context(|| format!("cannot connect to Agent API at {host}:{port}"))?;
+    let authorization = token
+        .map(|token| format!("Authorization: Bearer {token}\r\n"))
+        .unwrap_or_default();
     let request = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\nAuthorization: Bearer {password}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\n{authorization}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         payload.len()
     );
     stream.write_all(request.as_bytes()).await?;
@@ -579,5 +622,16 @@ mod tests {
             format_mysql_value(&MysqlValue::Bytes(vec![0, 0xff])),
             "0x00ff"
         );
+    }
+
+    #[test]
+    fn parses_update_command_without_sql_credentials() {
+        let args = Args::try_parse_from(["mydb", "update", "--check", "--version", "v0.1.5"])
+            .expect("update command should parse without a database password");
+        let Some(CliCommand::Update(options)) = args.command else {
+            panic!("expected update command");
+        };
+        assert!(options.check);
+        assert_eq!(options.version, "v0.1.5");
     }
 }

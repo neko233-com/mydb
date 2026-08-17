@@ -31,10 +31,10 @@ memory:
 security:
   default_username: "root"
   default_password: "root"
-  authentication: "mysql_native_password"
+  authentication: "caching_sha2_password"
   require_secure_transport: false
   password_lifetime: 0
-  enforce_strong_passwords: true
+  enforce_strong_passwords: false
   local_infile: true
   secure_file_priv: "/var/lib/mydb/imports"
   max_load_data_size: 1073741824

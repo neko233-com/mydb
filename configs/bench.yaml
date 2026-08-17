@@ -1,0 +1,65 @@
+# MyDB Benchmark Configuration
+# Used by scripts/run_compare.py and manual benchmarking. Listens on a
+# non-default port so it never collides with the native MySQL on 3306.
+
+server:
+  host: "0.0.0.0"
+  port: 13307
+  max_connections: 1000
+  thread_count: 0
+  connect_timeout: 10
+  interactive_timeout: 28800
+
+http:
+  port: 14307
+  host: "127.0.0.1"
+  admin_username: "root"
+  admin_password: "root"
+  enabled: true
+
+storage:
+  data_dir: "D:/Code/neko233-Projects/mydb/target/bench_data"
+  engine: "neko233"
+  buffer_pool_size: "800M"
+  log_file_size: "256M"
+  page_size: 16384
+  group_commit_window_us: 250
+
+memory:
+  max_memory: "1G"
+  query_cache_size: "64M"
+  sort_buffer_size: "4M"
+
+security:
+  default_username: "root"
+  default_password: "root"
+  authentication: "caching_sha2_password"
+  require_secure_transport: false
+  tls_cert: null
+  tls_key: null
+  password_lifetime: 0
+  enforce_strong_passwords: false
+  local_infile: true
+  secure_file_priv: null
+  max_load_data_size: 1073741824
+
+backup:
+  backup_dir: "D:/Code/neko233-Projects/mydb/target/bench_data/backups"
+  auto_backup_interval: 0
+  max_backups: 10
+
+logging:
+  level: "info"
+  file: ""
+  max_size: "100M"
+  max_files: 10
+
+character_set:
+  server: "utf8mb4"
+  connection: "utf8mb4"
+  results: "utf8mb4"
+
+agent:
+  enabled: true
+  slow_query_threshold_ms: 100
+  max_slow_queries: 1024

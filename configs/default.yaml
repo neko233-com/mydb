@@ -16,10 +16,10 @@ server:
   interactive_timeout: 28800
 
 http:
-  # HTTP 管理 API 端口
+  # Web 管理 API / SQL IDE 端口；3306 专用于 MySQL 协议
   port: 4306
-  # 监听地址（仅内网）
-  host: "127.0.0.1"
+  # 监听地址（内网可访问；公网部署请用防火墙/TLS限制来源）
+  host: "0.0.0.0"
   # 管理员用户名
   admin_username: "root"
   # 管理员密码
@@ -38,7 +38,7 @@ storage:
   log_file_size: "256M"
   # 页大小
   page_size: 16384
-  # group commit 收集窗口（微秒；0 = 不等待）
+  # 吞吐默认收集窗口（微秒；0 = 低延迟自然批量）
   group_commit_window_us: 250
 
 memory:
@@ -55,7 +55,8 @@ security:
   # MySQL 协议默认密码
   default_password: "root"
   # 认证方式
-  authentication: "mysql_native_password"
+  # MySQL 8.4 默认认证插件；mysql_native_password 仍可显式配置
+  authentication: "caching_sha2_password"
   # 是否要求安全传输
   require_secure_transport: false
   # MySQL STARTTLS PEM 证书和私钥；两项同时设置后服务广告 CLIENT_SSL

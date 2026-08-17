@@ -1,5 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
+use mydb_parser::Parser as SqlParser;
 use tracing::info;
 
 #[derive(Parser, Debug)]
@@ -26,9 +27,8 @@ async fn main() -> Result<()> {
 
     if let Some(query) = &args.query {
         info!("Parsing query: {}", query);
-        // TODO: Implement SQL parsing
-        println!("Query: {}", query);
-        println!("Status: Parser not yet implemented");
+        let statement = SqlParser::new().parse(query)?;
+        println!("Parsed: {statement}");
     } else if args.interactive {
         println!("MyDB Parser Interactive Mode");
         println!("Type SQL queries or 'quit' to exit.");
@@ -49,7 +49,10 @@ async fn main() -> Result<()> {
             }
 
             info!("Parsing: {}", input);
-            println!("Parsed: {}", input);
+            match SqlParser::new().parse(input) {
+                Ok(statement) => println!("Parsed: {statement}"),
+                Err(error) => eprintln!("{error}"),
+            }
         }
     } else {
         println!("MyDB SQL Parser");

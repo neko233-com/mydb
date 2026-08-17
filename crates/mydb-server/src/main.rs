@@ -1,22 +1,29 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(target_os = "windows")]
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use axum::extract::{Path as AxumPath, State};
+use axum::extract::{Path as AxumPath, Query as AxumQuery, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use clap::Parser;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+#[cfg(target_os = "windows")]
+use tokio::sync::Notify;
 use tokio::sync::Semaphore;
 use tower_http::trace::TraceLayer;
 use tracing::info;
+
+#[cfg(target_os = "windows")]
+static WINDOWS_SHUTDOWN: OnceLock<Arc<Notify>> = OnceLock::new();
 
 #[derive(Parser, Debug)]
 #[command(
@@ -41,6 +48,10 @@ struct Args {
     #[arg(short, long)]
     port: Option<u16>,
 
+    /// Override listen host/address (use 0.0.0.0 for remote clients)
+    #[arg(long)]
+    host: Option<String>,
+
     /// Override data directory
     #[arg(long)]
     data_dir: Option<PathBuf>,
@@ -62,6 +73,81 @@ struct AdminState {
     config: Arc<RwLock<mydb_config::ServerConfig>>,
     config_path: Option<PathBuf>,
     started: Instant,
+    sessions: Arc<parking_lot::Mutex<HashMap<String, AdminSession>>>,
+    login_rate_limiter: Arc<parking_lot::Mutex<LoginRateLimiter>>,
+}
+
+#[derive(Debug, Clone)]
+struct AdminSession {
+    expires_at: Instant,
+    sql_user: String,
+}
+
+const LOGIN_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+const LOGIN_USER_FAILURE_LIMIT: u32 = 5;
+const LOGIN_GLOBAL_FAILURE_LIMIT: u32 = 100;
+
+#[derive(Debug)]
+struct LoginAttempt {
+    window_started: Instant,
+    failures: u32,
+}
+
+#[derive(Debug, Default)]
+struct LoginRateLimiter {
+    users: HashMap<String, LoginAttempt>,
+    global: Option<LoginAttempt>,
+}
+
+impl LoginRateLimiter {
+    fn refresh(&mut self, now: Instant) {
+        self.users
+            .retain(|_, attempt| now.duration_since(attempt.window_started) < LOGIN_WINDOW);
+        if self
+            .global
+            .as_ref()
+            .is_some_and(|attempt| now.duration_since(attempt.window_started) >= LOGIN_WINDOW)
+        {
+            self.global = None;
+        }
+    }
+
+    fn allow(&mut self, username: &str) -> bool {
+        let now = Instant::now();
+        self.refresh(now);
+        let user_allowed = self
+            .users
+            .get(username)
+            .is_none_or(|attempt| attempt.failures < LOGIN_USER_FAILURE_LIMIT);
+        let global_allowed = self
+            .global
+            .as_ref()
+            .is_none_or(|attempt| attempt.failures < LOGIN_GLOBAL_FAILURE_LIMIT);
+        user_allowed && global_allowed
+    }
+
+    fn failed(&mut self, username: &str) {
+        let now = Instant::now();
+        self.refresh(now);
+        let attempt = self
+            .users
+            .entry(username.to_string())
+            .or_insert(LoginAttempt {
+                window_started: now,
+                failures: 0,
+            });
+        attempt.failures = attempt.failures.saturating_add(1);
+        let global = self.global.get_or_insert(LoginAttempt {
+            window_started: now,
+            failures: 0,
+        });
+        global.failures = global.failures.saturating_add(1);
+    }
+
+    fn succeeded(&mut self, username: &str) {
+        self.refresh(Instant::now());
+        self.users.remove(username);
+    }
 }
 
 fn main() -> Result<()> {
@@ -72,6 +158,11 @@ fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+
+    #[cfg(target_os = "windows")]
+    if args.service.as_deref() == Some("run") {
+        return run_windows_service();
+    }
 
     if args.healthcheck {
         let address = "127.0.0.1:3306".parse()?;
@@ -120,6 +211,9 @@ fn main() -> Result<()> {
     if let Some(port) = args.port {
         config.server.port = port;
     }
+    if let Some(host) = &args.host {
+        config.server.host = host.clone();
+    }
     if let Some(data_dir) = &args.data_dir {
         config.storage.data_dir = data_dir.clone();
     }
@@ -150,6 +244,24 @@ fn runtime_worker_threads(configured: u32) -> usize {
         .unwrap_or(1)
 }
 
+async fn bind_http_listener(
+    config: &mydb_config::ServerConfig,
+) -> Result<Option<tokio::net::TcpListener>> {
+    if !config.http.enabled {
+        return Ok(None);
+    }
+    let address = format!("{}:{}", config.http.host, config.http.port);
+    let listener = tokio::net::TcpListener::bind(&address)
+        .await
+        .with_context(|| {
+            format!(
+            "failed to bind HTTP management listener at {address}; port {} may already be in use",
+            config.http.port
+        )
+        })?;
+    Ok(Some(listener))
+}
+
 async fn run_server(args: Args, config: mydb_config::ServerConfig) -> Result<()> {
     // Ensure data directory exists
     std::fs::create_dir_all(&config.storage.data_dir)?;
@@ -163,22 +275,16 @@ async fn run_server(args: Args, config: mydb_config::ServerConfig) -> Result<()>
     info!("Storage engine: {}", config.storage.engine);
 
     // Initialize storage engine with WAL
-    let storage = Arc::new(
-        mydb_storage::StorageEngineManager::try_new_with_group_commit_window(
-            config.storage.data_dir.clone(),
-            config.storage.page_size as usize,
-            &config.storage.buffer_pool_size,
-            std::time::Duration::from_micros(config.storage.group_commit_window_us),
-        )?,
-    );
+    let storage = Arc::new(mydb_storage::StorageEngineManager::try_new_sharded(
+        config.storage.data_dir.clone(),
+        config.storage.page_size as usize,
+        &config.storage.buffer_pool_size,
+        std::time::Duration::from_micros(config.storage.group_commit_window_us),
+        config.storage.shard_count,
+    )?);
 
     // Initialize storage (load databases, replay WAL)
     storage.init().await?;
-
-    // Create default "mydb" database if it doesn't exist
-    if storage.get_database("mydb").is_none() {
-        storage.create_database("mydb").await?;
-    }
 
     // Authentication is configured before accepting connections. Never log secrets.
     info!(
@@ -188,9 +294,14 @@ async fn run_server(args: Args, config: mydb_config::ServerConfig) -> Result<()>
     info!("HTTP management API port: {}", config.http.port);
 
     let wire_stats = Arc::new(mydb_wire::WireStats::default());
+    wire_stats.initialize_xa_catalog(config.storage.data_dir.join("xa"), storage.as_ref())?;
     let protocol_config = Arc::new(RwLock::new(protocol_config_for(&config)?));
+    let sessions = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    let login_rate_limiter = Arc::new(parking_lot::Mutex::new(LoginRateLimiter::default()));
 
-    if config.http.enabled {
+    let http_listener = bind_http_listener(&config).await?;
+
+    if let Some(listener) = http_listener {
         let state = AdminState {
             storage: storage.clone(),
             wire_stats: wire_stats.clone(),
@@ -198,10 +309,11 @@ async fn run_server(args: Args, config: mydb_config::ServerConfig) -> Result<()>
             config: Arc::new(RwLock::new(config.clone())),
             config_path: args.config.clone(),
             started: Instant::now(),
+            sessions: sessions.clone(),
+            login_rate_limiter,
         };
-        let address = format!("{}:{}", config.http.host, config.http.port);
         tokio::spawn(async move {
-            if let Err(error) = run_admin_server(&address, state).await {
+            if let Err(error) = run_admin_server(listener, state).await {
                 tracing::error!("HTTP management server stopped: {}", error);
             }
         });
@@ -285,6 +397,15 @@ async fn run_server(args: Args, config: mydb_config::ServerConfig) -> Result<()>
 }
 
 fn validate_runtime_security(config: &mydb_config::ServerConfig) -> Result<()> {
+    if !matches!(
+        config.security.authentication.as_str(),
+        "mysql_native_password" | "caching_sha2_password"
+    ) {
+        anyhow::bail!(
+            "unsupported authentication plugin '{}'; use mysql_native_password or caching_sha2_password",
+            config.security.authentication
+        );
+    }
     if config.security.tls_cert.is_some() != config.security.tls_key.is_some() {
         anyhow::bail!("tls_cert and tls_key must be configured together");
     }
@@ -340,10 +461,15 @@ fn protocol_config_for(config: &mydb_config::ServerConfig) -> Result<mydb_wire::
     Ok(mydb_wire::ProtocolConfig {
         username: config.security.default_username.clone(),
         password: config.security.default_password.clone(),
-        default_database: "mydb".to_string(),
+        authentication: config.security.authentication.clone(),
+        default_sql_mode: mydb_wire::MYSQL84_DEFAULT_SQL_MODE.to_string(),
+        // MySQL leaves the session schema unset when the handshake omits
+        // CLIENT_CONNECT_WITH_DB. The client must issue USE or provide a DSN
+        // database.
+        default_database: String::new(),
         slow_query_threshold_ms: config.agent.slow_query_threshold_ms,
         max_slow_queries: config.agent.max_slow_queries,
-        lock_wait_timeout_ms: 5_000,
+        lock_wait_timeout_ms: mydb_wire::MYSQL84_DEFAULT_INNODB_LOCK_WAIT_TIMEOUT_SECONDS * 1_000,
         local_infile: config.security.local_infile,
         secure_file_priv,
         max_load_data_size: config.security.max_load_data_size,
@@ -392,13 +518,26 @@ async fn shutdown_signal() {
 
     #[cfg(not(unix))]
     {
+        #[cfg(target_os = "windows")]
+        if let Some(notify) = WINDOWS_SHUTDOWN.get() {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {},
+                _ = notify.notified() => {},
+            }
+            return;
+        }
         let _ = tokio::signal::ctrl_c().await;
     }
 }
 
-async fn run_admin_server(address: &str, state: AdminState) -> Result<()> {
+async fn run_admin_server(listener: tokio::net::TcpListener, state: AdminState) -> Result<()> {
     let app = Router::new()
+        .route("/", get(admin_ui))
+        .route("/admin", get(admin_ui))
+        .route("/admin/doc", get(admin_doc))
         .route("/metrics", get(metrics))
+        .route("/api/v1/auth/login", post(auth_login))
+        .route("/api/v1/auth/logout", post(auth_logout))
         .route("/api/v1/status", get(status))
         .route("/api/v1/config", get(get_config).put(put_config))
         .route("/api/v1/config/reload", post(reload_config))
@@ -418,9 +557,10 @@ async fn run_admin_server(address: &str, state: AdminState) -> Result<()> {
         .route("/api/v1/agent/ask", post(agent_diagnose))
         .route("/api/v1/agent/diagnose", post(agent_diagnose))
         .route("/api/v1/agent/sql", post(agent_sql_debug))
+        .route("/api/v1/sql/query", post(sql_query))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
-    let listener = tokio::net::TcpListener::bind(address).await?;
+    let address = listener.local_addr()?;
     info!(
         "HTTP management and Prometheus metrics listening on {}",
         address
@@ -429,16 +569,160 @@ async fn run_admin_server(address: &str, state: AdminState) -> Result<()> {
     Ok(())
 }
 
-fn authorize(headers: &HeaderMap, state: &AdminState) -> Result<(), StatusCode> {
-    let expected = format!("Bearer {}", state.config.read().http.admin_password);
-    let actual = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok());
-    if actual.is_some_and(|actual| constant_time_eq(expected.as_bytes(), actual.as_bytes())) {
-        Ok(())
-    } else {
-        Err(StatusCode::UNAUTHORIZED)
+async fn admin_ui() -> impl IntoResponse {
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        include_str!("admin.html"),
+    )
+}
+
+async fn admin_doc() -> impl IntoResponse {
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        include_str!("admin_doc.html"),
+    )
+}
+
+#[derive(Debug, Deserialize)]
+struct LoginRequest {
+    username: String,
+    password: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SqlQueryRequest {
+    sql: String,
+    database: Option<String>,
+}
+
+async fn auth_login(
+    State(state): State<AdminState>,
+    Json(request): Json<LoginRequest>,
+) -> Result<Json<Value>, StatusCode> {
+    if request.username.len() > 512 || request.password.len() > 4096 {
+        return Err(StatusCode::UNAUTHORIZED);
     }
+    if !state.login_rate_limiter.lock().allow(&request.username) {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+    let config = state.config.read().clone();
+    let valid_user = constant_time_eq(
+        request.username.as_bytes(),
+        config.http.admin_username.as_bytes(),
+    );
+    let valid_password = constant_time_eq(
+        request.password.as_bytes(),
+        config.http.admin_password.as_bytes(),
+    );
+    let database_user = state
+        .protocol_config
+        .read()
+        .auth_catalog
+        .verify_password(&request.username, &request.password);
+    if (!valid_user || !valid_password) && database_user.is_none() {
+        state.login_rate_limiter.lock().failed(&request.username);
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    state.login_rate_limiter.lock().succeeded(&request.username);
+    let sql_user = database_user.unwrap_or(config.security.default_username.clone());
+    let token = uuid::Uuid::new_v4().to_string();
+    let expires_at = Instant::now() + std::time::Duration::from_secs(12 * 60 * 60);
+    let mut sessions = state.sessions.lock();
+    sessions.retain(|_, session| session.expires_at > Instant::now());
+    sessions.insert(
+        token.clone(),
+        AdminSession {
+            expires_at,
+            sql_user,
+        },
+    );
+    Ok(Json(json!({
+        "token": token,
+        "expires_in_seconds": 12 * 60 * 60,
+        "username": request.username,
+    })))
+}
+
+async fn auth_logout(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, StatusCode> {
+    let token = bearer_token(&headers).ok_or(StatusCode::UNAUTHORIZED)?;
+    state.sessions.lock().remove(token);
+    Ok(Json(json!({"logged_out": true})))
+}
+
+async fn sql_query(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Json(request): Json<SqlQueryRequest>,
+) -> std::result::Result<Json<mydb_wire::AdminSqlResult>, axum::response::Response> {
+    let sql = request.sql.trim();
+    if sql.is_empty() || sql.len() > 4 * 1024 * 1024 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "SQL must contain 1..4194304 bytes",
+                "code": "ER_BAD_REQUEST"
+            })),
+        )
+            .into_response());
+    }
+    let protocol_config = Arc::new(state.protocol_config.read().clone());
+    let sql_user = authorized_identity(&headers, &state).map_err(IntoResponse::into_response)?;
+    let result = mydb_wire::execute_admin_sql(
+        state.storage.clone(),
+        protocol_config,
+        state.wire_stats.clone(),
+        &sql_user,
+        request.database.as_deref(),
+        sql,
+    )
+    .await
+    .map_err(|error| {
+        let message = error.to_string();
+        tracing::warn!(error = %message, sql = %sql, "Admin SQL failed");
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "error": message,
+                "code": "ER_ADMIN_SQL"
+            })),
+        )
+            .into_response()
+    })?;
+    Ok(Json(result))
+}
+
+fn authorize(headers: &HeaderMap, state: &AdminState) -> Result<(), StatusCode> {
+    authorized_identity(headers, state).map(|_| ())
+}
+
+fn authorized_identity(headers: &HeaderMap, state: &AdminState) -> Result<String, StatusCode> {
+    let Some(token) = bearer_token(headers) else {
+        return Err(StatusCode::UNAUTHORIZED);
+    };
+    let config = state.config.read().clone();
+    if legacy_admin_bearer_matches(&config, token) {
+        return Ok(config.security.default_username);
+    }
+    let mut sessions = state.sessions.lock();
+    let Some(session) = sessions.get(token).cloned() else {
+        return Err(StatusCode::UNAUTHORIZED);
+    };
+    if session.expires_at <= Instant::now() {
+        sessions.remove(token);
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    Ok(session.sql_user)
+}
+
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .filter(|token| !token.is_empty())
 }
 
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
@@ -450,6 +734,11 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     difference == 0
 }
 
+fn legacy_admin_bearer_matches(config: &mydb_config::ServerConfig, token: &str) -> bool {
+    !config.security.enforce_strong_passwords
+        && constant_time_eq(config.http.admin_password.as_bytes(), token.as_bytes())
+}
+
 fn authorize_agent(headers: &HeaderMap, state: &AdminState) -> Result<(), StatusCode> {
     if !state.config.read().agent.enabled {
         return Err(StatusCode::NOT_FOUND);
@@ -457,7 +746,10 @@ fn authorize_agent(headers: &HeaderMap, state: &AdminState) -> Result<(), Status
     authorize(headers, state)
 }
 
-async fn metrics(State(state): State<AdminState>) -> impl IntoResponse {
+async fn metrics(State(state): State<AdminState>, headers: HeaderMap) -> Response {
+    if authorize(&headers, &state).is_err() {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
     let wire = state.wire_stats.snapshot();
     let storage = state.storage.stats();
     let audit = state.protocol_config.read().audit_log.snapshot();
@@ -484,7 +776,7 @@ async fn metrics(State(state): State<AdminState>) -> impl IntoResponse {
             "# TYPE mydb_storage_reads_total counter\nmydb_storage_reads_total {}\n",
             "# TYPE mydb_storage_write_batches_total counter\nmydb_storage_write_batches_total {}\n",
             "# TYPE mydb_storage_errors_total counter\nmydb_storage_errors_total {}\n",
-            "# TYPE mydb_write_actor_queue_depth gauge\nmydb_write_actor_queue_depth {}\n",
+            "# TYPE mydb_write_commit_queue_depth gauge\nmydb_write_commit_queue_depth {}\n",
             "# TYPE mydb_buffer_pool_pages gauge\nmydb_buffer_pool_pages {}\n",
             "# TYPE mydb_group_commits_total counter\nmydb_group_commits_total {}\n",
             "# TYPE mydb_grouped_requests_total counter\nmydb_grouped_requests_total {}\n",
@@ -514,7 +806,7 @@ async fn metrics(State(state): State<AdminState>) -> impl IntoResponse {
         storage.reads,
         storage.writes,
         storage.errors,
-        storage.actor_queue_depth,
+        storage.commit_queue_depth,
         storage.buffer_pool_pages,
         storage.group_commits,
         storage.grouped_requests,
@@ -535,6 +827,7 @@ async fn metrics(State(state): State<AdminState>) -> impl IntoResponse {
         ],
         body,
     )
+        .into_response()
 }
 
 async fn status(
@@ -627,6 +920,7 @@ fn apply_runtime_config(
     let protocol = protocol_config_for(&candidate)?;
     *state.protocol_config.write() = protocol;
     *state.config.write() = candidate;
+    state.sessions.lock().clear();
     Ok(())
 }
 
@@ -661,7 +955,7 @@ async fn memory_stats(
         "max_memory": config.memory.max_memory,
         "buffer_pool_size": config.storage.buffer_pool_size,
         "buffer_pool_pages": stats.buffer_pool_pages,
-        "actor_queue_depth": stats.actor_queue_depth,
+        "commit_queue_depth": stats.commit_queue_depth,
     })))
 }
 
@@ -742,12 +1036,27 @@ async fn connections(
     })))
 }
 
+#[derive(Debug, Deserialize)]
+struct KillConnectionRequest {
+    connection_id: u32,
+}
+
 async fn kill_connection(
     State(state): State<AdminState>,
     headers: HeaderMap,
+    Json(request): Json<KillConnectionRequest>,
 ) -> Result<Json<Value>, StatusCode> {
     authorize(&headers, &state)?;
-    Err(StatusCode::NOT_IMPLEMENTED)
+    if request.connection_id == 0 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    if !state.wire_stats.kill_connection(request.connection_id) {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    Ok(Json(json!({
+        "connection_id": request.connection_id,
+        "killed": true,
+    })))
 }
 
 const BACKUP_FORMAT_VERSION: u32 = 1;
@@ -783,6 +1092,27 @@ struct RestoreRequest {
     id: String,
     #[serde(default)]
     point_in_time: Option<String>,
+    #[serde(default)]
+    confirmation: String,
+}
+
+const DELETE_BACKUP_CONFIRMATION_PREFIX: &str = "DELETE_BACKUP:";
+const RESTORE_BACKUP_CONFIRMATION_PREFIX: &str = "RESTORE_BACKUP:";
+
+fn confirmation_matches(value: Option<&str>, prefix: &str, id: &str) -> bool {
+    value.is_some_and(|value| value == format!("{prefix}{id}"))
+}
+
+fn record_admin_event(state: &AdminState, user: &str, event: &str, outcome: &str) {
+    if let Err(error) =
+        state
+            .protocol_config
+            .read()
+            .audit_log
+            .record(event, user, "ADMIN_API", outcome)
+    {
+        tracing::warn!(event, error = %error, "management audit event rejected");
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -978,8 +1308,17 @@ async fn backup_delete(
     headers: HeaderMap,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<Value>, StatusCode> {
-    authorize(&headers, &state)?;
+    let user = authorized_identity(&headers, &state)?;
     validate_backup_id(&id)?;
+    if !confirmation_matches(
+        headers
+            .get("x-mydb-confirm")
+            .and_then(|value| value.to_str().ok()),
+        DELETE_BACKUP_CONFIRMATION_PREFIX,
+        &id,
+    ) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
     let backup_root = state.config.read().backup.backup_dir.clone();
     let path = backup_root.join(&id);
     if !path.exists() {
@@ -1003,6 +1342,7 @@ async fn backup_delete(
     tokio::fs::remove_dir_all(path)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    record_admin_event(&state, &user, "backup.delete", "success");
     Ok(Json(json!({"deleted": id})))
 }
 
@@ -1011,8 +1351,15 @@ async fn backup_restore(
     headers: HeaderMap,
     Json(request): Json<RestoreRequest>,
 ) -> Result<Json<Value>, StatusCode> {
-    authorize(&headers, &state)?;
+    let user = authorized_identity(&headers, &state)?;
     validate_backup_id(&request.id)?;
+    if !confirmation_matches(
+        Some(request.confirmation.as_str()),
+        RESTORE_BACKUP_CONFIRMATION_PREFIX,
+        &request.id,
+    ) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
     let backup_root = state.config.read().backup.backup_dir.clone();
     let chain = build_backup_chain(&backup_root, &request.id).map_err(|_| StatusCode::CONFLICT)?;
     let target_lsn =
@@ -1029,6 +1376,7 @@ async fn backup_restore(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    record_admin_event(&state, &user, "backup.restore", "staged");
     Ok(Json(json!({
         "staged": request.id,
         "chain": chain.iter().map(|backup| backup.id.as_str()).collect::<Vec<_>>(),
@@ -1213,10 +1561,18 @@ fn apply_pending_restore(config: &mydb_config::ServerConfig) -> Result<()> {
     clear_restore_destination(data_dir, backup_root, &marker)?;
     copy_directory(&backup_root.join(&full.id).join("data"), data_dir, None)?;
     let wal_dir = data_dir.join("wal");
+    // The full backup copies every shard's WAL; `max_lsn` over the sharded
+    // layout yields the global high-water mark, which must equal `full.to_lsn`.
     let mut installed_lsn = mydb_wal::WalReader::open(wal_dir.clone())?.max_lsn()?;
     if installed_lsn != full.to_lsn {
         anyhow::bail!("restored full backup ends at unexpected LSN");
     }
+    // Incremental archives are a single merged, globally-ordered stream. Under
+    // sharding each shard's WAL is replayed independently, so install the
+    // merged archive into shard 0's directory: shard 0's replay re-applies
+    // every record through the shared catalog, and each global LSN appears in
+    // exactly one shard's WAL, so nothing is applied twice.
+    let shard_zero_wal = wal_dir.join("shard_0");
     let target_lsn = pending
         .target_lsn
         .unwrap_or_else(|| chain.last().map_or(full.to_lsn, |backup| backup.to_lsn));
@@ -1238,7 +1594,7 @@ fn apply_pending_restore(config: &mydb_config::ServerConfig) -> Result<()> {
         if target_lsn < incremental.to_lsn {
             mydb_wal::install_wal_archive_prefix(
                 &archive,
-                &wal_dir,
+                &shard_zero_wal,
                 incremental.from_lsn,
                 incremental.to_lsn,
                 target_lsn,
@@ -1248,7 +1604,7 @@ fn apply_pending_restore(config: &mydb_config::ServerConfig) -> Result<()> {
         } else {
             mydb_wal::install_wal_archive(
                 &archive,
-                &wal_dir,
+                &shard_zero_wal,
                 incremental.from_lsn,
                 incremental.to_lsn,
             )?;
@@ -1343,6 +1699,15 @@ struct AgentRequest {
     question: String,
     #[serde(default)]
     sql: String,
+    #[serde(default)]
+    database: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct SlowQueryFilter {
+    limit: Option<usize>,
+    database: Option<String>,
+    digest: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1470,7 +1835,7 @@ fn answer_agent_question(
         AgentIntent::Health => diagnose_advice(
             wire.query_errors,
             storage.errors,
-            storage.actor_queue_depth,
+            storage.commit_queue_depth,
             wire.lock_timeouts,
         )
         .join("; "),
@@ -1499,7 +1864,7 @@ fn answer_agent_question(
                 .unwrap_or("unknown");
             format!(
                 "{groups} write groups, queue depth {}, average prepare/WAL/apply/checkpoint = {}/{}/{}/{} us per group; dominant phase: {dominant}",
-                storage.actor_queue_depth,
+                storage.commit_queue_depth,
                 storage.prepare_validation_micros / groups,
                 storage.wal_sync_micros / groups,
                 storage.apply_micros / groups,
@@ -1543,7 +1908,7 @@ async fn agent_health(
     let healthy = audit.healthy
         && storage.errors == 0
         && storage.checkpoint_errors == 0
-        && storage.actor_queue_depth < 1024;
+        && storage.commit_queue_depth < 1024;
     Ok(Json(json!({
         "healthy": healthy,
         "connections": wire.active_connections,
@@ -1551,7 +1916,7 @@ async fn agent_health(
         "audit_healthy": audit.healthy,
         "audit_events": audit.accepted,
         "audit_rejections": audit.rejected,
-        "write_actor_queue_depth": storage.actor_queue_depth,
+        "write_commit_queue_depth": storage.commit_queue_depth,
         "storage_errors": storage.errors,
         "group_commits": storage.group_commits,
         "grouped_requests": storage.grouped_requests,
@@ -1568,7 +1933,7 @@ async fn agent_health(
         "advice": diagnose_advice(
             wire.query_errors,
             storage.errors,
-            storage.actor_queue_depth,
+            storage.commit_queue_depth,
             wire.lock_timeouts,
         ),
     })))
@@ -1577,25 +1942,76 @@ async fn agent_health(
 async fn agent_slow_queries(
     State(state): State<AdminState>,
     headers: HeaderMap,
+    AxumQuery(filter): AxumQuery<SlowQueryFilter>,
 ) -> Result<Json<Value>, StatusCode> {
     authorize_agent(&headers, &state)?;
-    let queries: Vec<_> = state
-        .wire_stats
-        .slow_queries()
-        .into_iter()
-        .rev()
-        .map(|query| {
-            json!({
-                "timestamp_ms": query.unix_ms,
-                "duration_ms": query.duration_ms,
-                "connection_id": query.connection_id,
-                "database": query.database,
-                "sql": query.sql,
-                "error": query.error,
-            })
-        })
-        .collect();
+    let queries = filtered_slow_queries(state.wire_stats.slow_queries(), &filter);
     Ok(Json(json!({"slow_queries": queries})))
+}
+
+fn filtered_slow_queries(
+    queries: Vec<mydb_wire::SlowQuerySnapshot>,
+    filter: &SlowQueryFilter,
+) -> Vec<Value> {
+    let limit = filter.limit.unwrap_or(100).clamp(1, 1024);
+    queries
+        .into_iter()
+        .filter(|query| {
+            filter
+                .database
+                .as_deref()
+                .is_none_or(|database| query.database.eq_ignore_ascii_case(database))
+        })
+        .filter(|query| {
+            filter
+                .digest
+                .as_deref()
+                .is_none_or(|digest| query.query_digest == digest)
+        })
+        .rev()
+        .take(limit)
+        .map(|query| slow_query_json(&query))
+        .collect()
+}
+
+fn slow_query_json(query: &mydb_wire::SlowQuerySnapshot) -> Value {
+    json!({
+        "id": query.id,
+        "timestamp_ms": query.unix_ms,
+        "duration_ms": query.duration_ms,
+        "connection_id": query.connection_id,
+        "database": query.database,
+        "statement_type": query.statement_type,
+        "query_digest": query.query_digest,
+        "sql": query.sql,
+        "error": query.error,
+        "outcome": query.outcome,
+        "execution_micros": query.execution_micros,
+        "explain_micros": query.explain_micros,
+        "rows_returned": query.rows_returned,
+        "affected_rows": query.affected_rows,
+        "execution_trace": {
+            "status": query.outcome,
+            "phases": [
+                {
+                    "name": "execute",
+                    "duration_micros": query.execution_micros,
+                },
+                {
+                    "name": "explain_json",
+                    "duration_micros": query.explain_micros,
+                    "attempted": query.statement_type == "SELECT",
+                    "available": query.explain_json.is_some(),
+                },
+            ],
+            "rows_returned": query.rows_returned,
+            "affected_rows": query.affected_rows,
+        },
+        "explain_json": query
+            .explain_json
+            .as_deref()
+            .and_then(|value| serde_json::from_str::<Value>(value).ok()),
+    })
 }
 
 async fn agent_diagnose(
@@ -1619,16 +2035,7 @@ async fn agent_diagnose(
         .iter()
         .rev()
         .take(5)
-        .map(|query| {
-            json!({
-                "timestamp_ms": query.unix_ms,
-                "duration_ms": query.duration_ms,
-                "connection_id": query.connection_id,
-                "database": query.database,
-                "sql": query.sql,
-                "error": query.error,
-            })
-        })
+        .map(slow_query_json)
         .collect();
     Ok(Json(json!({
         "question": request.question,
@@ -1638,7 +2045,7 @@ async fn agent_diagnose(
         "summary": diagnose_advice(
             wire.query_errors,
             storage.errors,
-            storage.actor_queue_depth,
+            storage.commit_queue_depth,
             wire.lock_timeouts,
         ),
         "signals": {
@@ -1646,7 +2053,7 @@ async fn agent_diagnose(
             "total_queries": wire.queries,
             "query_errors": wire.query_errors,
             "storage_errors": storage.errors,
-            "actor_queue_depth": storage.actor_queue_depth,
+            "commit_queue_depth": storage.commit_queue_depth,
             "buffer_pool_pages": storage.buffer_pool_pages,
             "group_commits": storage.group_commits,
             "grouped_requests": storage.grouped_requests,
@@ -1689,10 +2096,43 @@ async fn agent_sql_debug(
     if advice.is_empty() {
         advice.push("no obvious static issue; inspect slow-query duration and actor queue depth");
     }
+    let mut explain_json = Value::Null;
+    let mut explain_error = None;
+    let statement = request.sql.trim().trim_end_matches(';').trim();
+    if statement.to_ascii_uppercase().starts_with("SELECT ") {
+        let protocol_config = Arc::new(state.protocol_config.read().clone());
+        let sql_user = authorized_identity(&headers, &state)?;
+        match mydb_wire::execute_admin_sql(
+            state.storage.clone(),
+            protocol_config,
+            state.wire_stats.clone(),
+            &sql_user,
+            request.database.as_deref(),
+            &format!("EXPLAIN FORMAT=JSON {statement}"),
+        )
+        .await
+        {
+            Ok(result) => {
+                explain_json = result
+                    .result_sets
+                    .first()
+                    .and_then(|set| set.rows.first())
+                    .and_then(|row| row.first())
+                    .and_then(|value| value.as_deref())
+                    .and_then(|value| serde_json::from_str(value).ok())
+                    .unwrap_or(Value::Null);
+            }
+            Err(error) => explain_error = Some(error.to_string()),
+        }
+    }
     Ok(Json(json!({
         "statement_type": kind,
         "sql": request.sql,
+        "database": request.database,
         "advice": advice,
+        "explain_format": "JSON",
+        "explain": explain_json,
+        "explain_error": explain_error,
         "engine": "single-node actor-ordered writer",
     })))
 }
@@ -1760,6 +2200,93 @@ fn copy_directory(source: &Path, destination: &Path, skip: Option<&Path>) -> Res
         }
     }
     Ok(())
+}
+
+#[cfg(target_os = "windows")]
+windows_service::define_windows_service!(ffi_service_main, windows_service_main);
+
+#[cfg(target_os = "windows")]
+fn run_windows_service() -> Result<()> {
+    let _ = WINDOWS_SHUTDOWN.set(Arc::new(Notify::new()));
+    windows_service::service_dispatcher::start("MyDBServer", ffi_service_main)
+        .map_err(|error| anyhow::anyhow!("Windows service dispatcher failed: {error}"))
+}
+
+#[cfg(target_os = "windows")]
+fn windows_service_main(_arguments: Vec<std::ffi::OsString>) {
+    use windows_service::service::{
+        ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus,
+        ServiceType,
+    };
+    use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
+
+    let result = (|| -> Result<()> {
+        let shutdown = WINDOWS_SHUTDOWN
+            .get()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Windows service shutdown channel is missing"))?;
+        let event_handler = move |control_event| -> ServiceControlHandlerResult {
+            match control_event {
+                ServiceControl::Stop | ServiceControl::Shutdown => {
+                    shutdown.notify_waiters();
+                    ServiceControlHandlerResult::NoError
+                }
+                ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
+                _ => ServiceControlHandlerResult::NotImplemented,
+            }
+        };
+        let status_handle = service_control_handler::register("MyDBServer", event_handler)?;
+        status_handle.set_service_status(ServiceStatus {
+            service_type: ServiceType::OWN_PROCESS,
+            current_state: ServiceState::Running,
+            controls_accepted: ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
+            exit_code: ServiceExitCode::Win32(0),
+            checkpoint: 0,
+            wait_hint: std::time::Duration::default(),
+            process_id: None,
+        })?;
+
+        let args = Args::try_parse_from(std::env::args_os())?;
+        let mut config = mydb_config::ServerConfig::load(args.config.as_deref())?;
+        if let Some(port) = args.port {
+            config.server.port = port;
+        }
+        if let Some(host) = &args.host {
+            config.server.host = host.clone();
+        }
+        if let Some(data_dir) = &args.data_dir {
+            config.storage.data_dir = data_dir.clone();
+        }
+        validate_runtime_security(&config)?;
+        let worker_threads = runtime_worker_threads(config.server.thread_count);
+        let result = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(worker_threads)
+            .thread_name("mydb-worker")
+            .build()?
+            .block_on(run_server(args, config));
+        if let Err(error) = &result {
+            tracing::error!("MyDB Windows service stopped with error: {error}");
+        }
+        status_handle.set_service_status(ServiceStatus {
+            service_type: ServiceType::OWN_PROCESS,
+            current_state: ServiceState::Stopped,
+            controls_accepted: ServiceControlAccept::empty(),
+            exit_code: if result.is_ok() {
+                ServiceExitCode::Win32(0)
+            } else {
+                ServiceExitCode::Win32(1)
+            },
+            checkpoint: 0,
+            wait_hint: std::time::Duration::default(),
+            process_id: None,
+        })?;
+        result
+    })();
+
+    if let Err(error) = result {
+        tracing::error!("MyDB Windows service initialization failed: {error}");
+    }
 }
 
 fn install_service() -> Result<()> {
@@ -1984,6 +2511,20 @@ mod tests {
     }
 
     #[test]
+    fn strong_password_mode_rejects_raw_admin_bearer() {
+        let mut config = mydb_config::ServerConfig::default();
+        assert!(legacy_admin_bearer_matches(
+            &config,
+            &config.http.admin_password
+        ));
+        config.security.enforce_strong_passwords = true;
+        assert!(!legacy_admin_bearer_matches(
+            &config,
+            &config.http.admin_password
+        ));
+    }
+
+    #[test]
     fn secure_transport_cannot_claim_tls_without_tls_listener() {
         let mut config = mydb_config::ServerConfig::default();
         assert!(validate_runtime_security(&config).is_ok());
@@ -2006,6 +2547,43 @@ mod tests {
     }
 
     #[test]
+    fn destructive_backup_operations_require_id_bound_confirmation() {
+        assert!(confirmation_matches(
+            Some("DELETE_BACKUP:full-1"),
+            DELETE_BACKUP_CONFIRMATION_PREFIX,
+            "full-1"
+        ));
+        assert!(!confirmation_matches(
+            Some("DELETE_BACKUP:full-2"),
+            DELETE_BACKUP_CONFIRMATION_PREFIX,
+            "full-1"
+        ));
+        assert!(confirmation_matches(
+            Some("RESTORE_BACKUP:inc-1"),
+            RESTORE_BACKUP_CONFIRMATION_PREFIX,
+            "inc-1"
+        ));
+        assert!(!confirmation_matches(
+            None,
+            RESTORE_BACKUP_CONFIRMATION_PREFIX,
+            "inc-1"
+        ));
+    }
+
+    #[test]
+    fn admin_login_rate_limit_is_bounded_and_success_resets_user_bucket() {
+        let mut limiter = LoginRateLimiter::default();
+        assert!(limiter.allow("root"));
+        for _ in 0..LOGIN_USER_FAILURE_LIMIT {
+            limiter.failed("root");
+        }
+        assert!(!limiter.allow("root"));
+        assert!(limiter.allow("other-user"));
+        limiter.succeeded("root");
+        assert!(limiter.allow("root"));
+    }
+
+    #[test]
     fn config_response_never_contains_secrets() {
         let config = mydb_config::ServerConfig::default();
         let redacted = redacted_config(&config);
@@ -2014,10 +2592,41 @@ mod tests {
     }
 
     #[test]
+    fn admin_schema_explorer_is_metadata_driven() {
+        let html = include_str!("admin.html");
+        assert!(html.contains("SHOW DATABASES"));
+        assert!(html.contains("information_schema.TABLES"));
+        assert!(html.contains("clearInspector"));
+        assert!(!html.contains("<summary>◉ mydb</summary>"));
+    }
+
+    #[test]
+    fn admin_documentation_describes_lan_endpoints() {
+        let html = include_str!("admin_doc.html");
+        assert!(html.contains("server.host 与 http.host 都是 0.0.0.0"));
+        assert!(html.contains("&lt;server-ip&gt;:3306"));
+        assert!(html.contains("&lt;server-ip&gt;:4306/admin"));
+    }
+
+    #[test]
     fn runtime_worker_count_honors_explicit_configuration() {
         assert_eq!(runtime_worker_threads(1), 1);
         assert_eq!(runtime_worker_threads(8), 8);
         assert!(runtime_worker_threads(0) >= 1);
+    }
+
+    #[tokio::test]
+    async fn http_port_conflict_fails_startup_before_mysql_listener() {
+        let blocker = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = blocker.local_addr().unwrap().port();
+        let mut config = mydb_config::ServerConfig::default();
+        config.http.host = "127.0.0.1".to_string();
+        config.http.port = port;
+        config.http.enabled = true;
+
+        let error = bind_http_listener(&config).await.unwrap_err();
+        assert!(error.to_string().contains("HTTP management listener"));
+        assert!(error.to_string().contains(&port.to_string()));
     }
 
     #[test]
@@ -2045,6 +2654,74 @@ mod tests {
     }
 
     #[test]
+    fn slow_query_json_preserves_trace_and_plan_fields() {
+        let value = slow_query_json(&mydb_wire::SlowQuerySnapshot {
+            id: 7,
+            unix_ms: 11,
+            duration_ms: 12,
+            connection_id: 13,
+            database: "mydb".to_string(),
+            statement_type: "SELECT".to_string(),
+            query_digest: "SELECT * FROM players WHERE id=?".to_string(),
+            sql: "SELECT * FROM players WHERE id=1".to_string(),
+            error: None,
+            outcome: "rows".to_string(),
+            execution_micros: 4_000,
+            explain_micros: 200,
+            rows_returned: Some(1),
+            affected_rows: None,
+            explain_json: Some(r#"{"query_block":{"table":{"access_type":"const"}}}"#.to_string()),
+        });
+        assert_eq!(value["id"], 7);
+        assert_eq!(value["query_digest"], "SELECT * FROM players WHERE id=?");
+        assert_eq!(value["execution_trace"]["status"], "rows");
+        assert_eq!(value["execution_trace"]["phases"][0]["name"], "execute");
+        assert_eq!(
+            value["execution_trace"]["phases"][0]["duration_micros"],
+            4_000
+        );
+        assert_eq!(
+            value["explain_json"]["query_block"]["table"]["access_type"],
+            "const"
+        );
+    }
+
+    #[test]
+    fn slow_query_filter_applies_database_digest_and_limit() {
+        let make = |id: u64, database: &str, digest: &str| mydb_wire::SlowQuerySnapshot {
+            id,
+            unix_ms: id,
+            duration_ms: id,
+            connection_id: id as u32,
+            database: database.to_string(),
+            statement_type: "SELECT".to_string(),
+            query_digest: digest.to_string(),
+            sql: "SELECT 1".to_string(),
+            error: None,
+            outcome: "rows".to_string(),
+            execution_micros: 1,
+            explain_micros: 1,
+            rows_returned: Some(1),
+            affected_rows: None,
+            explain_json: None,
+        };
+        let values = filtered_slow_queries(
+            vec![
+                make(1, "mydb", "SELECT ?"),
+                make(2, "other", "SELECT ?"),
+                make(3, "MYDB", "SELECT ?"),
+            ],
+            &SlowQueryFilter {
+                limit: Some(1),
+                database: Some("mydb".to_string()),
+                digest: Some("SELECT ?".to_string()),
+            },
+        );
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0]["id"], 3);
+    }
+
+    #[test]
     fn write_latency_answer_identifies_dominant_phase() {
         let answer = answer_agent_question(
             AgentIntent::WriteLatency,
@@ -2067,7 +2744,7 @@ mod tests {
                 reads: 0,
                 writes: 20,
                 errors: 0,
-                actor_queue_depth: 4,
+                commit_queue_depth: 4,
                 buffer_pool_pages: 2,
                 group_commits: 10,
                 grouped_requests: 20,
@@ -2093,9 +2770,12 @@ mod tests {
         let full_id = "full-test";
         let incremental_id = "incremental-test";
         let full_data = backup_root.join(full_id).join("data");
-        std::fs::create_dir_all(full_data.join("wal")).unwrap();
+        // The sharded deployment keeps each shard's WAL under `wal/shard_N/`;
+        // the full backup copies that layout, so seed it the same way.
+        let full_wal = full_data.join("wal").join("shard_0");
+        std::fs::create_dir_all(&full_wal).unwrap();
         {
-            let mut writer = mydb_wal::WalWriter::open(full_data.join("wal"), None).unwrap();
+            let mut writer = mydb_wal::WalWriter::open(full_wal, None).unwrap();
             for transaction in 1..=2 {
                 let mut record = mydb_wal::WalRecord::new(
                     0,

@@ -41,6 +41,10 @@ struct Args {
 
     #[arg(long)]
     keep_database: bool,
+
+    /// Print MySQL server version and durability settings, then exit.
+    #[arg(long)]
+    probe_server: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, ValueEnum)]
@@ -74,6 +78,15 @@ struct Report {
     verified_rows: u64,
 }
 
+#[derive(Debug, Serialize)]
+struct ServerProbe {
+    version: String,
+    version_comment: String,
+    innodb_flush_log_at_trx_commit: u64,
+    sync_binlog: u64,
+    transaction_isolation: String,
+}
+
 #[derive(Default)]
 struct ActorResult {
     transaction_latencies: Vec<Duration>,
@@ -83,6 +96,10 @@ struct ActorResult {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    let opts = Opts::from_url(&args.url).context("invalid database URL")?;
+    if args.probe_server {
+        return probe_server(opts);
+    }
     anyhow::ensure!(args.actors > 0, "actors must be greater than zero");
     anyhow::ensure!(
         args.table_count > 0,
@@ -93,7 +110,6 @@ fn main() -> Result<()> {
         "transaction-size must be greater than zero"
     );
 
-    let opts = Opts::from_url(&args.url).context("invalid database URL")?;
     let setup_opts = OptsBuilder::from_opts(opts.clone())
         .pool_opts(PoolOpts::default().with_constraints(PoolConstraints::new_const::<0, 1>()));
     let pool = Pool::new(setup_opts)?;
@@ -196,6 +212,27 @@ fn main() -> Result<()> {
     if !args.keep_database {
         cleanup(&pool, &database)?;
     }
+    Ok(())
+}
+
+fn probe_server(opts: Opts) -> Result<()> {
+    let mut connection = Conn::new(opts)?;
+    let probe = connection
+        .query_first::<(String, String, u64, u64, String), _>(
+            "SELECT VERSION(), @@version_comment, @@innodb_flush_log_at_trx_commit, \
+             @@sync_binlog, @@transaction_isolation",
+        )?
+        .ok_or_else(|| anyhow::anyhow!("MySQL server probe returned no row"))?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&ServerProbe {
+            version: probe.0,
+            version_comment: probe.1,
+            innodb_flush_log_at_trx_commit: probe.2,
+            sync_binlog: probe.3,
+            transaction_isolation: probe.4,
+        })?
+    );
     Ok(())
 }
 

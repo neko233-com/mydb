@@ -6,11 +6,11 @@
 [![Rust](https://img.shields.io/badge/rust-1.75+-orange.svg)](https://www.rust-lang.org/)
 [![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)]()
 
-**单机高性能数据库 · MySQL 协议兼容 · SQLite 替代者**
+**单机高性能数据库 · MySQL 8.4 协议兼容目标 · MySQL 替代目标**
 
 </div>
 
-MyDB 是一款用 Rust 编写的单机高性能数据库，定位为 **SQLite 的替代者**。它以 MySQL 协议暴露接口，业务可直接使用现有 MySQL 驱动/工具接入且无需改写 SQL；内部采用自研 Neko233 Actor 顺序写、Group Commit、WAL 与 Copy-on-Write 存储内核，专为游戏行业写多读少、低交互延迟和低资源常驻场景优化。
+MyDB 是一款用 Rust 编写的单机高性能数据库，目标是替代 MySQL 8.4 的常用单机部署。它以 MySQL 协议暴露接口，JDBC、Go、Node.js/TypeScript、JetBrains、VS Code、dbx 和标准 MySQL 客户端均走同一协议入口；内部采用自研 Neko233 Leader/Follower 组提交、Group Commit、WAL 与 Copy-on-Write 存储内核。
 
 > **设计边界**：MyDB 是**单机数据库**，复制拓扑、读写分离、分布式 XA 协调等非单机能力**设计上不支持**。
 
@@ -20,8 +20,8 @@ MyDB 是一款用 Rust 编写的单机高性能数据库，定位为 **SQLite �
 
 | 特性 | 说明 |
 |------|------|
-| 🔌 **MySQL 兼容** | 标准 MySQL 8 协议，支持 CLI/驱动直连，无需改写 SQL |
-| ⚡ **Actor 顺序写** | 所有写批次进入有界 FIFO，适合玩家状态和游戏事件更新 |
+| 🔌 **MySQL 兼容** | MySQL 8 协议、CLI/驱动直连；SQL 覆盖以已验收兼容矩阵为准 |
+| ⚡ **Leader/Follower 组提交** | 调用方线程协作的严格 FIFO 写，适合玩家状态和游戏事件更新 |
 | 💾 **事务支持** | `BEGIN`/`COMMIT`/`ROLLBACK`/`SAVEPOINT`，断线自动回滚 |
 | 📊 **Prometheus 监控** | `/metrics` 原生导出连接、查询、锁、WAL、存储等指标 |
 | 🔧 **内置 Agent** | HTTP API 提供健康诊断、慢 SQL 分析、SQL 静态检查 |
@@ -58,12 +58,18 @@ mydb/
 
 ### 存储引擎：Neko233
 
-- **Actor FIFO 写入**：单写 Actor 保证顺序一致性，避免锁竞争
-- **Group Commit**：多个事务的 WAL fsync 合并，显著降低 IO 开销
-- **WAL-backed Memtable**：写前日志保证崩溃恢复，内存表提供快速访问
-- **Copy-on-Write Checkpoint**：表级 COW 快照，无锁读，原子提交
-- **幂等 Redo**：崩溃恢复时 WAL 重放幂等，保证数据一致性
+- **Leader/Follower FIFO 写入**：首个空闲写者成为 leader 串行 drain 写队列、每组单次 WAL fsync，保证顺序一致性，无专用写线程
+- **Leader/Follower Group Commit**：吞吐默认 250μs 收集窗口；`group_commit_window_us=0` 切换为低延迟自然批量
+- **WAL 单块写入**：预分配文件（8MB 粒度）+ 64KB 可复用缓冲区，`append_raw` 直写热路径，单 `write_all` 原子追加，CRC32 校验
+- **bincode fixint 编码**：WAL 记录使用小端固定长度整数编码，序列化/反序列化比 varint 更快
+- **WAL-backed Memtable**：INSERT 追加到内存表（pending_rewrites），不直接写数据页
+- **Copy-on-Write Checkpoint**：每 1024 个已提交请求折叠一次，staging→backup→rename 原子替换，仅重建受影响表的索引和缓存
+- **幂等 Redo**：崩溃恢复时 WAL 重放幂等，预分配零字节尾部通过 CRC 校验安全截断
 - **CRC 校验**：WAL 和数据页均带 CRC，检测损坏并安全拒绝启动
+- **提交热路径**：一次 `sync_data()` 顺序 fsync = 持久性保证，锁内仅 write+fsync，无额外 syscall
+- **MVCC 基础**：持久化 row-id、事务 commit 序号、RR/SERIALIZABLE 读视图、RC 语句视图、历史版本链与旧版本清理基础已接入；事务读不再复制整库快照
+- **索引锁基础**：主键/二级索引的 record、next-key、gap、insert-intention 锁；二级索引锁定读会同步锁定命中的聚簇记录；复合索引左前缀与单列索引 `LIKE` 前缀范围锁，以及 statement-duration 基础 MDL 已覆盖已验收路径；JOIN 锁定读已覆盖最终命中基表聚簇记录、二级索引点锁、列对列比较范围锁和基础 `SKIP LOCKED` 行过滤，完整隐式锁与 InnoDB 边界仍按验收清单推进
+- **InnoDB 名称兼容**：`ENGINE=InnoDB` 在 SQL/协议层映射至 Neko233；项目不加载或复用 MySQL InnoDB 源码，`MEMORY` 保持独立语义
 
 ---
 
@@ -108,6 +114,15 @@ mysql --protocol=TCP -h 127.0.0.1 -P 3306 -u root -p
 docker compose down
 ```
 
+开发期 Docker 故障注入（不碰宿主数据、不发布 3306/4306；默认 0.5 CPU、512 MiB）：
+```powershell
+# 仅首次或源码变更后构建，构建本身限制 0.5 CPU、768 MiB
+.\scripts\docker-fault-injection.ps1 -Build
+# 已有 mydb:dev 镜像时只运行测试
+.\scripts\docker-fault-injection.ps1
+```
+覆盖 SIGKILL 掉电模型、数据目录只读、8 MiB tmpfs 磁盘满，以及恢复 replay 阶段再次 SIGKILL。全部 fixture 使用独立临时 named volume/network，脚本结束自动清理；`MYDB_TEST_*` 恢复暂停/标记变量仅在显式 `MYDB_TEST_FAULT_INJECTION=1` 时生效。
+
 ### 一键安装脚本
 
 **Linux / macOS:**
@@ -119,6 +134,32 @@ curl -fsSL https://raw.githubusercontent.com/neko233-com/mydb/main/scripts/insta
 ```powershell
 irm https://raw.githubusercontent.com/neko233-com/mydb/main/scripts/install.ps1 | iex
 ```
+
+Windows 默认安装到 `C:\Server\mydb\mydb-server`，创建 `MyDBServer` 自动启动服务，监听
+`0.0.0.0:3306`，配置和数据分别位于 `config\`、`data\`。首次安装会生成强随机 root/admin 密钥到
+`config\secrets\root` 与 `config\secrets\admin`，并通过 Windows 服务环境注入；升级幂等保留已有配置、数据和密钥，只替换二进制。远程连接需要 Windows 防火墙允许 TCP 3306；Web SQL IDE/管理 API 使用 4306，安装器会创建对应入站规则。
+
+Linux/macOS 安装默认监听内网 `0.0.0.0:3306` 与 `0.0.0.0:4306`，密钥位于 `~/.config/mydb/secrets/`；需要 systemd/launchd 托管时再执行 `bash scripts/install.sh service`。已有配置不会被覆盖，需管理员自行完成旧配置的密码/TLS 加固与防火墙来源限制。
+
+```powershell
+# 本地发布包升级（不重复发布版本）
+.\scripts\install.ps1 -PackagePath .\mydb-windows-x86_64.zip
+# 若同目录存在 .sha256，安装器会先校验；远程下载始终强制校验 SHA-256。
+
+# 静默安装/升级：不弹 PowerShell 窗口；首次提权仍可能显示 UAC 同意框
+cscript //nologo .\scripts\install-silent.vbs -PackagePath .\mydb-windows-x86_64.zip
+
+# 卸载 MySQL/MariaDB；先完成迁移和备份，再按需加 -PurgeData
+.\scripts\uninstall-mysql.ps1
+```
+
+Docker 开发配置中的 root/root 仅用于本地兼容 smoke；新安装不使用该默认值。公网部署必须使用密钥文件、启用 TLS，并限制防火墙来源。
+
+Linux/macOS 也支持离线包升级：
+```bash
+PACKAGE_PATH=./mydb-linux-x86_64.tar.gz bash scripts/install.sh all
+```
+远程包和带 `.sha256` sidecar 的本地包会先校验 SHA-256；未带 sidecar 的本地包只用于受控离线场景并会告警。
 
 ### 从源码编译
 
@@ -132,12 +173,41 @@ cd mydb
 # 编译（Release 模式）
 cargo build --release
 
+# 正式包只包含 server/cli/mydb/migrate/dump、配置、安装脚本和文档；
+# mydb-bench、测试结果与 target/bench 不进入发布包
+.\scripts\build-release.ps1 -Version "0.1.34"
+# 发布包同时生成同名 `.sha256` 校验文件；发布脚本默认只构建不上传，必须显式加 `-ConfirmPublish`，并在交互提示中输入 `PUBLISH v<version>` 才会创建 GitHub tag/release；脚本会拒绝覆盖已存在的 Release。
+
+```powershell
+# 仅构建/打包候选物（推荐先做这一步）
+.\scripts\build-release.ps1 -Version "0.1.36"
+# 最终发布：仍需人工输入精确确认文本
+.\scripts\build-release.ps1 -Version "0.1.36" -ConfirmPublish
+```
+
 # 安装到系统
 cargo install --path crates/mydb-server
 cargo install --path crates/mydb-cli
 cargo install --path crates/mydb-migrate
 cargo install --path crates/mydb-dump
 ```
+
+### 命令行更新
+
+发布包提供 `mydb`（兼容保留 `mydb-cli`）命令。更新只替换二进制，保留现有配置、数据目录和密钥；下载包与 `.sha256` sidecar 会先校验。
+
+```bash
+# 检查最新稳定版，不改文件
+mydb update --check
+
+# 更新到最新稳定版
+mydb update
+
+# 指定版本
+mydb update --version v0.1.33
+```
+
+Windows 服务更新会在当前 CLI 退出后由后台 helper 完成；服务运行时自动请求 UAC 提权，日志写入安装目录的 `mydb-update.log`；Linux 更新会自动处理同名 systemd 服务。
 
 ---
 
@@ -146,7 +216,7 @@ cargo install --path crates/mydb-dump
 配置文件使用 YAML 格式，默认位置：
 - Linux: `/etc/mydb/config.yaml`
 - macOS: `/usr/local/etc/mydb/config.yaml`
-- Windows: `%APPDATA%\mydb\config.yaml`
+- Windows: `C:\Server\mydb\mydb-server\config\config.yaml`
 
 ### 生产级配置示例
 
@@ -154,18 +224,22 @@ cargo install --path crates/mydb-dump
 
 ```yaml
 server:
-  host: "127.0.0.1"          # 生产环境限制到 loopback
+  host: "0.0.0.0"            # 内网监听；公网请用防火墙限制来源
   port: 3306
   max_connections: 1000
   thread_count: 4
 
+http:
+  host: "0.0.0.0"            # Web SQL IDE / 管理 API，内网监听
+  port: 4306
+
 storage:
   data_dir: "/var/lib/mydb"
   buffer_pool_size: "1G"
-  group_commit_window_us: 250  # 并发写入 WAL fsync 合并窗口
+  group_commit_window_us: 250   # 吞吐默认；0 = 低延迟自然批量
 
 security:
-  authentication: "mysql_native_password"
+  authentication: "caching_sha2_password" # MySQL 8.4 默认
   require_secure_transport: true  # 生产环境强制 TLS
   tls_cert: "/etc/mydb/tls/server.crt"
   tls_key: "/etc/mydb/tls/server.key"
@@ -206,7 +280,33 @@ mydb-cli -h 127.0.0.1 -P 3306 -u root -p --source schema.sql
 mysql -h 127.0.0.1 -P 3306 -u root -p
 ```
 
----
+### JDBC / JetBrains / VS Code / Go / Node.js
+
+MyDB 暴露标准 MySQL TCP 协议，不要求使用 `mydb-cli`。JetBrains DataGrip/IDEA、VS Code
+MySQL 扩展和数据库插件使用 MySQL 数据源：Host `127.0.0.1`、Port `3306`、User `root`。
+Docker 开发配置密码为 root；原生新安装请读取 `config/secrets/root`。JDBC URL：
+
+```text
+jdbc:mysql://127.0.0.1:3306/game_db_0?useSSL=false&serverTimezone=UTC
+```
+
+Go `database/sql`（`github.com/go-sql-driver/mysql`）：
+
+```go
+db, err := sql.Open("mysql", "root:root@tcp(127.0.0.1:3306)/game_db_0?charset=utf8mb4&parseTime=true&loc=Local")
+```
+
+Node.js / VS Code JavaScript/TypeScript（`mysql2`）：
+
+```js
+const db = await mysql.createConnection({
+  host: "127.0.0.1", port: 3306, user: "root", password: "root", database: "game_db_0"
+});
+```
+
+远程客户端将 Host 改为服务器 IP；原生安装脚本默认监听全部网卡，Windows 自动创建 TCP 3306/4306 入站规则，Linux/macOS 请在主机防火墙放行内网来源。
+生产环境应改为强密码、TLS 或明确的来源 IP 白名单。
+启用 `security.enforce_strong_passwords` 后，管理密码只能用于登录换取短期 session token，不能直接作为 Bearer；Prometheus `/metrics` 也需要该 token。CLI Agent 会自动完成登录。
 
 ## 🔒 生产部署最佳实践
 
@@ -247,7 +347,7 @@ mydb-server --config /etc/mydb/production.yaml
 ### Prometheus 指标
 
 ```bash
-curl http://127.0.0.1:4306/metrics
+curl http://127.0.0.1:4306/metrics  # 弱密码/开发模式；强密码模式使用登录后的 Bearer token
 ```
 
 暴露的关键指标：
@@ -259,23 +359,42 @@ curl http://127.0.0.1:4306/metrics
 
 ### HTTP 管理 API
 
-使用管理员密码作为 Bearer Token：
+强密码模式先登录取得短期 session token；弱密码/开发模式才允许管理员密码直接作为 Bearer：
 
 ```bash
+# 强密码模式
+TOKEN=$(curl -fsS -X POST -H 'Content-Type: application/json' \
+  -d '{"username":"admin","password":"'"$(cat /run/mydb-secrets/admin)"'"}' \
+  http://127.0.0.1:4306/api/v1/auth/login | jq -r .token)
+
 # 服务状态
-curl -H "Authorization: Bearer <admin-password>" \
+curl -H "Authorization: Bearer $TOKEN" \
   http://127.0.0.1:4306/api/v1/status
 
 # 健康检查
-curl -H "Authorization: Bearer <admin-password>" \
+curl -H "Authorization: Bearer $TOKEN" \
   http://127.0.0.1:4306/api/v1/agent/health
 
 # 慢查询列表
-curl -H "Authorization: Bearer <admin-password>" \
+curl -H "Authorization: Bearer $TOKEN" \
   http://127.0.0.1:4306/api/v1/agent/slow-queries
+# 返回 id、query_digest、执行耗时/结果行数、执行阶段和 EXPLAIN JSON；记录仅保留内存中的最近 N 条
+# 支持 `?limit=50&database=mydb&digest=...` 过滤，limit 最大 1024
+
+# SQL 静态建议 + 同权限 EXPLAIN FORMAT=JSON（只读，不执行原 SQL）
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"database":"mydb","sql":"SELECT id FROM players WHERE id=1"}' \
+  http://127.0.0.1:4306/api/v1/agent/sql
+
+# 按 SHOW PROCESSLIST 的连接 ID 断开连接并回滚其未提交事务
+curl -fsS -X POST -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"connection_id":123}' \
+  http://127.0.0.1:4306/api/v1/connections/kill
 
 # 自然语言诊断
-curl -X POST -H "Authorization: Bearer <admin-password>" \
+curl -X POST -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"question":"为什么写入延迟高？"}' \
   http://127.0.0.1:4306/api/v1/agent/ask
@@ -283,9 +402,32 @@ curl -X POST -H "Authorization: Bearer <admin-password>" \
 
 也可以通过 CLI 访问：
 ```bash
-mydb-cli --admin-password <admin-password> agent health
-mydb-cli --admin-password <admin-password> agent slow
-mydb-cli --admin-password <admin-password> agent ask "最近有哪些慢 SQL？"
+mydb-cli --admin-password "$(cat /run/mydb-secrets/admin)" agent health
+mydb-cli --admin-password "$(cat /run/mydb-secrets/admin)" agent slow
+mydb-cli --admin-password "$(cat /run/mydb-secrets/admin)" agent ask "最近有哪些慢 SQL？"
+```
+
+### 内置 Web SQL IDE
+
+打开 `http://127.0.0.1:4306/`；使用 `http.admin_username` / `http.admin_password` 登录；完整使用文档：
+`http://127.0.0.1:4306/admin/doc`。
+登录后可直接执行 SQL、查看结果集、切换数据库、格式化查询和退出会话；执行入口复用
+MyDB 的同一套 SQL parser、权限、事务、WAL 与 MVCC，不是旁路模拟器。接口为：
+
+Web 后台默认自动识别浏览器中英文；右上角可手动切换 `Auto`、`中文`、`English`，选择保存在当前浏览器。
+登录既支持 HTTP 管理账号，也支持真实 MySQL 用户；后者按该用户的 SQL 权限执行查询。
+
+```bash
+# 登录，返回短期 Bearer session token
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"username":"root","password":"root"}' \
+  http://127.0.0.1:4306/api/v1/auth/login
+
+# Web SQL IDE 使用的统一执行入口
+curl -X POST -H "Authorization: Bearer <session-token>" \
+  -H "Content-Type: application/json" \
+  -d '{"sql":"SELECT 1 AS ok","database":null}' \
+  http://127.0.0.1:4306/api/v1/sql/query
 ```
 
 ---
@@ -329,21 +471,31 @@ mydbdump restore \
 ### HTTP 备份 API
 
 ```bash
+# 强密码模式：先登录取得短期 session token，再调用管理 API。
+TOKEN=$(curl -fsS -X POST -H 'Content-Type: application/json' \
+  -d '{"username":"admin","password":"'"$(cat /run/mydb-secrets/admin)"'"}' \
+  http://127.0.0.1:4306/api/v1/auth/login | jq -r .token)
+
 # 全量备份
-curl -X POST -H "Authorization: Bearer <admin-password>" \
+curl -X POST -H "Authorization: Bearer $TOKEN" \
   http://127.0.0.1:4306/api/v1/backup/full
 
 # LSN 增量备份
-curl -X POST -H "Authorization: Bearer <admin-password>" \
+curl -X POST -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"base_id":"full-..."}' \
   http://127.0.0.1:4306/api/v1/backup/incremental
 
-# 时间点恢复 (PITR)
-curl -X POST -H "Authorization: Bearer <admin-password>" \
+# 时间点恢复 (PITR；必须显式确认，避免误恢复)
+curl -X POST -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"id":"incremental-...","point_in_time":"2026-07-15T14:22:53.842Z"}' \
+  -d '{"id":"incremental-...","point_in_time":"2026-07-15T14:22:53.842Z","confirmation":"RESTORE_BACKUP:incremental-..."}' \
   http://127.0.0.1:4306/api/v1/backup/restore
+
+# 删除备份也必须按备份 ID 显式确认
+curl -X DELETE -H "Authorization: Bearer $TOKEN" \
+  -H "X-MyDB-Confirm: DELETE_BACKUP:full-..." \
+  http://127.0.0.1:4306/api/v1/backup/full-...
 ```
 
 ---
@@ -355,7 +507,7 @@ curl -X POST -H "Authorization: Bearer <admin-password>" \
 ```bash
 mydb-migrate \
   --source 'mysql://root:password@127.0.0.1:3306' \
-  --target 'mysql://root:root@127.0.0.1:13306' \
+  --target 'mysql://root:root@127.0.0.1:3306' \
   --database game \
   --batch-size 500 \
   --report migration-report.json
@@ -384,15 +536,18 @@ mysql -h 127.0.0.1 -P 3306 game < game.sql
 
 - `CREATE DATABASE`/`DROP DATABASE`
 - `CREATE TABLE`（含列定义、主键、索引、外键、CHECK 约束）
+- `FULLTEXT`/`SPATIAL` 索引：类型持久化、CREATE/ALTER、SHOW INDEX、`information_schema.STATISTICS`，以及全文 TF-IDF 基础相关性、布尔必选/排除/短语/前缀、基础查询扩展检索和 POINT/LINESTRING/POLYGON/MULTI*/GEOMETRYCOLLECTION 基础空间构造、度量、访问器、SRID 轴序与谓词；完整倒排索引/可配置停止词、CJK ngram、多数 GIS 类型、鲁棒拓扑和空间优化仍按兼容矩阵推进
 - `CREATE TABLE ... LIKE ...`（跨 schema 复制结构）
 - `CREATE TABLE ... AS SELECT ...`（快照建表）
 - `ALTER TABLE`（ADD/DROP/MODIFY/CHANGE COLUMN、ADD/DROP INDEX/PRIMARY KEY/FOREIGN KEY/CHECK）
 - `CREATE INDEX`/`DROP INDEX`
-- `CREATE VIEW`/`DROP VIEW`（只读视图）
+- 表级逻辑分区：`PARTITION BY RANGE/LIST/HASH/KEY`，含复合 `RANGE COLUMNS`、常用表达式分区函数（`YEAR`/`MONTH`/`DAY`/`QUARTER`/`TO_DAYS`/`TO_SECONDS`/`UNIX_TIMESTAMP`/`ABS`/`MOD`）的写入校验、重启恢复和 `information_schema.PARTITIONS` 元数据；数据保持单表物理布局，子分区/在线重组/物理裁剪仍按兼容矩阵推进
+- `CREATE VIEW`/`DROP VIEW`；复杂 JOIN/聚合/表达式视图只读，单基表直接列投影支持 DML 与 `WITH CHECK OPTION`
 - `CREATE TEMPORARY TABLE`（连接级临时表）
 - `CREATE TRIGGER`/`DROP TRIGGER`（BEFORE/AFTER INSERT/UPDATE/DELETE）
 - `CREATE PROCEDURE`/`DROP PROCEDURE`（含 IN/OUT/INOUT、游标、条件处理、诊断）
 - `CREATE FUNCTION`/`DROP FUNCTION`
+- Routine 局部变量显式 `CHARACTER SET`/`COLLATE`：比较、`LIKE`、CASE/IF、DML、`COLLATION()`/`CHARSET()` 路径已接入；默认数据库字符集与完整排序规则权重仍按兼容矩阵推进
 - `CREATE EVENT`/`DROP EVENT`
 - `TRUNCATE TABLE`、`RENAME TABLE`
 
@@ -404,7 +559,9 @@ mysql -h 127.0.0.1 -P 3306 game < game.sql
 - `INSERT ... SELECT`
 - `UPDATE`（单表、JOIN UPDATE、ORDER BY/LIMIT）
 - `DELETE`（单表、多表 DELETE、USING 语法）
-- `SELECT`（JOIN、子查询、CTE、窗口函数、GROUP BY、聚合、HAVING、ORDER BY、LIMIT/OFFSET、DISTINCT、SQL_CALC_FOUND_ROWS）
+- `JOIN ... ON` 支持列对列等值/范围、常量、常用标量函数与算术表达式；锁定读对非索引表达式使用安全表级回退
+- `SELECT`（JOIN、子查询、CTE、窗口函数、GROUP BY、聚合、HAVING（含常用未关联与分组相关标量子查询）、ORDER BY、LIMIT/OFFSET、DISTINCT、SQL_CALC_FOUND_ROWS）
+- `MATCH(...) AGAINST(...)` 基础自然语言/布尔检索；`ST_GeomFromText`、`ST_AsText`、`ST_X`、`ST_Y`、`ST_GeometryType`
 - `LOAD DATA [LOCAL] INFILE`
 - `PREPARE`/`EXECUTE`/`DEALLOCATE PREPARE`（SQL 级命名预处理语句）
 
@@ -419,16 +576,16 @@ mysql -h 127.0.0.1 -P 3306 game < game.sql
 
 ### 函数
 
-- **字符串**：CONCAT、SUBSTRING、TRIM、REPLACE、LPAD/RPAD、UPPER/LOWER、HEX/UNHEX、Base64、MD5、SHA1、SHA2、CRC32、REGEXP 等
-- **数值**：ABS、CEIL/FLOOR、ROUND、MOD、POW/SQRT、RAND、PI、三角函数、BIT_COUNT、CONV 等
+- **字符串**：CONCAT、SUBSTRING、TRIM、REPLACE、LPAD/RPAD、UPPER/LOWER、HEX/UNHEX、Base64、MD5、SHA1、SHA2、CRC32、REGEXP_LIKE/INSTR/SUBSTR/REPLACE 等
+- **数值**：ABS、CEIL/FLOOR、ROUND、MOD、POW/SQRT、RAND、PI、三角函数、BIT_COUNT、BIT_AND、BIT_OR、BIT_XOR、CONV 等
 - **日期时间**：NOW、CURDATE、CURTIME、DATE_ADD/DATE_SUB、DATEDIFF、TIMESTAMPDIFF、DATE_FORMAT、UNIX_TIMESTAMP/FROM_UNIXTIME、CONVERT_TZ（内置 IANA 时区）、WEEK/YEARWEEK、EXTRACT 等
-- **JSON**：JSON_EXTRACT、JSON_UNQUOTE、JSON_OBJECT、JSON_ARRAY、JSON_VALID、JSON_TYPE、JSON_LENGTH、JSON_CONTAINS、JSON_SET、JSON_REMOVE
+- **JSON**：JSON_EXTRACT、JSON_UNQUOTE、JSON_OBJECT、JSON_ARRAY、JSON_VALID、JSON_TYPE、JSON_LENGTH、JSON_CONTAINS、JSON_CONTAINS_PATH、JSON_OVERLAPS、JSON_SET、JSON_REMOVE、JSON_ARRAY_APPEND、JSON_ARRAY_INSERT、JSON_MERGE_PATCH、JSON_DEPTH、JSON_KEYS、JSON_PRETTY、JSON_SEARCH、JSON_ARRAYAGG、JSON_OBJECTAGG
 - **其他**：UUID、INET_ATON/INET_NTOA、INET6_ATON/INET6_NTOA、GROUP_CONCAT、IF、CASE、NULLIF、COALESCE、CAST/CONVERT 等
 
 ### 系统表
 
-- `information_schema`（SCHEMATA、TABLES、COLUMNS、STATISTICS、TABLE_CONSTRAINTS、KEY_COLUMN_USAGE、CHECK_CONSTRAINTS、REFERENTIAL_CONSTRAINTS、VIEWS、TRIGGERS、ROUTINES、PARAMETERS、EVENTS 等）
-- `mysql` 系统库（用户、权限、角色）
+- `information_schema`（SCHEMATA、TABLES、COLUMNS、STATISTICS、TABLE_CONSTRAINTS、KEY_COLUMN_USAGE、CHECK_CONSTRAINTS、REFERENTIAL_CONSTRAINTS、VIEWS、TRIGGERS、ROUTINES、PARAMETERS、EVENTS、APPLICABLE_ROLES 等）；系统库自身的 TABLES/COLUMNS 元数据也可自描述，方便 DataGrip/JDBC/ORM 二次探测
+- `mysql` 系统库（用户、权限、角色、`role_edges` 与 MariaDB/GoLand 兼容的 `roles_mapping`）
 - `performance_schema`（常用表）
 - `sys` 视图
 
@@ -442,9 +599,10 @@ mysql -h 127.0.0.1 -P 3306 game < game.sql
 
 - 持久化存储引擎
 - 完整 ACID 支持
-- Actor 顺序写、Group Commit、WAL、COW Checkpoint
+- Leader/Follower 组提交、Group Commit、WAL、COW Checkpoint
 - 主键/唯一索引、外键、CHECK 约束
-- 崩溃安全：SIGKILL、断电、WAL 坏尾/中段损坏、磁盘满、只读目录等场景均经过故障注入测试
+- `ENGINE=InnoDB` 是外部兼容别名；未知引擎返回 MySQL 1286，实际兼容范围以 [CheckList.md](CheckList.md) 已验收项为准
+- 崩溃恢复回归覆盖 WAL 预分配零尾、torn write 与中段损坏；完整故障注入/平台验收仍是发布门槛
 
 ### MEMORY
 
@@ -472,22 +630,27 @@ cargo test --workspace
 
 # Docker 烟测（Linux/macOS Bash）
 bash scripts/docker-smoke.sh
+
+# Docker 低资源故障注入（Windows PowerShell；Linux 逻辑同样由容器验证）
+.\scripts\docker-fault-injection.ps1
 ```
 
 ---
 
-## 📊 性能说明
+## 📊 性能
 
-> ⚠️ **注意**：以下为开发机 Docker 限速回归数据，不代表物理生产硬件正式验收结论。正式性能验收需在 Ubuntu 24.04 物理机、双方同配置、I/O 限速条件下进行。
+> 完整测试方法、运行指标和发布前验证见 [性能报告.md](性能报告.md)。下表为 2026-08-17 Docker `linux/amd64` 受控实测；MyDB 与 MySQL 8.4.11 使用相同 CPU/内存限制和持久化设置，性能阶段不预热、1 次采样且限时 60 秒。
+>
+> 本轮数据：MyDB/MySQL 均为 2 vCPU、2 GiB；MySQL 8.4.11 使用 `innodb_flush_log_at_trx_commit=1`、`sync_binlog=1`，MyDB 使用默认 250μs Group Commit 与每 1024 个已提交请求 checkpoint。
 
-| 场景 | MyDB | MySQL 8.0.46 | 比例 |
-|------|------|--------------|------|
-| 单表写 (fsync-per-commit) | 2262 ops/s | 3318 ops/s | 0.68x |
-| 8表/4CPU 写 P99 延迟 | 40.5 ms | 495.9 ms | **12.2x 更快** |
-| 8表/4CPU Group Commit (6.1 req/group) | 7017 ops/s | 7315 ops/s | 0.96x |
-| 读 P50 延迟 | 210 μs | - | - |
+| 场景 | MyDB | MySQL 8.4.11 | MyDB / MySQL |
+|------|------|--------------|--------------|
+| 单表写（fsync-per-commit） | 179 ops/s | 78 ops/s | 2.30x |
+| 4 actor / 4表 写 P99 延迟 | 23.1 ms | 60.6 ms | 2.62x（低更好） |
+| 4 actor / 4表 Group Commit | 302 ops/s | 150 ops/s | 2.01x |
+| 读 P50 延迟 | 340 μs | 137 μs | - |
 
-MyDB 设计目标是**同资源、同持久化级别下达到 MySQL 10x 写性能**，不以关闭持久化换取数字。
+性能优化不以关闭 WAL 持久化或弱化恢复语义换取数字。默认 250μs Group Commit 窗口优先并发吞吐，checkpoint 按 1024 个已提交请求触发；不声明未经实测证明的固定倍数。
 
 ---
 
@@ -495,14 +658,39 @@ MyDB 设计目标是**同资源、同持久化级别下达到 MySQL 10x 写性�
 
 当前开发状态、已完成项、未完成项、差分证据统一维护在 [CheckList.md](CheckList.md)。只有可复现实测证明的项目才会打勾。
 
-**测试覆盖：**
-- ✅ 243 个单元测试与集成测试全部通过
-- ✅ Clippy 零警告（`-D warnings`）
-- ✅ Docker SIGKILL 崩溃恢复测试
-- ✅ WAL 坏尾/中段损坏检测
-- ✅ 磁盘满（ENOSPC）、只读目录容错
-- ✅ 数据页校验和损坏检测
-- ✅ Rust 官方 mysql 驱动、db233-go 兼容性验证
+### v0.1.35 稳定版
+
+本版面向单机 MySQL 8.4 常用生产工作负载：3306 提供 MySQL 协议，4306 提供登录保护的 Web SQL IDE/管理 API；在 v0.1.33 基础上修复 Web Schema Explorer 的硬编码库树，改为按当前账号动态读取 `SHOW DATABASES` 与 `information_schema.TABLES`，支持空库、表列检查器和刷新清理，并保留库/表/列/例程作用域多权限 `REVOKE`、`SHOW DATABASES`/`SHOW SCHEMAS`、`information_schema.SCHEMATA` 权限过滤、`partial_revokes`、`SHOW GRANTS`/`mysql.user.User_attributes` 展示与 `SET GLOBAL/PERSIST` 语义。发布不宣称复制/集群、完整 InnoDB 全部锁边界、完整 GIS/OGC 语义、全部冷门字符集或全部 MySQL 错误码已完成；显式 `LATERAL` 前缀属于额外超集能力，不作为 MySQL 8.4 差分承诺；逐项状态见 [CheckList.md](CheckList.md) 和 [SYNTAX_MATRIX.md](SYNTAX_MATRIX.md)。
+
+**本轮本地门槛（2026-08-17）：**
+- ✅ `cargo test --workspace --locked`：Docker Linux 门禁通过；wire 279、storage 63、server 17，其他 workspace 测试与文档测试全部通过
+- ✅ `cargo clippy --workspace --all-targets -- -D warnings`
+- ✅ `cargo build --release -p mydb-server -p mydb-cli -p mydb-migrate -p mydb-dump`
+- ✅ `mydb update --check`：GitHub Release 页面解析最新 tag、资产下载、SHA-256 校验和包结构验证通过；v0.1.31→v0.1.33 实际更新链路通过，当前版本明确报告 up to date；更新仅替换二进制并保留配置/数据/密钥
+- ✅ MySQL 8.4 CLI 3306 连接、`event_scheduler`/版本探测
+- ✅ Connector/J 9.1.0、Node mysql2 3.23.3 已完成 3306 普通/预处理查询 smoke；Go `database/sql` + go-sql-driver/mysql 1.10.0 已完成当前 release 3306 服务的 Ping、中文、DATE、普通/预处理查询回归
+- ✅ MySQL `'user'@'host'` 基础账户匹配：精确主机优先于通配主机，握手按账户插件选择认证方式
+- ✅ `scripts/bench.ps1`：Docker Linux Rust gate、release build 与同条件 MySQL 8.4 持久化基准通过；性能阶段无预热、60 秒硬截止（报告见 [性能报告.md](性能报告.md)）
+- ✅ `scripts/mysql84-diff.ps1`：当前源码隔离端口与同机 Docker MySQL 8.4，131/131 差分通过；覆盖 `SHOW DATABASES` 系统 schema 输出、`partial_revokes` 默认关闭、1141/1147/1403、schema 限制、继承、`SHOW GRANTS`、`User_attributes`、`SET GLOBAL/PERSIST`，作用域多权限 REVOKE 完整性，以及正则、JSON_TABLE、空间、全文等覆盖
+- ✅ v0.1.33 授权兼容回归：库/表/列/例程作用域 `REVOKE` 要求列出的权限全部存在；`SHOW DATABASES` 与 `information_schema.SCHEMATA` 按全局/库/表/列/例程权限和激活角色过滤，Rust 回归已覆盖
+- ✅ v0.1.35 Web 回归：登录后 Schema Explorer 按权限动态展示 schema/table，创建、刷新、删除、表列检查器通过浏览器验证；控制台无 warning/error，Rust server 回归 17/17
+- ✅ v0.1.35 同条件持久化基准：无预热、22.9/60 秒、1 次采样；单表写 179/78 ops/s、4 actor P99 23.1/60.6 ms、并发吞吐 302/150 ops/s、读 P50 340/137 μs；源码提交 `6f9174b`，原始结果见 [性能报告.md](性能报告.md)
+- ✅ 2026-08-17 Docker 低资源故障注入：`scripts/docker-fault-injection.ps1` 通过 SIGKILL 掉电模型、只读数据目录、8 MiB tmpfs ENOSPC、replay 阶段二次 SIGKILL；容器限 0.5 CPU/512 MiB，无宿主目录挂载/端口发布，160 条 WAL 事务恢复后行数与 SUM 精确一致
+- ✅ 2026-08-17 generated 列 DDL 回归：`ALTER TABLE ADD/MODIFY/CHANGE COLUMN ... AS (...) STORED/VIRTUAL` 保留表达式与模式，已有行重算，`SHOW CREATE TABLE` 和 Rust 重启元数据路径通过
+- ✅ 2026-08-17 SQL 调试：慢/错误 SELECT 记录稳定 ID、字面量归一化 digest、执行/计划阶段耗时、结果状态/行数和可解析 `EXPLAIN FORMAT=JSON`；Agent `/api/v1/agent/sql` 返回静态风险建议与同权限 JSON 计划，调试路径不执行原 SQL
+- ✅ 2026-08-17 Linux Docker Rust 门禁：隔离容器 2 CPU/2 GiB 通过 fmt、workspace Clippy、workspace 全量测试与 release 构建；构建卷已清理
+- ✅ 2026-08-17 Windows 当前源码打包：5 个 release 二进制构建成功，本地 zip 解包完整性与 SHA-256 校验通过；本次 v0.1.35 发布包按同一源码生成
+- ⏳ Ubuntu 24.04 物理性能、macOS 原生验收、大数据压力与生产安全运维验收；宿主真实断电不在开发机执行，单机等价逻辑用 Docker 故障模型覆盖；以 [CheckList.md](CheckList.md) 与 [性能报告.md](性能报告.md) 为准
+
+### v0.1.36 稳定修复版（发布候选）
+
+- ✅ 修复 MySQL 握手、`VERSION()` 与 `@@version` 仍显示旧版 `0.1.34` 的外部可见版本漂移；现在由 Cargo 包版本统一生成 `8.4.0-mydb-<version>`，并有 Rust 回归保护
+- ✅ 隔离端口 `13316/13307` 对比 MySQL 8.4 Docker：131/131 差异用例通过；宿主机 3306/4306 不参与测试
+- ✅ 原生默认配置、Linux/macOS/Windows 安装器和生产模板统一监听 `0.0.0.0:3306` 与 `0.0.0.0:4306`；Windows 安装器同时创建 3306/4306 入站规则
+- ✅ Docker 受控性能实测（无预热、11.3/60 秒、1 次采样）：单表写 555/241 ops/s、4 actor P99 17.2/20.5 ms、并发吞吐 1176/562 ops/s；原始数据见 [性能报告.md](性能报告.md)
+- ✅ 发布脚本默认只构建/打包；必须显式 `-ConfirmPublish`（或 `--confirm-publish`）并人工输入 `PUBLISH <tag>`，才创建 GitHub tag/release 和上传二进制
+- ✅ `.github/workflows/release-macos-arm64.yml` 仅手动触发，在 Apple Silicon `macos-14` runner 原生构建并上传指定已有 Release，不创建新 tag
+- ⏳ 未完成项仍以 [CheckList.md](CheckList.md) 和 [SYNTAX_MATRIX.md](SYNTAX_MATRIX.md) 为准，不把单机发布版表述为完整 InnoDB 或集群产品
 
 ---
 
