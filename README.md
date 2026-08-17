@@ -628,16 +628,16 @@ bash scripts/docker-smoke.sh
 
 ## 📊 性能
 
-> 完整测试方法、运行指标和发布前验证见 [性能报告.md](性能报告.md)。下表为 2026-08-15 Docker `linux/amd64` 受控实测；MyDB 与 MySQL 8.4.11 使用相同 CPU/内存限制和持久化设置，性能阶段不预热、1 次采样且限时 60 秒。
+> 完整测试方法、运行指标和发布前验证见 [性能报告.md](性能报告.md)。下表为 2026-08-17 Docker `linux/amd64` 受控实测；MyDB 与 MySQL 8.4.11 使用相同 CPU/内存限制和持久化设置，性能阶段不预热、1 次采样且限时 60 秒。
 >
 > 本轮数据：MyDB/MySQL 均为 2 vCPU、2 GiB；MySQL 8.4.11 使用 `innodb_flush_log_at_trx_commit=1`、`sync_binlog=1`，MyDB 使用默认 250μs Group Commit 与每 1024 个已提交请求 checkpoint。
 
 | 场景 | MyDB | MySQL 8.4.11 | MyDB / MySQL |
 |------|------|--------------|--------------|
-| 单表写（fsync-per-commit） | 209 ops/s | 76 ops/s | 2.75x |
-| 4 actor / 4表 写 P99 延迟 | 45.5 ms | 55.3 ms | 1.21x（低更好） |
-| 4 actor / 4表 Group Commit | 335 ops/s | 142 ops/s | 2.36x |
-| 读 P50 延迟 | 283 μs | 145 μs | - |
+| 单表写（fsync-per-commit） | 510 ops/s | 248 ops/s | 2.06x |
+| 4 actor / 4表 写 P99 延迟 | 10.3 ms | 15.9 ms | 1.54x（低更好） |
+| 4 actor / 4表 Group Commit | 1070 ops/s | 547 ops/s | 1.95x |
+| 读 P50 延迟 | 348 μs | 163 μs | - |
 
 性能优化不以关闭 WAL 持久化或弱化恢复语义换取数字。默认 250μs Group Commit 窗口优先并发吞吐，checkpoint 按 1024 个已提交请求触发；不声明未经实测证明的固定倍数。
 
@@ -651,8 +651,8 @@ bash scripts/docker-smoke.sh
 
 本版面向单机 MySQL 8.4 常用生产工作负载：3306 提供 MySQL 协议，4306 提供登录保护的 Web SQL IDE/管理 API；在 v0.1.33 基础上修复 Web Schema Explorer 的硬编码库树，改为按当前账号动态读取 `SHOW DATABASES` 与 `information_schema.TABLES`，支持空库、表列检查器和刷新清理，并保留库/表/列/例程作用域多权限 `REVOKE`、`SHOW DATABASES`/`SHOW SCHEMAS`、`information_schema.SCHEMATA` 权限过滤、`partial_revokes`、`SHOW GRANTS`/`mysql.user.User_attributes` 展示与 `SET GLOBAL/PERSIST` 语义。发布不宣称复制/集群、完整 InnoDB 全部锁边界、完整 GIS/OGC 语义、全部冷门字符集或全部 MySQL 错误码已完成；显式 `LATERAL` 前缀属于额外超集能力，不作为 MySQL 8.4 差分承诺；逐项状态见 [CheckList.md](CheckList.md) 和 [SYNTAX_MATRIX.md](SYNTAX_MATRIX.md)。
 
-**本轮本地门槛（2026-08-15）：**
-- ✅ `cargo test --workspace --locked`：Docker Linux 门禁通过；wire 278（含嵌套聚合、授权撤销作用域、作用域多权限 REVOKE 完整性、`GRANT ALL`/`GRANT OPTION`、REVOKE warning/NOOP、`partial_revokes`、schema 可见性与 MySQL 错误码），其他 workspace 测试与文档测试全部通过
+**本轮本地门槛（2026-08-17）：**
+- ✅ `cargo test --workspace --locked`：Docker Linux 门禁通过；wire 279、storage 63、server 17，其他 workspace 测试与文档测试全部通过
 - ✅ `cargo clippy --workspace --all-targets -- -D warnings`
 - ✅ `cargo build --release -p mydb-server -p mydb-cli -p mydb-migrate -p mydb-dump`
 - ✅ `mydb update --check`：GitHub Release 页面解析最新 tag、资产下载、SHA-256 校验和包结构验证通过；v0.1.31→v0.1.33 实际更新链路通过，当前版本明确报告 up to date；更新仅替换二进制并保留配置/数据/密钥
@@ -662,13 +662,13 @@ bash scripts/docker-smoke.sh
 - ✅ `scripts/bench.ps1`：Docker Linux Rust gate、release build 与同条件 MySQL 8.4 持久化基准通过；性能阶段无预热、60 秒硬截止（报告见 [性能报告.md](性能报告.md)）
 - ✅ `scripts/mysql84-diff.ps1`：当前源码隔离端口与同机 Docker MySQL 8.4，131/131 差分通过；覆盖 `SHOW DATABASES` 系统 schema 输出、`partial_revokes` 默认关闭、1141/1147/1403、schema 限制、继承、`SHOW GRANTS`、`User_attributes`、`SET GLOBAL/PERSIST`，作用域多权限 REVOKE 完整性，以及正则、JSON_TABLE、空间、全文等覆盖
 - ✅ v0.1.33 授权兼容回归：库/表/列/例程作用域 `REVOKE` 要求列出的权限全部存在；`SHOW DATABASES` 与 `information_schema.SCHEMATA` 按全局/库/表/列/例程权限和激活角色过滤，Rust 回归已覆盖
-- ✅ v0.1.34 Web 回归：登录后 Schema Explorer 按权限动态展示 schema/table，创建、刷新、删除、表列检查器通过浏览器验证；控制台无 warning/error，Rust server 回归 15/15
-- ✅ v0.1.34 同条件持久化基准：无预热、23.6/60 秒、1 次采样；单表写 207/78 ops/s、4 actor P99 32.9/64.3 ms、并发吞吐 193/151 ops/s、读 P50 405/129 μs；源码提交 `b566964`，原始结果见 [性能报告.md](性能报告.md)
+- ✅ v0.1.34 Web 回归：登录后 Schema Explorer 按权限动态展示 schema/table，创建、刷新、删除、表列检查器通过浏览器验证；控制台无 warning/error，Rust server 回归 17/17
+- ✅ v0.1.34 同条件持久化基准：无预热、11.6/60 秒、1 次采样；单表写 510/248 ops/s、4 actor P99 10.3/15.9 ms、并发吞吐 1070/547 ops/s、读 P50 348/163 μs；源码提交 `29fa369`，原始结果见 [性能报告.md](性能报告.md)
 - ✅ 2026-08-17 Docker 低资源故障注入：`scripts/docker-fault-injection.ps1` 通过 SIGKILL 掉电模型、只读数据目录、8 MiB tmpfs ENOSPC、replay 阶段二次 SIGKILL；容器限 0.5 CPU/512 MiB，无宿主目录挂载/端口发布，160 条 WAL 事务恢复后行数与 SUM 精确一致
 - ✅ 2026-08-17 generated 列 DDL 回归：`ALTER TABLE ADD/MODIFY/CHANGE COLUMN ... AS (...) STORED/VIRTUAL` 保留表达式与模式，已有行重算，`SHOW CREATE TABLE` 和 Rust 重启元数据路径通过
 - ✅ 2026-08-17 SQL 调试：慢/错误 SELECT 记录稳定 ID、字面量归一化 digest、执行/计划阶段耗时、结果状态/行数和可解析 `EXPLAIN FORMAT=JSON`；Agent `/api/v1/agent/sql` 返回静态风险建议与同权限 JSON 计划，调试路径不执行原 SQL
-- ✅ 2026-08-17 Linux Docker Rust 门禁：隔离容器 1 CPU/2 GiB 通过 fmt、workspace Clippy 与 workspace 全量测试；构建卷已清理
-- ✅ 2026-08-17 Windows 当前源码打包：5 个 release 二进制构建成功，本地 zip 解包完整性与 SHA-256 校验通过；未上传 GitHub
+- ✅ 2026-08-17 Linux Docker Rust 门禁：隔离容器 2 CPU/2 GiB 通过 fmt、workspace Clippy、workspace 全量测试与 release 构建；构建卷已清理
+- ✅ 2026-08-17 Windows 当前源码打包：5 个 release 二进制构建成功，本地 zip 解包完整性与 SHA-256 校验通过；本次 v0.1.34 发布包按同一源码生成
 - ⏳ Ubuntu 24.04 物理性能、macOS 原生验收、大数据压力与生产安全运维验收；宿主真实断电不在开发机执行，单机等价逻辑用 Docker 故障模型覆盖；以 [CheckList.md](CheckList.md) 与 [性能报告.md](性能报告.md) 为准
 
 ---

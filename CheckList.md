@@ -34,7 +34,7 @@
 - [x] 2026-08-17 Docker 低资源故障注入脚本：`scripts/docker-fault-injection.ps1` 通过 SIGKILL 掉电模型、只读数据目录、8 MiB tmpfs ENOSPC、恢复 replay 中二次 SIGKILL；独立 named volume/network、无宿主目录挂载、无 3306/4306 发布，160 条 WAL 事务恢复后行数/SUM 精确一致
 - [x] 2026-08-17 generated 列 DDL 回归：`ALTER TABLE ADD/MODIFY/CHANGE COLUMN ... AS (...) STORED/VIRTUAL` 的表达式、类型和模式持久化，`SHOW CREATE TABLE`、已有行重算和 Rust 重启元数据路径通过
 - [x] 2026-08-17 Linux Docker Rust 门禁：隔离容器 1 CPU/2 GiB 通过 fmt、workspace Clippy、workspace 全量测试（279 wire、63 storage、17 server）；1 CPU/768 MiB 仅因 Clippy 编译内存 OOM，不是测试失败；构建卷已清理
-- [x] 2026-08-17 Windows 当前源码打包：server/cli/mydb/migrate/mydbdump 五个 release 二进制构建成功，本地 zip 解包 12 项完整性与 SHA-256 校验通过；未上传 GitHub，待最终发布门禁
+- [x] 2026-08-17 Windows 当前源码打包：server/cli/mydb/migrate/mydbdump 五个 release 二进制构建成功，本地 zip 解包 12 项完整性与 SHA-256 校验通过；v0.1.34 发布包按同一源码生成
 - [ ] 完整故障注入矩阵：宿主断电、磁盘满、只读盘、WAL 中段/页损坏、恢复中再次中断
 - [ ] 长时间压力、磁盘空间回收、碎片整理及多 TB 数据验证
 
@@ -239,6 +239,7 @@
 - [x] 2026-08-15 v0.1.33 同条件持久化基准（提交 `d657350`）：MyDB 与 MySQL 8.4.11 使用相同 Docker 资源和持久化设置；性能阶段无预热、22.6/60 秒、1 次采样，单表写 208/78 ops/s、4 actor P99 35.9/83.8 ms、并发吞吐 279/144 ops/s、读 P50 286/130 μs；原始结果见 `性能报告.md`
 - [x] 2026-08-15 v0.1.34 Web SQL IDE Schema Explorer：移除硬编码 `mydb`/固定系统库，按 `SHOW DATABASES` 与 `information_schema.TABLES` 动态展示权限可见 schema/table，支持空库、刷新清理和表列检查器；浏览器回归无 warning/error，Rust server 15/15
 - [x] 2026-08-15 v0.1.34 同条件持久化基准（提交 `b566964`）：MyDB 与 MySQL 8.4.11 使用相同 Docker 资源和持久化设置；性能阶段无预热、23.6/60 秒、1 次采样，单表写 207/78 ops/s、4 actor P99 32.9/64.3 ms、并发吞吐 193/151 ops/s、读 P50 405/129 μs；原始结果见 `性能报告.md`
+- [x] 2026-08-17 v0.1.34 发布前同条件持久化基准（提交 `29fa369`）：MyDB 与 MySQL 8.4.11 使用相同 Docker 资源和持久化设置；性能阶段无预热、11.6/60 秒、1 次采样，单表写 510/248 ops/s、4 actor P99 10.3/15.9 ms、并发吞吐 1070/547 ops/s、读 P50 348/163 μs；原始结果见 `性能报告.md`
 - [x] 2026-08-15 v0.1.32 同条件持久化基准（提交 `37af36d`）：MyDB 与 MySQL 8.4.11 使用相同 Docker 资源和持久化设置；性能阶段无预热、22.8/60 秒、1 次采样，单表写 206/74 ops/s、4 actor P99 37.5/67.6 ms、并发吞吐 279/140 ops/s、读 P50 265/129 μs；原始结果见 `性能报告.md`
 - [x] 2026-08-15 v0.1.29 同条件持久化基准（提交 `9531f70`）：MyDB 与 MySQL 8.4.11 使用相同 Docker 资源和持久化设置；性能阶段无预热、22.4/60 秒、1 次采样，单表写 216/79 ops/s、4 actor P99 31.7/55.3 ms、并发吞吐 272/148 ops/s、读 P50 401/140 μs；精确命令 `pwsh -File scripts/bench.ps1` 通过，原始结果见 `性能报告.md`
 - [x] 2026-08-15 v0.1.28 同条件持久化基准（提交 `c49d2b7`）：MyDB 与 MySQL 8.4.11 使用相同 Docker 资源和持久化设置；性能阶段无预热、22.2/60 秒、1 次采样，单表写 202/69 ops/s、4 actor P99 36.8/62.6 ms、并发吞吐 328/151 ops/s、读 P50 384/145 μs；精确命令 `pwsh -File scripts/bench.ps1` 通过，原始结果见 `性能报告.md`
