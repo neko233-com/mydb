@@ -45,7 +45,7 @@ use mydb_storage::{
     TriggerDefinition, TriggerEvent, TriggerTiming, UpdateValueExpression, WriteCommand,
 };
 
-pub const SERVER_VERSION: &str = "8.4.0-mydb-0.1.34";
+pub const SERVER_VERSION: &str = concat!("8.4.0-mydb-", env!("CARGO_PKG_VERSION"));
 pub const MYSQL84_DEFAULT_SQL_MODE: &str = "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION";
 /// MySQL 8.4 default `innodb_lock_wait_timeout`, in seconds.
 pub const MYSQL84_DEFAULT_INNODB_LOCK_WAIT_TIMEOUT_SECONDS: u64 = 50;
@@ -60135,6 +60135,10 @@ mod tests {
 
     #[tokio::test]
     async fn show_metadata_filters_support_database_variable_and_status_scopes() {
+        assert_eq!(
+            SERVER_VERSION,
+            concat!("8.4.0-mydb-", env!("CARGO_PKG_VERSION"))
+        );
         let (_temp, _storage, mut backend, _second) = transaction_backends().await;
         backend
             .execute("CREATE DATABASE metadata_filter_db")

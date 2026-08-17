@@ -671,6 +671,12 @@ bash scripts/docker-smoke.sh
 - ✅ 2026-08-17 Windows 当前源码打包：5 个 release 二进制构建成功，本地 zip 解包完整性与 SHA-256 校验通过；本次 v0.1.35 发布包按同一源码生成
 - ⏳ Ubuntu 24.04 物理性能、macOS 原生验收、大数据压力与生产安全运维验收；宿主真实断电不在开发机执行，单机等价逻辑用 Docker 故障模型覆盖；以 [CheckList.md](CheckList.md) 与 [性能报告.md](性能报告.md) 为准
 
+### v0.1.36 稳定修复版（发布候选）
+
+- ✅ 修复 MySQL 握手、`VERSION()` 与 `@@version` 仍显示旧版 `0.1.34` 的外部可见版本漂移；现在由 Cargo 包版本统一生成 `8.4.0-mydb-<version>`，并有 Rust 回归保护
+- ✅ 隔离端口 `13316/13307` 对比 MySQL 8.4 Docker：131/131 差异用例通过；宿主机 3306/4306 不参与测试
+- ⏳ 未完成项仍以 [CheckList.md](CheckList.md) 和 [SYNTAX_MATRIX.md](SYNTAX_MATRIX.md) 为准，不把单机发布版表述为完整 InnoDB 或集群产品
+
 ---
 
 ## 🤝 贡献

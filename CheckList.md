@@ -35,6 +35,8 @@
 - [x] 2026-08-17 generated 列 DDL 回归：`ALTER TABLE ADD/MODIFY/CHANGE COLUMN ... AS (...) STORED/VIRTUAL` 的表达式、类型和模式持久化，`SHOW CREATE TABLE`、已有行重算和 Rust 重启元数据路径通过
 - [x] 2026-08-17 Linux Docker Rust 门禁：隔离容器 1 CPU/2 GiB 通过 fmt、workspace Clippy、workspace 全量测试（279 wire、63 storage、17 server）；1 CPU/768 MiB 仅因 Clippy 编译内存 OOM，不是测试失败；构建卷已清理
 - [x] 2026-08-17 Windows 当前源码打包：server/cli/mydb/migrate/mydbdump 五个 release 二进制构建成功，本地 zip 解包 12 项完整性与 SHA-256 校验通过；v0.1.35 发布包按同一源码生成
+- [x] 2026-08-17 v0.1.36 发布修复：MySQL 握手、`VERSION()`、`@@version` 从 Cargo 包版本生成，避免发布包仍报告旧版本；Rust wire 回归覆盖版本一致性
+- [x] 2026-08-17 隔离 Docker MySQL 8.4 差异回归：`scripts/mysql84-diff.ps1` 131/131 通过，MyDB 使用 13316、MySQL 使用 13307，未占用宿主 3306/4306
 - [ ] 完整故障注入矩阵：宿主断电、磁盘满、只读盘、WAL 中段/页损坏、恢复中再次中断
 - [ ] 长时间压力、磁盘空间回收、碎片整理及多 TB 数据验证
 
