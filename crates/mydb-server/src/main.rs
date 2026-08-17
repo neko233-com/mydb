@@ -2601,6 +2601,14 @@ mod tests {
     }
 
     #[test]
+    fn admin_documentation_describes_lan_endpoints() {
+        let html = include_str!("admin_doc.html");
+        assert!(html.contains("server.host 与 http.host 都是 0.0.0.0"));
+        assert!(html.contains("&lt;server-ip&gt;:3306"));
+        assert!(html.contains("&lt;server-ip&gt;:4306/admin"));
+    }
+
+    #[test]
     fn runtime_worker_count_honors_explicit_configuration() {
         assert_eq!(runtime_worker_threads(1), 1);
         assert_eq!(runtime_worker_threads(8), 8);

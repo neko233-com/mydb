@@ -315,7 +315,7 @@ create_config() {
         fi
         cat > "${CONFIG_DIR}/config.yaml" << EOF
 server:
-  host: "127.0.0.1"
+  host: "0.0.0.0"
   port: 3306
   max_connections: 512
   thread_count: 0
@@ -323,7 +323,7 @@ server:
   interactive_timeout: 28800
 
 http:
-  host: "127.0.0.1"
+  host: "0.0.0.0"
   port: 4306
   admin_username: "admin"
   admin_password: "CHANGE_ME_USE_MYDB_ADMIN_PASSWORD_FILE"
@@ -534,7 +534,8 @@ main() {
         echo "  MYDB_ROOT_PASSWORD_FILE=${SECRETS_DIR}/root MYDB_ADMIN_PASSWORD_FILE=${SECRETS_DIR}/admin MYDB_ENFORCE_STRONG_PASSWORDS=true ${INSTALL_DIR}/mydb-server --config ${CONFIG_DIR}/config.yaml"
         echo ""
         echo "Connect with:"
-        echo "  ${INSTALL_DIR}/mydb-cli -h 127.0.0.1 -P 3306 -u root --password \$(cat ${SECRETS_DIR}/root)"
+        echo "  LAN MySQL endpoint: <server-ip>:3306"
+        echo "  LAN Web endpoint: http://<server-ip>:4306/admin"
         echo "  ${INSTALL_DIR}/mydb-migrate --help"
         echo "  ${INSTALL_DIR}/mydbdump --help"
     else

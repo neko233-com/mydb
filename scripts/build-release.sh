@@ -6,6 +6,7 @@ set -euo pipefail
 
 VERSION="${1:-}"
 TAG="${2:-}"
+CONFIRM_PUBLISH="${3:-}"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -20,7 +21,7 @@ error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 
 # 检查参数
 if [ -z "$VERSION" ]; then
-    echo "Usage: $0 <version> [tag]"
+    echo "Usage: $0 <version> [tag] [--confirm-publish]"
     echo "Example: $0 0.1.0 v0.1.0"
     exit 1
 fi
@@ -133,6 +134,16 @@ printf '%s  %s\n' "$CHECKSUM" "$(basename "$PACKAGE_PATH")" > "$CHECKSUM_PATH"
 
 success "Package created: $PACKAGE_PATH ($PACKAGE_SIZE)"
 success "Checksum created: $CHECKSUM_PATH"
+
+# 发布是不可逆的外部写操作。默认只完成构建和打包，必须由人工显式确认两次。
+if [ "$CONFIRM_PUBLISH" != "--confirm-publish" ]; then
+    warn "Package is ready; GitHub release was NOT created. Re-run with --confirm-publish and type PUBLISH $TAG to publish."
+    exit 0
+fi
+read -r -p "Type PUBLISH $TAG to create the immutable GitHub release: " CONFIRMATION
+if [ "$CONFIRMATION" != "PUBLISH $TAG" ]; then
+    error "Release confirmation did not match; no GitHub tag or assets were created."
+fi
 
 # 创建 release
 info "Creating GitHub release: $TAG"

@@ -45,6 +45,9 @@ pub struct ServerSection {
 pub struct HttpSection {
     #[serde(default = "default_http_port")]
     pub port: u16,
+    /// Bind address for the Web SQL IDE and management API. The default is
+    /// all interfaces so a fresh native install is reachable from the LAN;
+    /// firewall and TLS policy remain deployment responsibilities.
     #[serde(default = "default_http_host")]
     pub host: String,
     #[serde(default = "default_admin_username")]
@@ -177,7 +180,7 @@ fn default_http_port() -> u16 {
     4306
 }
 fn default_http_host() -> String {
-    "127.0.0.1".to_string()
+    "0.0.0.0".to_string()
 }
 fn default_admin_username() -> String {
     "root".to_string()
@@ -505,5 +508,16 @@ mod tests {
         assert!(config.security.enforce_strong_passwords);
         assert_eq!(config.character_set.server, "utf8mb4");
         assert!(!config.security.local_infile);
+        assert_eq!(config.server.host, "0.0.0.0");
+        assert_eq!(config.http.host, "0.0.0.0");
+    }
+
+    #[test]
+    fn fresh_config_binds_mysql_and_http_to_the_lan() {
+        let config = ServerConfig::default();
+        assert_eq!(config.server.host, "0.0.0.0");
+        assert_eq!(config.server.port, 3306);
+        assert_eq!(config.http.host, "0.0.0.0");
+        assert_eq!(config.http.port, 4306);
     }
 }

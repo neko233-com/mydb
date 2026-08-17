@@ -9,18 +9,18 @@
 <div class="wrap"><div class="hero"><h1 data-i18n="title">MyDB 使用文档</h1><p data-i18n="intro">MyDB 是 Rust 编写的单机数据库，提供 MySQL 8.4 协议连接、远程访问、Web SQL 工作台与管理 API。页面自动识别中英文，也可手动切换。</p><p class="tip" data-i18n="tip">默认端口：MySQL 3306；Web 后台：4306。生产环境请使用强密码和 TLS。</p></div>
 <div class="grid"><nav class="toc"><a href="#start" data-i18n="start">快速开始</a><a href="#clients" data-i18n="clients">客户端连接</a><a href="#web" data-i18n="web">Web 后台</a><a href="#sql" data-i18n="sql">SQL API</a><a href="#remote" data-i18n="remote">远程连接</a><a href="#security" data-i18n="security">认证与安全</a><a href="#ops" data-i18n="ops">运维与排错</a></nav><main>
 <section id="start"><h2 data-i18n="startTitle">快速开始</h2><p data-i18n="startText">Docker 开发配置可使用 root/root；原生新安装请使用安装器生成的 root 密钥文件。</p><pre>mydb-server --config configs/default.yaml
-mydb-cli -h 127.0.0.1 -P 3306 -u root -proot -D mydb</pre><p data-i18n="directText">所有 JDBC、Go、Node.js、IDE 与远程客户端直接连接 3306，无需代理。</p></section>
-<section id="clients"><h2 data-i18n="clientsTitle">客户端连接</h2><h3>JDBC / DataGrip / IntelliJ</h3><pre>jdbc:mysql://127.0.0.1:3306/mydb?useSSL=false&amp;serverTimezone=Asia/Shanghai&amp;allowPublicKeyRetrieval=true</pre><p data-i18n="jdbcText">使用 MySQL Connector/J 8.x/9.x，支持 caching_sha2_password 和 mysql_native_password。</p><h3>Go database/sql</h3><pre>import _ "github.com/go-sql-driver/mysql"
-db, err := sql.Open("mysql", "root:root@tcp(127.0.0.1:3306)/mydb?parseTime=true")</pre><h3>Node.js / VS Code JavaScript / TypeScript</h3><pre>import mysql from "mysql2/promise";
-const db = await mysql.createConnection({host:"127.0.0.1",port:3306,user:"root",password:"root",database:"mydb"});</pre><p data-i18n="clientText">VS Code 数据库扩展、Notebook、迁移工具与任意 MySQL 驱动均可直连。</p></section>
-<section id="web"><h2 data-i18n="webTitle">Web 后台与 SQL 工作台</h2><p data-i18n="webText">打开 /admin 登录。支持 HTTP 管理账号和真实 MySQL 用户密码；SQL 按登录用户权限执行。</p><pre>http://127.0.0.1:4306/admin
-http://127.0.0.1:4306/admin/doc</pre><p data-i18n="localeText">页面自动识别浏览器语言；可选择 Auto、中文或 English 并保存。</p></section>
+mydb-cli -h &lt;server-ip&gt; -P 3306 -u root -p -D mydb</pre><p data-i18n="directText">所有 JDBC、Go、Node.js、IDE 与远程客户端直接连接 3306，无需代理。</p></section>
+<section id="clients"><h2 data-i18n="clientsTitle">客户端连接</h2><h3>JDBC / DataGrip / IntelliJ</h3><pre>jdbc:mysql://&lt;server-ip&gt;:3306/mydb?useSSL=false&amp;serverTimezone=Asia/Shanghai&amp;allowPublicKeyRetrieval=true</pre><p data-i18n="jdbcText">使用 MySQL Connector/J 8.x/9.x，支持 caching_sha2_password 和 mysql_native_password。</p><h3>Go database/sql</h3><pre>import _ "github.com/go-sql-driver/mysql"
+db, err := sql.Open("mysql", "root:root@tcp(&lt;server-ip&gt;:3306)/mydb?parseTime=true")</pre><h3>Node.js / VS Code JavaScript / TypeScript</h3><pre>import mysql from "mysql2/promise";
+const db = await mysql.createConnection({host:"&lt;server-ip&gt;",port:3306,user:"root",password:"root",database:"mydb"});</pre><p data-i18n="clientText">VS Code 数据库扩展、Notebook、迁移工具与任意 MySQL 驱动均可直连。</p></section>
+<section id="web"><h2 data-i18n="webTitle">Web 后台与 SQL 工作台</h2><p data-i18n="webText">打开 /admin 登录。支持 HTTP 管理账号和真实 MySQL 用户密码；SQL 按登录用户权限执行。</p><pre>http://&lt;server-ip&gt;:4306/admin
+http://&lt;server-ip&gt;:4306/admin/doc</pre><p data-i18n="localeText">页面自动识别浏览器语言；可选择 Auto、中文或 English 并保存。</p></section>
 <section id="sql"><h2 data-i18n="sqlTitle">SQL 管理 API</h2><pre>POST /api/v1/auth/login
 {"username":"root","password":"root"}
 POST /api/v1/sql/query
 Authorization: Bearer &lt;token&gt;</pre><p data-i18n="apiText">API 返回结果集、列、行、影响行数和 last_insert_id，并复用权限、事务、WAL 与 MVCC 路径。</p></section>
-<section id="remote"><h2 data-i18n="remoteTitle">远程连接</h2><p data-i18n="remoteText">将 server.host 配置为 0.0.0.0，并在防火墙放行 3306；客户端把 host 改成服务器 IP。</p><pre>jdbc:mysql://192.168.1.20:3306/mydb?useSSL=false
-mysql -h 192.168.1.20 -P 3306 -u root -p</pre><p class="tip" data-i18n="remoteTip">公网部署必须使用 TLS、强密码、最小权限、网络白名单和安全 secure_file_priv。</p></section>
+<section id="remote"><h2 data-i18n="remoteTitle">远程连接</h2><p data-i18n="remoteLanText">默认 server.host 与 http.host 都是 0.0.0.0；在防火墙仅向内网放行 3306/4306，客户端把 host 改成服务器 IP。</p><pre>jdbc:mysql://&lt;server-ip&gt;:3306/mydb?useSSL=false
+mysql -h &lt;server-ip&gt; -P 3306 -u root -p</pre><p class="tip" data-i18n="remoteTip">公网部署必须使用 TLS、强密码、最小权限、网络白名单和安全 secure_file_priv。</p></section>
 <section id="security"><h2 data-i18n="securityTitle">认证与安全</h2><p data-i18n="securityText">支持标准账户语法与常用 MySQL 认证插件：</p><pre>CREATE USER 'app'@'%' IDENTIFIED BY 'strong-password';
 GRANT SELECT ON mydb.* TO 'app'@'%';</pre><p data-i18n="securityText2">密码只保存不可逆校验值。生产环境开启 require_secure_transport 并设置 TLS。</p></section>
 <section id="ops"><h2 data-i18n="opsTitle">运维与排错</h2><p data-i18n="opsText">连接失败时确认 3306 监听、服务日志、账号插件、权限、TLS 参数和数据库名称。</p><p>危险管理操作需要显式确认：删除备份发送 <code>X-MyDB-Confirm: DELETE_BACKUP:&lt;backup-id&gt;</code>；恢复备份在 JSON 中发送 <code>confirmation: "RESTORE_BACKUP:&lt;backup-id&gt;"</code>。操作会写入审计日志。</p><pre>GET /api/v1/status

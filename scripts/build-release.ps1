@@ -11,6 +11,9 @@
     
 .PARAMETER Tag
     Git tag，如 v0.1.0（可选，默认为 v<version>）
+
+.PARAMETER ConfirmPublish
+    允许进入 GitHub 发布阶段；即使提供此开关仍必须交互输入 PUBLISH <tag>
     
 .EXAMPLE
     .\build-release.ps1 -Version "0.1.0"
@@ -21,7 +24,9 @@ param(
     [Parameter(Mandatory=$true)]
     [string]$Version,
     
-    [string]$Tag = "v$Version"
+    [string]$Tag = "v$Version",
+
+    [switch]$ConfirmPublish
 )
 
 $ErrorActionPreference = "Stop"
@@ -129,6 +134,16 @@ $checksum = (Get-FileHash -LiteralPath $packagePath -Algorithm SHA256).Hash.ToLo
 
 Write-Success "Package created: $packagePath ($([math]::Round($packageSize, 2)) MB)"
 Write-Success "Checksum created: $checksumPath"
+
+# 发布是不可逆的外部写操作。默认只完成构建和打包，必须由人工显式确认两次。
+if (-not $ConfirmPublish) {
+    Write-Warn "Package is ready; GitHub release was NOT created. Re-run with -ConfirmPublish and type PUBLISH $Tag to publish."
+    exit 0
+}
+$confirmation = Read-Host "Type PUBLISH $Tag to create the immutable GitHub release"
+if ($confirmation -cne "PUBLISH $Tag") {
+    Write-Error "Release confirmation did not match; no GitHub tag or assets were created."
+}
 
 # 创建 release
 Write-Info "Creating GitHub release: $Tag"

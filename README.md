@@ -139,7 +139,7 @@ Windows 默认安装到 `C:\Server\mydb\mydb-server`，创建 `MyDBServer` 自�
 `0.0.0.0:3306`，配置和数据分别位于 `config\`、`data\`。首次安装会生成强随机 root/admin 密钥到
 `config\secrets\root` 与 `config\secrets\admin`，并通过 Windows 服务环境注入；升级幂等保留已有配置、数据和密钥，只替换二进制。远程连接需要 Windows 防火墙允许 TCP 3306。
 
-Linux/macOS 安装默认监听本机 `127.0.0.1:3306`，密钥位于 `~/.config/mydb/secrets/`；需要 systemd/launchd 托管时再执行 `bash scripts/install.sh service`。已有配置不会被覆盖，需管理员自行完成旧配置的密码/TLS 加固。
+Linux/macOS 安装默认监听内网 `0.0.0.0:3306` 与 `0.0.0.0:4306`，密钥位于 `~/.config/mydb/secrets/`；需要 systemd/launchd 托管时再执行 `bash scripts/install.sh service`。已有配置不会被覆盖，需管理员自行完成旧配置的密码/TLS 加固与防火墙来源限制。
 
 ```powershell
 # 本地发布包升级（不重复发布版本）
@@ -176,7 +176,14 @@ cargo build --release
 # 正式包只包含 server/cli/mydb/migrate/dump、配置、安装脚本和文档；
 # mydb-bench、测试结果与 target/bench 不进入发布包
 .\scripts\build-release.ps1 -Version "0.1.34"
-# 发布包同时生成同名 `.sha256` 校验文件；发布脚本会拒绝覆盖已存在的 GitHub Release。
+# 发布包同时生成同名 `.sha256` 校验文件；发布脚本默认只构建不上传，必须显式加 `-ConfirmPublish`，并在交互提示中输入 `PUBLISH v<version>` 才会创建 GitHub tag/release；脚本会拒绝覆盖已存在的 Release。
+
+```powershell
+# 仅构建/打包候选物（推荐先做这一步）
+.\scripts\build-release.ps1 -Version "0.1.36"
+# 最终发布：仍需人工输入精确确认文本
+.\scripts\build-release.ps1 -Version "0.1.36" -ConfirmPublish
+```
 
 # 安装到系统
 cargo install --path crates/mydb-server
@@ -217,10 +224,14 @@ Windows 服务更新会在当前 CLI 退出后由后台 helper 完成；服务�
 
 ```yaml
 server:
-  host: "127.0.0.1"          # 生产环境限制到 loopback
+  host: "0.0.0.0"            # 内网监听；公网请用防火墙限制来源
   port: 3306
   max_connections: 1000
   thread_count: 4
+
+http:
+  host: "0.0.0.0"            # Web SQL IDE / 管理 API，内网监听
+  port: 4306
 
 storage:
   data_dir: "/var/lib/mydb"
@@ -675,6 +686,9 @@ bash scripts/docker-smoke.sh
 
 - ✅ 修复 MySQL 握手、`VERSION()` 与 `@@version` 仍显示旧版 `0.1.34` 的外部可见版本漂移；现在由 Cargo 包版本统一生成 `8.4.0-mydb-<version>`，并有 Rust 回归保护
 - ✅ 隔离端口 `13316/13307` 对比 MySQL 8.4 Docker：131/131 差异用例通过；宿主机 3306/4306 不参与测试
+- ✅ 原生默认配置、Linux/macOS/Windows 安装器和生产模板统一监听 `0.0.0.0:3306` 与 `0.0.0.0:4306`；Windows 安装器同时创建 3306/4306 入站规则
+- ✅ Docker 受控性能实测（无预热、12.5/60 秒、1 次采样）：单表写 558/196 ops/s、4 actor P99 8.5/15.5 ms、并发吞吐 1062/551 ops/s；原始数据见 [性能报告.md](性能报告.md)
+- ✅ 发布脚本默认只构建/打包；必须显式 `-ConfirmPublish`（或 `--confirm-publish`）并人工输入 `PUBLISH <tag>`，才创建 GitHub tag/release 和上传二进制
 - ⏳ 未完成项仍以 [CheckList.md](CheckList.md) 和 [SYNTAX_MATRIX.md](SYNTAX_MATRIX.md) 为准，不把单机发布版表述为完整 InnoDB 或集群产品
 
 ---

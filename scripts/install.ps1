@@ -50,7 +50,10 @@ param(
 
 $ErrorActionPreference = "Stop"
 $repo = "neko233-com/mydb"
-$firewallRuleName = "MyDB Server (MySQL TCP 3306)"
+$firewallRules = @(
+    @{ Name = "MyDB Server (MySQL TCP 3306)"; Port = 3306; Label = "MySQL-compatible TCP 3306" },
+    @{ Name = "MyDB Web Admin (HTTP TCP 4306)"; Port = 4306; Label = "Web admin TCP 4306" }
+)
 
 function Write-Info { if (-not $Quiet) { Write-Host "[INFO] $args" -ForegroundColor Blue } }
 function Write-Success { if (-not $Quiet) { Write-Host "[OK] $args" -ForegroundColor Green } }
@@ -377,7 +380,7 @@ server:
   interactive_timeout: 28800
 
 http:
-  host: "127.0.0.1"
+  host: "0.0.0.0"
   port: 4306
   admin_username: "admin"
   admin_password: "CHANGE_ME_USE_MYDB_ADMIN_PASSWORD_FILE"
@@ -444,15 +447,17 @@ function Ensure-Path {
 function Ensure-Firewall {
     if ($NoRemoteFirewall) { return }
     if (-not (Get-Command New-NetFirewallRule -ErrorAction SilentlyContinue)) {
-        Write-Warn "New-NetFirewallRule unavailable; TCP 3306 firewall rule not created"
+        Write-Warn "New-NetFirewallRule unavailable; remote MySQL/Web firewall rules not created"
         return
     }
-    $rule = Get-NetFirewallRule -DisplayName $firewallRuleName -ErrorAction SilentlyContinue
-    if ($null -eq $rule) {
-        New-NetFirewallRule -DisplayName $firewallRuleName -Direction Inbound -Action Allow -Protocol TCP -LocalPort 3306 -Profile Any | Out-Null
-        Write-Success "Allowed inbound MySQL-compatible TCP 3306"
-    } else {
-        Write-Info "Firewall rule already exists: $firewallRuleName"
+    foreach ($firewallRule in $firewallRules) {
+        $rule = Get-NetFirewallRule -DisplayName $firewallRule.Name -ErrorAction SilentlyContinue
+        if ($null -eq $rule) {
+            New-NetFirewallRule -DisplayName $firewallRule.Name -Direction Inbound -Action Allow -Protocol TCP -LocalPort $firewallRule.Port -Profile Any | Out-Null
+            Write-Success "Allowed inbound $($firewallRule.Label)"
+        } else {
+            Write-Info "Firewall rule already exists: $($firewallRule.Name)"
+        }
     }
 }
 
@@ -523,8 +528,8 @@ function Main {
         Write-Success "MyDB install/update complete"
         Write-Host "Config: $ConfigDir\config.yaml"
         Write-Host "Data:   $DataDir"
-        Write-Host "JDBC/Go/Node endpoint: 127.0.0.1:3306, user root; generated password is in $ConfigDir\secrets\root"
-        Write-Host "Remote endpoint: <server-ip>:3306 (firewall rule enabled unless -NoRemoteFirewall)"
+        Write-Host "LAN MySQL endpoint: <server-ip>:3306, user root; generated password is in $ConfigDir\secrets\root"
+        Write-Host "LAN Web endpoint: http://<server-ip>:4306/admin (firewall rule enabled unless -NoRemoteFirewall)"
     }
 }
 

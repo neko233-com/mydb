@@ -1,10 +1,10 @@
 # MyDB production baseline. Secrets come only from the deployment environment:
 # MYDB_ROOT_PASSWORD_FILE and MYDB_ADMIN_PASSWORD_FILE are preferred.
-# Native MySQL STARTTLS uses these PEM paths. For mutual TLS and external
-# policy enforcement, keep a TLS proxy in front of the loopback listener.
+# Native MySQL STARTTLS uses these PEM paths. Both listeners bind the LAN by
+# default; restrict inbound sources with the host firewall or a TLS proxy.
 
 server:
-  host: "127.0.0.1"
+  host: "0.0.0.0"
   port: 3306
   max_connections: 512
   thread_count: 0
@@ -12,7 +12,7 @@ server:
   interactive_timeout: 28800
 
 http:
-  host: "127.0.0.1"
+  host: "0.0.0.0"
   port: 4306
   admin_username: "admin"
   admin_password: "CHANGE_ME_USE_MYDB_ADMIN_PASSWORD_FILE"

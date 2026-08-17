@@ -37,6 +37,8 @@
 - [x] 2026-08-17 Windows 当前源码打包：server/cli/mydb/migrate/mydbdump 五个 release 二进制构建成功，本地 zip 解包 12 项完整性与 SHA-256 校验通过；v0.1.35 发布包按同一源码生成
 - [x] 2026-08-17 v0.1.36 发布修复：MySQL 握手、`VERSION()`、`@@version` 从 Cargo 包版本生成，避免发布包仍报告旧版本；Rust wire 回归覆盖版本一致性
 - [x] 2026-08-17 隔离 Docker MySQL 8.4 差异回归：`scripts/mysql84-diff.ps1` 131/131 通过，MyDB 使用 13316、MySQL 使用 13307，未占用宿主 3306/4306
+- [x] 2026-08-17 LAN 默认监听回归：原生默认/生产/安装模板统一为 MySQL `0.0.0.0:3306`、Web `0.0.0.0:4306`；Rust config/server 测试与 Windows 3306/4306 防火墙模板通过
+- [x] 2026-08-17 发布保护：Windows/Linux 发布脚本默认只生成候选包；未显式开关且未人工输入 `PUBLISH <tag>` 时不创建 GitHub tag/release
 - [ ] 完整故障注入矩阵：宿主断电、磁盘满、只读盘、WAL 中段/页损坏、恢复中再次中断
 - [ ] 长时间压力、磁盘空间回收、碎片整理及多 TB 数据验证
 

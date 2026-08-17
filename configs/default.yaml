@@ -18,8 +18,8 @@ server:
 http:
   # Web 管理 API / SQL IDE 端口；3306 专用于 MySQL 协议
   port: 4306
-  # 监听地址（仅内网）
-  host: "127.0.0.1"
+  # 监听地址（内网可访问；公网部署请用防火墙/TLS限制来源）
+  host: "0.0.0.0"
   # 管理员用户名
   admin_username: "root"
   # 管理员密码
