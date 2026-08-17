@@ -4183,6 +4183,54 @@ fn audit_statement_type(sql: &str) -> String {
         .to_ascii_uppercase()
 }
 
+fn sql_fingerprint(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    let mut output = String::with_capacity(sql.len());
+    let mut index = 0;
+    let is_identifier = |byte: u8| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$');
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if matches!(byte, b'\'' | b'"') {
+            let quote = byte;
+            output.push('?');
+            index += 1;
+            while index < bytes.len() {
+                if bytes[index] == b'\\' {
+                    index = (index + 2).min(bytes.len());
+                } else if bytes[index] == quote {
+                    if bytes.get(index + 1) == Some(&quote) {
+                        index += 2;
+                    } else {
+                        index += 1;
+                        break;
+                    }
+                } else {
+                    index += 1;
+                }
+            }
+        } else {
+            let numeric = byte.is_ascii_digit()
+                || (byte == b'.' && bytes.get(index + 1).is_some_and(u8::is_ascii_digit));
+            let starts_literal =
+                numeric && (index == 0 || !is_identifier(bytes[index.saturating_sub(1)]));
+            if starts_literal {
+                output.push('?');
+                index += 1;
+                while bytes
+                    .get(index)
+                    .is_some_and(|value| value.is_ascii_alphanumeric() || *value == b'.')
+                {
+                    index += 1;
+                }
+            } else {
+                output.push(byte as char);
+                index += 1;
+            }
+        }
+    }
+    normalize_sql_whitespace(&output)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KillScope {
     Connection,
@@ -4238,6 +4286,7 @@ pub struct WireStats {
     deadlocks: AtomicU64,
     row_lock_acquires: AtomicU64,
     table_lock_acquires: AtomicU64,
+    next_slow_query_id: AtomicU64,
     slow_queries: parking_lot::Mutex<VecDeque<SlowQuerySnapshot>>,
     transaction_locks: parking_lot::Mutex<HashMap<String, LockState>>,
     // LOCK TABLES locks outlive a transaction, so keep them separate from
@@ -4547,12 +4596,20 @@ fn event_atomic_statement_forbidden(upper: &str) -> bool {
 
 #[derive(Debug, Clone)]
 pub struct SlowQuerySnapshot {
+    pub id: u64,
     pub unix_ms: u64,
     pub duration_ms: u64,
     pub connection_id: u32,
     pub database: String,
+    pub statement_type: String,
+    pub query_digest: String,
     pub sql: String,
     pub error: Option<String>,
+    pub outcome: String,
+    pub execution_micros: u64,
+    pub explain_micros: u64,
+    pub rows_returned: Option<usize>,
+    pub affected_rows: Option<u64>,
     pub explain_json: Option<String>,
 }
 
@@ -19593,8 +19650,38 @@ impl Backend {
         if !upper.starts_with("SELECT ") {
             anyhow::bail!("EXPLAIN supports SELECT statements only");
         }
-        let from = find_top_level_keyword(statement, " FROM ", 0)
-            .ok_or_else(|| anyhow::anyhow!("EXPLAIN requires FROM"))?;
+        let Some(from) = find_top_level_keyword(statement, " FROM ", 0) else {
+            return Ok(QueryOutcome::rows(
+                vec![
+                    "id",
+                    "select_type",
+                    "table",
+                    "partitions",
+                    "type",
+                    "possible_keys",
+                    "key",
+                    "key_len",
+                    "ref",
+                    "rows",
+                    "filtered",
+                    "Extra",
+                ],
+                vec![vec![
+                    Some("1".into()),
+                    Some("SIMPLE".into()),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some("1".into()),
+                    Some("100.00".into()),
+                    Some("No tables used".into()),
+                ]],
+            ));
+        };
         let from_start = from + 6;
         let from_end = select_from_clause_end(statement, from_start);
         let join_clauses = find_join_clauses(statement, from_start, from_end);
@@ -19831,6 +19918,20 @@ impl Backend {
     }
 
     async fn explain_select_json(&mut self, statement: &str) -> anyhow::Result<QueryOutcome> {
+        if find_top_level_keyword(statement, " FROM ", 0).is_none() {
+            return Ok(QueryOutcome::byte_rows(
+                vec!["EXPLAIN"],
+                vec![vec![Some(
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "query_block": {
+                            "select_id": 1,
+                            "table": {"message": "No tables used"}
+                        }
+                    }))?
+                    .into_bytes(),
+                )]],
+            ));
+        }
         let QueryOutcome::Rows { rows, .. } = self.explain_select(statement).await? else {
             unreachable!("EXPLAIN always returns rows")
         };
@@ -39861,7 +39962,10 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for Backend {
             }
             let started = Instant::now();
             let outcome = self.execute_prepared_call(id, &sql).await;
-            return self.finish_query(&sql, started, outcome, results).await;
+            let execution_micros = started.elapsed().as_micros() as u64;
+            return self
+                .finish_query(&sql, started, execution_micros, outcome, results)
+                .await;
         }
         self.execute_and_write(&sql, results).await
     }
@@ -39920,7 +40024,8 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for Backend {
             Err(error) => Err(error),
         };
         self.update_session_diagnostics(&outcome, false);
-        self.finish_query(&normalized, started, outcome, results)
+        let execution_micros = started.elapsed().as_micros() as u64;
+        self.finish_query(&normalized, started, execution_micros, outcome, results)
             .await
     }
 
@@ -40090,8 +40195,11 @@ impl Backend {
         self.stats
             .query_execute_micros
             .fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        let execution_micros = started.elapsed().as_micros() as u64;
         let response_started = Instant::now();
-        let result = self.finish_query(query, started, outcome, results).await;
+        let result = self
+            .finish_query(query, started, execution_micros, outcome, results)
+            .await;
         self.stats.query_response_micros.fetch_add(
             response_started.elapsed().as_micros() as u64,
             Ordering::Relaxed,
@@ -40118,15 +40226,48 @@ impl Backend {
         &mut self,
         query: &str,
         started: Instant,
+        execution_micros: u64,
         outcome: anyhow::Result<QueryOutcome>,
         results: QueryResultWriter<'_, W>,
     ) -> io::Result<()> {
         let elapsed_ms = started.elapsed().as_millis() as u64;
         let error = outcome.as_ref().err().map(ToString::to_string);
         if elapsed_ms >= self.config.slow_query_threshold_ms || error.is_some() {
+            let (outcome, rows_returned, affected_rows) = match &outcome {
+                Ok(QueryOutcome::Ok { affected_rows, .. }) => ("ok", None, Some(*affected_rows)),
+                Ok(QueryOutcome::Rows { rows, .. }) => ("rows", Some(rows.len()), None),
+                Ok(QueryOutcome::Multiple {
+                    result_sets,
+                    out_parameters,
+                    affected_rows,
+                }) => (
+                    "multiple",
+                    Some(
+                        result_sets
+                            .iter()
+                            .map(|result_set| result_set.rows.len())
+                            .sum::<usize>()
+                            + out_parameters
+                                .as_ref()
+                                .map(|result_set| result_set.rows.len())
+                                .unwrap_or(0),
+                    ),
+                    Some(*affected_rows),
+                ),
+                Err(_) => ("error", None, None),
+            };
+            let explain_started = Instant::now();
             let explain_json = self.explain_json_for_slow_query(query).await;
+            let explain_micros = explain_started.elapsed().as_micros() as u64;
+            let normalized_query =
+                normalize_sql_whitespace(query.trim().trim_end_matches(';').trim());
             self.stats.record_query(
                 SlowQuerySnapshot {
+                    id: self
+                        .stats
+                        .next_slow_query_id
+                        .fetch_add(1, Ordering::Relaxed)
+                        + 1,
                     unix_ms: SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .unwrap_or_default()
@@ -40134,8 +40275,15 @@ impl Backend {
                     duration_ms: elapsed_ms,
                     connection_id: self.connection_id,
                     database: self.database.clone(),
+                    statement_type: audit_statement_type(&normalized_query),
+                    query_digest: sql_fingerprint(&normalized_query),
                     sql: query.to_string(),
                     error: error.clone(),
+                    outcome: outcome.to_string(),
+                    execution_micros,
+                    explain_micros,
+                    rows_returned,
+                    affected_rows,
                     explain_json,
                 },
                 self.config.max_slow_queries,
@@ -69705,6 +69853,26 @@ mod tests {
             evaluate_scalar_expression("NULLIF(value,10) IS NULL", &scalar_row).unwrap(),
             Some(b"1".to_vec())
         );
+        let QueryOutcome::Rows { rows, .. } = backend.execute("EXPLAIN SELECT 1").await.unwrap()
+        else {
+            panic!("expected no-table explain rows")
+        };
+        assert_eq!(rows[0][2], None);
+        assert_eq!(rows[0][9], Some(b"1".to_vec()));
+        assert_eq!(rows[0][11], Some(b"No tables used".to_vec()));
+        let QueryOutcome::Rows { rows, .. } = backend
+            .execute("EXPLAIN FORMAT=JSON SELECT 1")
+            .await
+            .unwrap()
+        else {
+            panic!("expected no-table explain JSON row")
+        };
+        let no_table_plan: serde_json::Value =
+            serde_json::from_slice(rows[0][0].as_deref().unwrap()).unwrap();
+        assert_eq!(
+            no_table_plan["query_block"]["table"]["message"],
+            "No tables used"
+        );
         let QueryOutcome::Rows { columns, rows } = backend
             .execute("EXPLAIN SELECT id FROM expression_rows WHERE id=1")
             .await
@@ -70045,6 +70213,22 @@ mod tests {
         assert_eq!(
             mysql_expression_column("formatted", "DATE_FORMAT(dt,'%Y-%m-%d')").coltype,
             ColumnType::MYSQL_TYPE_VAR_STRING
+        );
+    }
+
+    #[test]
+    fn sql_fingerprint_groups_literal_variants_without_merging_identifiers() {
+        assert_eq!(
+            sql_fingerprint("SELECT name FROM accounts WHERE id=1 AND name='alpha'"),
+            "SELECT name FROM accounts WHERE id=? AND name=?"
+        );
+        assert_eq!(
+            sql_fingerprint("SELECT name FROM accounts WHERE id=2 AND name='beta'"),
+            sql_fingerprint("SELECT name FROM accounts WHERE id=1 AND name='alpha'")
+        );
+        assert_ne!(
+            sql_fingerprint("SELECT item1 FROM accounts"),
+            sql_fingerprint("SELECT item2 FROM accounts")
         );
     }
 

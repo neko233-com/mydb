@@ -1944,12 +1944,37 @@ async fn agent_slow_queries(
         .rev()
         .map(|query| {
             json!({
+                "id": query.id,
                 "timestamp_ms": query.unix_ms,
                 "duration_ms": query.duration_ms,
                 "connection_id": query.connection_id,
                 "database": query.database,
+                "statement_type": query.statement_type,
+                "query_digest": query.query_digest,
                 "sql": query.sql,
                 "error": query.error,
+                "outcome": query.outcome,
+                "execution_micros": query.execution_micros,
+                "explain_micros": query.explain_micros,
+                "rows_returned": query.rows_returned,
+                "affected_rows": query.affected_rows,
+                "execution_trace": {
+                    "status": query.outcome,
+                    "phases": [
+                        {
+                            "name": "execute",
+                            "duration_micros": query.execution_micros,
+                        },
+                        {
+                            "name": "explain_json",
+                            "duration_micros": query.explain_micros,
+                            "attempted": query.statement_type == "SELECT",
+                            "available": query.explain_json.is_some(),
+                        },
+                    ],
+                    "rows_returned": query.rows_returned,
+                    "affected_rows": query.affected_rows,
+                },
                 "explain_json": query
                     .explain_json
                     .as_deref()
@@ -1983,12 +2008,37 @@ async fn agent_diagnose(
         .take(5)
         .map(|query| {
             json!({
+                "id": query.id,
                 "timestamp_ms": query.unix_ms,
                 "duration_ms": query.duration_ms,
                 "connection_id": query.connection_id,
                 "database": query.database,
+                "statement_type": query.statement_type,
+                "query_digest": query.query_digest,
                 "sql": query.sql,
                 "error": query.error,
+                "outcome": query.outcome,
+                "execution_micros": query.execution_micros,
+                "explain_micros": query.explain_micros,
+                "rows_returned": query.rows_returned,
+                "affected_rows": query.affected_rows,
+                "execution_trace": {
+                    "status": query.outcome,
+                    "phases": [
+                        {
+                            "name": "execute",
+                            "duration_micros": query.execution_micros,
+                        },
+                        {
+                            "name": "explain_json",
+                            "duration_micros": query.explain_micros,
+                            "attempted": query.statement_type == "SELECT",
+                            "available": query.explain_json.is_some(),
+                        },
+                    ],
+                    "rows_returned": query.rows_returned,
+                    "affected_rows": query.affected_rows,
+                },
                 "explain_json": query
                     .explain_json
                     .as_deref()

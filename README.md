@@ -367,6 +367,7 @@ curl -H "Authorization: Bearer $TOKEN" \
 # 慢查询列表
 curl -H "Authorization: Bearer $TOKEN" \
   http://127.0.0.1:4306/api/v1/agent/slow-queries
+# 返回 id、query_digest、执行耗时/结果行数、执行阶段和 EXPLAIN JSON；记录仅保留内存中的最近 N 条
 
 # SQL 静态建议 + 同权限 EXPLAIN FORMAT=JSON（只读，不执行原 SQL）
 curl -X POST -H "Authorization: Bearer $TOKEN" \
@@ -664,7 +665,7 @@ bash scripts/docker-smoke.sh
 - ✅ v0.1.34 同条件持久化基准：无预热、23.6/60 秒、1 次采样；单表写 207/78 ops/s、4 actor P99 32.9/64.3 ms、并发吞吐 193/151 ops/s、读 P50 405/129 μs；源码提交 `b566964`，原始结果见 [性能报告.md](性能报告.md)
 - ✅ 2026-08-17 Docker 低资源故障注入：`scripts/docker-fault-injection.ps1` 通过 SIGKILL 掉电模型、只读数据目录、8 MiB tmpfs ENOSPC、replay 阶段二次 SIGKILL；容器限 0.5 CPU/512 MiB，无宿主目录挂载/端口发布，160 条 WAL 事务恢复后行数与 SUM 精确一致
 - ✅ 2026-08-17 generated 列 DDL 回归：`ALTER TABLE ADD/MODIFY/CHANGE COLUMN ... AS (...) STORED/VIRTUAL` 保留表达式与模式，已有行重算，`SHOW CREATE TABLE` 和 Rust 重启元数据路径通过
-- ✅ 2026-08-17 SQL 调试：慢/错误 SELECT 记录可解析 `EXPLAIN FORMAT=JSON`；Agent `/api/v1/agent/sql` 返回静态风险建议与同权限 JSON 计划，调试路径不执行原 SQL
+- ✅ 2026-08-17 SQL 调试：慢/错误 SELECT 记录稳定 ID、字面量归一化 digest、执行/计划阶段耗时、结果状态/行数和可解析 `EXPLAIN FORMAT=JSON`；Agent `/api/v1/agent/sql` 返回静态风险建议与同权限 JSON 计划，调试路径不执行原 SQL
 - ⏳ Ubuntu 24.04 物理性能、macOS 原生验收、大数据压力与生产安全运维验收；宿主真实断电不在开发机执行，单机等价逻辑用 Docker 故障模型覆盖；以 [CheckList.md](CheckList.md) 与 [性能报告.md](性能报告.md) 为准
 
 ---

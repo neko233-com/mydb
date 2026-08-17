@@ -203,7 +203,7 @@
 | prepared statement（协议级 + SQL 级 `PREPARE/EXECUTE`） | ✅ Verified | 真实 TCP 回归覆盖基表列类型元数据、`UNSIGNED`、INT/DATE/BLOB 参数及 binary result row 解码；复杂表达式仍按表达式推断类型 |
 | `LAST_INSERT_ID()` / `ROW_COUNT()` / `FOUND_ROWS()` / `SQL_CALC_FOUND_ROWS` | ✅ Verified | |
 | 会话用户变量 `@x` | ✅ Verified | |
-| Prometheus / Agent HTTP / 原生 CLI | ✅ Verified | slow/error SELECT 自动保留可解析的 `EXPLAIN FORMAT=JSON`；`POST /api/v1/agent/sql` 返回同权限 JSON 计划与静态建议，原 SQL 不被执行；跨时间段根因、完整索引建议和告警仍 Deferred |
+| Prometheus / Agent HTTP / 原生 CLI | ✅ Verified | slow/error SELECT 自动保留稳定 ID、字面量归一化 digest、结果状态/行数、执行/EXPLAIN 阶段耗时与可解析的 `EXPLAIN FORMAT=JSON`；`POST /api/v1/agent/sql` 返回同权限 JSON 计划与静态建议，原 SQL 不被执行；跨时间段根因、完整索引建议和告警仍 Deferred |
 | `mydbdump` / `mydb-migrate` 迁移与备份（全量/增量/PITR） | ✅ Verified | |
 | Docker / Compose / 原生安装脚本 | ✅ Verified | macOS Docker、Windows/Linux 安装脚本端到端待补（CheckList） |
 | 故障注入矩阵（SIGKILL/WAL 坏尾/页损坏/只读/ENOSPC） | ✅ Verified | Docker 已验证 SIGKILL 掉电等价模型、WAL 坏尾/中段损坏、页损坏、只读、8 MiB tmpfs ENOSPC、恢复 replay 中二次 SIGKILL；宿主物理断电与更大压力矩阵仍 Deferred，不在开发机执行 |
