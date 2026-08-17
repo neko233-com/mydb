@@ -368,6 +368,7 @@ curl -H "Authorization: Bearer $TOKEN" \
 curl -H "Authorization: Bearer $TOKEN" \
   http://127.0.0.1:4306/api/v1/agent/slow-queries
 # 返回 id、query_digest、执行耗时/结果行数、执行阶段和 EXPLAIN JSON；记录仅保留内存中的最近 N 条
+# 支持 `?limit=50&database=mydb&digest=...` 过滤，limit 最大 1024
 
 # SQL 静态建议 + 同权限 EXPLAIN FORMAT=JSON（只读，不执行原 SQL）
 curl -X POST -H "Authorization: Bearer $TOKEN" \

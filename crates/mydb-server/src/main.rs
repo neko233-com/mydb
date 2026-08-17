@@ -7,7 +7,7 @@ use std::sync::OnceLock;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use axum::extract::{Path as AxumPath, State};
+use axum::extract::{Path as AxumPath, Query as AxumQuery, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
@@ -1703,6 +1703,13 @@ struct AgentRequest {
     database: Option<String>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct SlowQueryFilter {
+    limit: Option<usize>,
+    database: Option<String>,
+    digest: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AgentIntent {
     Health,
@@ -1935,54 +1942,76 @@ async fn agent_health(
 async fn agent_slow_queries(
     State(state): State<AdminState>,
     headers: HeaderMap,
+    AxumQuery(filter): AxumQuery<SlowQueryFilter>,
 ) -> Result<Json<Value>, StatusCode> {
     authorize_agent(&headers, &state)?;
-    let queries: Vec<_> = state
-        .wire_stats
-        .slow_queries()
-        .into_iter()
-        .rev()
-        .map(|query| {
-            json!({
-                "id": query.id,
-                "timestamp_ms": query.unix_ms,
-                "duration_ms": query.duration_ms,
-                "connection_id": query.connection_id,
-                "database": query.database,
-                "statement_type": query.statement_type,
-                "query_digest": query.query_digest,
-                "sql": query.sql,
-                "error": query.error,
-                "outcome": query.outcome,
-                "execution_micros": query.execution_micros,
-                "explain_micros": query.explain_micros,
-                "rows_returned": query.rows_returned,
-                "affected_rows": query.affected_rows,
-                "execution_trace": {
-                    "status": query.outcome,
-                    "phases": [
-                        {
-                            "name": "execute",
-                            "duration_micros": query.execution_micros,
-                        },
-                        {
-                            "name": "explain_json",
-                            "duration_micros": query.explain_micros,
-                            "attempted": query.statement_type == "SELECT",
-                            "available": query.explain_json.is_some(),
-                        },
-                    ],
-                    "rows_returned": query.rows_returned,
-                    "affected_rows": query.affected_rows,
-                },
-                "explain_json": query
-                    .explain_json
-                    .as_deref()
-                    .and_then(|value| serde_json::from_str::<Value>(value).ok()),
-            })
-        })
-        .collect();
+    let queries = filtered_slow_queries(state.wire_stats.slow_queries(), &filter);
     Ok(Json(json!({"slow_queries": queries})))
+}
+
+fn filtered_slow_queries(
+    queries: Vec<mydb_wire::SlowQuerySnapshot>,
+    filter: &SlowQueryFilter,
+) -> Vec<Value> {
+    let limit = filter.limit.unwrap_or(100).clamp(1, 1024);
+    queries
+        .into_iter()
+        .filter(|query| {
+            filter
+                .database
+                .as_deref()
+                .is_none_or(|database| query.database.eq_ignore_ascii_case(database))
+        })
+        .filter(|query| {
+            filter
+                .digest
+                .as_deref()
+                .is_none_or(|digest| query.query_digest == digest)
+        })
+        .rev()
+        .take(limit)
+        .map(|query| slow_query_json(&query))
+        .collect()
+}
+
+fn slow_query_json(query: &mydb_wire::SlowQuerySnapshot) -> Value {
+    json!({
+        "id": query.id,
+        "timestamp_ms": query.unix_ms,
+        "duration_ms": query.duration_ms,
+        "connection_id": query.connection_id,
+        "database": query.database,
+        "statement_type": query.statement_type,
+        "query_digest": query.query_digest,
+        "sql": query.sql,
+        "error": query.error,
+        "outcome": query.outcome,
+        "execution_micros": query.execution_micros,
+        "explain_micros": query.explain_micros,
+        "rows_returned": query.rows_returned,
+        "affected_rows": query.affected_rows,
+        "execution_trace": {
+            "status": query.outcome,
+            "phases": [
+                {
+                    "name": "execute",
+                    "duration_micros": query.execution_micros,
+                },
+                {
+                    "name": "explain_json",
+                    "duration_micros": query.explain_micros,
+                    "attempted": query.statement_type == "SELECT",
+                    "available": query.explain_json.is_some(),
+                },
+            ],
+            "rows_returned": query.rows_returned,
+            "affected_rows": query.affected_rows,
+        },
+        "explain_json": query
+            .explain_json
+            .as_deref()
+            .and_then(|value| serde_json::from_str::<Value>(value).ok()),
+    })
 }
 
 async fn agent_diagnose(
@@ -2006,45 +2035,7 @@ async fn agent_diagnose(
         .iter()
         .rev()
         .take(5)
-        .map(|query| {
-            json!({
-                "id": query.id,
-                "timestamp_ms": query.unix_ms,
-                "duration_ms": query.duration_ms,
-                "connection_id": query.connection_id,
-                "database": query.database,
-                "statement_type": query.statement_type,
-                "query_digest": query.query_digest,
-                "sql": query.sql,
-                "error": query.error,
-                "outcome": query.outcome,
-                "execution_micros": query.execution_micros,
-                "explain_micros": query.explain_micros,
-                "rows_returned": query.rows_returned,
-                "affected_rows": query.affected_rows,
-                "execution_trace": {
-                    "status": query.outcome,
-                    "phases": [
-                        {
-                            "name": "execute",
-                            "duration_micros": query.execution_micros,
-                        },
-                        {
-                            "name": "explain_json",
-                            "duration_micros": query.explain_micros,
-                            "attempted": query.statement_type == "SELECT",
-                            "available": query.explain_json.is_some(),
-                        },
-                    ],
-                    "rows_returned": query.rows_returned,
-                    "affected_rows": query.affected_rows,
-                },
-                "explain_json": query
-                    .explain_json
-                    .as_deref()
-                    .and_then(|value| serde_json::from_str::<Value>(value).ok()),
-            })
-        })
+        .map(slow_query_json)
         .collect();
     Ok(Json(json!({
         "question": request.question,
@@ -2652,6 +2643,74 @@ mod tests {
             classify_agent_question("这个句子没有已知意图"),
             AgentIntent::Unknown
         );
+    }
+
+    #[test]
+    fn slow_query_json_preserves_trace_and_plan_fields() {
+        let value = slow_query_json(&mydb_wire::SlowQuerySnapshot {
+            id: 7,
+            unix_ms: 11,
+            duration_ms: 12,
+            connection_id: 13,
+            database: "mydb".to_string(),
+            statement_type: "SELECT".to_string(),
+            query_digest: "SELECT * FROM players WHERE id=?".to_string(),
+            sql: "SELECT * FROM players WHERE id=1".to_string(),
+            error: None,
+            outcome: "rows".to_string(),
+            execution_micros: 4_000,
+            explain_micros: 200,
+            rows_returned: Some(1),
+            affected_rows: None,
+            explain_json: Some(r#"{"query_block":{"table":{"access_type":"const"}}}"#.to_string()),
+        });
+        assert_eq!(value["id"], 7);
+        assert_eq!(value["query_digest"], "SELECT * FROM players WHERE id=?");
+        assert_eq!(value["execution_trace"]["status"], "rows");
+        assert_eq!(value["execution_trace"]["phases"][0]["name"], "execute");
+        assert_eq!(
+            value["execution_trace"]["phases"][0]["duration_micros"],
+            4_000
+        );
+        assert_eq!(
+            value["explain_json"]["query_block"]["table"]["access_type"],
+            "const"
+        );
+    }
+
+    #[test]
+    fn slow_query_filter_applies_database_digest_and_limit() {
+        let make = |id: u64, database: &str, digest: &str| mydb_wire::SlowQuerySnapshot {
+            id,
+            unix_ms: id,
+            duration_ms: id,
+            connection_id: id as u32,
+            database: database.to_string(),
+            statement_type: "SELECT".to_string(),
+            query_digest: digest.to_string(),
+            sql: "SELECT 1".to_string(),
+            error: None,
+            outcome: "rows".to_string(),
+            execution_micros: 1,
+            explain_micros: 1,
+            rows_returned: Some(1),
+            affected_rows: None,
+            explain_json: None,
+        };
+        let values = filtered_slow_queries(
+            vec![
+                make(1, "mydb", "SELECT ?"),
+                make(2, "other", "SELECT ?"),
+                make(3, "MYDB", "SELECT ?"),
+            ],
+            &SlowQueryFilter {
+                limit: Some(1),
+                database: Some("mydb".to_string()),
+                digest: Some("SELECT ?".to_string()),
+            },
+        );
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0]["id"], 3);
     }
 
     #[test]

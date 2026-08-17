@@ -169,7 +169,7 @@
 ## Agent HTTP 与运维
 
 - [x] Agent HTTP 默认开启，提供 health、自然语言诊断、slow SQL、锁/WAL/checkpoint 状态
-- [x] slow SQL 基础排查：慢/错误 SELECT 自动附带可解析的 `EXPLAIN FORMAT=JSON`、稳定 ID/字面量归一化 digest、结果状态/行数、执行与计划阶段耗时；`POST /api/v1/agent/sql` 返回静态建议与同权限 JSON 执行计划；不执行用户 SQL，不把调试请求写入业务数据
+- [x] slow SQL 基础排查：慢/错误 SELECT 自动附带可解析的 `EXPLAIN FORMAT=JSON`、稳定 ID/字面量归一化 digest、结果状态/行数、执行与计划阶段耗时；`GET /api/v1/agent/slow-queries` 支持 limit/database/digest 过滤；`POST /api/v1/agent/sql` 返回静态建议与同权限 JSON 执行计划；不执行用户 SQL，不把调试请求写入业务数据
 - [x] HTTP 全量/增量备份、PITR 恢复 staging 和重启安装
 - [x] 原生 CLI 可访问 Agent API，Prometheus `/metrics` 默认可用
 - [x] 管理端口与 SQL 端口分离，支持 bearer/admin 密码
