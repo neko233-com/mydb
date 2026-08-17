@@ -137,7 +137,7 @@ irm https://raw.githubusercontent.com/neko233-com/mydb/main/scripts/install.ps1 
 
 Windows 默认安装到 `C:\Server\mydb\mydb-server`，创建 `MyDBServer` 自动启动服务，监听
 `0.0.0.0:3306`，配置和数据分别位于 `config\`、`data\`。首次安装会生成强随机 root/admin 密钥到
-`config\secrets\root` 与 `config\secrets\admin`，并通过 Windows 服务环境注入；升级幂等保留已有配置、数据和密钥，只替换二进制。远程连接需要 Windows 防火墙允许 TCP 3306。
+`config\secrets\root` 与 `config\secrets\admin`，并通过 Windows 服务环境注入；升级幂等保留已有配置、数据和密钥，只替换二进制。远程连接需要 Windows 防火墙允许 TCP 3306；Web SQL IDE/管理 API 使用 4306，安装器会创建对应入站规则。
 
 Linux/macOS 安装默认监听内网 `0.0.0.0:3306` 与 `0.0.0.0:4306`，密钥位于 `~/.config/mydb/secrets/`；需要 systemd/launchd 托管时再执行 `bash scripts/install.sh service`。已有配置不会被覆盖，需管理员自行完成旧配置的密码/TLS 加固与防火墙来源限制。
 
@@ -304,7 +304,7 @@ const db = await mysql.createConnection({
 });
 ```
 
-远程客户端将 Host 改为服务器 IP；Windows 安装脚本默认监听全部网卡并创建 TCP 3306 入站规则，Linux/macOS 默认仅监听本机。
+远程客户端将 Host 改为服务器 IP；原生安装脚本默认监听全部网卡，Windows 自动创建 TCP 3306/4306 入站规则，Linux/macOS 请在主机防火墙放行内网来源。
 生产环境应改为强密码、TLS 或明确的来源 IP 白名单。
 启用 `security.enforce_strong_passwords` 后，管理密码只能用于登录换取短期 session token，不能直接作为 Bearer；Prometheus `/metrics` 也需要该 token。CLI Agent 会自动完成登录。
 
@@ -687,7 +687,7 @@ bash scripts/docker-smoke.sh
 - ✅ 修复 MySQL 握手、`VERSION()` 与 `@@version` 仍显示旧版 `0.1.34` 的外部可见版本漂移；现在由 Cargo 包版本统一生成 `8.4.0-mydb-<version>`，并有 Rust 回归保护
 - ✅ 隔离端口 `13316/13307` 对比 MySQL 8.4 Docker：131/131 差异用例通过；宿主机 3306/4306 不参与测试
 - ✅ 原生默认配置、Linux/macOS/Windows 安装器和生产模板统一监听 `0.0.0.0:3306` 与 `0.0.0.0:4306`；Windows 安装器同时创建 3306/4306 入站规则
-- ✅ Docker 受控性能实测（无预热、12.5/60 秒、1 次采样）：单表写 558/196 ops/s、4 actor P99 8.5/15.5 ms、并发吞吐 1062/551 ops/s；原始数据见 [性能报告.md](性能报告.md)
+- ✅ Docker 受控性能实测（无预热、18.7/60 秒、1 次采样）：单表写 572/258 ops/s、4 actor P99 9.1/48.3 ms、并发吞吐 330/146 ops/s；原始数据见 [性能报告.md](性能报告.md)
 - ✅ 发布脚本默认只构建/打包；必须显式 `-ConfirmPublish`（或 `--confirm-publish`）并人工输入 `PUBLISH <tag>`，才创建 GitHub tag/release 和上传二进制
 - ⏳ 未完成项仍以 [CheckList.md](CheckList.md) 和 [SYNTAX_MATRIX.md](SYNTAX_MATRIX.md) 为准，不把单机发布版表述为完整 InnoDB 或集群产品
 
