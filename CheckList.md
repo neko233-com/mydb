@@ -39,7 +39,8 @@
 - [x] 2026-08-17 隔离 Docker MySQL 8.4 差异回归：`scripts/mysql84-diff.ps1` 131/131 通过，MyDB 使用 13316、MySQL 使用 13307，未占用宿主 3306/4306
 - [x] 2026-08-17 LAN 默认监听回归：原生默认/生产/安装模板统一为 MySQL `0.0.0.0:3306`、Web `0.0.0.0:4306`；Rust config/server 测试与 Windows 3306/4306 防火墙模板通过
 - [x] 2026-08-17 发布保护：Windows/Linux 发布脚本默认只生成候选包；未显式开关且未人工输入 `PUBLISH <tag>` 时不创建 GitHub tag/release
-- [x] 2026-08-17 最终候选性能门禁：`pwsh -File scripts/bench.ps1` 通过；无预热、21.1/60 秒、1 次采样，单表写 577/80 ops/s、4 actor P99 53.2/52.3 ms、并发吞吐 326/150 ops/s
+- [x] 2026-08-17 最终候选性能门禁：`pwsh -File scripts/bench.ps1` 通过；无预热、11.3/60 秒、1 次采样，单表写 555/241 ops/s、4 actor P99 17.2/20.5 ms、并发吞吐 1176/562 ops/s
+- [x] 2026-08-17 macOS arm64 发布路径：新增仅手动触发的 `macos-14` 原生 Apple Silicon workflow，构建 Mach-O arm64 并只上传到指定已有 Release
 - [ ] 完整故障注入矩阵：宿主断电、磁盘满、只读盘、WAL 中段/页损坏、恢复中再次中断
 - [ ] 长时间压力、磁盘空间回收、碎片整理及多 TB 数据验证
 

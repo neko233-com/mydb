@@ -687,8 +687,9 @@ bash scripts/docker-smoke.sh
 - ✅ 修复 MySQL 握手、`VERSION()` 与 `@@version` 仍显示旧版 `0.1.34` 的外部可见版本漂移；现在由 Cargo 包版本统一生成 `8.4.0-mydb-<version>`，并有 Rust 回归保护
 - ✅ 隔离端口 `13316/13307` 对比 MySQL 8.4 Docker：131/131 差异用例通过；宿主机 3306/4306 不参与测试
 - ✅ 原生默认配置、Linux/macOS/Windows 安装器和生产模板统一监听 `0.0.0.0:3306` 与 `0.0.0.0:4306`；Windows 安装器同时创建 3306/4306 入站规则
-- ✅ Docker 受控性能实测（无预热、21.1/60 秒、1 次采样）：单表写 577/80 ops/s、4 actor P99 53.2/52.3 ms、并发吞吐 326/150 ops/s；原始数据见 [性能报告.md](性能报告.md)
+- ✅ Docker 受控性能实测（无预热、11.3/60 秒、1 次采样）：单表写 555/241 ops/s、4 actor P99 17.2/20.5 ms、并发吞吐 1176/562 ops/s；原始数据见 [性能报告.md](性能报告.md)
 - ✅ 发布脚本默认只构建/打包；必须显式 `-ConfirmPublish`（或 `--confirm-publish`）并人工输入 `PUBLISH <tag>`，才创建 GitHub tag/release 和上传二进制
+- ✅ `.github/workflows/release-macos-arm64.yml` 仅手动触发，在 Apple Silicon `macos-14` runner 原生构建并上传指定已有 Release，不创建新 tag
 - ⏳ 未完成项仍以 [CheckList.md](CheckList.md) 和 [SYNTAX_MATRIX.md](SYNTAX_MATRIX.md) 为准，不把单机发布版表述为完整 InnoDB 或集群产品
 
 ---
