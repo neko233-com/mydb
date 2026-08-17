@@ -634,10 +634,10 @@ bash scripts/docker-smoke.sh
 
 | 场景 | MyDB | MySQL 8.4.11 | MyDB / MySQL |
 |------|------|--------------|--------------|
-| 单表写（fsync-per-commit） | 510 ops/s | 248 ops/s | 2.06x |
-| 4 actor / 4表 写 P99 延迟 | 10.3 ms | 15.9 ms | 1.54x（低更好） |
-| 4 actor / 4表 Group Commit | 1070 ops/s | 547 ops/s | 1.95x |
-| 读 P50 延迟 | 348 μs | 163 μs | - |
+| 单表写（fsync-per-commit） | 179 ops/s | 78 ops/s | 2.30x |
+| 4 actor / 4表 写 P99 延迟 | 23.1 ms | 60.6 ms | 2.62x（低更好） |
+| 4 actor / 4表 Group Commit | 302 ops/s | 150 ops/s | 2.01x |
+| 读 P50 延迟 | 340 μs | 137 μs | - |
 
 性能优化不以关闭 WAL 持久化或弱化恢复语义换取数字。默认 250μs Group Commit 窗口优先并发吞吐，checkpoint 按 1024 个已提交请求触发；不声明未经实测证明的固定倍数。
 
@@ -663,7 +663,7 @@ bash scripts/docker-smoke.sh
 - ✅ `scripts/mysql84-diff.ps1`：当前源码隔离端口与同机 Docker MySQL 8.4，131/131 差分通过；覆盖 `SHOW DATABASES` 系统 schema 输出、`partial_revokes` 默认关闭、1141/1147/1403、schema 限制、继承、`SHOW GRANTS`、`User_attributes`、`SET GLOBAL/PERSIST`，作用域多权限 REVOKE 完整性，以及正则、JSON_TABLE、空间、全文等覆盖
 - ✅ v0.1.33 授权兼容回归：库/表/列/例程作用域 `REVOKE` 要求列出的权限全部存在；`SHOW DATABASES` 与 `information_schema.SCHEMATA` 按全局/库/表/列/例程权限和激活角色过滤，Rust 回归已覆盖
 - ✅ v0.1.35 Web 回归：登录后 Schema Explorer 按权限动态展示 schema/table，创建、刷新、删除、表列检查器通过浏览器验证；控制台无 warning/error，Rust server 回归 17/17
-- ✅ v0.1.35 同条件持久化基准：无预热、11.6/60 秒、1 次采样；单表写 510/248 ops/s、4 actor P99 10.3/15.9 ms、并发吞吐 1070/547 ops/s、读 P50 348/163 μs；源码提交 `29fa369`，原始结果见 [性能报告.md](性能报告.md)
+- ✅ v0.1.35 同条件持久化基准：无预热、22.9/60 秒、1 次采样；单表写 179/78 ops/s、4 actor P99 23.1/60.6 ms、并发吞吐 302/150 ops/s、读 P50 340/137 μs；源码提交 `6f9174b`，原始结果见 [性能报告.md](性能报告.md)
 - ✅ 2026-08-17 Docker 低资源故障注入：`scripts/docker-fault-injection.ps1` 通过 SIGKILL 掉电模型、只读数据目录、8 MiB tmpfs ENOSPC、replay 阶段二次 SIGKILL；容器限 0.5 CPU/512 MiB，无宿主目录挂载/端口发布，160 条 WAL 事务恢复后行数与 SUM 精确一致
 - ✅ 2026-08-17 generated 列 DDL 回归：`ALTER TABLE ADD/MODIFY/CHANGE COLUMN ... AS (...) STORED/VIRTUAL` 保留表达式与模式，已有行重算，`SHOW CREATE TABLE` 和 Rust 重启元数据路径通过
 - ✅ 2026-08-17 SQL 调试：慢/错误 SELECT 记录稳定 ID、字面量归一化 digest、执行/计划阶段耗时、结果状态/行数和可解析 `EXPLAIN FORMAT=JSON`；Agent `/api/v1/agent/sql` 返回静态风险建议与同权限 JSON 计划，调试路径不执行原 SQL
