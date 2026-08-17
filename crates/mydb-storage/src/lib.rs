@@ -6583,6 +6583,63 @@ struct CommitShard {
     snapshot_barrier: Arc<tokio::sync::RwLock<()>>,
 }
 
+/// Docker-only recovery fault injection. The hook is completely disabled
+/// unless MYDB_TEST_FAULT_INJECTION=1 is set, so normal startup does not read
+/// or write a marker and does not sleep.
+#[derive(Debug, Clone)]
+struct RecoveryFaultInjection {
+    pause: Duration,
+    marker: Option<PathBuf>,
+}
+
+impl RecoveryFaultInjection {
+    fn from_env() -> Result<Option<Self>> {
+        if std::env::var("MYDB_TEST_FAULT_INJECTION").ok().as_deref() != Some("1") {
+            return Ok(None);
+        }
+
+        let pause_ms = std::env::var("MYDB_TEST_RECOVERY_PAUSE_MS")
+            .unwrap_or_else(|_| "0".to_string())
+            .parse::<u64>()
+            .map_err(|error| anyhow::anyhow!("invalid MYDB_TEST_RECOVERY_PAUSE_MS: {error}"))?;
+        let marker = std::env::var_os("MYDB_TEST_RECOVERY_MARKER").map(PathBuf::from);
+        if pause_ms == 0 && marker.is_none() {
+            return Ok(None);
+        }
+
+        Ok(Some(Self {
+            pause: Duration::from_millis(pause_ms),
+            marker,
+        }))
+    }
+
+    fn write_marker(&self, value: &str) -> Result<()> {
+        let Some(marker) = &self.marker else {
+            return Ok(());
+        };
+        if let Some(parent) = marker.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(marker, format!("{value}\n"))?;
+        Ok(())
+    }
+
+    async fn before_batch(&self, shard: usize, batch: usize, total: usize) -> Result<()> {
+        self.write_marker(&format!(
+            "running shard={shard} batch={batch} total={total}"
+        ))?;
+        if !self.pause.is_zero() {
+            tokio::time::sleep(self.pause).await;
+        }
+        Ok(())
+    }
+}
+
+struct ReplayContext<'a> {
+    shard_index: usize,
+    fault_injection: Option<&'a RecoveryFaultInjection>,
+}
+
 /// Replay one shard's WAL: redo every committed group that has not yet been
 /// folded into the data files (no `Applied` marker), then append an `Applied`
 /// marker so a subsequent checkpoint can advance. Each shard owns its durable
@@ -6594,6 +6651,7 @@ async fn replay_shard_wal(
     buffer_pool: &Arc<BufferPool>,
     data_dir: &Path,
     mvcc: &Arc<MvccManager>,
+    replay_context: ReplayContext<'_>,
 ) -> Result<u64> {
     let reader = WalReader::open(wal_dir.to_path_buf())?;
 
@@ -6637,7 +6695,13 @@ async fn replay_shard_wal(
     batches.sort_by_key(|(lsn, _, _)| *lsn);
 
     let mut recovered = 0u64;
-    for (_, tx_id, commands) in batches {
+    let batch_total = batches.len();
+    for (batch_index, (_, tx_id, commands)) in batches.into_iter().enumerate() {
+        if let Some(fault_injection) = replay_context.fault_injection {
+            fault_injection
+                .before_batch(replay_context.shard_index, batch_index, batch_total)
+                .await?;
+        }
         let commands = normalize_replay_commands(commands, databases)?;
         if !commands.is_empty() {
             let tables = commands
@@ -7363,6 +7427,10 @@ impl StorageEngineManager {
     }
 
     async fn wal_replay(&self) -> Result<()> {
+        let fault_injection = RecoveryFaultInjection::from_env()?;
+        if let Some(fault_injection) = &fault_injection {
+            fault_injection.write_marker("started")?;
+        }
         let mut total_recovered = 0u64;
         for shard in &self.shards {
             let wal_dir = self
@@ -7376,9 +7444,16 @@ impl StorageEngineManager {
                 &self.buffer_pool,
                 &self.data_dir,
                 &self.mvcc,
+                ReplayContext {
+                    shard_index: shard.index,
+                    fault_injection: fault_injection.as_ref(),
+                },
             )
             .await?;
             total_recovered += recovered;
+        }
+        if let Some(fault_injection) = &fault_injection {
+            fault_injection.write_marker(&format!("complete recovered={total_recovered}"))?;
         }
         if total_recovered > 0 {
             info!("WAL redid {} committed transaction(s)", total_recovered);
@@ -12438,6 +12513,24 @@ impl Checkpointer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovery_fault_injection_marker_is_explicit_and_writable() {
+        let temp = tempfile::tempdir().expect("create recovery fault marker directory");
+        let marker = temp.path().join("nested").join("recovery.marker");
+        let fault = RecoveryFaultInjection {
+            pause: Duration::ZERO,
+            marker: Some(marker.clone()),
+        };
+
+        fault
+            .write_marker("running shard=0 batch=1 total=2")
+            .expect("write recovery fault marker");
+        assert_eq!(
+            fs::read_to_string(marker).expect("read recovery fault marker"),
+            "running shard=0 batch=1 total=2\n"
+        );
+    }
 
     #[test]
     fn case_insensitive_table_names_are_adjacent_before_deduplication() {

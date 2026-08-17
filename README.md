@@ -114,6 +114,15 @@ mysql --protocol=TCP -h 127.0.0.1 -P 3306 -u root -p
 docker compose down
 ```
 
+开发期 Docker 故障注入（不碰宿主数据、不发布 3306/4306；默认 0.5 CPU、512 MiB）：
+```powershell
+# 仅首次或源码变更后构建，构建本身限制 0.5 CPU、768 MiB
+.\scripts\docker-fault-injection.ps1 -Build
+# 已有 mydb:dev 镜像时只运行测试
+.\scripts\docker-fault-injection.ps1
+```
+覆盖 SIGKILL 掉电模型、数据目录只读、8 MiB tmpfs 磁盘满，以及恢复 replay 阶段再次 SIGKILL。全部 fixture 使用独立临时 named volume/network，脚本结束自动清理；`MYDB_TEST_*` 恢复暂停/标记变量仅在显式 `MYDB_TEST_FAULT_INJECTION=1` 时生效。
+
 ### 一键安装脚本
 
 **Linux / macOS:**
@@ -602,6 +611,9 @@ cargo test --workspace
 
 # Docker 烟测（Linux/macOS Bash）
 bash scripts/docker-smoke.sh
+
+# Docker 低资源故障注入（Windows PowerShell；Linux 逻辑同样由容器验证）
+.\scripts\docker-fault-injection.ps1
 ```
 
 ---
@@ -644,7 +656,8 @@ bash scripts/docker-smoke.sh
 - ✅ v0.1.33 授权兼容回归：库/表/列/例程作用域 `REVOKE` 要求列出的权限全部存在；`SHOW DATABASES` 与 `information_schema.SCHEMATA` 按全局/库/表/列/例程权限和激活角色过滤，Rust 回归已覆盖
 - ✅ v0.1.34 Web 回归：登录后 Schema Explorer 按权限动态展示 schema/table，创建、刷新、删除、表列检查器通过浏览器验证；控制台无 warning/error，Rust server 回归 15/15
 - ✅ v0.1.34 同条件持久化基准：无预热、23.6/60 秒、1 次采样；单表写 207/78 ops/s、4 actor P99 32.9/64.3 ms、并发吞吐 193/151 ops/s、读 P50 405/129 μs；源码提交 `b566964`，原始结果见 [性能报告.md](性能报告.md)
-- ⏳ Ubuntu 24.04 物理性能、macOS 原生验收、宿主断电/恢复中断、大数据压力与生产安全运维验收：以 [CheckList.md](CheckList.md) 与 [性能报告.md](性能报告.md) 为准
+- ✅ 2026-08-17 Docker 低资源故障注入：`scripts/docker-fault-injection.ps1` 通过 SIGKILL 掉电模型、只读数据目录、8 MiB tmpfs ENOSPC、replay 阶段二次 SIGKILL；容器限 0.5 CPU/512 MiB，无宿主目录挂载/端口发布，160 条 WAL 事务恢复后行数与 SUM 精确一致
+- ⏳ Ubuntu 24.04 物理性能、macOS 原生验收、大数据压力与生产安全运维验收；宿主真实断电不在开发机执行，单机等价逻辑用 Docker 故障模型覆盖；以 [CheckList.md](CheckList.md) 与 [性能报告.md](性能报告.md) 为准
 
 ---
 

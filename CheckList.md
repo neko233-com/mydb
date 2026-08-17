@@ -1,6 +1,6 @@
 # MyDB 落地验收清单
 
-> 规则：只有当前源码和可复现实测能证明的项目才打勾。宽泛目标不能由局部 smoke 代替。最后更新：2026-08-15。
+> 规则：只有当前源码和可复现实测能证明的项目才打勾。宽泛目标不能由局部 smoke 代替。最后更新：2026-08-17。
 
 > **范围边界（当前验收口径）**：MyDB 目标是替代 MySQL 8.x 的单机部署，以 MySQL 协议、SQL、事务和可见外部行为为验收面。单机客户端直接连接 3306；复制拓扑、Group Replication / Galera、分布式 XA 两阶段协调仍不宣称已实现。完整 InnoDB 语义必须逐项通过本清单，不能由名称别名代替。
 
@@ -31,6 +31,7 @@
 - [x] Docker ENOSPC 故障注入：独立 8 MiB tmpfs 数据目录上大 WAL 写返回 MySQL 1105，服务存活且失败事务零行
 - [x] Docker 页损坏故障注入：篡改持久化 `pages.dat` 已校验数据字节；启动安全拒绝并报告页校验损坏，不静默少读数据
 - [x] 恢复中断边界：模拟页已持久化但 `Applied` 未写入时进程消失；真实重启重新 replay 后无重复行且补写一个 `Applied`
+- [x] 2026-08-17 Docker 低资源故障注入脚本：`scripts/docker-fault-injection.ps1` 通过 SIGKILL 掉电模型、只读数据目录、8 MiB tmpfs ENOSPC、恢复 replay 中二次 SIGKILL；独立 named volume/network、无宿主目录挂载、无 3306/4306 发布，160 条 WAL 事务恢复后行数/SUM 精确一致
 - [ ] 完整故障注入矩阵：宿主断电、磁盘满、只读盘、WAL 中段/页损坏、恢复中再次中断
 - [ ] 长时间压力、磁盘空间回收、碎片整理及多 TB 数据验证
 
@@ -198,6 +199,7 @@
 - [x] MySQL 8.0.45/8.0.46 差分：真实 dump、changed-row affected counts/no-op UPSERT insert id、INSERT/REPLACE SET、INSERT VALUES 默认行/表达式/DEFAULT(col)/1364、UPDATE/UPSERT/JOIN DEFAULT、MySQL 8 行/列别名 UPSERT、复杂冲突标量表达式和左到右赋值、CREATE TABLE LIKE、TRUNCATE 隐式提交/自增/FK 1701、LOAD DATA 用户变量/SET/latin1/BLOB/1261/1262/1062 warning/strict 1261/1262/1300 原子失败、FOR SHARE/NOWAIT 3572/主键队列 SKIP LOCKED/双事务死锁 1213、FK/CHECK/事务/SAVEPOINT、JOIN/NATURAL/USING、有键/无键重复行单/多目标 JOIN UPDATE/DELETE、相关/派生/CTE 子查询、set operators、多列 GROUP BY、窗口、多列/表达式 ORDER BY、常用 CASE/字符串/数值/CAST 投影/WHERE/UPDATE/DELETE
 - [x] 本轮 SQL 回归：JOIN ON 常量/算术/常用标量函数；分组 HAVING 未关联标量子查询及 `IN (SELECT ...)`；锁定读非索引 JOIN 表达式安全回退
 - [x] `scripts/docker-smoke.ps1`：通过，含 changed-row affected counts/no-op WAL avoidance、INSERT/REPLACE SET、INSERT VALUES 默认行/表达式/1364、UPDATE/UPSERT/JOIN DEFAULT、MySQL 8 行/列别名 UPSERT、复杂冲突标量表达式/左到右赋值、SIGKILL committed/uncommitted 恢复、WAL 坏尾精确截断、CREATE TABLE LIKE、TRUNCATE 自增/FK、双连接 FOR SHARE/NOWAIT/SKIP LOCKED/死锁受害者回滚、真实 `LOAD DATA LOCAL INFILE` 协议、字符集/warning/strict error 诊断、语句原子性及 `secure_file_priv` 边界
+- [x] `scripts/docker-fault-injection.ps1`：低资源 Docker（0.5 CPU、512 MiB）通过掉电/只读/ENOSPC/恢复中断四场景；源码镜像构建限制 0.5 CPU、768 MiB，结束自动清理 fixture
 - [x] `NO_BUILD=1 bash scripts/docker-smoke.sh`：通过（当前脚本与 PowerShell 同覆盖）
 - [x] Windows Docker Desktop Ubuntu 24.04 开发基准门禁：20 秒预算、1 轮、同为 `ENGINE=InnoDB`、20 MB/s/500 IOPS、fsync-on-commit；2026-07-20 最新原始样本 `target/io-bench-desktop-header-check/` 为 MyDB 2262.9 ops/s、MySQL 8.0.46 3318.4 ops/s、0.682x，MyDB 写 P99 40.5 ms、MySQL 495.9 ms。仅证明限速工具链与回归数据，不作为正式性能结论
 - [x] 2026-07-20 8 表/4 CPU 限速单轮：`target/io-bench-current-multitable-windowed/`，MyDB 1802.7 ops/s、MySQL 3417.4 ops/s、0.527x；WAL 305 次 fsync 覆盖 821 请求（2.69 请求/组），比无窗口专用写线程的 2.17 请求/组提升。单轮仅作回归证据，不作为正式性能结论
