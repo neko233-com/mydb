@@ -1803,6 +1803,16 @@ pub struct Column {
     pub nullable: bool,
     pub default: Option<String>,
     pub is_primary_key: bool,
+    // Appended after the legacy fields so old bincode images/WAL payloads
+    // deserialize with the default value.
+    #[serde(default)]
+    pub generated: Option<GeneratedColumn>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GeneratedColumn {
+    pub expression: String,
+    pub stored: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -11900,27 +11910,45 @@ fn render_table_schema_sql(
         .columns
         .iter()
         .map(|column| {
-            let default = column.default.as_ref().map_or_else(String::new, |value| {
-                if value.eq_ignore_ascii_case("NULL") {
-                    " DEFAULT NULL".to_string()
-                } else if is_current_timestamp_default(value)
-                    || (matches!(
-                        column.data_type,
-                        DataType::Int
-                            | DataType::BigInt
-                            | DataType::Float
-                            | DataType::Double
-                            | DataType::Boolean
-                    ) && value.parse::<f64>().is_ok())
-                {
-                    format!(" DEFAULT {value}")
-                } else {
+            let generated = column
+                .generated
+                .as_ref()
+                .map_or_else(String::new, |generated| {
                     format!(
-                        " DEFAULT '{}'",
-                        value.replace('\\', "\\\\").replace('\'', "''")
+                        " AS ({}) {}",
+                        generated.expression,
+                        if generated.stored {
+                            "STORED"
+                        } else {
+                            "VIRTUAL"
+                        }
                     )
-                }
-            });
+                });
+            let default = if column.generated.is_some() {
+                String::new()
+            } else {
+                column.default.as_ref().map_or_else(String::new, |value| {
+                    if value.eq_ignore_ascii_case("NULL") {
+                        " DEFAULT NULL".to_string()
+                    } else if is_current_timestamp_default(value)
+                        || (matches!(
+                            column.data_type,
+                            DataType::Int
+                                | DataType::BigInt
+                                | DataType::Float
+                                | DataType::Double
+                                | DataType::Boolean
+                        ) && value.parse::<f64>().is_ok())
+                    {
+                        format!(" DEFAULT {value}")
+                    } else {
+                        format!(
+                            " DEFAULT '{}'",
+                            value.replace('\\', "\\\\").replace('\'', "''")
+                        )
+                    }
+                })
+            };
             let comment = column_comment_from_schema(schema, &column.name).map_or_else(
                 String::new,
                 |comment| {
@@ -11931,7 +11959,7 @@ fn render_table_schema_sql(
                 },
             );
             format!(
-                "  `{}` {}{}{}{}{}{}",
+                "  `{}` {}{}{}{}{}{}{}",
                 column.name.replace('`', "``"),
                 storage_data_type_sql(&column.data_type),
                 if column.nullable { "" } else { " NOT NULL" },
@@ -11945,6 +11973,7 @@ fn render_table_schema_sql(
                 } else {
                     ""
                 },
+                generated,
                 default,
                 comment,
             )
@@ -12595,6 +12624,7 @@ mod tests {
                     nullable: false,
                     default: None,
                     is_primary_key: true,
+                    generated: None,
                 },
                 Column {
                     name: "value".into(),
@@ -12602,6 +12632,7 @@ mod tests {
                     nullable: true,
                     default: None,
                     is_primary_key: false,
+                    generated: None,
                 },
             ],
             primary_key: Some(vec!["id".into()]),
@@ -12624,6 +12655,7 @@ mod tests {
                     nullable: false,
                     default: None,
                     is_primary_key: true,
+                    generated: None,
                 },
                 Column {
                     name: "name".into(),
@@ -12631,6 +12663,7 @@ mod tests {
                     nullable: false,
                     default: None,
                     is_primary_key: false,
+                    generated: None,
                 },
                 Column {
                     name: "email".into(),
@@ -12638,6 +12671,7 @@ mod tests {
                     nullable: false,
                     default: None,
                     is_primary_key: false,
+                    generated: None,
                 },
             ],
             primary_key: Some(vec!["id".into()]),
@@ -12997,6 +13031,7 @@ mod tests {
                             nullable: false,
                             default: None,
                             is_primary_key: true,
+                            generated: None,
                         }],
                         primary_key: Some(vec!["id".into()]),
                         indexes: Vec::new(),
@@ -13578,6 +13613,7 @@ mod tests {
                 nullable: false,
                 default: None,
                 is_primary_key: false,
+                generated: None,
             }],
             primary_key: None,
             indexes: vec![Index {
@@ -13620,6 +13656,7 @@ mod tests {
                 nullable: false,
                 default: None,
                 is_primary_key: false,
+                generated: None,
             }],
             primary_key: None,
             indexes: Vec::new(),

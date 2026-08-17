@@ -6,7 +6,7 @@
 >
 > **非单机能力明确不支持（设计决定，非临时延迟）**：binlog 复制拓扑 / GTID、读写分离、Group Replication / Galera、分布式 XA 两阶段协调、跨节点一致性。这些在 [`SYNTAX_MATRIX.md`](SYNTAX_MATRIX.md) 中统一标记为 ❌ 明确不支持，不会纳入范围，也不视为“缺失”。单机本地 XA 支持跨连接 prepared 分支、锁保留、RECOVER、one-phase 与 durable WAL commit marker 故障恢复。
 >
-> 最后更新：2026-08-15（补齐 `event_scheduler` 全局变量 ON/OFF/DISABLED、DataGrip/GoLand 探测路径、无默认 schema 的 `DATABASE()`、明文 `SHOW STATUS LIKE 'ssl_version'`、SHOW 元数据 LIKE 大小写不敏感、CASE 文本投影中的嵌套 `IN`、持久 row-id、MVCC 读视图/历史版本、基础 statement-duration MDL、主键/单列二级索引 next-key/gap 区间锁、二级索引插入意向锁、RC 记录锁、复合索引全等值/左前缀范围锁、单列索引 `LIKE` 前缀范围锁、无主键基础隐藏行锁和 JOIN 基础 `SKIP LOCKED` 行过滤；新增单基表直接列投影可更新视图和 LOCAL/CASCADED CHECK OPTION、逻辑表级 RANGE/LIST/HASH/KEY 分区及常用表达式函数、`information_schema.PARTITIONS` 行级元数据、`LOAD DATA ... PARTITION` 逻辑分区校验、`PAD SPACE/NO PAD` 与字符串 `_bin` 排序规则边界；新增二级索引锁定读同步锁聚簇记录、JOIN 二级索引点锁、列对列比较范围锁、JOIN ON 常量/常用标量函数/算术表达式、HAVING 未关联标量子查询/`IN (SELECT ...)` 与存储层 UPSERT 唯一键候选镜像校验回归；新增基础空间构造器、度量、SRID 轴序和空间谓词差分，并扩展 MULTI*/GEOMETRYCOLLECTION 基础构造器、度量和访问器；新增 `REGEXP_INSTR`/`REGEXP_SUBSTR`/`REGEXP_REPLACE` 的位置、occurrence、return_option、NULL 和 Unicode 差分；新增多列/表达式 `COUNT(DISTINCT ...)` 元组 NULL 与排序规则语义，以及多表达式 `GROUP_CONCAT` 的 NULL、元组去重、排序和分隔符语义，新增 `group_concat_max_len` SESSION/GLOBAL、下限、UTF-8 截断与 1260 警告语义，以及无 `FROM`、单表和 JOIN 的嵌套聚合标量投影；新增库/表/列/例程 `REVOKE` 不存在授权错误、多权限作用域校验和 `GRANT ALL`/`GRANT OPTION` 分离；新增无 `ON` 的 `REVOKE ALL PRIVILEGES, GRANT OPTION FROM user` 全量清除全局/库/表/列/例程权限、`CREATE USER`/`UPDATE` 管理权限路径；新增 `REVOKE IF EXISTS`、`IGNORE UNKNOWN USER` 及 1147/3162/3523 warning 语义；新增 `partial_revokes` 默认关闭、`SET GLOBAL/PERSIST[_ONLY]`、schema 级全局权限限制、限制继承、`SHOW GRANTS` 与 `mysql.user.User_attributes`，当前 MySQL 8.4 差分 131/131；完整 InnoDB/GIS/正则 ICU 边界语义仍按清单逐项验收）。
+> 最后更新：2026-08-17（补齐 `event_scheduler` 全局变量 ON/OFF/DISABLED、DataGrip/GoLand 探测路径、无默认 schema 的 `DATABASE()`、明文 `SHOW STATUS LIKE 'ssl_version'`、SHOW 元数据 LIKE 大小写不敏感、CASE 文本投影中的嵌套 `IN`、持久 row-id、MVCC 读视图/历史版本、基础 statement-duration MDL、主键/单列二级索引 next-key/gap 区间锁、二级索引插入意向锁、RC 记录锁、复合索引全等值/左前缀范围锁、单列索引 `LIKE` 前缀范围锁、无主键基础隐藏行锁和 JOIN 基础 `SKIP LOCKED` 行过滤；新增单基表直接列投影可更新视图和 LOCAL/CASCADED CHECK OPTION、逻辑表级 RANGE/LIST/HASH/KEY 分区及常用表达式函数、`information_schema.PARTITIONS` 行级元数据、`LOAD DATA ... PARTITION` 逻辑分区校验、`PAD SPACE/NO PAD` 与字符串 `_bin` 排序规则边界；新增二级索引锁定读同步锁聚簇记录、JOIN 二级索引点锁、列对列比较范围锁、JOIN ON 常量/常用标量函数/算术表达式、HAVING 未关联标量子查询/`IN (SELECT ...)` 与存储层 UPSERT 唯一键候选镜像校验回归；新增基础空间构造器、度量、SRID 轴序和空间谓词差分，并扩展 MULTI*/GEOMETRYCOLLECTION 基础构造器、度量和访问器；新增 `REGEXP_INSTR`/`REGEXP_SUBSTR`/`REGEXP_REPLACE` 的位置、occurrence、return_option、NULL 和 Unicode 差分；新增多列/表达式 `COUNT(DISTINCT ...)` 元组 NULL 与排序规则语义，以及多表达式 `GROUP_CONCAT` 的 NULL、元组去重、排序和分隔符语义，新增 `group_concat_max_len` SESSION/GLOBAL、下限、UTF-8 截断与 1260 警告语义，以及无 `FROM`、单表和 JOIN 的嵌套聚合标量投影；新增库/表/列/例程 `REVOKE` 不存在授权错误、多权限作用域校验和 `GRANT ALL`/`GRANT OPTION` 分离；新增无 `ON` 的 `REVOKE ALL PRIVILEGES, GRANT OPTION FROM user` 全量清除全局/库/表/列/例程权限、`CREATE USER`/`UPDATE` 管理权限路径；新增 `REVOKE IF EXISTS`、`IGNORE UNKNOWN USER` 及 1147/3162/3523 warning 语义；新增 `partial_revokes` 默认关闭、`SET GLOBAL/PERSIST[_ONLY]`、schema 级全局权限限制、限制继承、`SHOW GRANTS` 与 `mysql.user.User_attributes`，当前 MySQL 8.4 差分 131/131；本轮新增 generated 列 ALTER ADD/MODIFY/CHANGE 表达式持久化与重启元数据回归，以及 Docker 低资源故障注入的掉电等价模型/ENOSPC/只读/replay 二次中断覆盖，宿主物理断电仍不在开发机执行；完整 InnoDB/GIS/正则 ICU 边界语义仍按清单逐项验收）。
 
 ## 状态图例
 
@@ -47,7 +47,7 @@
 | `ALTER TABLE ADD/DROP PRIMARY KEY`、`RENAME INDEX` | ✅ Verified | |
 | `ALTER TABLE ADD/DROP FOREIGN KEY`、`ADD/DROP CHECK` | ✅ Verified | 旧数据 WAL 前校验 |
 | `ALTER COLUMN SET/DROP DEFAULT`、`ADD/DROP ... IF [NOT] EXISTS` | ✅ Verified | |
-| `GENERATED ALWAYS AS (...)` STORED/VIRTUAL 基础列 | 🟡 Partial | 基础算术/字符串表达式的 INSERT、UPDATE、WHERE、索引过滤、SHOW/`information_schema.COLUMNS` 元数据、显式写入拒绝（3105）与跨列依赖重算已与 MySQL 8.4 差分；完整 generated 表达式类型推导、物化布局与全部 DDL 边界仍 Deferred |
+| `GENERATED ALWAYS AS (...)` STORED/VIRTUAL 基础列 | 🟡 Partial | 基础算术/字符串表达式的 INSERT、UPDATE、WHERE、索引过滤、SHOW/`information_schema.COLUMNS` 元数据、显式写入拒绝（3105）、跨列依赖重算，以及 ALTER ADD/MODIFY/CHANGE 的表达式持久化与重启元数据已与 MySQL 8.4 差分；完整 generated 表达式类型推导、物化布局与全部 DDL 边界仍 Deferred |
 | `CREATE/DROP INDEX`、`CREATE UNIQUE INDEX` | ✅ Verified | |
 | `RENAME TABLE`（多项）、`ALTER TABLE RENAME` | ✅ Verified | 原子镜像、跨库 |
 | 表/列 `COMMENT` 持久化 | ✅ Verified | CREATE/ALTER TABLE comment 通过 CREATE SQL 持久化；SHOW FULL COLUMNS、SHOW TABLE STATUS、information_schema.tables/columns、SHOW CREATE TABLE 已回归；复杂 MODIFY 边界仍待补 |
@@ -203,10 +203,10 @@
 | prepared statement（协议级 + SQL 级 `PREPARE/EXECUTE`） | ✅ Verified | 真实 TCP 回归覆盖基表列类型元数据、`UNSIGNED`、INT/DATE/BLOB 参数及 binary result row 解码；复杂表达式仍按表达式推断类型 |
 | `LAST_INSERT_ID()` / `ROW_COUNT()` / `FOUND_ROWS()` / `SQL_CALC_FOUND_ROWS` | ✅ Verified | |
 | 会话用户变量 `@x` | ✅ Verified | |
-| Prometheus / Agent HTTP / 原生 CLI | ✅ Verified | |
+| Prometheus / Agent HTTP / 原生 CLI | ✅ Verified | slow/error SELECT 自动保留可解析的 `EXPLAIN FORMAT=JSON`；`POST /api/v1/agent/sql` 返回同权限 JSON 计划与静态建议，原 SQL 不被执行；跨时间段根因、完整索引建议和告警仍 Deferred |
 | `mydbdump` / `mydb-migrate` 迁移与备份（全量/增量/PITR） | ✅ Verified | |
 | Docker / Compose / 原生安装脚本 | ✅ Verified | macOS Docker、Windows/Linux 安装脚本端到端待补（CheckList） |
-| 故障注入矩阵（SIGKILL/WAL 坏尾/页损坏/只读/ENOSPC） | ✅ Verified | 完整矩阵（宿主断电、磁盘满、恢复中再次中断）🔴 Deferred |
+| 故障注入矩阵（SIGKILL/WAL 坏尾/页损坏/只读/ENOSPC） | ✅ Verified | Docker 已验证 SIGKILL 掉电等价模型、WAL 坏尾/中段损坏、页损坏、只读、8 MiB tmpfs ENOSPC、恢复 replay 中二次 SIGKILL；宿主物理断电与更大压力矩阵仍 Deferred，不在开发机执行 |
 
 ---
 

@@ -32,6 +32,7 @@
 - [x] Docker 页损坏故障注入：篡改持久化 `pages.dat` 已校验数据字节；启动安全拒绝并报告页校验损坏，不静默少读数据
 - [x] 恢复中断边界：模拟页已持久化但 `Applied` 未写入时进程消失；真实重启重新 replay 后无重复行且补写一个 `Applied`
 - [x] 2026-08-17 Docker 低资源故障注入脚本：`scripts/docker-fault-injection.ps1` 通过 SIGKILL 掉电模型、只读数据目录、8 MiB tmpfs ENOSPC、恢复 replay 中二次 SIGKILL；独立 named volume/network、无宿主目录挂载、无 3306/4306 发布，160 条 WAL 事务恢复后行数/SUM 精确一致
+- [x] 2026-08-17 generated 列 DDL 回归：`ALTER TABLE ADD/MODIFY/CHANGE COLUMN ... AS (...) STORED/VIRTUAL` 的表达式、类型和模式持久化，`SHOW CREATE TABLE`、已有行重算和 Rust 重启元数据路径通过
 - [ ] 完整故障注入矩阵：宿主断电、磁盘满、只读盘、WAL 中段/页损坏、恢复中再次中断
 - [ ] 长时间压力、磁盘空间回收、碎片整理及多 TB 数据验证
 
@@ -168,11 +169,12 @@
 ## Agent HTTP 与运维
 
 - [x] Agent HTTP 默认开启，提供 health、自然语言诊断、slow SQL、锁/WAL/checkpoint 状态
+- [x] slow SQL 基础排查：慢/错误 SELECT 自动附带可解析的 `EXPLAIN FORMAT=JSON`，`POST /api/v1/agent/sql` 返回静态建议与同权限 JSON 执行计划；不执行用户 SQL，不把调试请求写入业务数据
 - [x] HTTP 全量/增量备份、PITR 恢复 staging 和重启安装
 - [x] 原生 CLI 可访问 Agent API，Prometheus `/metrics` 默认可用
 - [x] 管理端口与 SQL 端口分离，支持 bearer/admin 密码
 - [ ] 完整生产鉴权、TLS、密钥轮换、权限审计与危险操作审批；当前已落地强密码/TLS 配置校验、HTTP 登录失败限流、管理 API 审计，以及备份删除/恢复的 ID 绑定显式确认；密钥轮换持久化、细粒度管理角色和审批留痕仍待补齐
-- [ ] slow SQL 执行计划、索引建议、跨时间段根因分析和告警集成
+- [ ] slow SQL 跨时间段根因分析、完整索引建议、采样/告警集成；基础 JSON 执行计划与静态建议已完成
 
 ## 安装、Docker 与平台
 

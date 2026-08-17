@@ -38,7 +38,7 @@ use mydb_storage::{
     partition_for_row, table_engine_from_sql, table_partition_info,
     validate_table_partition_definition, AlterTableOperation, Column, ColumnPosition, DataType,
     EventDefinition, EventFinishAction, EventMetadata, EventSchedule, ExpressionAssignment,
-    ForeignKeyDefinition, FunctionDefinition, FunctionParameter, Index, IndexKind,
+    ForeignKeyDefinition, FunctionDefinition, FunctionParameter, GeneratedColumn, Index, IndexKind,
     IsolationLevel as MvccIsolation, NumericOperator, ProcedureDefinition, ProcedureMetadata,
     ProcedureParameter, ProcedureParameterMode, Row, RowPredicate, RowPredicateColumnOperator,
     StorageEngineManager, TableEngine, TablePartitionInfo, TableSchema, TransactionId,
@@ -4553,6 +4553,7 @@ pub struct SlowQuerySnapshot {
     pub database: String,
     pub sql: String,
     pub error: Option<String>,
+    pub explain_json: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -10282,6 +10283,7 @@ impl Backend {
                         nullable: true,
                         default: None,
                         is_primary_key: false,
+                        generated: None,
                     })
                     .collect(),
                 primary_key: None,
@@ -18374,6 +18376,7 @@ impl Backend {
                     nullable: true,
                     default: None,
                     is_primary_key: false,
+                    generated: None,
                 })
                 .collect(),
             primary_key: None,
@@ -19548,6 +19551,7 @@ impl Backend {
                     nullable: true,
                     default: None,
                     is_primary_key: false,
+                    generated: None,
                 })
                 .collect(),
             primary_key: None,
@@ -24567,6 +24571,7 @@ fn virtual_table_schema(name: &str, columns: &[String]) -> TableSchema {
                 nullable: true,
                 default: None,
                 is_primary_key: false,
+                generated: None,
             })
             .collect(),
         primary_key: None,
@@ -28502,6 +28507,7 @@ fn json_table_schema_columns_into(
             nullable: true,
             default: None,
             is_primary_key: false,
+            generated: None,
         });
     }
     Ok(())
@@ -29736,6 +29742,7 @@ fn evaluate_grouped_window_projection(
                 nullable: true,
                 default: None,
                 is_primary_key: false,
+                generated: None,
             });
         }
     }
@@ -40092,6 +40099,21 @@ impl Backend {
         result
     }
 
+    async fn explain_json_for_slow_query(&mut self, query: &str) -> Option<String> {
+        let statement = query.trim().trim_end_matches(';').trim();
+        if !statement.to_ascii_uppercase().starts_with("SELECT ") {
+            return None;
+        }
+        let QueryOutcome::Rows { rows, .. } = self.explain_select_json(statement).await.ok()?
+        else {
+            return None;
+        };
+        rows.first()
+            .and_then(|row| row.first())
+            .and_then(|value| value.as_ref())
+            .and_then(|value| String::from_utf8(value.clone()).ok())
+    }
+
     async fn finish_query<W: AsyncWrite + Send + Unpin>(
         &mut self,
         query: &str,
@@ -40102,6 +40124,7 @@ impl Backend {
         let elapsed_ms = started.elapsed().as_millis() as u64;
         let error = outcome.as_ref().err().map(ToString::to_string);
         if elapsed_ms >= self.config.slow_query_threshold_ms || error.is_some() {
+            let explain_json = self.explain_json_for_slow_query(query).await;
             self.stats.record_query(
                 SlowQuerySnapshot {
                     unix_ms: SystemTime::now()
@@ -40113,6 +40136,7 @@ impl Backend {
                     database: self.database.clone(),
                     sql: query.to_string(),
                     error: error.clone(),
+                    explain_json,
                 },
                 self.config.max_slow_queries,
             );
@@ -46472,6 +46496,7 @@ fn ctas_schema(
                 nullable,
                 default: None,
                 is_primary_key: false,
+                generated: None,
             }
         })
         .collect::<Vec<_>>();
@@ -46996,12 +47021,28 @@ fn parse_column(definition: &str) -> anyhow::Result<Column> {
         .next()
         .ok_or_else(|| anyhow::anyhow!("Missing column type"))?;
     let upper = definition.to_ascii_uppercase();
+    let generated = parse_generated_column_definition(definition);
     Ok(Column {
         name,
         data_type: parse_data_type(data_type),
         nullable: !upper.contains("NOT NULL") && !upper.contains("PRIMARY KEY"),
         default: parse_default(definition),
         is_primary_key: upper.contains("PRIMARY KEY"),
+        generated,
+    })
+}
+
+fn parse_generated_column_definition(definition: &str) -> Option<GeneratedColumn> {
+    let upper = definition.to_ascii_uppercase();
+    let as_position = [" AS (", " AS("].into_iter().find_map(|marker| {
+        upper
+            .find(marker)
+            .map(|position| position + marker.len() - 1)
+    })?;
+    let close = matching_parenthesis(definition, as_position)?;
+    Some(GeneratedColumn {
+        expression: definition[as_position + 1..close].trim().to_string(),
+        stored: upper[close + 1..].contains("STORED"),
     })
 }
 
@@ -47024,6 +47065,15 @@ fn column_definition(schema: &TableSchema, column: &str) -> Option<String> {
 }
 
 fn generated_column_definition(schema: &TableSchema, column: &str) -> Option<(String, bool)> {
+    if let Some(column) = schema
+        .columns
+        .iter()
+        .find(|item| item.name.eq_ignore_ascii_case(column))
+    {
+        if let Some(generated) = &column.generated {
+            return Some((generated.expression.clone(), generated.stored));
+        }
+    }
     let definition = column_definition(schema, column)?;
     let upper = definition.to_ascii_uppercase();
     let as_position = [" AS (", " AS("].into_iter().find_map(|marker| {
@@ -69694,6 +69744,15 @@ mod tests {
             plan["query_block"]["table"]["used_key_parts"],
             serde_json::json!(["name"])
         );
+        let slow_plan = backend
+            .explain_json_for_slow_query("SELECT name FROM expression_rows WHERE name='world';")
+            .await
+            .expect("slow query plan");
+        let slow_plan: serde_json::Value = serde_json::from_str(&slow_plan).unwrap();
+        assert_eq!(
+            slow_plan["query_block"]["table"]["key"],
+            "idx_expression_name"
+        );
         backend
             .execute("CREATE TABLE explain_roles (id BIGINT PRIMARY KEY, title VARCHAR(32))")
             .await
@@ -74203,6 +74262,7 @@ mod tests {
                 nullable: false,
                 default: None,
                 is_primary_key: false,
+                generated: None,
             }],
             primary_key: None,
             indexes: Vec::new(),
@@ -79125,6 +79185,7 @@ mod tests {
                     nullable: false,
                     default: None,
                     is_primary_key: true,
+                    generated: None,
                 },
                 Column {
                     name: "name".into(),
@@ -79132,6 +79193,7 @@ mod tests {
                     nullable: false,
                     default: None,
                     is_primary_key: false,
+                    generated: None,
                 },
             ],
             primary_key: Some(vec!["id".into()]),
@@ -79162,6 +79224,7 @@ mod tests {
                     nullable: false,
                     default: None,
                     is_primary_key: true,
+                    generated: None,
                 },
                 Column {
                     name: "name".into(),
@@ -79169,6 +79232,7 @@ mod tests {
                     nullable: false,
                     default: None,
                     is_primary_key: false,
+                    generated: None,
                 },
                 Column {
                     name: "level".into(),
@@ -79176,6 +79240,7 @@ mod tests {
                     nullable: false,
                     default: None,
                     is_primary_key: false,
+                    generated: None,
                 },
             ],
             primary_key: Some(vec!["playerId".into()]),
@@ -79232,6 +79297,7 @@ mod tests {
                     nullable: true,
                     default: None,
                     is_primary_key: false,
+                    generated: None,
                 },
                 Column {
                     name: "empty_value".into(),
@@ -79239,6 +79305,7 @@ mod tests {
                     nullable: false,
                     default: None,
                     is_primary_key: false,
+                    generated: None,
                 },
                 Column {
                     name: "binary_value".into(),
@@ -79246,6 +79313,7 @@ mod tests {
                     nullable: false,
                     default: None,
                     is_primary_key: false,
+                    generated: None,
                 },
             ],
             primary_key: None,
@@ -79519,6 +79587,60 @@ mod tests {
                 Some(b"12".to_vec())
             ]]
         );
+
+        backend
+            .execute("ALTER TABLE generated_values ADD COLUMN doubled BIGINT AS (base * 2) STORED")
+            .await
+            .expect("add generated column");
+        let QueryOutcome::Rows { rows, .. } = backend
+            .execute("SELECT doubled FROM generated_values WHERE id=1")
+            .await
+            .expect("read added generated column")
+        else {
+            panic!("expected added generated column rows");
+        };
+        assert_eq!(rows, vec![vec![Some(b"20".to_vec())]]);
+        let QueryOutcome::Rows { rows, .. } = backend
+            .execute("SHOW CREATE TABLE generated_values")
+            .await
+            .expect("show altered generated table")
+        else {
+            panic!("expected altered generated table rows");
+        };
+        let create_sql = rows[0][1].as_ref().expect("CREATE TABLE SQL");
+        assert!(
+            String::from_utf8_lossy(create_sql).contains("`doubled` bigint AS (base * 2) STORED")
+        );
+
+        backend
+            .execute(
+                "ALTER TABLE generated_values MODIFY COLUMN doubled BIGINT AS (base * 3) VIRTUAL",
+            )
+            .await
+            .expect("modify generated column");
+        let QueryOutcome::Rows { rows, .. } = backend
+            .execute("SELECT doubled FROM generated_values WHERE id=1")
+            .await
+            .expect("read modified generated column")
+        else {
+            panic!("expected modified generated column rows");
+        };
+        assert_eq!(rows, vec![vec![Some(b"30".to_vec())]]);
+
+        backend
+            .execute(
+                "ALTER TABLE generated_values CHANGE COLUMN doubled quadrupled BIGINT AS (base * 4) STORED",
+            )
+            .await
+            .expect("change generated column");
+        let QueryOutcome::Rows { rows, .. } = backend
+            .execute("SELECT quadrupled FROM generated_values WHERE id=1")
+            .await
+            .expect("read changed generated column")
+        else {
+            panic!("expected changed generated column rows");
+        };
+        assert_eq!(rows, vec![vec![Some(b"40".to_vec())]]);
 
         let insert_error = backend
             .execute("INSERT INTO generated_values (id,base,stored_value) VALUES (2,20,99)")

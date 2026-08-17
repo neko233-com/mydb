@@ -1699,6 +1699,8 @@ struct AgentRequest {
     question: String,
     #[serde(default)]
     sql: String,
+    #[serde(default)]
+    database: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1948,6 +1950,10 @@ async fn agent_slow_queries(
                 "database": query.database,
                 "sql": query.sql,
                 "error": query.error,
+                "explain_json": query
+                    .explain_json
+                    .as_deref()
+                    .and_then(|value| serde_json::from_str::<Value>(value).ok()),
             })
         })
         .collect();
@@ -1983,6 +1989,10 @@ async fn agent_diagnose(
                 "database": query.database,
                 "sql": query.sql,
                 "error": query.error,
+                "explain_json": query
+                    .explain_json
+                    .as_deref()
+                    .and_then(|value| serde_json::from_str::<Value>(value).ok()),
             })
         })
         .collect();
@@ -2045,10 +2055,43 @@ async fn agent_sql_debug(
     if advice.is_empty() {
         advice.push("no obvious static issue; inspect slow-query duration and actor queue depth");
     }
+    let mut explain_json = Value::Null;
+    let mut explain_error = None;
+    let statement = request.sql.trim().trim_end_matches(';').trim();
+    if statement.to_ascii_uppercase().starts_with("SELECT ") {
+        let protocol_config = Arc::new(state.protocol_config.read().clone());
+        let sql_user = authorized_identity(&headers, &state)?;
+        match mydb_wire::execute_admin_sql(
+            state.storage.clone(),
+            protocol_config,
+            state.wire_stats.clone(),
+            &sql_user,
+            request.database.as_deref(),
+            &format!("EXPLAIN FORMAT=JSON {statement}"),
+        )
+        .await
+        {
+            Ok(result) => {
+                explain_json = result
+                    .result_sets
+                    .first()
+                    .and_then(|set| set.rows.first())
+                    .and_then(|row| row.first())
+                    .and_then(|value| value.as_deref())
+                    .and_then(|value| serde_json::from_str(value).ok())
+                    .unwrap_or(Value::Null);
+            }
+            Err(error) => explain_error = Some(error.to_string()),
+        }
+    }
     Ok(Json(json!({
         "statement_type": kind,
         "sql": request.sql,
+        "database": request.database,
         "advice": advice,
+        "explain_format": "JSON",
+        "explain": explain_json,
+        "explain_error": explain_error,
         "engine": "single-node actor-ordered writer",
     })))
 }
