@@ -647,7 +647,7 @@ bash scripts/docker-smoke.sh
 
 当前开发状态、已完成项、未完成项、差分证据统一维护在 [CheckList.md](CheckList.md)。只有可复现实测证明的项目才会打勾。
 
-### v0.1.34 稳定版
+### v0.1.35 稳定版
 
 本版面向单机 MySQL 8.4 常用生产工作负载：3306 提供 MySQL 协议，4306 提供登录保护的 Web SQL IDE/管理 API；在 v0.1.33 基础上修复 Web Schema Explorer 的硬编码库树，改为按当前账号动态读取 `SHOW DATABASES` 与 `information_schema.TABLES`，支持空库、表列检查器和刷新清理，并保留库/表/列/例程作用域多权限 `REVOKE`、`SHOW DATABASES`/`SHOW SCHEMAS`、`information_schema.SCHEMATA` 权限过滤、`partial_revokes`、`SHOW GRANTS`/`mysql.user.User_attributes` 展示与 `SET GLOBAL/PERSIST` 语义。发布不宣称复制/集群、完整 InnoDB 全部锁边界、完整 GIS/OGC 语义、全部冷门字符集或全部 MySQL 错误码已完成；显式 `LATERAL` 前缀属于额外超集能力，不作为 MySQL 8.4 差分承诺；逐项状态见 [CheckList.md](CheckList.md) 和 [SYNTAX_MATRIX.md](SYNTAX_MATRIX.md)。
 
@@ -662,13 +662,13 @@ bash scripts/docker-smoke.sh
 - ✅ `scripts/bench.ps1`：Docker Linux Rust gate、release build 与同条件 MySQL 8.4 持久化基准通过；性能阶段无预热、60 秒硬截止（报告见 [性能报告.md](性能报告.md)）
 - ✅ `scripts/mysql84-diff.ps1`：当前源码隔离端口与同机 Docker MySQL 8.4，131/131 差分通过；覆盖 `SHOW DATABASES` 系统 schema 输出、`partial_revokes` 默认关闭、1141/1147/1403、schema 限制、继承、`SHOW GRANTS`、`User_attributes`、`SET GLOBAL/PERSIST`，作用域多权限 REVOKE 完整性，以及正则、JSON_TABLE、空间、全文等覆盖
 - ✅ v0.1.33 授权兼容回归：库/表/列/例程作用域 `REVOKE` 要求列出的权限全部存在；`SHOW DATABASES` 与 `information_schema.SCHEMATA` 按全局/库/表/列/例程权限和激活角色过滤，Rust 回归已覆盖
-- ✅ v0.1.34 Web 回归：登录后 Schema Explorer 按权限动态展示 schema/table，创建、刷新、删除、表列检查器通过浏览器验证；控制台无 warning/error，Rust server 回归 17/17
-- ✅ v0.1.34 同条件持久化基准：无预热、11.6/60 秒、1 次采样；单表写 510/248 ops/s、4 actor P99 10.3/15.9 ms、并发吞吐 1070/547 ops/s、读 P50 348/163 μs；源码提交 `29fa369`，原始结果见 [性能报告.md](性能报告.md)
+- ✅ v0.1.35 Web 回归：登录后 Schema Explorer 按权限动态展示 schema/table，创建、刷新、删除、表列检查器通过浏览器验证；控制台无 warning/error，Rust server 回归 17/17
+- ✅ v0.1.35 同条件持久化基准：无预热、11.6/60 秒、1 次采样；单表写 510/248 ops/s、4 actor P99 10.3/15.9 ms、并发吞吐 1070/547 ops/s、读 P50 348/163 μs；源码提交 `29fa369`，原始结果见 [性能报告.md](性能报告.md)
 - ✅ 2026-08-17 Docker 低资源故障注入：`scripts/docker-fault-injection.ps1` 通过 SIGKILL 掉电模型、只读数据目录、8 MiB tmpfs ENOSPC、replay 阶段二次 SIGKILL；容器限 0.5 CPU/512 MiB，无宿主目录挂载/端口发布，160 条 WAL 事务恢复后行数与 SUM 精确一致
 - ✅ 2026-08-17 generated 列 DDL 回归：`ALTER TABLE ADD/MODIFY/CHANGE COLUMN ... AS (...) STORED/VIRTUAL` 保留表达式与模式，已有行重算，`SHOW CREATE TABLE` 和 Rust 重启元数据路径通过
 - ✅ 2026-08-17 SQL 调试：慢/错误 SELECT 记录稳定 ID、字面量归一化 digest、执行/计划阶段耗时、结果状态/行数和可解析 `EXPLAIN FORMAT=JSON`；Agent `/api/v1/agent/sql` 返回静态风险建议与同权限 JSON 计划，调试路径不执行原 SQL
 - ✅ 2026-08-17 Linux Docker Rust 门禁：隔离容器 2 CPU/2 GiB 通过 fmt、workspace Clippy、workspace 全量测试与 release 构建；构建卷已清理
-- ✅ 2026-08-17 Windows 当前源码打包：5 个 release 二进制构建成功，本地 zip 解包完整性与 SHA-256 校验通过；本次 v0.1.34 发布包按同一源码生成
+- ✅ 2026-08-17 Windows 当前源码打包：5 个 release 二进制构建成功，本地 zip 解包完整性与 SHA-256 校验通过；本次 v0.1.35 发布包按同一源码生成
 - ⏳ Ubuntu 24.04 物理性能、macOS 原生验收、大数据压力与生产安全运维验收；宿主真实断电不在开发机执行，单机等价逻辑用 Docker 故障模型覆盖；以 [CheckList.md](CheckList.md) 与 [性能报告.md](性能报告.md) 为准
 
 ---
