@@ -1,5 +1,7 @@
 # MyDB MySQL 8.4 语法矩阵（验收基线）
 
+> 操作说明见 [中文](docs/zh/README.md)、[English](docs/en/README.md)、[日本語](docs/ja/README.md)、[한국어](docs/ko/README.md)。语法矩阵保留中文验收基线。
+
 > 本文档是 [`CheckList.md`](CheckList.md) 的**全量语法对照基线**：逐条枚举 MySQL 8.4 对外暴露的 SQL 表面，标注 MyDB 当前实现状态。状态以**源码实测**为准（检索 `crates/mydb-wire/src/lib.rs`、`crates/mydb-storage/src/lib.rs`、`vendor/opensrv-mysql`），不是目标描述。
 >
 > 定位：MyDB 目标是替代 MySQL 8.x 的单机部署，暴露 MySQL 的协议、形式、语法和可见行为。兼容性以源码与同机差分实测为准；InnoDB 语义不因 `ENGINE=InnoDB` 名称映射而自动视为完成。JDBC、Go、Node.js/TypeScript、JetBrains、VS Code、dbx 和 mysql CLI 均直接连接 MyDB 的 3306 端口。

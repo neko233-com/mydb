@@ -1,5 +1,7 @@
 # MyDB 开发规范
 
+操作文档：[中文](docs/zh/README.md) · [English](docs/en/README.md) · [日本語](docs/ja/README.md) · [한국어](docs/ko/README.md)。压测和测试结束后运行 `scripts/clear-bench-disk.ps1` 或 `scripts/clear-bench-disk.sh`，不要把 Rust `target` 卷和 I/O 回环文件留在机器上。
+
 ## 项目决策记忆
 
 - MyDB 的产品定位是**单机 MySQL 8.4 兼容数据库**：目标是作为 MySQL 的单机替代品，3306 提供 MySQL 协议，4306 提供 Web SQL IDE/管理 API。

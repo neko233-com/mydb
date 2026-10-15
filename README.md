@@ -14,6 +14,8 @@ MyDB 是一款用 Rust 编写的单机高性能数据库，目标是替代 MySQL
 
 > **设计边界**：MyDB 是**单机数据库**，复制拓扑、读写分离、分布式 XA 协调等非单机能力**设计上不支持**。
 
+**文档 / Docs：** [中文操作指南](docs/zh/README.md) · [English](docs/en/README.md) · [日本語](docs/ja/README.md) · [한국어](docs/ko/README.md)
+
 ---
 
 ## ✨ 核心特性
@@ -634,6 +636,15 @@ bash scripts/docker-smoke.sh
 # Docker 低资源故障注入（Windows PowerShell；Linux 逻辑同样由容器验证）
 .\scripts\docker-fault-injection.ps1
 ```
+
+### 磁盘
+
+压测和测试不能把编译产物、回环文件和结果历史留在机器上。
+
+- `scripts/test-docker.ps1` 与 `scripts/test-docker.sh` 结束后删除 Docker 卷 `mydb-rust-target`。需要留着编译缓存时使用 `-KeepCache` 或 `KEEP_CACHE=1`。`mydb-rust-registry` 与 `mydb-rust-git` 默认保留，用来加快下一次依赖下载。
+- Linux I/O 基准的两份回环文件默认各 1G。工作负载是 8 个 actor、每个 500 次 256 字节写入。更大的镜像用环境变量 `FILE_SIZE` 指定。
+- I/O 基准结束时删除 `mydb:io-bench` 和 `mydb-bench:ubuntu24`，并只清理名为 `mydb-target-bookworm`、`mydb-bench-bookworm-target` 的 BuildKit 缓存。`mysql:8.0`、`rust`、`debian`、`ubuntu` 基础镜像保留。
+- 需要把本机压测残留一次清掉时，重复执行 `.\scripts\clear-bench-disk.ps1` 或 `bash scripts/clear-bench-disk.sh`。它只删除 MyDB 压测和测试使用的 compose 项目、容器、卷、镜像和 `target/io-bench*`。不执行全量 `docker builder prune`，也不删除名为 `mydb` 的业务容器。
 
 ---
 

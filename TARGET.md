@@ -1,5 +1,7 @@
 # MyDB 目标与规划
 
+> 操作说明见 [中文](docs/zh/README.md)、[English](docs/en/README.md)、[日本語](docs/ja/README.md)、[한국어](docs/ko/README.md)。
+
 ## 核心定位
 
 **替代 MySQL 8.4 单机部署的高性能数据库，以 MySQL 的协议与语法暴露接口。**

@@ -1,5 +1,7 @@
 # MyDB 落地验收清单
 
+> 操作说明见 [中文](docs/zh/README.md)、[English](docs/en/README.md)、[日本語](docs/ja/README.md)、[한국어](docs/ko/README.md)。本清单保留中文验收记录，不逐条译成四种语言。
+
 > 规则：只有当前源码和可复现实测能证明的项目才打勾。宽泛目标不能由局部 smoke 代替。最后更新：2026-08-17。
 
 > **范围边界（当前验收口径）**：MyDB 目标是替代 MySQL 8.x 的单机部署，以 MySQL 协议、SQL、事务和可见外部行为为验收面。单机客户端直接连接 3306；复制拓扑、Group Replication / Galera、分布式 XA 两阶段协调仍不宣称已实现。完整 InnoDB 语义必须逐项通过本清单，不能由名称别名代替。
