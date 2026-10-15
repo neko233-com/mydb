@@ -38,7 +38,9 @@ MYSQL_CONTAINER="mysql-io-bench-$$"
 MYDB_LOOP=""
 MYSQL_LOOP=""
 
-FILE_SIZE=${FILE_SIZE:-8G}
+# 8 actor * 500 writes * 256 bytes does not need 16G of loop files.
+# Set FILE_SIZE explicitly when a larger durability image is required.
+FILE_SIZE=${FILE_SIZE:-1G}
 WRITE_BPS=${WRITE_BPS:-20mb}
 READ_BPS=${READ_BPS:-100mb}
 WRITE_IOPS=${WRITE_IOPS:-500}
@@ -90,6 +92,9 @@ cleanup() {
     /var/tmp/mydb-io-bench.*) rm -rf -- "$RUN_ROOT" ;;
     *) echo "refusing to remove unexpected path: $RUN_ROOT" >&2 ;;
   esac
+  docker image rm mydb:io-bench mydb-bench:ubuntu24 >/dev/null 2>&1 || true
+  docker buildx prune --force --filter id=mydb-target-bookworm >/dev/null 2>&1 || true
+  docker buildx prune --force --filter id=mydb-bench-bookworm-target >/dev/null 2>&1 || true
 }
 trap cleanup EXIT INT TERM
 

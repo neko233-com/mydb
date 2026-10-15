@@ -293,5 +293,10 @@ try {
 } finally {
     if (-not $Keep) {
         Remove-BenchmarkResources
+        foreach ($image in @("mydb:io-bench", "mydb-bench:ubuntu24")) {
+            docker image rm --force $image 2>$null | Out-Null
+        }
+        docker buildx prune --force --filter "id=mydb-target-bookworm" 2>$null | Out-Null
+        docker buildx prune --force --filter "id=mydb-bench-bookworm-target" 2>$null | Out-Null
     }
 }

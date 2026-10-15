@@ -32,6 +32,14 @@ fi
 
 printf -v command ' && %s' "${commands[@]}"
 command=${command:4}
+cleanup_target() {
+  # debug 和 release 产物留在命名卷里会持续占数 GB。默认每次跑完删掉编译卷。
+  # KEEP_CACHE=1 才保留。registry 与 git 卷留给下一次加速。
+  if [ "${KEEP_CACHE:-0}" != "1" ]; then
+    docker volume rm --force "$TARGET_VOLUME" >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup_target EXIT
 echo "Docker Rust gate: image=$RUST_IMAGE memory=$MEMORY_LIMIT cpus=$CPU_LIMIT jobs=$BUILD_JOBS"
 docker run --rm --init \
   --cpus "$CPU_LIMIT" --memory "$MEMORY_LIMIT" --memory-swap "$MEMORY_LIMIT" \
