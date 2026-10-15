@@ -179,6 +179,7 @@ cargo build --release
 # mydb-bench、测试结果与 target/bench 不进入发布包
 .\scripts\build-release.ps1 -Version "0.1.34"
 # 发布包同时生成同名 `.sha256` 校验文件；发布脚本默认只构建不上传，必须显式加 `-ConfirmPublish`，并在交互提示中输入 `PUBLISH v<version>` 才会创建 GitHub tag/release；脚本会拒绝覆盖已存在的 Release。
+# 日常开发在 main。已发布版本用 tag 记录，不保留长期发布分支。
 
 ```powershell
 # 仅构建/打包候选物（推荐先做这一步）
