@@ -6,7 +6,7 @@ on:
       tag:
         description: Existing GitHub Release tag to receive the asset
         required: true
-        default: v0.1.36
+        default: v0.1.37
 
 permissions:
   contents: write
@@ -18,12 +18,14 @@ jobs:
     runs-on: macos-14
     steps:
       - name: Check out the requested release source
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.tag }}
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+        with:
+          toolchain: '1.99.1'
 
       - name: Build release binaries
         run: |
@@ -44,6 +46,8 @@ jobs:
           cp configs/default.yaml "$package_dir/config.yaml.example"
           cp scripts/install.sh scripts/install.ps1 scripts/install-silent.vbs \
              README.md CheckList.md SYNTAX_MATRIX.md 性能报告.md LICENSE "$package_dir/"
+          cp -R docs "$package_dir/"
+          if [ -d examples ]; then cp -R examples "$package_dir/"; fi
           tar -czf target/release/mydb-macos-aarch64.tar.gz \
             -C "$package_dir" .
           shasum -a 256 target/release/mydb-macos-aarch64.tar.gz \

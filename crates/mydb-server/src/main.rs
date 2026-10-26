@@ -22,6 +22,9 @@ use tokio::sync::Semaphore;
 use tower_http::trace::TraceLayer;
 use tracing::info;
 
+mod metrics_panel;
+mod observability;
+
 #[cfg(target_os = "windows")]
 static WINDOWS_SHUTDOWN: OnceLock<Arc<Notify>> = OnceLock::new();
 
@@ -75,12 +78,15 @@ struct AdminState {
     started: Instant,
     sessions: Arc<parking_lot::Mutex<HashMap<String, AdminSession>>>,
     login_rate_limiter: Arc<parking_lot::Mutex<LoginRateLimiter>>,
+    otlp_exporter: observability::OtlpExporter,
+    metrics_token: Option<Arc<str>>,
 }
 
 #[derive(Debug, Clone)]
 struct AdminSession {
     expires_at: Instant,
     sql_user: String,
+    administrator: bool,
 }
 
 const LOGIN_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
@@ -298,6 +304,10 @@ async fn run_server(args: Args, config: mydb_config::ServerConfig) -> Result<()>
     let protocol_config = Arc::new(RwLock::new(protocol_config_for(&config)?));
     let sessions = Arc::new(parking_lot::Mutex::new(HashMap::new()));
     let login_rate_limiter = Arc::new(parking_lot::Mutex::new(LoginRateLimiter::default()));
+    let otlp_exporter = observability::OtlpExporter::new(&config.observability.otlp);
+    let metrics_token =
+        metrics_panel::load_token(config.observability.metrics_token_file.as_deref())?
+            .map(Arc::<str>::from);
 
     let http_listener = bind_http_listener(&config).await?;
 
@@ -311,12 +321,32 @@ async fn run_server(args: Args, config: mydb_config::ServerConfig) -> Result<()>
             started: Instant::now(),
             sessions: sessions.clone(),
             login_rate_limiter,
+            otlp_exporter: otlp_exporter.clone(),
+            metrics_token,
         };
         tokio::spawn(async move {
             if let Err(error) = run_admin_server(listener, state).await {
                 tracing::error!("HTTP management server stopped: {}", error);
             }
         });
+    }
+
+    let (exporter_shutdown, exporter_shutdown_rx) = tokio::sync::watch::channel(false);
+    if config.observability.otlp.enabled {
+        info!(
+            endpoint = %config.observability.otlp.endpoint,
+            interval_secs = config.observability.otlp.interval_secs,
+            "OTLP exporter enabled"
+        );
+        tokio::spawn(observability::run_otlp_exporter(
+            otlp_exporter.clone(),
+            wire_stats.clone(),
+            storage.clone(),
+            protocol_config.read().audit_log.clone(),
+            config.server.host.clone(),
+            config.server.port,
+            exporter_shutdown_rx,
+        ));
     }
 
     // Start TCP listener
@@ -389,6 +419,7 @@ async fn run_server(args: Args, config: mydb_config::ServerConfig) -> Result<()>
     }
 
     let _ = scheduler_stop.send(true);
+    let _ = exporter_shutdown.send(true);
     if let Err(error) = scheduler.await {
         tracing::error!("EVENT scheduler task failed while stopping: {}", error);
     }
@@ -421,6 +452,31 @@ fn validate_runtime_security(config: &mydb_config::ServerConfig) -> Result<()> {
         if config.security.default_password == config.http.admin_password {
             anyhow::bail!("MySQL and HTTP administrator secrets must be different");
         }
+    }
+    if config.observability.otlp.enabled {
+        let endpoint = reqwest::Url::parse(&config.observability.otlp.endpoint)
+            .map_err(|_| anyhow::anyhow!("invalid OTLP endpoint"))?;
+        anyhow::ensure!(
+            matches!(endpoint.scheme(), "http" | "https")
+                && endpoint.username().is_empty()
+                && endpoint.password().is_none()
+                && endpoint.query().is_none()
+                && endpoint.fragment().is_none(),
+            "OTLP endpoint must be HTTP(S) without credentials, query or fragment"
+        );
+        let loopback = endpoint.host_str().is_some_and(|host| {
+            host == "localhost"
+                || host
+                    .trim_matches(['[', ']'])
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|address| address.is_loopback())
+        });
+        anyhow::ensure!(
+            config.observability.otlp.headers.is_empty()
+                || endpoint.scheme() == "https"
+                || loopback,
+            "OTLP credentials require HTTPS except on loopback"
+        );
     }
     Ok(())
 }
@@ -458,6 +514,7 @@ fn protocol_config_for(config: &mydb_config::ServerConfig) -> Result<mydb_wire::
         config.logging.max_files,
     )?);
     let tls_config = load_tls_config(config)?;
+    let slow_query_log = slow_query_log_for(config)?;
     Ok(mydb_wire::ProtocolConfig {
         username: config.security.default_username.clone(),
         password: config.security.default_password.clone(),
@@ -475,9 +532,32 @@ fn protocol_config_for(config: &mydb_config::ServerConfig) -> Result<mydb_wire::
         max_load_data_size: config.security.max_load_data_size,
         auth_catalog,
         audit_log,
+        slow_query_log,
         tls_config,
         require_secure_transport: config.security.require_secure_transport,
     })
+}
+
+/// The slow query log is enabled by default and defaults to `<data_dir>/slow.log`.
+/// Without a file the in-memory ring still feeds the monitoring API.
+fn slow_query_log_for(
+    config: &mydb_config::ServerConfig,
+) -> Result<Option<Arc<mydb_wire::SlowQueryLog>>> {
+    if !config.agent.slow_query_log {
+        return Ok(None);
+    }
+    let path = config
+        .agent
+        .slow_query_log_file
+        .clone()
+        .unwrap_or_else(|| config.storage.data_dir.join("slow.log"));
+    let log = mydb_wire::SlowQueryLog::open(
+        &path,
+        &config.agent.slow_query_log_max_size,
+        config.agent.slow_query_log_max_files,
+    )
+    .with_context(|| format!("failed to open slow query log at {}", path.display()))?;
+    Ok(Some(Arc::new(log)))
 }
 
 fn load_tls_config(
@@ -614,17 +694,28 @@ async fn auth_login(
         request.password.as_bytes(),
         config.http.admin_password.as_bytes(),
     );
+    let administrator = valid_user && valid_password;
     let database_user = state
         .protocol_config
         .read()
         .auth_catalog
         .verify_password(&request.username, &request.password);
-    if (!valid_user || !valid_password) && database_user.is_none() {
+    if !administrator && database_user.is_none() {
         state.login_rate_limiter.lock().failed(&request.username);
+        let _ = state.protocol_config.read().audit_log.record(
+            "authentication",
+            "http",
+            "CONNECT",
+            "denied",
+        );
         return Err(StatusCode::UNAUTHORIZED);
     }
     state.login_rate_limiter.lock().succeeded(&request.username);
-    let sql_user = database_user.unwrap_or(config.security.default_username.clone());
+    let sql_user = if administrator {
+        config.security.default_username.clone()
+    } else {
+        database_user.ok_or(StatusCode::UNAUTHORIZED)?
+    };
     let token = uuid::Uuid::new_v4().to_string();
     let expires_at = Instant::now() + std::time::Duration::from_secs(12 * 60 * 60);
     let mut sessions = state.sessions.lock();
@@ -634,12 +725,14 @@ async fn auth_login(
         AdminSession {
             expires_at,
             sql_user,
+            administrator,
         },
     );
     Ok(Json(json!({
         "token": token,
         "expires_in_seconds": 12 * 60 * 60,
         "username": request.username,
+        "administrator": administrator,
     })))
 }
 
@@ -652,24 +745,36 @@ async fn auth_logout(
     Ok(Json(json!({"logged_out": true})))
 }
 
+/// Boxed response keeps the handler result small enough for the future.
+struct ApiError(Box<Response>);
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        *self.0
+    }
+}
+
 async fn sql_query(
     State(state): State<AdminState>,
     headers: HeaderMap,
     Json(request): Json<SqlQueryRequest>,
-) -> std::result::Result<Json<mydb_wire::AdminSqlResult>, axum::response::Response> {
+) -> std::result::Result<Json<mydb_wire::AdminSqlResult>, ApiError> {
     let sql = request.sql.trim();
     if sql.is_empty() || sql.len() > 4 * 1024 * 1024 {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(json!({
-                "error": "SQL must contain 1..4194304 bytes",
-                "code": "ER_BAD_REQUEST"
-            })),
-        )
-            .into_response());
+        return Err(ApiError(Box::new(
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "SQL must contain 1..4194304 bytes",
+                    "code": "ER_BAD_REQUEST"
+                })),
+            )
+                .into_response(),
+        )));
     }
     let protocol_config = Arc::new(state.protocol_config.read().clone());
-    let sql_user = authorized_identity(&headers, &state).map_err(IntoResponse::into_response)?;
+    let sql_user = authorized_identity(&headers, &state)
+        .map_err(|status| ApiError(Box::new(status.into_response())))?;
     let result = mydb_wire::execute_admin_sql(
         state.storage.clone(),
         protocol_config,
@@ -682,29 +787,45 @@ async fn sql_query(
     .map_err(|error| {
         let message = error.to_string();
         tracing::warn!(error = %message, sql = %sql, "Admin SQL failed");
-        (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(json!({
-                "error": message,
-                "code": "ER_ADMIN_SQL"
-            })),
-        )
-            .into_response()
+        ApiError(Box::new(
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({
+                    "error": message,
+                    "code": "ER_ADMIN_SQL"
+                })),
+            )
+                .into_response(),
+        ))
     })?;
     Ok(Json(result))
 }
 
 fn authorize(headers: &HeaderMap, state: &AdminState) -> Result<(), StatusCode> {
-    authorized_identity(headers, state).map(|_| ())
+    let (_, administrator) = authorized_session(headers, state)?;
+    if administrator {
+        Ok(())
+    } else {
+        Err(StatusCode::FORBIDDEN)
+    }
 }
 
 fn authorized_identity(headers: &HeaderMap, state: &AdminState) -> Result<String, StatusCode> {
+    authorized_session(headers, state).map(|(identity, _)| identity)
+}
+
+// SQL login preserves database grants but never confers service administration.
+// Only the separately configured HTTP administrator can manage this instance.
+fn authorized_session(
+    headers: &HeaderMap,
+    state: &AdminState,
+) -> Result<(String, bool), StatusCode> {
     let Some(token) = bearer_token(headers) else {
         return Err(StatusCode::UNAUTHORIZED);
     };
     let config = state.config.read().clone();
     if legacy_admin_bearer_matches(&config, token) {
-        return Ok(config.security.default_username);
+        return Ok((config.security.default_username, true));
     }
     let mut sessions = state.sessions.lock();
     let Some(session) = sessions.get(token).cloned() else {
@@ -714,7 +835,7 @@ fn authorized_identity(headers: &HeaderMap, state: &AdminState) -> Result<String
         sessions.remove(token);
         return Err(StatusCode::UNAUTHORIZED);
     }
-    Ok(session.sql_user)
+    Ok((session.sql_user, session.administrator))
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {
@@ -747,12 +868,34 @@ fn authorize_agent(headers: &HeaderMap, state: &AdminState) -> Result<(), Status
 }
 
 async fn metrics(State(state): State<AdminState>, headers: HeaderMap) -> Response {
-    if authorize(&headers, &state).is_err() {
-        return StatusCode::UNAUTHORIZED.into_response();
+    let scrape_authorized = state
+        .metrics_token
+        .as_deref()
+        .zip(bearer_token(&headers))
+        .is_some_and(|(expected, actual)| constant_time_eq(expected.as_bytes(), actual.as_bytes()));
+    if !scrape_authorized {
+        if let Err(status) = authorize(&headers, &state) {
+            return status.into_response();
+        }
     }
     let wire = state.wire_stats.snapshot();
     let storage = state.storage.stats();
     let audit = state.protocol_config.read().audit_log.snapshot();
+    let latency = state.wire_stats.query_latency();
+    let digests = state.wire_stats.statement_digests();
+    let slow_log = state
+        .protocol_config
+        .read()
+        .slow_query_log
+        .as_ref()
+        .map(|log| log.snapshot())
+        .unwrap_or(mydb_wire::SlowQueryLogSnapshot {
+            healthy: true,
+            enabled: false,
+            written: 0,
+            dropped: 0,
+        });
+    let otlp = state.otlp_exporter.status();
     let body = format!(
         concat!(
             "# HELP mydb_up Whether MyDB is running.\n",
@@ -762,6 +905,7 @@ async fn metrics(State(state): State<AdminState>, headers: HeaderMap) -> Respons
             "# TYPE mydb_connections_total counter\nmydb_connections_total {}\n",
             "# TYPE mydb_queries_total counter\nmydb_queries_total {}\n",
             "# TYPE mydb_query_errors_total counter\nmydb_query_errors_total {}\n",
+            "# TYPE mydb_slow_queries_total counter\nmydb_slow_queries_total {}\n",
             "# TYPE mydb_query_execute_microseconds_total counter\nmydb_query_execute_microseconds_total {}\n",
             "# TYPE mydb_query_response_microseconds_total counter\nmydb_query_response_microseconds_total {}\n",
             "# TYPE mydb_audit_healthy gauge\nmydb_audit_healthy {}\n",
@@ -792,6 +936,7 @@ async fn metrics(State(state): State<AdminState>, headers: HeaderMap) -> Respons
         wire.total_connections,
         wire.queries,
         wire.query_errors,
+        state.wire_stats.slow_queries_total(),
         wire.query_execute_micros,
         wire.query_response_micros,
         u8::from(audit.healthy),
@@ -817,6 +962,28 @@ async fn metrics(State(state): State<AdminState>, headers: HeaderMap) -> Respons
         storage.apply_micros,
         storage.checkpoint_micros,
     );
+    let body = format!(
+        "{body}{}",
+        observability::prometheus_monitoring_metrics(
+            &latency,
+            &digests,
+            &slow_log,
+            &otlp,
+            state.wire_stats.statement_digest_count(),
+            state.wire_stats.statement_digest_dropped(),
+        )
+    );
+    let body = format!(
+        "{body}{}",
+        metrics_panel::security_metrics(
+            &state.config.read(),
+            state
+                .protocol_config
+                .read()
+                .audit_log
+                .authentication_failures(),
+        )
+    );
     (
         [
             (
@@ -837,6 +1004,14 @@ async fn status(
     authorize(&headers, &state)?;
     let wire = state.wire_stats.snapshot();
     let storage = state.storage.stats();
+    let latency = state.wire_stats.query_latency();
+    let slow_log = state
+        .protocol_config
+        .read()
+        .slow_query_log
+        .as_ref()
+        .map(|log| log.snapshot());
+    let otlp = state.otlp_exporter.status();
     Ok(Json(json!({
         "version": env!("CARGO_PKG_VERSION"),
         "uptime": state.started.elapsed().as_secs(),
@@ -855,6 +1030,37 @@ async fn status(
         "wal_sync_microseconds": storage.wal_sync_micros,
         "apply_microseconds": storage.apply_micros,
         "checkpoint_microseconds": storage.checkpoint_micros,
+        "slow_queries": state.wire_stats.slow_queries_total(),
+        "query_latency": {
+            "count": latency.count,
+            "average_micros": latency.average_micros(),
+            "min_micros": latency.min_micros,
+            "max_micros": latency.max_micros,
+            "p50_micros": latency.percentile_micros(0.50),
+            "p95_micros": latency.percentile_micros(0.95),
+            "p99_micros": latency.percentile_micros(0.99),
+        },
+        "statement_digests": state.wire_stats.statement_digest_count(),
+        "statement_digests_dropped": state.wire_stats.statement_digest_dropped(),
+        "slow_query_log": slow_log.map(|snapshot| json!({
+            "enabled": snapshot.enabled,
+            "healthy": snapshot.healthy,
+            "written": snapshot.written,
+            "dropped": snapshot.dropped,
+        })),
+        "otlp": {
+            "enabled": otlp.enabled,
+            "endpoint": otlp.endpoint,
+            "interval_seconds": otlp.interval_seconds,
+            "service_name": otlp.service_name,
+            "export_traces": otlp.export_traces,
+            "include_sql": otlp.include_sql,
+            "metric_exports": otlp.metric_exports,
+            "span_exports": otlp.span_exports,
+            "failures": otlp.failures,
+            "last_success_unix_ms": otlp.last_success_unix_ms,
+            "last_error": otlp.last_error,
+        }
     })))
 }
 
@@ -901,6 +1107,9 @@ fn redacted_config(config: &mydb_config::ServerConfig) -> mydb_config::ServerCon
     let mut redacted = config.clone();
     redacted.security.default_password = "<redacted>".to_string();
     redacted.http.admin_password = "<redacted>".to_string();
+    for value in redacted.observability.otlp.headers.values_mut() {
+        *value = "<redacted>".to_string();
+    }
     redacted
 }
 
@@ -909,6 +1118,17 @@ fn apply_runtime_config(
     mut candidate: mydb_config::ServerConfig,
 ) -> Result<()> {
     let current = state.config.read().clone();
+    for (name, value) in &mut candidate.observability.otlp.headers {
+        if value == "<redacted>" {
+            *value = current
+                .observability
+                .otlp
+                .headers
+                .get(name)
+                .context("redacted OTLP header has no existing value")?
+                .clone();
+        }
+    }
     if candidate.security.default_password == "<redacted>" {
         candidate.security.default_password = current.security.default_password.clone();
     }
@@ -920,6 +1140,9 @@ fn apply_runtime_config(
     let protocol = protocol_config_for(&candidate)?;
     *state.protocol_config.write() = protocol;
     *state.config.write() = candidate;
+    state
+        .otlp_exporter
+        .apply(&state.config.read().observability.otlp);
     state.sessions.lock().clear();
     Ok(())
 }
@@ -936,9 +1159,11 @@ fn validate_reloadable_config(
         || current.http.host != candidate.http.host
         || current.http.port != candidate.http.port
         || current.http.enabled != candidate.http.enabled
+        || current.observability.metrics_token_file != candidate.observability.metrics_token_file
+        || current.observability.otlp.enabled != candidate.observability.otlp.enabled
     {
         anyhow::bail!(
-            "listener, storage, memory, logging, and character-set settings require a process restart"
+            "listener, storage, memory, logging, character-set, metrics credential and OTLP enablement settings require a process restart"
         );
     }
     Ok(())
@@ -1308,6 +1533,7 @@ async fn backup_delete(
     headers: HeaderMap,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<Value>, StatusCode> {
+    authorize(&headers, &state)?;
     let user = authorized_identity(&headers, &state)?;
     validate_backup_id(&id)?;
     if !confirmation_matches(
@@ -1351,6 +1577,7 @@ async fn backup_restore(
     headers: HeaderMap,
     Json(request): Json<RestoreRequest>,
 ) -> Result<Json<Value>, StatusCode> {
+    authorize(&headers, &state)?;
     let user = authorized_identity(&headers, &state)?;
     validate_backup_id(&request.id)?;
     if !confirmation_matches(
@@ -2589,6 +2816,31 @@ mod tests {
         let redacted = redacted_config(&config);
         assert_eq!(redacted.security.default_password, "<redacted>");
         assert_eq!(redacted.http.admin_password, "<redacted>");
+    }
+
+    #[test]
+    fn monitoring_config_rejects_secret_urls_and_redacts_headers() {
+        let mut config = mydb_config::ServerConfig::default();
+        config.observability.otlp.enabled = true;
+        config.observability.otlp.endpoint =
+            "https://user:private-value@metrics.example.com".into();
+        let error = validate_runtime_security(&config).expect_err("secret URLs must fail");
+        assert!(!error.to_string().contains("private-value"));
+        config.observability.otlp.endpoint = "http://metrics.example.com".into();
+        config
+            .observability
+            .otlp
+            .headers
+            .insert("Authorization".into(), "Bearer private-value".into());
+        assert!(validate_runtime_security(&config).is_err());
+        config.observability.otlp.endpoint = "https://metrics.example.com".into();
+        assert!(validate_runtime_security(&config).is_ok());
+        let encoded =
+            serde_json::to_string(&redacted_config(&config)).expect("encode public config");
+        assert!(!encoded.contains("private-value"));
+        let mut candidate = config.clone();
+        candidate.observability.otlp.enabled = false;
+        assert!(validate_reloadable_config(&config, &candidate).is_err());
     }
 
     #[test]

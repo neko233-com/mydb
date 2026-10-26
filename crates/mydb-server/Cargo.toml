@@ -30,6 +30,8 @@ chrono.workspace = true
 uuid.workspace = true
 tokio-rustls.workspace = true
 rustls-pemfile.workspace = true
+reqwest.workspace = true
+sha2.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-service.workspace = true

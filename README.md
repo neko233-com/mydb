@@ -177,15 +177,15 @@ cargo build --release
 
 # 正式包只包含 server/cli/mydb/migrate/dump、配置、安装脚本和文档；
 # mydb-bench、测试结果与 target/bench 不进入发布包
-.\scripts\build-release.ps1 -Version "0.1.34"
+.\scripts\build-release.ps1 -Version "0.1.37"
 # 发布包同时生成同名 `.sha256` 校验文件；发布脚本默认只构建不上传，必须显式加 `-ConfirmPublish`，并在交互提示中输入 `PUBLISH v<version>` 才会创建 GitHub tag/release；脚本会拒绝覆盖已存在的 Release。
 # 日常开发在 main。已发布版本用 tag 记录，不保留长期发布分支。
 
 ```powershell
 # 仅构建/打包候选物（推荐先做这一步）
-.\scripts\build-release.ps1 -Version "0.1.36"
+.\scripts\build-release.ps1 -Version "0.1.37"
 # 最终发布：仍需人工输入精确确认文本
-.\scripts\build-release.ps1 -Version "0.1.36" -ConfirmPublish
+.\scripts\build-release.ps1 -Version "0.1.37" -ConfirmPublish
 ```
 
 # 安装到系统
@@ -347,11 +347,19 @@ mydb-server --config /etc/mydb/production.yaml
 
 ## 📊 监控与运维
 
+Metrics233 / Grafana 原生安全接入：使用专用只读 `/metrics` 凭据；支持连接、查询、慢 SQL、
+P95/P99、锁、WAL、审计和安全配置监控。MetricsPanel233 可自动生成仪表盘与持续告警；
+Grafana 通过 Prometheus 数据源接入。公网仅暴露 HTTPS `/metrics`，管理 API 保持 loopback。
+配置、权限边界与示例见 [接入指南](docs/zh/metrics-panel.md) 和
+[Grafana dashboard](examples/monitoring/grafana-mydb.json)。该接入需要 `0.1.37` 及以上；发布及平台验收记录见 [CheckList.md](CheckList.md)。
+
 ### Prometheus 指标
 
 ```bash
-curl http://127.0.0.1:4306/metrics  # 弱密码/开发模式；强密码模式使用登录后的 Bearer token
+curl --config /path/to/private-metrics.curl http://127.0.0.1:4306/metrics
 ```
+
+`private-metrics.curl` 应限制文件权限，并配置专用只读 metrics token 的 Bearer header；未认证请求返回 401。凭据文件及 HTTPS 反代示例见[监控接入指南](docs/zh/metrics-panel.md)。
 
 暴露的关键指标：
 - 连接数、活跃事务、锁等待
@@ -642,7 +650,7 @@ bash scripts/docker-smoke.sh
 
 压测和测试不能把编译产物、回环文件和结果历史留在机器上。
 
-- `scripts/test-docker.ps1` 与 `scripts/test-docker.sh` 结束后删除 Docker 卷 `mydb-rust-target`。需要留着编译缓存时使用 `-KeepCache` 或 `KEEP_CACHE=1`。`mydb-rust-registry` 与 `mydb-rust-git` 默认保留，用来加快下一次依赖下载。
+- `scripts/test-docker.ps1` 与 `scripts/test-docker.sh` 使用每轮唯一的容器和 target/registry/git 卷，默认结束后全部清理，源码以只读方式挂载。默认每轮磁盘预算 10 GiB、保留空闲空间 6 GiB、最长 45 分钟；超出预算或清理失败均判失败。Windows 可设置 `-DiskBudgetGiB`、`-MinimumFreeGiB`、`-TimeoutMinutes`，Linux/macOS 使用 `MYDB_TEST_DISK_GIB`、`MYDB_TEST_MIN_FREE_GIB`、`MYDB_TEST_TIMEOUT_MINUTES`。只有显式 `-KeepCache` 或 `KEEP_CACHE=1` 才保留本轮卷；小型日志和回执在 `target/docker-gate-*`，不会全局 prune 其它项目缓存。
 - Linux I/O 基准的两份回环文件默认各 1G。工作负载是 8 个 actor、每个 500 次 256 字节写入。更大的镜像用环境变量 `FILE_SIZE` 指定。
 - I/O 基准结束时删除 `mydb:io-bench` 和 `mydb-bench:ubuntu24`，并只清理名为 `mydb-target-bookworm`、`mydb-bench-bookworm-target` 的 BuildKit 缓存。`mysql:8.0`、`rust`、`debian`、`ubuntu` 基础镜像保留。
 - 需要把本机压测残留一次清掉时，重复执行 `.\scripts\clear-bench-disk.ps1` 或 `bash scripts/clear-bench-disk.sh`。它只删除 MyDB 压测和测试使用的 compose 项目、容器、卷、镜像和 `target/io-bench*`。不执行全量 `docker builder prune`，也不删除名为 `mydb` 的业务容器。
@@ -651,16 +659,16 @@ bash scripts/docker-smoke.sh
 
 ## 📊 性能
 
-> 完整测试方法、运行指标和发布前验证见 [性能报告.md](性能报告.md)。下表为 2026-08-17 Docker `linux/amd64` 受控实测；MyDB 与 MySQL 8.4.11 使用相同 CPU/内存限制和持久化设置，性能阶段不预热、1 次采样且限时 60 秒。
+> 完整测试方法、运行指标和发布前验证见 [性能报告.md](性能报告.md)。下表为 2026-10-27 Docker Desktop / WSL2 `linux/amd64` 受控实测；MyDB 0.1.37 与 MySQL 8.4.11 使用相同 CPU/内存限制和持久化设置，性能阶段不预热、1 次采样，实际 12.8 秒。原始 JSON 保存在 [bench/results/latest.json](bench/results/latest.json)，不等同物理 Ubuntu 平台或长期性能验收。
 >
 > 本轮数据：MyDB/MySQL 均为 2 vCPU、2 GiB；MySQL 8.4.11 使用 `innodb_flush_log_at_trx_commit=1`、`sync_binlog=1`，MyDB 使用默认 250μs Group Commit 与每 1024 个已提交请求 checkpoint。
 
 | 场景 | MyDB | MySQL 8.4.11 | MyDB / MySQL |
 |------|------|--------------|--------------|
-| 单表写（fsync-per-commit） | 179 ops/s | 78 ops/s | 2.30x |
-| 4 actor / 4表 写 P99 延迟 | 23.1 ms | 60.6 ms | 2.62x（低更好） |
-| 4 actor / 4表 Group Commit | 302 ops/s | 150 ops/s | 2.01x |
-| 读 P50 延迟 | 340 μs | 137 μs | - |
+| 单表写（fsync-per-commit） | 548 ops/s | 274 ops/s | 2.00x |
+| 4 actor / 4表 写 P99 延迟 | 15.2 ms | 12.5 ms | 1.22x（延迟比，低更好） |
+| 4 actor / 4表 Group Commit | 1201 ops/s | 728 ops/s | 1.65x |
+| 读 P50 延迟 | 451 μs | 172 μs | - |
 
 性能优化不以关闭 WAL 持久化或弱化恢复语义换取数字。默认 250μs Group Commit 窗口优先并发吞吐，checkpoint 按 1024 个已提交请求触发；不声明未经实测证明的固定倍数。
 

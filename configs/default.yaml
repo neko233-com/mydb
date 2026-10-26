@@ -102,7 +102,38 @@ character_set:
 agent:
   # 内置 Agent HTTP 诊断，默认开启
   enabled: true
-  # 慢 SQL 阈值（毫秒）
+  # 慢 SQL 阈值（毫秒）；单条语句超过该阈值即进入慢查询监控
   slow_query_threshold_ms: 100
-  # 内存中保留最近慢 SQL 数量
+  # 内存中保留最近慢 SQL 数量（管理 API 与 OTel 导出共用）
   max_slow_queries: 1024
+  # 慢查询落盘为 NDJSON（默认 <data_dir>/slow.log，轮转）
+  slow_query_log: true
+  # 慢查询日志文件路径（留空 = <data_dir>/slow.log）
+  slow_query_log_file: null
+  # 慢查询日志轮转大小
+  slow_query_log_max_size: "100M"
+  # 慢查询日志保留文件数
+  slow_query_log_max_files: 10
+
+observability:
+  # Optional read-only /metrics credential file. Requires restart to rotate.
+  # The file contains 32..8192 printable ASCII bytes; never put the token in YAML.
+  metrics_token_file: null
+  # OpenTelemetry OTLP/HTTP JSON 导出（指标 + 慢查询 span）
+  otlp:
+    # 未配置采集器时保持关闭；Prometheus /metrics 始终可用
+    enabled: false
+    # 采集器基址，自动追加 /v1/metrics 与 /v1/traces
+    endpoint: "http://127.0.0.1:4318"
+    # 导出间隔（秒）
+    interval_secs: 15
+    # 单次导出超时（秒）
+    timeout_secs: 5
+    # OTel service.name
+    service_name: "mydb"
+    # 附加请求头，例如 Authorization
+    headers: {}
+    # 导出慢查询/错误语句的 span（不改动查询热路径）
+    export_traces: true
+    # 是否在 span 中携带 SQL 原文（默认关闭，避免泄露业务数据）
+    include_sql: false

@@ -1,0 +1,571 @@
+{
+  "version": 1,
+  "timezone": "browser",
+  "tags": [
+    "mydb",
+    "metrics233"
+  ],
+  "refresh": "15s",
+  "__inputs": [
+    {
+      "label": "Prometheus or MetricsPanel233",
+      "name": "DS_PROMETHEUS",
+      "pluginId": "prometheus",
+      "pluginName": "Prometheus",
+      "type": "datasource"
+    }
+  ],
+  "schemaVersion": 41,
+  "panels": [
+    {
+      "title": "MyDB availability",
+      "type": "stat",
+      "id": 1,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "range": true,
+          "refId": "A",
+          "expr": "mydb_up{job=~\"$job\",instance=~\"$instance\"}",
+          "legendFormat": "{{job}} / {{instance}}"
+        }
+      ],
+      "gridPos": {
+        "y": 0,
+        "w": 12,
+        "h": 8,
+        "x": 0
+      },
+      "fieldConfig": {
+        "overrides": [],
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "palette-classic"
+          }
+        }
+      }
+    },
+    {
+      "title": "Active connections",
+      "type": "timeseries",
+      "id": 2,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "range": true,
+          "refId": "A",
+          "expr": "mydb_connections_active{job=~\"$job\",instance=~\"$instance\"}",
+          "legendFormat": "{{job}} / {{instance}}"
+        }
+      ],
+      "gridPos": {
+        "y": 0,
+        "w": 12,
+        "h": 8,
+        "x": 12
+      },
+      "fieldConfig": {
+        "overrides": [],
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          }
+        }
+      }
+    },
+    {
+      "title": "Queries / second",
+      "type": "timeseries",
+      "id": 3,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "range": true,
+          "refId": "A",
+          "expr": "rate(mydb_queries_total{job=~\"$job\",instance=~\"$instance\"}[2m])",
+          "legendFormat": "{{job}} / {{instance}}"
+        }
+      ],
+      "gridPos": {
+        "y": 8,
+        "w": 12,
+        "h": 8,
+        "x": 0
+      },
+      "fieldConfig": {
+        "overrides": [],
+        "defaults": {
+          "unit": "ops",
+          "color": {
+            "mode": "palette-classic"
+          }
+        }
+      }
+    },
+    {
+      "title": "Query errors / second",
+      "type": "timeseries",
+      "id": 4,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "range": true,
+          "refId": "A",
+          "expr": "rate(mydb_query_errors_total{job=~\"$job\",instance=~\"$instance\"}[2m])",
+          "legendFormat": "{{job}} / {{instance}}"
+        }
+      ],
+      "gridPos": {
+        "y": 8,
+        "w": 12,
+        "h": 8,
+        "x": 12
+      },
+      "fieldConfig": {
+        "overrides": [],
+        "defaults": {
+          "unit": "ops",
+          "color": {
+            "mode": "palette-classic"
+          }
+        }
+      }
+    },
+    {
+      "title": "Slow queries / second",
+      "type": "timeseries",
+      "id": 5,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "range": true,
+          "refId": "A",
+          "expr": "rate(mydb_slow_queries_total{job=~\"$job\",instance=~\"$instance\"}[2m])",
+          "legendFormat": "{{job}} / {{instance}}"
+        }
+      ],
+      "gridPos": {
+        "y": 16,
+        "w": 12,
+        "h": 8,
+        "x": 0
+      },
+      "fieldConfig": {
+        "overrides": [],
+        "defaults": {
+          "unit": "ops",
+          "color": {
+            "mode": "palette-classic"
+          }
+        }
+      }
+    },
+    {
+      "title": "Query latency P95",
+      "type": "timeseries",
+      "id": 6,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "range": true,
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (job,instance,le) (rate(mydb_query_latency_microseconds_bucket{job=~\"$job\",instance=~\"$instance\"}[2m]))) / 1000000",
+          "legendFormat": "{{job}} / {{instance}}"
+        }
+      ],
+      "gridPos": {
+        "y": 16,
+        "w": 12,
+        "h": 8,
+        "x": 12
+      },
+      "fieldConfig": {
+        "overrides": [],
+        "defaults": {
+          "unit": "s",
+          "color": {
+            "mode": "palette-classic"
+          }
+        }
+      }
+    },
+    {
+      "title": "Query latency P99",
+      "type": "timeseries",
+      "id": 7,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "range": true,
+          "refId": "A",
+          "expr": "histogram_quantile(0.99, sum by (job,instance,le) (rate(mydb_query_latency_microseconds_bucket{job=~\"$job\",instance=~\"$instance\"}[2m]))) / 1000000",
+          "legendFormat": "{{job}} / {{instance}}"
+        }
+      ],
+      "gridPos": {
+        "y": 24,
+        "w": 12,
+        "h": 8,
+        "x": 0
+      },
+      "fieldConfig": {
+        "overrides": [],
+        "defaults": {
+          "unit": "s",
+          "color": {
+            "mode": "palette-classic"
+          }
+        }
+      }
+    },
+    {
+      "title": "Lock waits / second",
+      "type": "timeseries",
+      "id": 8,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "range": true,
+          "refId": "A",
+          "expr": "rate(mydb_lock_waits_total{job=~\"$job\",instance=~\"$instance\"}[2m])",
+          "legendFormat": "{{job}} / {{instance}}"
+        }
+      ],
+      "gridPos": {
+        "y": 24,
+        "w": 12,
+        "h": 8,
+        "x": 12
+      },
+      "fieldConfig": {
+        "overrides": [],
+        "defaults": {
+          "unit": "ops",
+          "color": {
+            "mode": "palette-classic"
+          }
+        }
+      }
+    },
+    {
+      "title": "Deadlocks / second",
+      "type": "timeseries",
+      "id": 9,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "range": true,
+          "refId": "A",
+          "expr": "rate(mydb_deadlocks_total{job=~\"$job\",instance=~\"$instance\"}[2m])",
+          "legendFormat": "{{job}} / {{instance}}"
+        }
+      ],
+      "gridPos": {
+        "y": 32,
+        "w": 12,
+        "h": 8,
+        "x": 0
+      },
+      "fieldConfig": {
+        "overrides": [],
+        "defaults": {
+          "unit": "ops",
+          "color": {
+            "mode": "palette-classic"
+          }
+        }
+      }
+    },
+    {
+      "title": "Commit queue",
+      "type": "timeseries",
+      "id": 10,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "range": true,
+          "refId": "A",
+          "expr": "mydb_write_commit_queue_depth{job=~\"$job\",instance=~\"$instance\"}",
+          "legendFormat": "{{job}} / {{instance}}"
+        }
+      ],
+      "gridPos": {
+        "y": 32,
+        "w": 12,
+        "h": 8,
+        "x": 12
+      },
+      "fieldConfig": {
+        "overrides": [],
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          }
+        }
+      }
+    },
+    {
+      "title": "WAL average sync time",
+      "type": "timeseries",
+      "id": 11,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "range": true,
+          "refId": "A",
+          "expr": "(rate(mydb_wal_sync_microseconds_total{job=~\"$job\",instance=~\"$instance\"}[2m]) / rate(mydb_group_commits_total{job=~\"$job\",instance=~\"$instance\"}[2m]) / 1000000) and (rate(mydb_group_commits_total{job=~\"$job\",instance=~\"$instance\"}[2m]) > 0)",
+          "legendFormat": "{{job}} / {{instance}}"
+        }
+      ],
+      "gridPos": {
+        "y": 40,
+        "w": 12,
+        "h": 8,
+        "x": 0
+      },
+      "fieldConfig": {
+        "overrides": [],
+        "defaults": {
+          "unit": "s",
+          "color": {
+            "mode": "palette-classic"
+          }
+        }
+      }
+    },
+    {
+      "title": "Audit writer healthy",
+      "type": "stat",
+      "id": 12,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "range": true,
+          "refId": "A",
+          "expr": "mydb_audit_healthy{job=~\"$job\",instance=~\"$instance\"}",
+          "legendFormat": "{{job}} / {{instance}}"
+        }
+      ],
+      "gridPos": {
+        "y": 40,
+        "w": 12,
+        "h": 8,
+        "x": 12
+      },
+      "fieldConfig": {
+        "overrides": [],
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "palette-classic"
+          }
+        }
+      }
+    },
+    {
+      "title": "Storage errors / second",
+      "type": "timeseries",
+      "id": 13,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "range": true,
+          "refId": "A",
+          "expr": "rate(mydb_storage_errors_total{job=~\"$job\",instance=~\"$instance\"}[2m])",
+          "legendFormat": "{{job}} / {{instance}}"
+        }
+      ],
+      "gridPos": {
+        "y": 48,
+        "w": 12,
+        "h": 8,
+        "x": 0
+      },
+      "fieldConfig": {
+        "overrides": [],
+        "defaults": {
+          "unit": "ops",
+          "color": {
+            "mode": "palette-classic"
+          }
+        }
+      }
+    },
+    {
+      "title": "Failed logins / second",
+      "type": "timeseries",
+      "id": 14,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "range": true,
+          "refId": "A",
+          "expr": "rate(mydb_authentication_failures_total{job=~\"$job\",instance=~\"$instance\"}[2m])",
+          "legendFormat": "{{job}} / {{instance}}"
+        }
+      ],
+      "gridPos": {
+        "y": 48,
+        "w": 12,
+        "h": 8,
+        "x": 12
+      },
+      "fieldConfig": {
+        "overrides": [],
+        "defaults": {
+          "unit": "ops",
+          "color": {
+            "mode": "palette-classic"
+          }
+        }
+      }
+    }
+  ],
+  "uid": "mydb-native-performance",
+  "time": {
+    "to": "now",
+    "from": "now-1h"
+  },
+  "annotations": {
+    "list": []
+  },
+  "templating": {
+    "list": [
+      {
+        "query": "label_values(mydb_up,job)",
+        "name": "job",
+        "multi": false,
+        "type": "query",
+        "refresh": 1,
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${DS_PROMETHEUS}"
+        },
+        "current": {
+          "value": "mydb",
+          "text": "mydb"
+        },
+        "includeAll": false
+      },
+      {
+        "multi": true,
+        "includeAll": true,
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${DS_PROMETHEUS}"
+        },
+        "refresh": 1,
+        "query": "label_values(mydb_up{job=~\"$job\"},instance)",
+        "name": "instance",
+        "current": {
+          "value": "$__all",
+          "text": "All"
+        },
+        "allValue": ".*",
+        "type": "query"
+      }
+    ]
+  },
+  "title": "MyDB performance and security"
+}

@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
+ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
+cd "$ROOT_DIR"
 
 # MyDB Local Build & Package Script
 # 构建并打包，上传到 GitHub Releases
@@ -29,6 +31,12 @@ fi
 if [ -z "$TAG" ]; then
     TAG="v$VERSION"
 fi
+[[ $VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ && $TAG == "v$VERSION" ]] || error 'Version must be semantic and Tag must equal v<version>'
+SOURCE_PACKAGE=$(cargo pkgid --locked -p mydb-server)
+SOURCE_VERSION=${SOURCE_PACKAGE##*#}
+SOURCE_VERSION=${SOURCE_VERSION##*@}
+[[ $SOURCE_VERSION == "$VERSION" ]] || error 'Requested package version does not match the Cargo source version'
+SOURCE_REVISION=$(git rev-parse HEAD)
 
 # 检查 gh 是否可用
 if ! command -v gh &> /dev/null; then
@@ -69,8 +77,8 @@ MYDB_TEST_MEMORY=2g MYDB_TEST_CPUS=2 MYDB_TEST_JOBS=1 \
 
 # 构建 release 版本
 info "Building release..."
-cargo build --release -p mydb-server -p mydb-migrate -p mydb-dump
-cargo build --release -p mydb-cli --bins
+cargo build --release --locked -p mydb-server -p mydb-migrate -p mydb-dump
+cargo build --release --locked -p mydb-cli --bins
 
 # 创建打包目录
 BUILD_DIR="target/release/package"
@@ -106,6 +114,11 @@ cp README.md "$BUILD_DIR/"
 cp CheckList.md "$BUILD_DIR/"
 cp SYNTAX_MATRIX.md "$BUILD_DIR/"
 cp 性能报告.md "$BUILD_DIR/"
+while IFS= read -r -d '' file; do
+    [[ -f "$file" && ! -L "$file" ]] || error 'Package inputs must be regular public files'
+    mkdir -p "$BUILD_DIR/$(dirname "$file")"
+    cp "$file" "$BUILD_DIR/$file"
+done < <(git ls-files -z --cached --others --exclude-standard -- docs examples)
 cp LICENSE "$BUILD_DIR/" 2>/dev/null || true
 
 # 打包
@@ -120,7 +133,7 @@ else
     tar -czf "$PACKAGE_FILE" .
 fi
 
-cd ../..
+cd "$ROOT_DIR"
 
 PACKAGE_PATH="target/release/${PACKAGE_FILE#../}"
 PACKAGE_SIZE=$(du -h "$PACKAGE_PATH" | cut -f1)
@@ -140,6 +153,7 @@ if [ "$CONFIRM_PUBLISH" != "--confirm-publish" ]; then
     warn "Package is ready; GitHub release was NOT created. Re-run with --confirm-publish and type PUBLISH $TAG to publish."
     exit 0
 fi
+[[ $VERSION != *-* && -z $(git status --porcelain) && $(git rev-parse HEAD) == "$SOURCE_REVISION" ]] || error 'Publication requires a stable version and an unchanged clean source commit'
 read -r -p "Type PUBLISH $TAG to create the immutable GitHub release: " CONFIRMATION
 if [ "$CONFIRMATION" != "PUBLISH $TAG" ]; then
     error "Release confirmation did not match; no GitHub tag or assets were created."
@@ -148,6 +162,7 @@ fi
 # 创建 release
 info "Creating GitHub release: $TAG"
 gh release create "$TAG" \
+    --target "$SOURCE_REVISION" \
     --title "MyDB $VERSION" \
     --notes "MyDB $VERSION - MySQL 8.x compatible database" \
     "$PACKAGE_PATH" \

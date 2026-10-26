@@ -3117,6 +3117,49 @@ impl Database {
         Ok(all_rows)
     }
 
+    /// Cheap row-count estimate for planner use. Only the first page of a
+    /// paged table is read, so sizing a plan never scans the whole table.
+    pub fn estimated_row_count(&self, table_name: &str) -> Result<u64> {
+        let stored_table = self
+            .stored_table_name(table_name)
+            .ok_or_else(|| anyhow::anyhow!("Table '{}' does not exist", table_name))?;
+        let table_name = stored_table.as_str();
+        if let Some(rows) = self.memory_rows.read().get(table_name) {
+            return Ok(rows.len() as u64);
+        }
+        if let Some(rows) = self.pending_rewrites.read().get(table_name) {
+            return Ok(rows.len() as u64);
+        }
+        if let Some(rows) = self.disk_manager.read_overflow_rows(table_name)? {
+            return Ok(rows.len() as u64);
+        }
+        let next_page_number = self
+            .tables
+            .read()
+            .get(table_name)
+            .ok_or_else(|| anyhow::anyhow!("Table '{}' does not exist", table_name))?
+            .next_page_number;
+        if next_page_number == 0 {
+            return Ok(0);
+        }
+        let namespace = self.page_namespace(table_name);
+        let page = match self.buffer_pool.get_table_page(&namespace, 0) {
+            Some(page) => Some(page),
+            None => {
+                let page = self.disk_manager.read_page(table_name, 0)?;
+                if let Some(page) = &page {
+                    self.buffer_pool.insert_table_page(&namespace, page.clone());
+                }
+                page
+            }
+        };
+        let rows_per_page = page
+            .as_ref()
+            .map(|page| u64::from(page.header.row_count))
+            .unwrap_or(0);
+        Ok(rows_per_page.saturating_mul(u64::from(next_page_number)))
+    }
+
     /// Get all rows from a table
     pub fn scan_table(&self, table_name: &str) -> Result<Vec<Row>> {
         let stored_table = self
@@ -7785,6 +7828,14 @@ impl StorageEngineManager {
         self.get_database(database)
             .ok_or_else(|| anyhow::anyhow!("Unknown database '{}'", database))?
             .scan_table(table)
+    }
+
+    /// Row-count estimate for the planner. It reads at most one page, so it
+    /// stays cheap on large tables.
+    pub fn estimated_row_count(&self, database: &str, table: &str) -> Result<u64> {
+        self.get_database(database)
+            .ok_or_else(|| anyhow::anyhow!("Unknown database '{}'", database))?
+            .estimated_row_count(table)
     }
 
     pub fn constraint_key_exists_for_row(

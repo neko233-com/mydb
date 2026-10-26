@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -23,6 +24,8 @@ pub struct ServerConfig {
     pub character_set: CharacterSetSection,
     #[serde(default)]
     pub agent: AgentSection,
+    #[serde(default)]
+    pub observability: ObservabilitySection,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -158,6 +161,54 @@ pub struct AgentSection {
     pub slow_query_threshold_ms: u64,
     #[serde(default = "default_max_slow_queries")]
     pub max_slow_queries: usize,
+    /// Append slow statements to a rotating NDJSON log. The in-memory ring
+    /// used by the monitoring API stays enabled independently.
+    #[serde(default = "default_true")]
+    pub slow_query_log: bool,
+    /// Defaults to `<data_dir>/slow.log` when unset.
+    #[serde(default)]
+    pub slow_query_log_file: Option<PathBuf>,
+    #[serde(default = "default_slow_query_log_max_size")]
+    pub slow_query_log_max_size: String,
+    #[serde(default = "default_slow_query_log_max_files")]
+    pub slow_query_log_max_files: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ObservabilitySection {
+    /// A dedicated read-only credential file for GET /metrics, never admin APIs.
+    #[serde(default)]
+    pub metrics_token_file: Option<PathBuf>,
+    #[serde(default)]
+    pub otlp: OtlpSection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OtlpSection {
+    /// OTLP/HTTP JSON export. Prometheus `/metrics` remains available even
+    /// when this is disabled.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Base endpoint such as `http://127.0.0.1:4318`. Paths `/v1/metrics`
+    /// and `/v1/traces` are appended automatically.
+    #[serde(default = "default_otlp_endpoint")]
+    pub endpoint: String,
+    #[serde(default = "default_otlp_interval_secs")]
+    pub interval_secs: u64,
+    #[serde(default = "default_otlp_timeout_secs")]
+    pub timeout_secs: u64,
+    #[serde(default = "default_otlp_service_name")]
+    pub service_name: String,
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    /// Export spans for slow/error SQL captured by the monitor. There is no
+    /// per-statement instrumentation cost on the query hot path.
+    #[serde(default = "default_true")]
+    pub export_traces: bool,
+    /// SQL text may contain business or personal data. Keep it disabled by
+    /// default and export the digest instead.
+    #[serde(default)]
+    pub include_sql: bool,
 }
 
 // Default values
@@ -251,6 +302,24 @@ fn default_slow_query_threshold_ms() -> u64 {
 }
 fn default_max_slow_queries() -> usize {
     1024
+}
+fn default_slow_query_log_max_size() -> String {
+    "100M".to_string()
+}
+fn default_slow_query_log_max_files() -> u32 {
+    10
+}
+fn default_otlp_endpoint() -> String {
+    "http://127.0.0.1:4318".to_string()
+}
+fn default_otlp_interval_secs() -> u64 {
+    15
+}
+fn default_otlp_timeout_secs() -> u64 {
+    5
+}
+fn default_otlp_service_name() -> String {
+    "mydb".to_string()
 }
 fn default_max_load_data_size() -> usize {
     1024 * 1024 * 1024
@@ -350,6 +419,25 @@ impl Default for AgentSection {
             enabled: true,
             slow_query_threshold_ms: default_slow_query_threshold_ms(),
             max_slow_queries: default_max_slow_queries(),
+            slow_query_log: true,
+            slow_query_log_file: None,
+            slow_query_log_max_size: default_slow_query_log_max_size(),
+            slow_query_log_max_files: default_slow_query_log_max_files(),
+        }
+    }
+}
+
+impl Default for OtlpSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: default_otlp_endpoint(),
+            interval_secs: default_otlp_interval_secs(),
+            timeout_secs: default_otlp_timeout_secs(),
+            service_name: default_otlp_service_name(),
+            headers: BTreeMap::new(),
+            export_traces: true,
+            include_sql: false,
         }
     }
 }
@@ -401,6 +489,27 @@ impl ServerConfig {
         }
         if let Ok(value) = std::env::var("MYDB_LOG_LEVEL") {
             self.logging.level = value;
+        }
+        if let Ok(value) = std::env::var("MYDB_SLOW_QUERY_LOG") {
+            self.agent.slow_query_log = matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "on" | "yes"
+            );
+        }
+        if let Ok(value) = std::env::var("MYDB_SLOW_QUERY_THRESHOLD_MS") {
+            self.agent.slow_query_threshold_ms = value.parse()?;
+        }
+        if let Ok(value) = std::env::var("MYDB_OTLP_ENABLED") {
+            self.observability.otlp.enabled = matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "on" | "yes"
+            );
+        }
+        if let Ok(value) = std::env::var("MYDB_OTLP_ENDPOINT") {
+            self.observability.otlp.endpoint = value;
+        }
+        if let Ok(value) = std::env::var("MYDB_METRICS_TOKEN_FILE") {
+            self.observability.metrics_token_file = Some(PathBuf::from(value));
         }
         if let Ok(value) = std::env::var("MYDB_LOCAL_INFILE") {
             self.security.local_infile = matches!(
@@ -519,5 +628,29 @@ mod tests {
         assert_eq!(config.server.port, 3306);
         assert_eq!(config.http.host, "0.0.0.0");
         assert_eq!(config.http.port, 4306);
+    }
+
+    #[test]
+    fn observability_defaults_keep_slow_log_on_and_otlp_off() {
+        let config = ServerConfig::default();
+        assert!(config.agent.slow_query_log);
+        assert_eq!(config.agent.slow_query_threshold_ms, 100);
+        assert_eq!(config.agent.slow_query_log_max_files, 10);
+        assert!(!config.observability.otlp.enabled);
+        assert!(config.observability.otlp.export_traces);
+        assert!(!config.observability.otlp.include_sql);
+        assert_eq!(config.observability.otlp.endpoint, "http://127.0.0.1:4318");
+    }
+
+    #[test]
+    fn shipped_config_templates_parse_with_observability_section() {
+        let default_config: ServerConfig =
+            serde_yaml::from_str(include_str!("../../../configs/default.yaml")).unwrap();
+        assert!(default_config.agent.slow_query_log);
+        assert!(!default_config.observability.otlp.enabled);
+        let production: ServerConfig =
+            serde_yaml::from_str(include_str!("../../../configs/production.yaml")).unwrap();
+        assert!(production.agent.slow_query_log);
+        assert_eq!(production.observability.otlp.service_name, "mydb");
     }
 }

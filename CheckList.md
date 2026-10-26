@@ -2,7 +2,7 @@
 
 > 操作说明见 [中文](docs/zh/README.md)、[English](docs/en/README.md)、[日本語](docs/ja/README.md)、[한국어](docs/ko/README.md)。本清单保留中文验收记录，不逐条译成四种语言。
 
-> 规则：只有当前源码和可复现实测能证明的项目才打勾。宽泛目标不能由局部 smoke 代替。最后更新：2026-08-17。
+> 规则：只有当前源码和可复现实测能证明的项目才打勾。宽泛目标不能由局部 smoke 代替。最后更新：2026-10-27。
 
 > **范围边界（当前验收口径）**：MyDB 目标是替代 MySQL 8.x 的单机部署，以 MySQL 协议、SQL、事务和可见外部行为为验收面。单机客户端直接连接 3306；复制拓扑、Group Replication / Galera、分布式 XA 两阶段协调仍不宣称已实现。完整 InnoDB 语义必须逐项通过本清单，不能由名称别名代替。
 
@@ -202,6 +202,20 @@
 - [ ] 发布产物签名、升级/降级和卸载流程验证
 
 ## 当前可复现证据
+
+### 2026-10-27 安全监控与正式版准备
+
+- [x] `0.1.37` Windows 与隔离 Linux：fmt、workspace Clippy、449 项 workspace 测试及 release 构建通过；使用 Rust 1.99.1，vendored 数值边界弃用警告已修正。上游 `proc-macro-error2` 的未来编译兼容提示不作为未来版本保证。
+- [x] `0.1.37` 原生客户端真实 MySQL 协议/版本、HTTP 管理身份、专用只读 metrics token、SQL 用户 403 管理隔离和 SQL 隐私通过；Windows 独立运行验证仅生成约 8.4 MB 临时数据并自动移除。
+- [x] 真实 MySQL 8.4.11 与隔离 Windows `0.1.37` 差分 131/131 通过，未连接本机业务 3306。
+- [x] Metrics233 真实采集、24 面板/11 条持续规则与 Prometheus 查询通过；Edge 实际数据库分类/24 面板及 Grafana 13.2.3 的14面板、可用性/审计健康值1和零控制台错误通过。空闲 WAL/延迟缺样保留为缺样。
+- [x] Docker 验证每轮独立资源、10 GiB 预算/6 GiB 空闲预留/45 分钟超时，Linux完整门禁峰值约2.48 GB，编译卷及容器已清理；超额预检实际拒绝且未分配卷。仅保留小型二进制与回执复用。
+- [x] Docker Desktop/WSL2、双方2CPU/2GiB、fsync开启，性能阶段12.8秒；原始样本与实际版本/二进制摘要已保存。单表写2.00x、并发吞吐1.65x、P99延迟比1.22x；未达到10x，亦不冒充物理Ubuntu验收。
+- [x] 本机服务已安装 `0.1.37-dev.1` 权限修复候选，冷备及二进制校验通过，专用metrics鉴权正常；正式发布物的安装与摘要单独核对。
+
+跨平台正式CI、完整Dockerfile/故障注入、公网HTTPS、通知送达、签名、发布下载及生产切换分别保留其验收边界；此阶段证据不勾选上方未完成的完整MySQL/InnoDB生产替代矩阵。
+
+### 2026-08 及以前的历史验收
 
 - [x] `cargo test --workspace --locked -- --test-threads=1`：通过（wire 269 个单测、storage 61 个单测、17 个集成测、WAL 18 个单测及其余 workspace 测试）
 - [x] `cargo test -p mydb-storage -p mydb-wire --locked`：通过（wire 269 个单测、storage 61 个单测）

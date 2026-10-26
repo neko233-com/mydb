@@ -1,0 +1,158 @@
+{
+  "format_version": 1,
+  "source_revision": "80a49fad360ad3eeff1242a75b54deee5e39056b",
+  "source_dirty": true,
+  "samples": 1,
+  "cpus_per_database": "2",
+  "memory_per_database": "2g",
+  "payload_bytes": 256,
+  "warmup": false,
+  "performance_budget_seconds": 60,
+  "results": {
+    "mydb": {
+      "single": [
+        {
+          "database": "mydb_game_bench_7_1793043686614",
+          "sql_engine": "InnoDB",
+          "actors": 1,
+          "writes": 200,
+          "table_count": 1,
+          "reads": 0,
+          "transaction_size": 1,
+          "write_mode": "transaction",
+          "reconnects": 0,
+          "elapsed_ms": 365,
+          "operations_per_second": 547.8157528648874,
+          "write_transactions_p50_us": 1663,
+          "write_transactions_p95_us": 2694,
+          "write_transactions_p99_us": 3062,
+          "reads_p50_us": 0,
+          "reads_p95_us": 0,
+          "reads_p99_us": 0,
+          "verified_rows": 200
+        }
+      ],
+      "concurrent-p99": [
+        {
+          "database": "mydb_game_bench_8_1793043690883",
+          "sql_engine": "InnoDB",
+          "actors": 4,
+          "writes": 320,
+          "table_count": 4,
+          "reads": 40,
+          "transaction_size": 5,
+          "write_mode": "transaction",
+          "reconnects": 0,
+          "elapsed_ms": 129,
+          "operations_per_second": 2773.9902750527713,
+          "write_transactions_p50_us": 6847,
+          "write_transactions_p95_us": 8842,
+          "write_transactions_p99_us": 15206,
+          "reads_p50_us": 451,
+          "reads_p95_us": 770,
+          "reads_p99_us": 1002,
+          "verified_rows": 320
+        }
+      ],
+      "concurrent-tp": [
+        {
+          "database": "mydb_game_bench_7_1793043694407",
+          "sql_engine": "InnoDB",
+          "actors": 4,
+          "writes": 800,
+          "table_count": 4,
+          "reads": 0,
+          "transaction_size": 1,
+          "write_mode": "transaction",
+          "reconnects": 0,
+          "elapsed_ms": 665,
+          "operations_per_second": 1201.2283406649278,
+          "write_transactions_p50_us": 2894,
+          "write_transactions_p95_us": 4654,
+          "write_transactions_p99_us": 5642,
+          "reads_p50_us": 0,
+          "reads_p95_us": 0,
+          "reads_p99_us": 0,
+          "verified_rows": 800
+        }
+      ]
+    },
+    "mysql": {
+      "single": [
+        {
+          "database": "mydb_game_bench_7_1793043688585",
+          "sql_engine": "InnoDB",
+          "actors": 1,
+          "writes": 200,
+          "table_count": 1,
+          "reads": 0,
+          "transaction_size": 1,
+          "write_mode": "transaction",
+          "reconnects": 0,
+          "elapsed_ms": 729,
+          "operations_per_second": 274.2330866058253,
+          "write_transactions_p50_us": 3454,
+          "write_transactions_p95_us": 4954,
+          "write_transactions_p99_us": 6353,
+          "reads_p50_us": 0,
+          "reads_p95_us": 0,
+          "reads_p99_us": 0,
+          "verified_rows": 200
+        }
+      ],
+      "concurrent-p99": [
+        {
+          "database": "mydb_game_bench_7_1793043692577",
+          "sql_engine": "InnoDB",
+          "actors": 4,
+          "writes": 320,
+          "table_count": 4,
+          "reads": 40,
+          "transaction_size": 5,
+          "write_mode": "transaction",
+          "reconnects": 0,
+          "elapsed_ms": 128,
+          "operations_per_second": 2800.6090515622313,
+          "write_transactions_p50_us": 7138,
+          "write_transactions_p95_us": 10329,
+          "write_transactions_p99_us": 12513,
+          "reads_p50_us": 172,
+          "reads_p95_us": 456,
+          "reads_p99_us": 487,
+          "verified_rows": 320
+        }
+      ],
+      "concurrent-tp": [
+        {
+          "database": "mydb_game_bench_7_1793043696657",
+          "sql_engine": "InnoDB",
+          "actors": 4,
+          "writes": 800,
+          "table_count": 4,
+          "reads": 0,
+          "transaction_size": 1,
+          "write_mode": "transaction",
+          "reconnects": 0,
+          "elapsed_ms": 1099,
+          "operations_per_second": 727.87187898012,
+          "write_transactions_p50_us": 5120,
+          "write_transactions_p95_us": 7590,
+          "write_transactions_p99_us": 9706,
+          "reads_p50_us": 0,
+          "reads_p95_us": 0,
+          "reads_p99_us": 0,
+          "verified_rows": 800
+        }
+      ]
+    }
+  },
+  "complete": true,
+  "performance_elapsed_seconds": 12.816421700001229,
+  "date": "2026-10-27",
+  "docker_os": "Docker Desktop",
+  "kernel": "6.6.114.1-microsoft-standard-WSL2",
+  "architecture": "x86_64",
+  "mydb_version": "mydb-server 0.1.37",
+  "mydb_binary_sha256": "f611589f0f764726126db99af9fe7b9121c2c201bc3612e087cce43e6723f5f2",
+  "mysql_version": "8.4.11 — MySQL Community Server - GPL"
+}

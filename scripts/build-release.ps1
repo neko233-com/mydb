@@ -30,6 +30,17 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+Set-Location -LiteralPath $root
+if ($Version -notmatch '^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$' -or $Tag -cne "v$Version") {
+    throw 'Version must be semantic and Tag must equal v<Version>'
+}
+$metadata = cargo metadata --no-deps --locked --format-version 1 | ConvertFrom-Json
+if ($LASTEXITCODE -ne 0 -or ($metadata.packages | Where-Object name -EQ 'mydb-server').version -cne $Version) {
+    throw 'Requested package version does not match the Cargo source version'
+}
+$sourceRevision = (git rev-parse HEAD) -join ''
+if ($LASTEXITCODE -ne 0) { throw 'Cannot identify the release source commit' }
 
 # Colors
 function Write-Info { Write-Host "[INFO] $args" -ForegroundColor Blue }
@@ -79,12 +90,14 @@ if ($LASTEXITCODE -ne 0) { Write-Error "Docker Rust quality gate failed" }
 
 # 构建 release 版本
 Write-Info "Building release..."
-cargo build --release -p mydb-server -p mydb-migrate -p mydb-dump
-cargo build --release -p mydb-cli --bins
+cargo build --release --locked -p mydb-server -p mydb-migrate -p mydb-dump
+if ($LASTEXITCODE -ne 0) { Write-Error "Server/tool build failed" }
+cargo build --release --locked -p mydb-cli --bins
 if ($LASTEXITCODE -ne 0) { Write-Error "Build failed" }
 
 # 创建打包目录
-$buildDir = "target/release/package"
+$buildDir = Join-Path $root 'target/release/package'
+if ([IO.Path]::GetFullPath($buildDir) -ne (Join-Path $root 'target\release\package')) { throw 'Unsafe package staging path' }
 # 仅清理明确的打包目录；保留 Cargo release 缓存，避免测试/增量构建拖慢后续打包。
 if (Test-Path $buildDir) { Remove-Item -Recurse -Force $buildDir }
 New-Item -ItemType Directory -Path $buildDir -Force | Out-Null
@@ -109,6 +122,15 @@ Copy-Item "README.md" "$buildDir/"
 Copy-Item "CheckList.md" "$buildDir/"
 Copy-Item "SYNTAX_MATRIX.md" "$buildDir/"
 Copy-Item "性能报告.md" "$buildDir/"
+$documentationFiles = @(git ls-files --cached --others --exclude-standard -- docs examples | Sort-Object -Unique)
+if ($LASTEXITCODE -ne 0) { throw 'Cannot enumerate public documentation inputs' }
+foreach ($relative in $documentationFiles) {
+    $sourceFile = Get-Item -LiteralPath (Join-Path $root $relative)
+    if ($sourceFile.PSIsContainer -or ($sourceFile.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Package inputs must be regular public files' }
+    $destination = Join-Path $buildDir $relative
+    New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force | Out-Null
+    Copy-Item -LiteralPath $sourceFile.FullName -Destination $destination
+}
 if (Test-Path "LICENSE") { Copy-Item "LICENSE" "$buildDir/" }
 
 # 打包
@@ -140,6 +162,9 @@ if (-not $ConfirmPublish) {
     Write-Warn "Package is ready; GitHub release was NOT created. Re-run with -ConfirmPublish and type PUBLISH $Tag to publish."
     exit 0
 }
+if ($Version.Contains('-') -or ((git status --porcelain) -join '').Length -ne 0 -or ((git rev-parse HEAD) -join '') -cne $sourceRevision) {
+    throw 'Publication requires a stable version and an unchanged clean source commit'
+}
 $confirmation = Read-Host "Type PUBLISH $Tag to create the immutable GitHub release"
 if ($confirmation -cne "PUBLISH $Tag") {
     Write-Error "Release confirmation did not match; no GitHub tag or assets were created."
@@ -148,6 +173,7 @@ if ($confirmation -cne "PUBLISH $Tag") {
 # 创建 release
 Write-Info "Creating GitHub release: $Tag"
 gh release create $Tag `
+    --target $sourceRevision `
     --title "MyDB $Version" `
     --notes "MyDB $Version - MySQL 8.x compatible database" `
     $packagePath `

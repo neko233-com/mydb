@@ -1,0 +1,149 @@
+name: Validate native release candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_commit:
+        description: Full immutable source commit to validate
+        required: true
+      version:
+        description: Cargo version expected in every native binary
+        required: true
+        default: 0.1.37
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-release-${{ inputs.source_commit }}
+  cancel-in-progress: false
+
+jobs:
+  native:
+    name: Native ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            platform: linux-x86_64
+            suffix: ''
+          - os: windows-2025
+            platform: windows-x86_64
+            suffix: .exe
+          - os: macos-14
+            platform: macos-aarch64
+            suffix: ''
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      EXPECTED_VERSION: ${{ inputs.version }}
+      SOURCE_COMMIT: ${{ inputs.source_commit }}
+      EXPECTED_PLATFORM: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source_commit }}
+          persist-credentials: false
+      - name: Validate immutable inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$EXPECTED_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+        with:
+          toolchain: '1.99.1'
+          components: rustfmt, clippy
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.13'
+      - name: Native quality and release binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          package=$(cargo pkgid --locked -p mydb-server)
+          actual_version=${package##*#}
+          actual_version=${actual_version##*@}
+          test "$actual_version" = "$EXPECTED_VERSION"
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo test --workspace --locked -- --test-threads=1
+          cargo build --release --locked -p mydb-server -p mydb-cli -p mydb-migrate -p mydb-dump
+      - name: Actual native CLI, authenticated metrics and SQL role isolation
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/verify-monitoring-runtime.py --binary-directory target/release --expected-version "$EXPECTED_VERSION" > target/native-smoke.json
+          cat target/native-smoke.json
+          git diff --exit-code
+      - name: Native architecture and artifact identity
+        shell: bash
+        run: |
+          python - <<'PY'
+          import hashlib, json, os, pathlib, platform, subprocess
+          machine = platform.machine().lower()
+          system = platform.system()
+          arch = {"amd64": "x86_64", "x86_64": "x86_64", "arm64": "aarch64", "aarch64": "aarch64"}.get(machine)
+          actual = {"Windows": "windows", "Linux": "linux", "Darwin": "macos"}[system] + "-" + str(arch)
+          if actual != os.environ["EXPECTED_PLATFORM"]:
+              raise SystemExit("The native runner does not match the artifact architecture")
+          root = pathlib.Path("target/release")
+          suffix = ".exe" if system == "Windows" else ""
+          files = [root / (name + suffix) for name in ("mydb-server", "mydb-cli", "mydb", "mydb-migrate", "mydbdump")]
+          record = {"source_revision": os.environ["SOURCE_COMMIT"], "version": os.environ["EXPECTED_VERSION"], "platform": actual, "compiler": subprocess.check_output(["rustc", "--version"], text=True).strip(), "binaries": {file.name: hashlib.sha256(file.read_bytes()).hexdigest() for file in files}}
+          pathlib.Path("target/build-info.json").write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+          PY
+      - name: Retain only small verified native binaries
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mydb-${{ inputs.version }}-${{ matrix.platform }}-validated
+          retention-days: 7
+          if-no-files-found: error
+          path: |
+            target/release/mydb-server${{ matrix.suffix }}
+            target/release/mydb-cli${{ matrix.suffix }}
+            target/release/mydb${{ matrix.suffix }}
+            target/release/mydb-migrate${{ matrix.suffix }}
+            target/release/mydbdump${{ matrix.suffix }}
+            target/native-smoke.json
+            target/build-info.json
+
+  docker:
+    name: Formal Dockerfile and bounded durability faults
+    needs: native
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      SOURCE_COMMIT: ${{ inputs.source_commit }}
+      EXPECTED_VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source_commit }}
+          persist-credentials: false
+      - name: Bounded formal image build
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+          free_kib=$(df -Pk . | awk 'END {print $4}')
+          test "$free_kib" -ge 10485760
+          docker buildx create --name "mydb-release-${GITHUB_RUN_ID}" --driver docker-container --driver-opt memory=3g,memory-swap=3g --use
+          docker buildx build --load --build-arg CARGO_BUILD_JOBS=1 --tag mydb:release-candidate .
+          test "$(docker image inspect mydb:release-candidate --format '{{.Config.User}}')" = mydb
+          docker run --rm --network none --read-only --memory 128m --cpus 1 mydb:release-candidate --version | grep -F "mydb-server $EXPECTED_VERSION"
+      - name: Isolated SIGKILL, read-only, 8 MiB ENOSPC and interrupted replay
+        shell: pwsh
+        run: ./scripts/docker-fault-injection.ps1 -Image mydb:release-candidate
+      - name: Remove this run's image and compiler cache
+        if: always()
+        shell: bash
+        run: |
+          docker image rm mydb:release-candidate || true
+          docker buildx rm "mydb-release-${GITHUB_RUN_ID}" || true

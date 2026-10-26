@@ -64,3 +64,22 @@ agent:
   enabled: true
   slow_query_threshold_ms: 100
   max_slow_queries: 4096
+  # 慢查询落盘（NDJSON，轮转），便于接入日志采集
+  slow_query_log: true
+  slow_query_log_file: null
+  slow_query_log_max_size: "256M"
+  slow_query_log_max_files: 14
+
+observability:
+  # Mount a protected token file for MetricsPanel233 read-only scraping.
+  metrics_token_file: null
+  otlp:
+    # 生产环境接入 OpenTelemetry 采集器时置为 true
+    enabled: false
+    endpoint: "http://127.0.0.1:4318"
+    interval_secs: 15
+    timeout_secs: 5
+    service_name: "mydb"
+    headers: {}
+    export_traces: true
+    include_sql: false

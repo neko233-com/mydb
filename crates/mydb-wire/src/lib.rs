@@ -58,6 +58,10 @@ const MYSQL84_MIN_GROUP_CONCAT_MAX_LEN: u64 = 4;
 const MYSQL84_MAX_GROUP_CONCAT_MAX_LEN: u64 = 18_446_744_073_709_547_520;
 const MAX_SCALAR_RESULT_BYTES: usize = 64 * 1024 * 1024;
 const REGEX_CACHE_CAPACITY: usize = 256;
+/// Slow-statement plans stay reusable for one minute; schema changes rarely
+/// need a faster refresh than that.
+const EXPLAIN_CACHE_TTL: Duration = Duration::from_secs(60);
+const EXPLAIN_CACHE_MAX_ENTRIES: usize = 256;
 const READ_ONLY_TRANSACTION_ERROR: &str = "Cannot execute statement in a READ ONLY transaction.";
 static REGEX_CACHE: OnceLock<parking_lot::Mutex<HashMap<String, Regex>>> = OnceLock::new();
 
@@ -448,6 +452,7 @@ pub struct ProtocolConfig {
     pub max_load_data_size: usize,
     pub auth_catalog: Arc<AuthCatalog>,
     pub audit_log: Arc<AuditLog>,
+    pub slow_query_log: Option<Arc<SlowQueryLog>>,
     pub tls_config: Option<Arc<RustlsServerConfig>>,
     pub require_secure_transport: bool,
 }
@@ -468,6 +473,7 @@ impl Default for ProtocolConfig {
             max_load_data_size: 1024 * 1024 * 1024,
             auth_catalog: Arc::new(AuthCatalog::in_memory("root", "root")),
             audit_log: Arc::new(AuditLog::in_memory()),
+            slow_query_log: None,
             tls_config: None,
             require_secure_transport: false,
         }
@@ -491,6 +497,7 @@ pub struct AuditLog {
     failure: Arc<parking_lot::Mutex<Option<String>>>,
     accepted: AtomicU64,
     rejected: AtomicU64,
+    authentication_failures: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -531,6 +538,7 @@ impl AuditLog {
             failure,
             accepted: AtomicU64::new(0),
             rejected: AtomicU64::new(0),
+            authentication_failures: AtomicU64::new(0),
         })
     }
 
@@ -540,6 +548,7 @@ impl AuditLog {
             failure: Arc::new(parking_lot::Mutex::new(None)),
             accepted: AtomicU64::new(0),
             rejected: AtomicU64::new(0),
+            authentication_failures: AtomicU64::new(0),
         }
     }
 
@@ -553,6 +562,9 @@ impl AuditLog {
         statement_type: &str,
         outcome: &str,
     ) -> anyhow::Result<()> {
+        if event == "authentication" && outcome == "denied" {
+            self.authentication_failures.fetch_add(1, Ordering::Relaxed);
+        }
         let Some(sender) = &self.sender else {
             return Ok(());
         };
@@ -586,6 +598,10 @@ impl AuditLog {
             accepted: self.accepted.load(Ordering::Relaxed),
             rejected: self.rejected.load(Ordering::Relaxed),
         }
+    }
+
+    pub fn authentication_failures(&self) -> u64 {
+        self.authentication_failures.load(Ordering::Relaxed)
     }
 
     pub fn flush(&self) -> anyhow::Result<()> {
@@ -737,6 +753,10 @@ fn write_audit_batch(
 }
 
 fn parse_audit_size(value: &str) -> anyhow::Result<u64> {
+    parse_log_size(value, "audit log")
+}
+
+fn parse_log_size(value: &str, label: &str) -> anyhow::Result<u64> {
     let value = value.trim().to_ascii_uppercase();
     let (number, multiplier) = match value.chars().last() {
         Some('K') => (&value[..value.len() - 1], 1024),
@@ -746,7 +766,7 @@ fn parse_audit_size(value: &str) -> anyhow::Result<u64> {
     };
     let bytes = number.parse::<u64>()?.saturating_mul(multiplier);
     if bytes == 0 {
-        anyhow::bail!("audit log size must be positive");
+        anyhow::bail!("{label} size must be positive");
     }
     Ok(bytes)
 }
@@ -756,17 +776,247 @@ fn rotate_audit_log(path: &Path, max_files: u32) -> anyhow::Result<()> {
         fs::remove_file(path)?;
         return Ok(());
     }
-    let oldest = path.with_extension(format!("ndjson.{max_files}"));
+    let oldest = rotated_log_path(path, max_files);
     if oldest.exists() {
         fs::remove_file(oldest)?;
     }
     for index in (1..max_files).rev() {
-        let source = path.with_extension(format!("ndjson.{index}"));
+        let source = rotated_log_path(path, index);
         if source.exists() {
-            fs::rename(source, path.with_extension(format!("ndjson.{}", index + 1)))?;
+            fs::rename(source, rotated_log_path(path, index + 1))?;
         }
     }
-    fs::rename(path, path.with_extension("ndjson.1"))?;
+    fs::rename(path, rotated_log_path(path, 1))?;
+    Ok(())
+}
+
+fn rotated_log_path(path: &Path, index: u32) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".{index}"));
+    path.with_file_name(name)
+}
+
+/// Slow-query log writer. The connection thread only serializes the event and
+/// hands it to a bounded queue, so the disk never blocks a query response.
+#[derive(Debug, Clone, Copy)]
+pub struct SlowQueryLogSnapshot {
+    pub healthy: bool,
+    pub enabled: bool,
+    pub written: u64,
+    pub dropped: u64,
+}
+
+enum SlowQueryLogCommand {
+    Record(Vec<u8>),
+    Flush(std::sync::mpsc::Sender<anyhow::Result<()>>),
+}
+
+#[derive(Debug)]
+pub struct SlowQueryLog {
+    sender: Option<SyncSender<SlowQueryLogCommand>>,
+    failure: Arc<parking_lot::Mutex<Option<String>>>,
+    written: AtomicU64,
+    dropped: AtomicU64,
+    enabled: AtomicBool,
+}
+
+impl SlowQueryLog {
+    pub fn open(path: &Path, max_size: &str, max_files: u32) -> anyhow::Result<Self> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let max_bytes = parse_log_size(max_size, "slow query log")?;
+        let (sender, receiver) = mpsc::sync_channel(1024);
+        let failure = Arc::new(parking_lot::Mutex::new(None));
+        let worker_failure = failure.clone();
+        let path = path.to_path_buf();
+        std::thread::Builder::new()
+            .name("mydb-slow-log".into())
+            .spawn(move || {
+                slow_query_log_worker(receiver, path, max_bytes, max_files, worker_failure)
+            })?;
+        Ok(Self {
+            sender: Some(sender),
+            failure,
+            written: AtomicU64::new(0),
+            dropped: AtomicU64::new(0),
+            enabled: AtomicBool::new(true),
+        })
+    }
+
+    pub fn in_memory() -> Self {
+        Self {
+            sender: None,
+            failure: Arc::new(parking_lot::Mutex::new(None)),
+            written: AtomicU64::new(0),
+            dropped: AtomicU64::new(0),
+            enabled: AtomicBool::new(false),
+        }
+    }
+
+    pub fn set_enabled(&self, enabled: bool) {
+        self.enabled.store(enabled, Ordering::Release);
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.load(Ordering::Acquire)
+    }
+
+    pub fn record(&self, snapshot: &SlowQuerySnapshot) -> anyhow::Result<()> {
+        let Some(sender) = &self.sender else {
+            return Ok(());
+        };
+        if !self.is_enabled() {
+            return Ok(());
+        }
+        if let Some(error) = self.failure.lock().clone() {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+            anyhow::bail!("slow query log worker failed: {error}");
+        }
+        let encoded = serde_json::to_vec(&slow_query_log_event(snapshot))?;
+        match sender.try_send(SlowQueryLogCommand::Record(encoded)) {
+            Ok(()) => {
+                self.written.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+            Err(error) => {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+                Err(anyhow::anyhow!("slow query log queue unavailable: {error}"))
+            }
+        }
+    }
+
+    pub fn snapshot(&self) -> SlowQueryLogSnapshot {
+        SlowQueryLogSnapshot {
+            healthy: self.failure.lock().is_none(),
+            enabled: self.is_enabled(),
+            written: self.written.load(Ordering::Relaxed),
+            dropped: self.dropped.load(Ordering::Relaxed),
+        }
+    }
+
+    pub fn flush(&self) -> anyhow::Result<()> {
+        let Some(sender) = &self.sender else {
+            return Ok(());
+        };
+        let (reply, result) = mpsc::channel();
+        sender
+            .send(SlowQueryLogCommand::Flush(reply))
+            .map_err(|error| anyhow::anyhow!("slow query log queue unavailable: {error}"))?;
+        result
+            .recv()
+            .map_err(|error| anyhow::anyhow!("slow query log worker stopped: {error}"))?
+    }
+}
+
+impl Drop for SlowQueryLog {
+    fn drop(&mut self) {
+        let _ = self.flush();
+    }
+}
+
+fn slow_query_log_event(snapshot: &SlowQuerySnapshot) -> serde_json::Value {
+    serde_json::json!({
+        "timestamp_ms": snapshot.unix_ms,
+        "duration_ms": snapshot.duration_ms,
+        "connection_id": snapshot.connection_id,
+        "database": snapshot.database,
+        "statement_type": snapshot.statement_type,
+        "query_digest": snapshot.query_digest,
+        "sql": snapshot.sql,
+        "error": snapshot.error,
+        "outcome": snapshot.outcome,
+        "rows_returned": snapshot.rows_returned,
+        "affected_rows": snapshot.affected_rows,
+        "execution_micros": snapshot.execution_micros,
+        "explain": snapshot
+            .explain_json
+            .as_deref()
+            .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok()),
+    })
+}
+
+fn slow_query_log_worker(
+    receiver: Receiver<SlowQueryLogCommand>,
+    path: PathBuf,
+    max_bytes: u64,
+    max_files: u32,
+    failure: Arc<parking_lot::Mutex<Option<String>>>,
+) {
+    let mut pending: Vec<Vec<u8>> = Vec::with_capacity(64);
+    loop {
+        let command = match receiver.recv_timeout(Duration::from_millis(200)) {
+            Ok(command) => command,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if !pending.is_empty() {
+                    if let Err(error) =
+                        write_slow_query_batch(&path, max_bytes, max_files, &mut pending)
+                    {
+                        *failure.lock() = Some(error.to_string());
+                        return;
+                    }
+                }
+                continue;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                if let Err(error) =
+                    write_slow_query_batch(&path, max_bytes, max_files, &mut pending)
+                {
+                    *failure.lock() = Some(error.to_string());
+                }
+                return;
+            }
+        };
+        match command {
+            SlowQueryLogCommand::Record(event) => pending.push(event),
+            SlowQueryLogCommand::Flush(reply) => {
+                let result = write_slow_query_batch(&path, max_bytes, max_files, &mut pending);
+                if let Err(error) = &result {
+                    *failure.lock() = Some(error.to_string());
+                }
+                let _ = reply.send(result);
+            }
+        }
+    }
+}
+
+fn write_slow_query_batch(
+    path: &Path,
+    max_bytes: u64,
+    max_files: u32,
+    pending: &mut Vec<Vec<u8>>,
+) -> anyhow::Result<()> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let mut current_bytes = fs::metadata(path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    let mut file: Option<fs::File> = None;
+    for event in pending.drain(..) {
+        let event_bytes = event.len() as u64 + 1;
+        if current_bytes.saturating_add(event_bytes) > max_bytes && current_bytes > 0 {
+            file.take();
+            rotate_audit_log(path, max_files)?;
+            current_bytes = 0;
+        }
+        if file.is_none() {
+            file = Some(
+                fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)?,
+            );
+        }
+        let file = file.as_mut().expect("opened slow query log file");
+        file.write_all(&event)?;
+        file.write_all(b"\n")?;
+        current_bytes = current_bytes.saturating_add(event_bytes);
+    }
+    if let Some(mut file) = file {
+        // The slow query log is a diagnostic stream, not a durability record.
+        file.flush()?;
+    }
     Ok(())
 }
 
@@ -4272,6 +4522,291 @@ fn parse_kill_statement(sql: &str) -> Option<anyhow::Result<(KillScope, u32)>> {
     }))
 }
 
+/// Aggregated statement statistics keyed by the normalized SQL text, matching
+/// the shape of `performance_schema.EVENTS_STATEMENTS_SUMMARY_BY_DIGEST`.
+#[derive(Debug, Clone)]
+pub struct StatementDigestSnapshot {
+    pub digest: String,
+    pub digest_text: String,
+    pub statement_type: String,
+    pub count_star: u64,
+    pub sum_timer_wait: u64,
+    pub min_timer_wait: u64,
+    pub max_timer_wait: u64,
+    pub sum_rows_sent: u64,
+    pub sum_rows_affected: u64,
+    pub sum_errors: u64,
+    pub first_seen_ms: u64,
+    pub last_seen_ms: u64,
+}
+
+impl StatementDigestSnapshot {
+    pub fn average_timer_wait(&self) -> u64 {
+        self.sum_timer_wait / self.count_star.max(1)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct StatementDigestEntry {
+    digest_text: String,
+    statement_type: String,
+    count_star: u64,
+    sum_timer_wait: u64,
+    min_timer_wait: u64,
+    max_timer_wait: u64,
+    sum_rows_sent: u64,
+    sum_rows_affected: u64,
+    sum_errors: u64,
+    first_seen_ms: u64,
+    last_seen_ms: u64,
+}
+
+/// Result counters of a single statement execution.
+#[derive(Debug, Clone, Copy)]
+pub struct StatementOutcome {
+    pub rows_sent: u64,
+    pub rows_affected: u64,
+    pub is_error: bool,
+}
+
+const DIGEST_SHARD_COUNT: usize = 16;
+const DEFAULT_DIGEST_MAX_ENTRIES: usize = 4096;
+
+/// Sharded statement digest registry. Recording is a single shard lock and a
+/// hash-map update, so the aggregation never serializes all connections.
+#[derive(Debug)]
+pub struct StatementDigestStats {
+    shards: Vec<parking_lot::Mutex<HashMap<String, StatementDigestEntry>>>,
+    max_entries: usize,
+    entries: AtomicUsize,
+    dropped: AtomicU64,
+}
+
+impl Default for StatementDigestStats {
+    fn default() -> Self {
+        Self::new(DEFAULT_DIGEST_MAX_ENTRIES)
+    }
+}
+
+impl StatementDigestStats {
+    pub fn new(max_entries: usize) -> Self {
+        let shards = (0..DIGEST_SHARD_COUNT)
+            .map(|_| parking_lot::Mutex::new(HashMap::new()))
+            .collect();
+        Self {
+            shards,
+            max_entries: max_entries.max(1),
+            entries: AtomicUsize::new(0),
+            dropped: AtomicU64::new(0),
+        }
+    }
+
+    pub fn record(
+        &self,
+        digest_text: &str,
+        statement_type: &str,
+        elapsed_micros: u64,
+        outcome: StatementOutcome,
+        now_ms: u64,
+    ) {
+        let timer_wait = elapsed_micros.saturating_mul(1_000);
+        let mut shard = self.shards[digest_shard_index(digest_text)].lock();
+        if let Some(entry) = shard.get_mut(digest_text) {
+            entry.count_star = entry.count_star.saturating_add(1);
+            entry.sum_timer_wait = entry.sum_timer_wait.saturating_add(timer_wait);
+            entry.min_timer_wait = entry.min_timer_wait.min(timer_wait);
+            entry.max_timer_wait = entry.max_timer_wait.max(timer_wait);
+            entry.sum_rows_sent = entry.sum_rows_sent.saturating_add(outcome.rows_sent);
+            entry.sum_rows_affected = entry
+                .sum_rows_affected
+                .saturating_add(outcome.rows_affected);
+            entry.sum_errors = entry.sum_errors.saturating_add(u64::from(outcome.is_error));
+            entry.last_seen_ms = now_ms;
+            return;
+        }
+        if self.entries.load(Ordering::Relaxed) >= self.max_entries {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        shard.insert(
+            digest_text.to_string(),
+            StatementDigestEntry {
+                digest_text: digest_text.to_string(),
+                statement_type: statement_type.to_string(),
+                count_star: 1,
+                sum_timer_wait: timer_wait,
+                min_timer_wait: timer_wait,
+                max_timer_wait: timer_wait,
+                sum_rows_sent: outcome.rows_sent,
+                sum_rows_affected: outcome.rows_affected,
+                sum_errors: u64::from(outcome.is_error),
+                first_seen_ms: now_ms,
+                last_seen_ms: now_ms,
+            },
+        );
+        self.entries.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn snapshots(&self) -> Vec<StatementDigestSnapshot> {
+        let mut snapshots = Vec::new();
+        for shard in &self.shards {
+            for entry in shard.lock().values() {
+                snapshots.push(StatementDigestSnapshot {
+                    digest: sha256_hex(entry.digest_text.as_bytes()),
+                    digest_text: entry.digest_text.clone(),
+                    statement_type: entry.statement_type.clone(),
+                    count_star: entry.count_star,
+                    sum_timer_wait: entry.sum_timer_wait,
+                    min_timer_wait: entry.min_timer_wait,
+                    max_timer_wait: entry.max_timer_wait,
+                    sum_rows_sent: entry.sum_rows_sent,
+                    sum_rows_affected: entry.sum_rows_affected,
+                    sum_errors: entry.sum_errors,
+                    first_seen_ms: entry.first_seen_ms,
+                    last_seen_ms: entry.last_seen_ms,
+                });
+            }
+        }
+        snapshots.sort_by(|left, right| {
+            right
+                .sum_timer_wait
+                .cmp(&left.sum_timer_wait)
+                .then_with(|| right.count_star.cmp(&left.count_star))
+        });
+        snapshots
+    }
+
+    pub fn entry_count(&self) -> usize {
+        self.entries.load(Ordering::Relaxed)
+    }
+
+    pub fn dropped(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+}
+
+fn digest_shard_index(digest_text: &str) -> usize {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in digest_text.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    (hash % DIGEST_SHARD_COUNT as u64) as usize
+}
+
+fn sha256_hex(value: &[u8]) -> String {
+    let digest = Sha256::digest(value);
+    let mut output = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        output.push_str(&format!("{byte:02x}"));
+    }
+    output
+}
+
+/// Upper latency bounds in microseconds. The last bucket is `+Inf`.
+pub const QUERY_LATENCY_BOUNDS_MICROS: [u64; 11] = [
+    100, 500, 1_000, 5_000, 10_000, 50_000, 100_000, 500_000, 1_000_000, 5_000_000, 30_000_000,
+];
+
+#[derive(Debug, Clone)]
+pub struct QueryLatencySnapshot {
+    pub bounds_micros: [u64; 11],
+    pub cumulative_counts: [u64; 12],
+    pub count: u64,
+    pub sum_micros: u64,
+    pub min_micros: u64,
+    pub max_micros: u64,
+}
+
+impl QueryLatencySnapshot {
+    /// Per-bucket counts. Prometheus and OTLP both expect the count of the
+    /// samples that fall into each bucket, not the running total.
+    pub fn bucket_counts(&self) -> [u64; 12] {
+        let mut counts = [0u64; 12];
+        let mut previous = 0u64;
+        for (index, cumulative) in self.cumulative_counts.iter().enumerate() {
+            counts[index] = cumulative.saturating_sub(previous);
+            previous = *cumulative;
+        }
+        counts
+    }
+
+    pub fn percentile_micros(&self, quantile: f64) -> u64 {
+        if self.count == 0 {
+            return 0;
+        }
+        let target = (self.count as f64 * quantile.clamp(0.0, 1.0)).ceil() as u64;
+        let target = target.max(1);
+        for (index, count) in self.cumulative_counts.iter().enumerate() {
+            if *count >= target {
+                return match index {
+                    index if index < self.bounds_micros.len() => self.bounds_micros[index],
+                    _ => self.max_micros,
+                };
+            }
+        }
+        self.max_micros
+    }
+
+    pub fn average_micros(&self) -> u64 {
+        self.sum_micros / self.count.max(1)
+    }
+}
+
+#[derive(Debug)]
+pub struct QueryLatencyHistogram {
+    buckets: [AtomicU64; 12],
+    count: AtomicU64,
+    sum_micros: AtomicU64,
+    min_micros: AtomicU64,
+    max_micros: AtomicU64,
+}
+
+impl Default for QueryLatencyHistogram {
+    fn default() -> Self {
+        Self {
+            buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+            count: AtomicU64::new(0),
+            sum_micros: AtomicU64::new(0),
+            min_micros: AtomicU64::new(u64::MAX),
+            max_micros: AtomicU64::new(0),
+        }
+    }
+}
+
+impl QueryLatencyHistogram {
+    pub fn record(&self, elapsed_micros: u64) {
+        let index = QUERY_LATENCY_BOUNDS_MICROS
+            .iter()
+            .position(|bound| elapsed_micros <= *bound)
+            .unwrap_or(QUERY_LATENCY_BOUNDS_MICROS.len());
+        self.buckets[index].fetch_add(1, Ordering::Relaxed);
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.sum_micros.fetch_add(elapsed_micros, Ordering::Relaxed);
+        self.min_micros.fetch_min(elapsed_micros, Ordering::Relaxed);
+        self.max_micros.fetch_max(elapsed_micros, Ordering::Relaxed);
+    }
+
+    pub fn snapshot(&self) -> QueryLatencySnapshot {
+        let mut cumulative_counts = [0u64; 12];
+        let mut running = 0u64;
+        for (index, bucket) in self.buckets.iter().enumerate() {
+            running += bucket.load(Ordering::Relaxed);
+            cumulative_counts[index] = running;
+        }
+        let count = self.count.load(Ordering::Relaxed);
+        let min_micros = self.min_micros.load(Ordering::Relaxed);
+        QueryLatencySnapshot {
+            bounds_micros: QUERY_LATENCY_BOUNDS_MICROS,
+            cumulative_counts,
+            count,
+            sum_micros: self.sum_micros.load(Ordering::Relaxed),
+            min_micros: if count == 0 { 0 } else { min_micros },
+            max_micros: self.max_micros.load(Ordering::Relaxed),
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct WireStats {
     active_connections: AtomicUsize,
@@ -4288,6 +4823,14 @@ pub struct WireStats {
     table_lock_acquires: AtomicU64,
     next_slow_query_id: AtomicU64,
     slow_queries: parking_lot::Mutex<VecDeque<SlowQuerySnapshot>>,
+    slow_queries_total: AtomicU64,
+    query_latency: QueryLatencyHistogram,
+    digest_stats: StatementDigestStats,
+    explain_cache: parking_lot::Mutex<HashMap<String, (Instant, String)>>,
+    global_long_query_time_micros: AtomicU64,
+    // 0 = default (enabled), 1 = disabled, 2 = enabled.
+    global_slow_query_log_state: AtomicU8,
+    global_explain_json_format_version: AtomicU8,
     transaction_locks: parking_lot::Mutex<HashMap<String, LockState>>,
     // LOCK TABLES locks outlive a transaction, so keep them separate from
     // transaction_locks.  Every operation that needs both registries takes
@@ -4613,6 +5156,22 @@ pub struct SlowQuerySnapshot {
     pub explain_json: Option<String>,
 }
 
+/// Statement metadata captured while the statement was still running. The
+/// execution plan is attached later so the planner cost never lands in the
+/// measured latency of the statement itself.
+#[derive(Debug, Clone)]
+struct SlowQueryCapture {
+    unix_ms: u64,
+    duration_ms: u64,
+    statement_type: String,
+    query_digest: String,
+    error: Option<String>,
+    outcome: String,
+    execution_micros: u64,
+    rows_returned: Option<usize>,
+    affected_rows: Option<u64>,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct WireStatsSnapshot {
     pub active_connections: usize,
@@ -4728,7 +5287,84 @@ impl WireStats {
         self.slow_queries.lock().iter().cloned().collect()
     }
 
+    pub fn slow_queries_total(&self) -> u64 {
+        self.slow_queries_total.load(Ordering::Relaxed)
+    }
+
+    pub fn query_latency(&self) -> QueryLatencySnapshot {
+        self.query_latency.snapshot()
+    }
+
+    pub fn statement_digests(&self) -> Vec<StatementDigestSnapshot> {
+        self.digest_stats.snapshots()
+    }
+
+    pub fn statement_digest_count(&self) -> usize {
+        self.digest_stats.entry_count()
+    }
+
+    pub fn statement_digest_dropped(&self) -> u64 {
+        self.digest_stats.dropped()
+    }
+
+    pub fn global_long_query_time_micros(&self) -> Option<u64> {
+        let stored = self.global_long_query_time_micros.load(Ordering::Relaxed);
+        (stored > 0).then(|| stored - 1)
+    }
+
+    pub fn set_global_long_query_time_micros(&self, micros: u64) {
+        self.global_long_query_time_micros
+            .store(micros.saturating_add(1), Ordering::Release);
+    }
+
+    pub fn global_slow_query_log_enabled(&self) -> bool {
+        self.global_slow_query_log_state.load(Ordering::Acquire) != 1
+    }
+
+    pub fn set_global_slow_query_log_enabled(&self, enabled: bool) {
+        self.global_slow_query_log_state
+            .store(if enabled { 2 } else { 1 }, Ordering::Release);
+    }
+
+    pub fn global_explain_json_format_version(&self) -> u8 {
+        // Version 1 is the default, so only version 2 needs a stored value.
+        match self
+            .global_explain_json_format_version
+            .load(Ordering::Acquire)
+        {
+            2 => 2,
+            _ => 1,
+        }
+    }
+
+    pub fn set_global_explain_json_format_version(&self, version: u8) {
+        self.global_explain_json_format_version
+            .store(version, Ordering::Release);
+    }
+
+    /// Reuse the plan of a recently analyzed slow statement. Re-running
+    /// EXPLAIN for every repetition of the same statement is wasteful, and
+    /// the cached plan stays valid for the cache window.
+    pub fn cached_explain(&self, key: &str) -> Option<String> {
+        let mut cache = self.explain_cache.lock();
+        let entry = cache.get(key)?;
+        if entry.0.elapsed() > EXPLAIN_CACHE_TTL {
+            cache.remove(key);
+            return None;
+        }
+        Some(entry.1.clone())
+    }
+
+    pub fn cache_explain(&self, key: &str, plan: String) {
+        let mut cache = self.explain_cache.lock();
+        if cache.len() >= EXPLAIN_CACHE_MAX_ENTRIES {
+            cache.clear();
+        }
+        cache.insert(key.to_string(), (Instant::now(), plan));
+    }
+
     fn record_query(&self, query: SlowQuerySnapshot, max_entries: usize) {
+        self.slow_queries_total.fetch_add(1, Ordering::Relaxed);
         let mut entries = self.slow_queries.lock();
         entries.push_back(query);
         while entries.len() > max_entries.max(1) {
@@ -6183,6 +6819,8 @@ struct Backend {
     // Names this connection currently holds, for RELEASE_ALL_LOCKS() counting
     // and to avoid re-registering the lease on a re-entrant GET_LOCK.
     held_named_locks: HashSet<String>,
+    long_query_time_micros: u64,
+    slow_query_log_enabled: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -6475,6 +7113,31 @@ impl Backend {
             "group_concat_max_len".into(),
             Some(stats.global_group_concat_max_len().to_string().into_bytes()),
         );
+        let long_query_time_micros = stats
+            .global_long_query_time_micros()
+            .unwrap_or_else(|| config.slow_query_threshold_ms.saturating_mul(1_000));
+        let slow_query_log_enabled = stats.global_slow_query_log_enabled();
+        session_variables.insert(
+            "long_query_time".into(),
+            Some(format_mysql_seconds(long_query_time_micros).into_bytes()),
+        );
+        session_variables.insert(
+            "slow_query_log".into(),
+            Some(if slow_query_log_enabled {
+                b"ON".to_vec()
+            } else {
+                b"OFF".to_vec()
+            }),
+        );
+        session_variables.insert(
+            "explain_json_format_version".into(),
+            Some(
+                stats
+                    .global_explain_json_format_version()
+                    .to_string()
+                    .into_bytes(),
+            ),
+        );
         Self {
             database: config.default_database.clone(),
             storage,
@@ -6523,6 +7186,8 @@ impl Backend {
             xa_branch_state: None,
             aggregate_context: AggregateEvaluationContext::default(),
             held_named_locks: HashSet::new(),
+            long_query_time_micros,
+            slow_query_log_enabled,
         }
     }
 
@@ -7337,6 +8002,34 @@ impl Backend {
             }
             "warning_count" => Some(self.session_warning_count.to_string().into_bytes()),
             "error_count" => Some(self.session_error_count.to_string().into_bytes()),
+            "long_query_time" => {
+                let micros = match scope {
+                    SystemVariableScope::Session => self.long_query_time_micros,
+                    SystemVariableScope::Global => self
+                        .stats
+                        .global_long_query_time_micros()
+                        .unwrap_or(self.config.slow_query_threshold_ms.saturating_mul(1_000)),
+                };
+                Some(format_mysql_seconds(micros).into_bytes())
+            }
+            "slow_query_log" => {
+                let enabled = match scope {
+                    SystemVariableScope::Session => self.slow_query_log_enabled,
+                    SystemVariableScope::Global => self.stats.global_slow_query_log_enabled(),
+                };
+                Some(if enabled {
+                    b"ON".to_vec()
+                } else {
+                    b"OFF".to_vec()
+                })
+            }
+            "explain_json_format_version" => {
+                let version = match scope {
+                    SystemVariableScope::Session => self.explain_json_format_version(),
+                    SystemVariableScope::Global => self.stats.global_explain_json_format_version(),
+                };
+                Some(version.to_string().into_bytes())
+            }
             _ => self
                 .session_variables
                 .get(&name)
@@ -7437,6 +8130,9 @@ impl Backend {
                     | "activate_all_roles_on_login"
                     | "partial_revokes"
                     | "innodb_lock_wait_timeout"
+                    | "long_query_time"
+                    | "slow_query_log"
+                    | "explain_json_format_version"
             )
         {
             anyhow::bail!("Global system variable '{}' is not supported", name);
@@ -7599,6 +8295,93 @@ impl Backend {
                         .set_global_innodb_lock_wait_timeout_seconds(seconds);
                 } else {
                     self.lock_wait_timeout = std::time::Duration::from_secs(seconds);
+                }
+            }
+            "long_query_time" => {
+                let value = value
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("Variable 'long_query_time' cannot be NULL"))?;
+                let micros = parse_long_query_time_micros(value)?;
+                if variable_scope == SystemVariableScope::Global {
+                    let user = self.authenticated_username();
+                    if !self.auth_has_privilege(&user, "", "SYSTEM_VARIABLES_ADMIN")
+                        && !self.auth_has_privilege(&user, "", "SUPER")
+                    {
+                        anyhow::bail!(
+                            "Access denied; user '{}' lacks SYSTEM_VARIABLES_ADMIN privilege",
+                            user
+                        );
+                    }
+                    self.stats.set_global_long_query_time_micros(micros);
+                } else {
+                    self.long_query_time_micros = micros;
+                    self.session_variables.insert(
+                        "long_query_time".into(),
+                        Some(format_mysql_seconds(micros).into_bytes()),
+                    );
+                }
+            }
+            "slow_query_log" => {
+                let enabled = mysql_truthy(value.as_deref());
+                if variable_scope == SystemVariableScope::Global {
+                    let user = self.authenticated_username();
+                    if !self.auth_has_privilege(&user, "", "SYSTEM_VARIABLES_ADMIN")
+                        && !self.auth_has_privilege(&user, "", "SUPER")
+                    {
+                        anyhow::bail!(
+                            "Access denied; user '{}' lacks SYSTEM_VARIABLES_ADMIN privilege",
+                            user
+                        );
+                    }
+                    self.stats.set_global_slow_query_log_enabled(enabled);
+                    if let Some(log) = self.config.slow_query_log.as_ref() {
+                        log.set_enabled(enabled);
+                    }
+                } else {
+                    self.slow_query_log_enabled = enabled;
+                    self.session_variables.insert(
+                        "slow_query_log".into(),
+                        Some(if enabled {
+                            b"ON".to_vec()
+                        } else {
+                            b"OFF".to_vec()
+                        }),
+                    );
+                }
+            }
+            "explain_json_format_version" => {
+                let value = value.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("Variable 'explain_json_format_version' cannot be NULL")
+                })?;
+                let version = std::str::from_utf8(value)
+                    .ok()
+                    .and_then(|value| value.trim().parse::<u8>().ok())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Variable 'explain_json_format_version' must be an integer between 1 and 2"
+                        )
+                    })?;
+                if !(1..=2).contains(&version) {
+                    anyhow::bail!(
+                        "Variable 'explain_json_format_version' must be an integer between 1 and 2"
+                    );
+                }
+                if variable_scope == SystemVariableScope::Global {
+                    let user = self.authenticated_username();
+                    if !self.auth_has_privilege(&user, "", "SYSTEM_VARIABLES_ADMIN")
+                        && !self.auth_has_privilege(&user, "", "SUPER")
+                    {
+                        anyhow::bail!(
+                            "Access denied; user '{}' lacks SYSTEM_VARIABLES_ADMIN privilege",
+                            user
+                        );
+                    }
+                    self.stats.set_global_explain_json_format_version(version);
+                } else {
+                    self.session_variables.insert(
+                        "explain_json_format_version".into(),
+                        Some(version.to_string().into_bytes()),
+                    );
                 }
             }
             "max_error_count" => {
@@ -9207,11 +9990,10 @@ impl Backend {
         {
             return self.execute_auth_statement(sql);
         }
-        if upper.starts_with("EXPLAIN FORMAT=JSON ") {
-            return self.explain_select_json(sql[20..].trim()).await;
-        }
-        if upper.starts_with("EXPLAIN ") {
-            return self.explain_select(sql[8..].trim()).await;
+        if upper.starts_with("EXPLAIN") {
+            if let Some(request) = parse_explain_request(sql)? {
+                return self.explain_statement(request).await;
+            }
         }
 
         if upper == "SHOW COUNT(*) WARNINGS" {
@@ -9796,6 +10578,43 @@ impl Backend {
                         "OFF"
                     }),
                 ],
+                vec![
+                    bytes("long_query_time"),
+                    bytes(&format_mysql_seconds(
+                        if upper.starts_with("SHOW GLOBAL VARIABLES") {
+                            self.stats.global_long_query_time_micros().unwrap_or(
+                                self.config.slow_query_threshold_ms.saturating_mul(1_000),
+                            )
+                        } else {
+                            self.long_query_time_micros
+                        },
+                    )),
+                ],
+                vec![
+                    bytes("slow_query_log"),
+                    bytes(if upper.starts_with("SHOW GLOBAL VARIABLES") {
+                        if self.stats.global_slow_query_log_enabled() {
+                            "ON"
+                        } else {
+                            "OFF"
+                        }
+                    } else if self.slow_query_log_enabled {
+                        "ON"
+                    } else {
+                        "OFF"
+                    }),
+                ],
+                vec![
+                    bytes("explain_json_format_version"),
+                    bytes(
+                        &(if upper.starts_with("SHOW GLOBAL VARIABLES") {
+                            self.stats.global_explain_json_format_version()
+                        } else {
+                            self.explain_json_format_version()
+                        })
+                        .to_string(),
+                    ),
+                ],
             ];
             return Ok(QueryOutcome::byte_rows(
                 columns.clone(),
@@ -9812,6 +10631,10 @@ impl Backend {
                     bytes(&stats.active_connections.to_string()),
                 ],
                 vec![bytes("Questions"), bytes(&stats.queries.to_string())],
+                vec![
+                    bytes("Slow_queries"),
+                    bytes(&self.stats.slow_queries_total().to_string()),
+                ],
                 // The default listener is plaintext, matching MySQL's
                 // SHOW STATUS surface when SSL is not negotiated.
                 vec![bytes("Ssl_version"), bytes("")],
@@ -11715,7 +12538,7 @@ impl Backend {
             None
         } else if upper.starts_with("SELECT ")
             || upper.starts_with("SHOW ")
-            || upper.starts_with("EXPLAIN ")
+            || is_explain_statement_start(upper)
             || upper.starts_with("DESCRIBE ")
             || upper.starts_with("DESC ")
         {
@@ -11772,7 +12595,7 @@ impl Backend {
         if privilege == "SELECT"
             && (upper.starts_with("SELECT ")
                 || upper.starts_with("SHOW ")
-                || upper.starts_with("EXPLAIN "))
+                || is_explain_statement_start(upper))
         {
             let tables = statement_privilege_tables(sql, upper, &self.database);
             if tables.len() > 1 {
@@ -19645,42 +20468,13 @@ impl Backend {
         ))
     }
 
-    async fn explain_select(&mut self, statement: &str) -> anyhow::Result<QueryOutcome> {
+    async fn explain_plan(&mut self, statement: &str) -> anyhow::Result<Vec<ExplainTablePlan>> {
         let upper = statement.to_ascii_uppercase();
         if !upper.starts_with("SELECT ") {
             anyhow::bail!("EXPLAIN supports SELECT statements only");
         }
         let Some(from) = find_top_level_keyword(statement, " FROM ", 0) else {
-            return Ok(QueryOutcome::rows(
-                vec![
-                    "id",
-                    "select_type",
-                    "table",
-                    "partitions",
-                    "type",
-                    "possible_keys",
-                    "key",
-                    "key_len",
-                    "ref",
-                    "rows",
-                    "filtered",
-                    "Extra",
-                ],
-                vec![vec![
-                    Some("1".into()),
-                    Some("SIMPLE".into()),
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    Some("1".into()),
-                    Some("100.00".into()),
-                    Some("No tables used".into()),
-                ]],
-            ));
+            return Ok(Vec::new());
         };
         let from_start = from + 6;
         let from_end = select_from_clause_end(statement, from_start);
@@ -19799,7 +20593,8 @@ impl Backend {
             }
         }
         let filter = parse_where(statement)?;
-        let mut plan_rows = Vec::with_capacity(sources.len());
+        let projection_columns = explain_projection_columns(statement);
+        let mut plans = Vec::with_capacity(sources.len());
         for (source_index, (source, source_rows)) in
             sources.into_iter().zip(source_overrides).enumerate()
         {
@@ -19826,8 +20621,7 @@ impl Backend {
                         1
                     } else {
                         self.storage
-                            .scan_table(&source.database, &source.table)?
-                            .len()
+                            .estimated_row_count(&source.database, &source.table)?
                     };
                     let indexed = key.is_some();
                     let primary = key.as_deref() == Some("PRIMARY");
@@ -19854,10 +20648,9 @@ impl Backend {
                     let rows = source_rows.map_or_else(
                         || {
                             self.storage
-                                .scan_table(&source.database, &source.table)
-                                .map(|rows| rows.len())
+                                .estimated_row_count(&source.database, &source.table)
                         },
-                        |rows| Ok(rows.len()),
+                        |rows| Ok(rows.len() as u64),
                     )?;
                     match join_access[source_index].take() {
                         Some((key, unique, reference)) if !derived => (
@@ -19883,20 +20676,83 @@ impl Backend {
             let key_len = key
                 .as_deref()
                 .and_then(|key| explain_key_length(&source.schema, key));
-            plan_rows.push(vec![
-                Some("1".into()),
-                Some(if derived { "DERIVED" } else { "SIMPLE" }.into()),
-                Some(source.alias),
-                None,
-                Some(access_type.into()),
-                key.clone(),
+            let key_columns = key
+                .as_deref()
+                .map(|key| explain_key_columns(&source.schema, key))
+                .unwrap_or_default();
+            let mut used_columns = projection_columns
+                .iter()
+                .filter(|column| {
+                    source
+                        .schema
+                        .columns
+                        .iter()
+                        .any(|schema_column| schema_column.name.eq_ignore_ascii_case(column))
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            for column in &key_columns {
+                if !used_columns
+                    .iter()
+                    .any(|value| value.eq_ignore_ascii_case(column))
+                {
+                    used_columns.push(column.clone());
+                }
+            }
+            plans.push(ExplainTablePlan {
+                id: source_index as u64 + 1,
+                select_type: if derived { "DERIVED" } else { "SIMPLE" }.to_string(),
+                table: source.alias.clone(),
+                base_table: source.table.clone(),
+                schema_name: source.database.clone(),
+                access_type: access_type.to_string(),
+                possible_keys: key.clone(),
                 key,
-                key_len.map(|value| value.to_string()),
+                key_len: key_len.map(|value| value.to_string()),
                 reference,
-                Some(rows.to_string()),
-                Some("100.00".into()),
-                (!extra.is_empty()).then(|| extra.to_string()),
-            ]);
+                rows,
+                filtered: "100.00".to_string(),
+                extra: (!extra.is_empty()).then(|| extra.to_string()),
+                used_columns,
+                key_columns,
+            });
+        }
+        Ok(plans)
+    }
+
+    async fn explain_select(&mut self, statement: &str) -> anyhow::Result<QueryOutcome> {
+        let plans = self.explain_plan(statement).await?;
+        if plans.is_empty() {
+            return Ok(QueryOutcome::rows(
+                vec![
+                    "id",
+                    "select_type",
+                    "table",
+                    "partitions",
+                    "type",
+                    "possible_keys",
+                    "key",
+                    "key_len",
+                    "ref",
+                    "rows",
+                    "filtered",
+                    "Extra",
+                ],
+                vec![vec![
+                    Some("1".into()),
+                    Some("SIMPLE".into()),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some("1".into()),
+                    Some("100.00".into()),
+                    Some("No tables used".into()),
+                ]],
+            ));
         }
         Ok(QueryOutcome::rows(
             vec![
@@ -19913,109 +20769,94 @@ impl Backend {
                 "filtered",
                 "Extra",
             ],
-            plan_rows,
+            plans.iter().map(explain_traditional_row).collect(),
         ))
     }
 
-    async fn explain_select_json(&mut self, statement: &str) -> anyhow::Result<QueryOutcome> {
-        if find_top_level_keyword(statement, " FROM ", 0).is_none() {
-            return Ok(QueryOutcome::byte_rows(
-                vec!["EXPLAIN"],
-                vec![vec![Some(
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "query_block": {
-                            "select_id": 1,
-                            "table": {"message": "No tables used"}
-                        }
-                    }))?
-                    .into_bytes(),
-                )]],
-            ));
-        }
-        let QueryOutcome::Rows { rows, .. } = self.explain_select(statement).await? else {
-            unreachable!("EXPLAIN always returns rows")
+    async fn explain_statement(&mut self, request: ExplainRequest) -> anyhow::Result<QueryOutcome> {
+        let analyze = if request.analyze {
+            Some(self.explain_analyze(&request.statement).await?)
+        } else {
+            None
         };
-        let row = rows.first().expect("EXPLAIN produces one row");
-        let key_name = row[6]
-            .as_deref()
-            .map(|value| String::from_utf8_lossy(value).into_owned());
-        let schema = find_top_level_keyword(statement, " FROM ", 0).and_then(|from| {
-            let source_start = from + 6;
-            let source_end = select_from_clause_end(statement, source_start);
-            self.join_source(statement[source_start..source_end].trim())
-                .ok()
-                .map(|source| source.schema)
-        });
-        let key_columns = key_name.as_deref().and_then(|key| {
-            schema
-                .as_ref()
-                .map(|schema| explain_key_columns(schema, key))
-        });
-        let possible_keys = row[5]
-            .as_deref()
-            .map(|value| vec![String::from_utf8_lossy(value).into_owned()]);
-        let mut used_columns = statement
-            .split_once(" FROM ")
-            .map(|(projection, _)| {
-                split_csv(projection.trim_start_matches("SELECT "))
-                    .into_iter()
-                    .map(|value| unqualified_column(value.trim()).to_string())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        if let Some(key_columns) = &key_columns {
-            for column in key_columns {
-                if !used_columns
-                    .iter()
-                    .any(|value| value.eq_ignore_ascii_case(column))
-                {
-                    used_columns.push(column.clone());
-                }
+        match request.format {
+            ExplainFormat::Traditional => self.explain_select(&request.statement).await,
+            ExplainFormat::Json => {
+                let version = self.explain_json_format_version();
+                self.explain_json(&request.statement, version, analyze.as_ref())
+                    .await
+            }
+            ExplainFormat::Tree => {
+                self.explain_tree(&request.statement, analyze.as_ref())
+                    .await
             }
         }
-        let table = |row: &Vec<Option<Vec<u8>>>| {
-            let rows_examined = String::from_utf8_lossy(row[9].as_deref().unwrap_or_default())
-                .parse::<usize>()
-                .unwrap_or(0);
-            serde_json::json!({
-                "table_name": String::from_utf8_lossy(row[2].as_deref().unwrap_or_default()),
-                "access_type": String::from_utf8_lossy(row[4].as_deref().unwrap_or_default()),
-                "possible_keys": possible_keys.clone(),
-                "key": row[6].as_deref().map(String::from_utf8_lossy),
-                "used_key_parts": key_columns.clone(),
-                "key_length": row[7].as_deref().map(String::from_utf8_lossy),
-                "ref": row[8]
-                    .as_deref()
-                    .map(|value| vec![String::from_utf8_lossy(value)]),
-                "rows_examined_per_scan": rows_examined,
-                "rows_produced_per_join": if row[8].is_some() { 1 } else { rows_examined },
-                "filtered": String::from_utf8_lossy(row[10].as_deref().unwrap_or_default()).to_string(),
-                "using_index": row[6].is_some(),
-                "cost_info": {
-                    "read_cost": "0.25",
-                    "eval_cost": "0.10",
-                    "prefix_cost": "0.35",
-                    "data_read_per_join": (rows_examined.saturating_mul(144)).to_string(),
-                },
-                "used_columns": used_columns.clone(),
-            })
+    }
+
+    /// MySQL exposes the JSON layout of `EXPLAIN FORMAT=JSON` through this
+    /// variable: version 1 keeps the `query_block` document, version 2 uses
+    /// the iterator tree introduced in MySQL 8.3.
+    fn explain_json_format_version(&self) -> u8 {
+        self.session_variables
+            .get("explain_json_format_version")
+            .and_then(|value| value.as_deref())
+            .and_then(|value| String::from_utf8_lossy(value).trim().parse::<u8>().ok())
+            .unwrap_or(1)
+            .clamp(1, 2)
+    }
+
+    async fn explain_json(
+        &mut self,
+        statement: &str,
+        version: u8,
+        analyze: Option<&ExplainAnalyze>,
+    ) -> anyhow::Result<QueryOutcome> {
+        let plans = self.explain_plan(statement).await?;
+        let analysis = analyze_explain_plan(&plans, analyze);
+        let mut document = if version >= 2 {
+            explain_document_v2(statement, &plans, analyze)
+        } else {
+            explain_document_v1(statement, &plans, analyze)
         };
-        let value = serde_json::json!({
-            "query_block": {
-                "select_id": 1,
-                "cost_info": {
-                    "query_cost": "0.35",
-                },
-                "table": table(row),
-                "nested_loop": (rows.len() > 1).then(|| rows.iter().map(|row| serde_json::json!({ "table": table(row) })).collect::<Vec<_>>()),
-            }
-        });
+        if let serde_json::Value::Object(map) = &mut document {
+            map.insert(
+                "mydb_analysis".to_string(),
+                explain_analysis_json(&analysis),
+            );
+        }
         Ok(QueryOutcome::byte_rows(
             vec!["EXPLAIN"],
             vec![vec![Some(
-                serde_json::to_string_pretty(&value)?.into_bytes(),
+                serde_json::to_string_pretty(&document)?.into_bytes(),
             )]],
         ))
+    }
+
+    async fn explain_tree(
+        &mut self,
+        statement: &str,
+        analyze: Option<&ExplainAnalyze>,
+    ) -> anyhow::Result<QueryOutcome> {
+        let plans = self.explain_plan(statement).await?;
+        Ok(QueryOutcome::rows(
+            vec!["EXPLAIN"],
+            vec![vec![Some(explain_tree_text(&plans, analyze))]],
+        ))
+    }
+
+    /// Run the explained statement so the plan can report the measured
+    /// runtime instead of estimates only.
+    async fn explain_analyze(&mut self, statement: &str) -> anyhow::Result<ExplainAnalyze> {
+        let started = Instant::now();
+        // The analyzed statement is dispatched through the regular path, so
+        // the future is boxed to break the recursive future type.
+        let outcome = Box::pin(self.execute(statement)).await?;
+        let elapsed = started.elapsed();
+        let rows = match &outcome {
+            QueryOutcome::Rows { rows, .. } => rows.len() as u64,
+            _ => 0,
+        };
+        Ok(ExplainAnalyze { elapsed, rows })
     }
 
     fn join_source(&self, value: &str) -> anyhow::Result<JoinSource> {
@@ -20937,10 +21778,10 @@ fn statement_privilege_table(
 
 fn statement_privilege_tables(
     sql: &str,
-    upper: &str,
+    _upper: &str,
     default_database: &str,
 ) -> Vec<(String, String)> {
-    statement_privilege_source_entries(sql, upper, default_database)
+    statement_privilege_source_entries(sql, _upper, default_database)
         .into_iter()
         .map(|(database, table, _)| (database, table))
         .collect::<HashSet<_>>()
@@ -21011,14 +21852,14 @@ fn strip_upsert_incoming_references(value: &str) -> String {
 
 fn statement_privilege_source_entries(
     sql: &str,
-    upper: &str,
+    _upper: &str,
     default_database: &str,
 ) -> Vec<(String, String, String)> {
-    let query = if upper.starts_with("EXPLAIN ") {
-        sql["EXPLAIN ".len()..].trim_start()
-    } else {
-        sql
+    let query = match parse_explain_request(sql) {
+        Ok(Some(request)) => request.statement,
+        _ => sql.to_string(),
     };
+    let query = query.as_str();
     let query_upper = query.to_ascii_uppercase();
     if query_upper.starts_with("INSERT ") || query_upper.starts_with("REPLACE ") {
         let Some(select) = find_top_level_keyword(query, " SELECT ", 0) else {
@@ -23613,6 +24454,656 @@ fn table_primary_key_columns(schema: &TableSchema) -> Vec<String> {
             .map(|column| column.name.clone())
             .collect()
     })
+}
+
+/// Output shape requested by an `EXPLAIN` statement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExplainFormat {
+    Traditional,
+    Json,
+    Tree,
+}
+
+#[derive(Debug, Clone)]
+struct ExplainRequest {
+    format: ExplainFormat,
+    analyze: bool,
+    statement: String,
+}
+
+/// Parse `EXPLAIN [ANALYZE] [FORMAT = {TRADITIONAL|JSON|TREE}] <statement>`.
+/// MySQL accepts the `=` sign in the FORMAT clause as optional.
+fn parse_explain_request(sql: &str) -> anyhow::Result<Option<ExplainRequest>> {
+    let trimmed = sql.trim_start();
+    let upper = trimmed.to_ascii_uppercase();
+    if !upper.starts_with("EXPLAIN") {
+        return Ok(None);
+    }
+    let mut rest = trimmed["EXPLAIN".len()..].trim_start();
+    if rest.is_empty() {
+        anyhow::bail!("EXPLAIN requires a statement to explain");
+    }
+    let mut analyze = false;
+    if let Some(after) = strip_explain_keyword(rest, "ANALYZE") {
+        analyze = true;
+        rest = after.trim_start();
+    }
+    let mut format = None;
+    if let Some((name, after)) = strip_explain_format(rest) {
+        format = Some(match name.to_ascii_uppercase().as_str() {
+            "TRADITIONAL" => ExplainFormat::Traditional,
+            "JSON" => ExplainFormat::Json,
+            "TREE" => ExplainFormat::Tree,
+            other => {
+                anyhow::bail!("Variable 'explain_format' can't be set to the value of '{other}'")
+            }
+        });
+        rest = after.trim_start();
+    }
+    if rest.is_empty() {
+        anyhow::bail!("EXPLAIN requires a statement to explain");
+    }
+    // MySQL renders EXPLAIN ANALYZE as a tree unless another format is asked
+    // for, and it rejects the traditional format for analyzed plans.
+    let format = match (format, analyze) {
+        (Some(ExplainFormat::Traditional), true) => {
+            anyhow::bail!("EXPLAIN ANALYZE does not support FORMAT=TRADITIONAL")
+        }
+        (Some(format), _) => format,
+        (None, true) => ExplainFormat::Tree,
+        (None, false) => ExplainFormat::Traditional,
+    };
+    Ok(Some(ExplainRequest {
+        format,
+        analyze,
+        statement: rest.to_string(),
+    }))
+}
+
+fn format_mysql_seconds(micros: u64) -> String {
+    format!("{}.{:06}", micros / 1_000_000, micros % 1_000_000)
+}
+
+fn parse_long_query_time_micros(value: &[u8]) -> anyhow::Result<u64> {
+    let text = std::str::from_utf8(value)
+        .map_err(|_| anyhow::anyhow!("Variable 'long_query_time' expects a decimal value"))?
+        .trim();
+    let seconds = text
+        .parse::<f64>()
+        .map_err(|_| anyhow::anyhow!("Variable 'long_query_time' expects a decimal value"))?;
+    if !seconds.is_finite() || seconds < 0.0 {
+        anyhow::bail!("Variable 'long_query_time' expects a non-negative decimal value");
+    }
+    Ok((seconds * 1_000_000.0).round() as u64)
+}
+
+fn is_explain_statement_start(upper: &str) -> bool {
+    upper.starts_with("EXPLAIN") && upper["EXPLAIN".len()..].starts_with(char::is_whitespace)
+}
+
+fn strip_explain_keyword<'a>(text: &'a str, keyword: &str) -> Option<&'a str> {
+    let upper = text.to_ascii_uppercase();
+    if !upper.starts_with(keyword) {
+        return None;
+    }
+    let rest = &text[keyword.len()..];
+    if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+        Some(rest)
+    } else {
+        None
+    }
+}
+
+fn strip_explain_format(text: &str) -> Option<(String, &str)> {
+    let upper = text.to_ascii_uppercase();
+    if !upper.starts_with("FORMAT") {
+        return None;
+    }
+    let rest = &text["FORMAT".len()..];
+    let rest = if let Some(rest) = rest.strip_prefix('=') {
+        rest
+    } else if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+        rest
+    } else {
+        return None;
+    };
+    let rest = rest.trim_start();
+    let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    if end == 0 {
+        return None;
+    }
+    Some((rest[..end].to_string(), &rest[end..]))
+}
+
+/// One table access inside an execution plan.
+#[derive(Debug, Clone)]
+struct ExplainTablePlan {
+    id: u64,
+    select_type: String,
+    table: String,
+    base_table: String,
+    schema_name: String,
+    access_type: String,
+    possible_keys: Option<String>,
+    key: Option<String>,
+    key_len: Option<String>,
+    reference: Option<String>,
+    rows: u64,
+    filtered: String,
+    extra: Option<String>,
+    used_columns: Vec<String>,
+    key_columns: Vec<String>,
+}
+
+/// Measured runtime of an `EXPLAIN ANALYZE` execution.
+#[derive(Debug, Clone, Copy)]
+struct ExplainAnalyze {
+    elapsed: std::time::Duration,
+    rows: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ExplainStatus {
+    Good,
+    Notice,
+    Warning,
+    Critical,
+}
+
+impl ExplainStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            ExplainStatus::Good => "good",
+            ExplainStatus::Notice => "notice",
+            ExplainStatus::Warning => "warning",
+            ExplainStatus::Critical => "critical",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ExplainFinding {
+    code: &'static str,
+    severity: ExplainStatus,
+    table: Option<String>,
+    message_zh: String,
+    message_en: String,
+}
+
+#[derive(Debug, Clone)]
+struct ExplainSuggestion {
+    code: &'static str,
+    message_zh: String,
+    message_en: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ExplainAnalysisMetrics {
+    tables: usize,
+    indexed_tables: usize,
+    full_scan_tables: usize,
+    filtered_tables: usize,
+    join_buffer_tables: usize,
+    estimated_rows: u64,
+}
+
+#[derive(Debug, Clone)]
+struct ExplainAnalysis {
+    status: ExplainStatus,
+    summary_zh: String,
+    summary_en: String,
+    findings: Vec<ExplainFinding>,
+    suggestions: Vec<ExplainSuggestion>,
+    metrics: ExplainAnalysisMetrics,
+}
+
+fn explain_traditional_row(plan: &ExplainTablePlan) -> Vec<Option<String>> {
+    vec![
+        Some(plan.id.to_string()),
+        Some(plan.select_type.clone()),
+        Some(plan.table.clone()),
+        None,
+        Some(plan.access_type.clone()),
+        plan.possible_keys.clone(),
+        plan.key.clone(),
+        plan.key_len.clone(),
+        plan.reference.clone(),
+        Some(plan.rows.to_string()),
+        Some(plan.filtered.clone()),
+        plan.extra.clone(),
+    ]
+}
+
+fn explain_projection_columns(statement: &str) -> Vec<String> {
+    statement
+        .split_once(" FROM ")
+        .map(|(projection, _)| {
+            split_csv(projection.trim_start_matches("SELECT "))
+                .into_iter()
+                .map(|value| unqualified_column(value.trim()).to_string())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+/// Turn a plan into the findings a human can act on. The summary also states
+/// the absence of a problem, because "nothing to optimize" is a result the
+/// reader needs just as much as a list of defects.
+fn analyze_explain_plan(
+    plans: &[ExplainTablePlan],
+    analyze: Option<&ExplainAnalyze>,
+) -> ExplainAnalysis {
+    let mut metrics = ExplainAnalysisMetrics::default();
+    let mut findings = Vec::new();
+    let mut suggestions = Vec::new();
+    for plan in plans {
+        metrics.tables += 1;
+        metrics.estimated_rows = metrics.estimated_rows.saturating_add(plan.rows);
+        let extra = plan.extra.as_deref().unwrap_or_default();
+        if extra.contains("Using where") {
+            metrics.filtered_tables += 1;
+        }
+        if extra.contains("Using join buffer") {
+            metrics.join_buffer_tables += 1;
+        }
+        if plan.key.is_some() {
+            metrics.indexed_tables += 1;
+        }
+        if plan.access_type == "ALL" {
+            metrics.full_scan_tables += 1;
+            let severity = if plan.rows >= 10_000 {
+                ExplainStatus::Critical
+            } else if plan.rows >= 100 {
+                ExplainStatus::Warning
+            } else {
+                ExplainStatus::Notice
+            };
+            findings.push(ExplainFinding {
+                code: "FULL_TABLE_SCAN",
+                severity,
+                table: Some(plan.table.clone()),
+                message_zh: format!("表 {} 没有可用的索引，扫描约 {} 行", plan.table, plan.rows),
+                message_en: format!(
+                    "Table {} has no usable index and scans about {} rows",
+                    plan.table, plan.rows
+                ),
+            });
+            suggestions.push(ExplainSuggestion {
+                code: "ADD_INDEX",
+                message_zh: format!("为 {} 的过滤列或连接列建立索引，避免全表扫描", plan.table),
+                message_en: format!(
+                    "Add an index on the filtered or joined columns of {} to avoid the full scan",
+                    plan.table
+                ),
+            });
+        }
+        if extra.contains("Using join buffer") {
+            findings.push(ExplainFinding {
+                code: "JOIN_WITHOUT_INDEX",
+                severity: if plan.rows >= 1_000 {
+                    ExplainStatus::Warning
+                } else {
+                    ExplainStatus::Notice
+                },
+                table: Some(plan.table.clone()),
+                message_zh: format!("表 {} 通过 join buffer 参与连接，没有命中索引", plan.table),
+                message_en: format!(
+                    "Table {} is joined through the join buffer without an index lookup",
+                    plan.table
+                ),
+            });
+            suggestions.push(ExplainSuggestion {
+                code: "INDEX_JOIN_COLUMN",
+                message_zh: format!(
+                    "为 {} 的连接列建立索引，把 join buffer 换成索引查找",
+                    plan.table
+                ),
+                message_en: format!(
+                    "Index the join column of {} to replace the join buffer with an index lookup",
+                    plan.table
+                ),
+            });
+        }
+        if plan.access_type == "ref" && plan.rows >= 1_000 {
+            findings.push(ExplainFinding {
+                code: "LOW_SELECTIVITY_INDEX",
+                severity: ExplainStatus::Notice,
+                table: Some(plan.table.clone()),
+                message_zh: format!(
+                    "表 {} 的索引选择性较低，命中约 {} 行",
+                    plan.table, plan.rows
+                ),
+                message_en: format!(
+                    "The index on table {} matches about {} rows, so the lookup stays expensive",
+                    plan.table, plan.rows
+                ),
+            });
+        }
+    }
+    if let Some(analyze) = analyze {
+        let estimated = metrics.estimated_rows;
+        if estimated > 0 && analyze.rows > estimated.saturating_mul(10) {
+            findings.push(ExplainFinding {
+                code: "STALE_ESTIMATES",
+                severity: ExplainStatus::Warning,
+                table: None,
+                message_zh: format!(
+                    "实际返回 {} 行，远多于估算的 {} 行",
+                    analyze.rows, estimated
+                ),
+                message_en: format!(
+                    "The statement returned {} rows, far above the estimated {}",
+                    analyze.rows, estimated
+                ),
+            });
+            suggestions.push(ExplainSuggestion {
+                code: "UPDATE_STATISTICS",
+                message_zh: "执行 ANALYZE TABLE 更新统计信息后重新评估计划".to_string(),
+                message_en: "Run ANALYZE TABLE to refresh the statistics and re-evaluate the plan"
+                    .to_string(),
+            });
+        }
+    }
+    let status = findings
+        .iter()
+        .map(|finding| finding.severity)
+        .max()
+        .unwrap_or(ExplainStatus::Good);
+    let (summary_zh, summary_en) = if status == ExplainStatus::Good {
+        (
+            format!(
+                "计划访问 {} 张表并全部命中索引，未发现性能问题，也没有可进一步优化的空间",
+                metrics.tables
+            ),
+            format!(
+                "The plan accesses {} table(s) with index lookups only: no performance issue was \
+                 found and no further optimization is possible",
+                metrics.tables
+            ),
+        )
+    } else {
+        let scan_zh = if metrics.full_scan_tables > 0 {
+            format!(
+                "，其中 {} 张为全表扫描（合计约 {} 行）",
+                metrics.full_scan_tables, metrics.estimated_rows
+            )
+        } else {
+            String::new()
+        };
+        let scan_en = if metrics.full_scan_tables > 0 {
+            format!(
+                ", {} of them via full scans (~{} rows in total)",
+                metrics.full_scan_tables, metrics.estimated_rows
+            )
+        } else {
+            String::new()
+        };
+        (
+            format!(
+                "计划访问 {} 张表{}，共发现 {} 个可优化点",
+                metrics.tables,
+                scan_zh,
+                findings.len()
+            ),
+            format!(
+                "The plan accesses {} table(s){}; {} optimization point(s) were found",
+                metrics.tables,
+                scan_en,
+                findings.len()
+            ),
+        )
+    };
+    ExplainAnalysis {
+        status,
+        summary_zh,
+        summary_en,
+        findings,
+        suggestions,
+        metrics,
+    }
+}
+
+fn explain_analysis_json(analysis: &ExplainAnalysis) -> serde_json::Value {
+    serde_json::json!({
+        "status": analysis.status.as_str(),
+        "summary": analysis.summary_zh,
+        "summary_i18n": {
+            "zh": analysis.summary_zh,
+            "en": analysis.summary_en,
+        },
+        "findings": analysis
+            .findings
+            .iter()
+            .map(|finding| serde_json::json!({
+                "code": finding.code,
+                "severity": finding.severity.as_str(),
+                "table": finding.table,
+                "message": finding.message_zh,
+                "message_i18n": {
+                    "zh": finding.message_zh,
+                    "en": finding.message_en,
+                },
+            }))
+            .collect::<Vec<_>>(),
+        "suggestions": analysis
+            .suggestions
+            .iter()
+            .map(|suggestion| serde_json::json!({
+                "code": suggestion.code,
+                "message": suggestion.message_zh,
+                "message_i18n": {
+                    "zh": suggestion.message_zh,
+                    "en": suggestion.message_en,
+                },
+            }))
+            .collect::<Vec<_>>(),
+        "metrics": {
+            "tables": analysis.metrics.tables,
+            "indexed_tables": analysis.metrics.indexed_tables,
+            "full_scan_tables": analysis.metrics.full_scan_tables,
+            "filtered_tables": analysis.metrics.filtered_tables,
+            "join_buffer_tables": analysis.metrics.join_buffer_tables,
+            "estimated_rows": analysis.metrics.estimated_rows,
+        },
+    })
+}
+
+fn explain_document_v1(
+    _statement: &str,
+    plans: &[ExplainTablePlan],
+    analyze: Option<&ExplainAnalyze>,
+) -> serde_json::Value {
+    if plans.is_empty() {
+        return serde_json::json!({
+            "query_block": {
+                "select_id": 1,
+                "table": {"message": "No tables used"}
+            }
+        });
+    }
+    let table = |plan: &ExplainTablePlan| {
+        let rows_examined = plan.rows;
+        let mut table = serde_json::json!({
+            "table_name": plan.table.clone(),
+            "access_type": plan.access_type.clone(),
+            "possible_keys": plan.possible_keys.clone().map(|value| vec![value]),
+            "key": plan.key.clone(),
+            "used_key_parts": plan.key_columns.clone(),
+            "key_length": plan.key_len.clone(),
+            "ref": plan.reference.clone().map(|value| vec![value]),
+            "rows_examined_per_scan": rows_examined,
+            "rows_produced_per_join": if plan.reference.is_some() { 1 } else { rows_examined },
+            "filtered": plan.filtered.clone(),
+            "using_index": plan.key.is_some(),
+            "cost_info": {
+                "read_cost": "0.25",
+                "eval_cost": "0.10",
+                "prefix_cost": "0.35",
+                "data_read_per_join": (rows_examined.saturating_mul(144)).to_string(),
+            },
+            "used_columns": plan.used_columns.clone(),
+        });
+        if let (Some(analyze), Some(object)) = (analyze, table.as_object_mut()) {
+            object.insert("actual_rows".to_string(), serde_json::json!(analyze.rows));
+        }
+        table
+    };
+    serde_json::json!({
+        "query_block": {
+            "select_id": 1,
+            "cost_info": {
+                "query_cost": "0.35",
+            },
+            "table": table(&plans[0]),
+            "nested_loop": (plans.len() > 1).then(|| {
+                plans
+                    .iter()
+                    .map(|plan| serde_json::json!({ "table": table(plan) }))
+                    .collect::<Vec<_>>()
+            }),
+        }
+    })
+}
+
+/// MySQL 8.3+ renders the plan as an iterator tree. The document keeps the
+/// same top-level keys so tools written for the new format can read it.
+fn explain_document_v2(
+    statement: &str,
+    plans: &[ExplainTablePlan],
+    analyze: Option<&ExplainAnalyze>,
+) -> serde_json::Value {
+    if plans.is_empty() {
+        return serde_json::json!({
+            "query": statement,
+            "operation": "No tables used",
+            "access_type": "none",
+            "inputs": [],
+            "estimated_rows": 1,
+            "estimated_total_cost": "0.35",
+        });
+    }
+    let estimated_rows = plans.iter().map(|plan| plan.rows).sum::<u64>();
+    let mut document = serde_json::json!({
+        "query": statement,
+        "operation": if plans.len() > 1 {
+            "Nested loop inner join".to_string()
+        } else {
+            explain_v2_operation(&plans[0])
+        },
+        "access_type": if plans.len() > 1 { "join" } else { "table" },
+        "inputs": plans.iter().map(explain_v2_input).collect::<Vec<_>>(),
+        "estimated_rows": estimated_rows,
+        "estimated_total_cost": "0.35",
+    });
+    if plans.len() > 1 {
+        document["join_type"] = serde_json::Value::String("inner join".to_string());
+        document["join_algorithm"] = serde_json::Value::String("nested_loop".to_string());
+    }
+    if let Some(analyze) = analyze {
+        if let Some(object) = document.as_object_mut() {
+            object.insert("actual_rows".to_string(), serde_json::json!(analyze.rows));
+            object.insert("actual_loops".to_string(), serde_json::json!(1));
+            object.insert(
+                "actual_total_time_ms".to_string(),
+                serde_json::json!(analyze.elapsed.as_secs_f64() * 1000.0),
+            );
+        }
+    }
+    document
+}
+
+fn explain_v2_operation(plan: &ExplainTablePlan) -> String {
+    match plan.access_type.as_str() {
+        "ALL" => format!("Table scan on {}", plan.table),
+        "const" | "eq_ref" => format!(
+            "Single-row index lookup on {} using {}",
+            plan.table,
+            plan.key.as_deref().unwrap_or("PRIMARY")
+        ),
+        "ref" => format!(
+            "Index lookup on {} using {}",
+            plan.table,
+            plan.key.as_deref().unwrap_or("PRIMARY")
+        ),
+        "range" => format!(
+            "Range scan on {} using {}",
+            plan.table,
+            plan.key.as_deref().unwrap_or("PRIMARY")
+        ),
+        other => format!("Index scan on {} ({})", plan.table, other),
+    }
+}
+
+fn explain_v2_input(plan: &ExplainTablePlan) -> serde_json::Value {
+    let mut node = serde_json::json!({
+        "operation": explain_v2_operation(plan),
+        "table_name": plan.base_table.clone(),
+        "alias": plan.table.clone(),
+        "schema_name": plan.schema_name.clone(),
+        "access_type": if plan.access_type == "ALL" { "table" } else { "index" },
+        "index_name": plan.key.clone(),
+        "used_columns": plan.used_columns.clone(),
+        "estimated_rows": plan.rows,
+        "estimated_total_cost": "0.35",
+    });
+    if let Some(reference) = &plan.reference {
+        node["lookup_condition"] = serde_json::Value::String(reference.clone());
+    }
+    node
+}
+
+fn explain_tree_text(plans: &[ExplainTablePlan], analyze: Option<&ExplainAnalyze>) -> String {
+    if plans.is_empty() {
+        return "-> No tables used".to_string();
+    }
+    let mut lines = Vec::with_capacity(plans.len() + 1);
+    if plans.len() > 1 {
+        lines.push(format!(
+            "-> Nested loop inner join  (cost=1.00 rows={})",
+            plans.iter().map(|plan| plan.rows).sum::<u64>()
+        ));
+    }
+    let indent = if plans.len() > 1 { "    " } else { "" };
+    for plan in plans {
+        let operation = match plan.access_type.as_str() {
+            "ALL" => format!("Table scan on {}", plan.table),
+            "const" | "eq_ref" => format!(
+                "Single-row index lookup on {} using {}",
+                plan.table,
+                plan.key.as_deref().unwrap_or("PRIMARY")
+            ),
+            "ref" => format!(
+                "Index lookup on {} using {}",
+                plan.table,
+                plan.key.as_deref().unwrap_or("PRIMARY")
+            ),
+            "range" => format!(
+                "Range scan on {} using {}",
+                plan.table,
+                plan.key.as_deref().unwrap_or("PRIMARY")
+            ),
+            other => format!("Index scan on {} ({})", plan.table, other),
+        };
+        let condition = plan
+            .reference
+            .as_ref()
+            .map(|reference| format!(" ({reference})"))
+            .unwrap_or_default();
+        lines.push(format!(
+            "{indent}-> {operation}{condition}  (cost=0.35 rows={})",
+            plan.rows
+        ));
+    }
+    if let Some(analyze) = analyze {
+        if let Some(root) = lines.first_mut() {
+            root.push_str(&format!(
+                " (actual time=0.000..{:.3} rows={} loops=1)",
+                analyze.elapsed.as_secs_f64() * 1000.0,
+                analyze.rows
+            ));
+        }
+    }
+    lines.join("\n")
 }
 
 fn explain_key_columns(schema: &TableSchema, key: &str) -> Vec<String> {
@@ -27304,7 +28795,7 @@ fn performance_schema_virtual_tables(
         vec![bytes("Queries"), bytes(&snapshot.queries.to_string())],
         vec![
             bytes("Slow_queries"),
-            bytes(&stats.slow_queries().len().to_string()),
+            bytes(&stats.slow_queries_total().to_string()),
         ],
         vec![
             bytes("Innodb_row_lock_current_waits"),
@@ -27388,13 +28879,42 @@ fn performance_schema_virtual_tables(
     );
     map.insert(
         "EVENTS_STATEMENTS_SUMMARY_BY_DIGEST".into(),
-        empty_information_schema_table(&[
-            "DIGEST",
-            "DIGEST_TEXT",
-            "COUNT_STAR",
-            "SUM_TIMER_WAIT",
-            "SUM_ROWS_SENT",
-        ]),
+        VirtualTable {
+            columns: vec![
+                "DIGEST".into(),
+                "DIGEST_TEXT".into(),
+                "COUNT_STAR".into(),
+                "SUM_TIMER_WAIT".into(),
+                "MIN_TIMER_WAIT".into(),
+                "AVG_TIMER_WAIT".into(),
+                "MAX_TIMER_WAIT".into(),
+                "SUM_ERRORS".into(),
+                "SUM_ROWS_AFFECTED".into(),
+                "SUM_ROWS_SENT".into(),
+                "FIRST_SEEN".into(),
+                "LAST_SEEN".into(),
+            ],
+            rows: stats
+                .statement_digests()
+                .iter()
+                .map(|digest| {
+                    vec![
+                        bytes(&digest.digest),
+                        bytes(&digest.digest_text),
+                        bytes(&digest.count_star.to_string()),
+                        bytes(&digest.sum_timer_wait.to_string()),
+                        bytes(&digest.min_timer_wait.to_string()),
+                        bytes(&digest.average_timer_wait().to_string()),
+                        bytes(&digest.max_timer_wait.to_string()),
+                        bytes(&digest.sum_errors.to_string()),
+                        bytes(&digest.sum_rows_affected.to_string()),
+                        bytes(&digest.sum_rows_sent.to_string()),
+                        bytes(&digest.first_seen_ms.to_string()),
+                        bytes(&digest.last_seen_ms.to_string()),
+                    ]
+                })
+                .collect(),
+        },
     );
     map.insert(
         "MUTEX_INSTANCES".into(),
@@ -27500,13 +29020,48 @@ fn sys_virtual_tables(stats: &WireStats) -> HashMap<String, VirtualTable> {
         "tmp_tables",
         "tmp_disk_tables",
     ];
+    let statement_rows: Vec<Vec<Option<Vec<u8>>>> = stats
+        .statement_digests()
+        .iter()
+        .map(|digest| {
+            vec![
+                bytes(&digest.digest_text),
+                bytes(""),
+                bytes("0"),
+                bytes(&digest.count_star.to_string()),
+                bytes(&digest.sum_errors.to_string()),
+                bytes("0"),
+                bytes(&digest.sum_timer_wait.to_string()),
+                bytes(&digest.max_timer_wait.to_string()),
+                bytes(&digest.average_timer_wait().to_string()),
+                bytes("0"),
+                bytes(&digest.sum_rows_sent.to_string()),
+                bytes("0"),
+                bytes(&digest.sum_rows_affected.to_string()),
+                bytes("0"),
+                bytes("0"),
+            ]
+        })
+        .collect();
     map.insert(
         "statement_analysis".into(),
-        empty_information_schema_table(&stmt_cols),
+        VirtualTable {
+            columns: stmt_cols
+                .iter()
+                .map(|column| (*column).to_string())
+                .collect(),
+            rows: statement_rows.clone(),
+        },
     );
     map.insert(
         "x$statement_analysis".into(),
-        empty_information_schema_table(&stmt_cols),
+        VirtualTable {
+            columns: stmt_cols
+                .iter()
+                .map(|column| (*column).to_string())
+                .collect(),
+            rows: statement_rows,
+        },
     );
     map.insert(
         "sys_config".into(),
@@ -33437,7 +34992,7 @@ fn evaluate_scalar_expression(value: &str, row: &Row) -> anyhow::Result<Option<V
         };
         let mut document: serde_json::Value = serde_json::from_slice(&document)
             .map_err(|error| anyhow::anyhow!("Invalid JSON document: {error}"))?;
-        for pair in arguments[1..].chunks_exact(2) {
+        for pair in arguments[1..].as_chunks::<2>().0 {
             let Some(path) = evaluate_scalar_expression(&pair[0], row)? else {
                 return Ok(None);
             };
@@ -33470,7 +35025,7 @@ fn evaluate_scalar_expression(value: &str, row: &Row) -> anyhow::Result<Option<V
         };
         let mut document: serde_json::Value = serde_json::from_slice(&document)
             .map_err(|error| anyhow::anyhow!("Invalid JSON document: {error}"))?;
-        for pair in arguments[1..].chunks_exact(2) {
+        for pair in arguments[1..].as_chunks::<2>().0 {
             let Some(path) = evaluate_scalar_expression(&pair[0], row)? else {
                 return Ok(None);
             };
@@ -33574,7 +35129,7 @@ fn evaluate_scalar_expression(value: &str, row: &Row) -> anyhow::Result<Option<V
             anyhow::bail!("JSON_OBJECT requires key/value pairs");
         }
         let mut object = serde_json::Map::new();
-        for pair in arguments.chunks_exact(2) {
+        for pair in arguments.as_chunks::<2>().0 {
             let Some(key) = evaluate_scalar_expression(&pair[0], row)? else {
                 anyhow::bail!("JSON documents may not contain NULL member names");
             };
@@ -33763,7 +35318,7 @@ fn evaluate_scalar_expression(value: &str, row: &Row) -> anyhow::Result<Option<V
         };
         let mut document: serde_json::Value = serde_json::from_slice(&document)
             .map_err(|error| anyhow::anyhow!("Invalid JSON document: {error}"))?;
-        for pair in arguments[1..].chunks_exact(2) {
+        for pair in arguments[1..].as_chunks::<2>().0 {
             let Some(path) = evaluate_scalar_expression(&pair[0], row)? else {
                 return Ok(None);
             };
@@ -40212,7 +41767,7 @@ impl Backend {
         if !statement.to_ascii_uppercase().starts_with("SELECT ") {
             return None;
         }
-        let QueryOutcome::Rows { rows, .. } = self.explain_select_json(statement).await.ok()?
+        let QueryOutcome::Rows { rows, .. } = self.explain_json(statement, 1, None).await.ok()?
         else {
             return None;
         };
@@ -40230,66 +41785,66 @@ impl Backend {
         outcome: anyhow::Result<QueryOutcome>,
         results: QueryResultWriter<'_, W>,
     ) -> io::Result<()> {
-        let elapsed_ms = started.elapsed().as_millis() as u64;
+        let elapsed = started.elapsed();
+        let elapsed_micros = elapsed.as_micros() as u64;
+        let elapsed_ms = elapsed.as_millis() as u64;
         let error = outcome.as_ref().err().map(ToString::to_string);
-        if elapsed_ms >= self.config.slow_query_threshold_ms || error.is_some() {
-            let (outcome, rows_returned, affected_rows) = match &outcome {
-                Ok(QueryOutcome::Ok { affected_rows, .. }) => ("ok", None, Some(*affected_rows)),
-                Ok(QueryOutcome::Rows { rows, .. }) => ("rows", Some(rows.len()), None),
-                Ok(QueryOutcome::Multiple {
-                    result_sets,
-                    out_parameters,
-                    affected_rows,
-                }) => (
-                    "multiple",
-                    Some(
-                        result_sets
-                            .iter()
+        let normalized_query = normalize_sql_whitespace(query.trim().trim_end_matches(';').trim());
+        let statement_type = audit_statement_type(&normalized_query);
+        let query_digest = sql_fingerprint(&normalized_query);
+        let (outcome_kind, rows_returned, affected_rows) = match &outcome {
+            Ok(QueryOutcome::Ok { affected_rows, .. }) => ("ok", None, Some(*affected_rows)),
+            Ok(QueryOutcome::Rows { rows, .. }) => ("rows", Some(rows.len()), None),
+            Ok(QueryOutcome::Multiple {
+                result_sets,
+                out_parameters,
+                affected_rows,
+            }) => (
+                "multiple",
+                Some(
+                    result_sets
+                        .iter()
+                        .map(|result_set| result_set.rows.len())
+                        .sum::<usize>()
+                        + out_parameters
+                            .as_ref()
                             .map(|result_set| result_set.rows.len())
-                            .sum::<usize>()
-                            + out_parameters
-                                .as_ref()
-                                .map(|result_set| result_set.rows.len())
-                                .unwrap_or(0),
-                    ),
-                    Some(*affected_rows),
+                            .unwrap_or(0),
                 ),
-                Err(_) => ("error", None, None),
-            };
-            let explain_started = Instant::now();
-            let explain_json = self.explain_json_for_slow_query(query).await;
-            let explain_micros = explain_started.elapsed().as_micros() as u64;
-            let normalized_query =
-                normalize_sql_whitespace(query.trim().trim_end_matches(';').trim());
-            self.stats.record_query(
-                SlowQuerySnapshot {
-                    id: self
-                        .stats
-                        .next_slow_query_id
-                        .fetch_add(1, Ordering::Relaxed)
-                        + 1,
-                    unix_ms: SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64,
-                    duration_ms: elapsed_ms,
-                    connection_id: self.connection_id,
-                    database: self.database.clone(),
-                    statement_type: audit_statement_type(&normalized_query),
-                    query_digest: sql_fingerprint(&normalized_query),
-                    sql: query.to_string(),
-                    error: error.clone(),
-                    outcome: outcome.to_string(),
-                    execution_micros,
-                    explain_micros,
-                    rows_returned,
-                    affected_rows,
-                    explain_json,
-                },
-                self.config.max_slow_queries,
-            );
-        }
-        match outcome {
+                Some(*affected_rows),
+            ),
+            Err(_) => ("error", None, None),
+        };
+        let unix_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        self.stats.query_latency.record(elapsed_micros);
+        self.stats.digest_stats.record(
+            &query_digest,
+            &statement_type,
+            elapsed_micros,
+            StatementOutcome {
+                rows_sent: rows_returned.unwrap_or(0) as u64,
+                rows_affected: affected_rows.unwrap_or(0),
+                is_error: error.is_some(),
+            },
+            unix_ms,
+        );
+        let capture = (self.slow_query_log_enabled
+            && (elapsed_micros >= self.long_query_time_micros || error.is_some()))
+        .then(|| SlowQueryCapture {
+            unix_ms,
+            duration_ms: elapsed_ms,
+            statement_type,
+            query_digest,
+            error: error.clone(),
+            outcome: outcome_kind.to_string(),
+            rows_returned,
+            affected_rows,
+            execution_micros,
+        });
+        let result = match outcome {
             Ok(QueryOutcome::Ok {
                 affected_rows,
                 last_insert_id,
@@ -40443,20 +41998,71 @@ impl Backend {
                         .as_bytes()
                         .try_into()
                         .expect("validated procedure condition SQLSTATE");
-                    return results
+                    results
                         .error_with_code(condition.0.error_code, &sqlstate, message.as_bytes())
-                        .await;
-                }
-                if message.starts_with("The value specified for generated column '") {
-                    return results
+                        .await
+                } else if message.starts_with("The value specified for generated column '") {
+                    results
                         .error_with_code(3105, b"HY000", message.as_bytes())
-                        .await;
+                        .await
+                } else {
+                    let kind = error
+                        .downcast_ref::<TriggerSignalError>()
+                        .map(|signal| signal_error_kind(&signal.sqlstate))
+                        .unwrap_or_else(|| mysql_error_kind(&message));
+                    results.error(kind, message.as_bytes()).await
                 }
-                let kind = error
-                    .downcast_ref::<TriggerSignalError>()
-                    .map(|signal| signal_error_kind(&signal.sqlstate))
-                    .unwrap_or_else(|| mysql_error_kind(&message));
-                results.error(kind, message.as_bytes()).await
+            }
+        };
+        if let Some(capture) = capture {
+            self.record_slow_query(capture, query).await;
+        }
+        result
+    }
+
+    /// Persist a slow statement after the response reached the client. The
+    /// execution plan is captured here on purpose: running EXPLAIN before the
+    /// response would add the planner cost to the measured latency.
+    async fn record_slow_query(&mut self, capture: SlowQueryCapture, query: &str) {
+        let explain_started = Instant::now();
+        let cache_key = format!("{}:{}", self.database, capture.query_digest);
+        let explain_json = match self.stats.cached_explain(&cache_key) {
+            Some(plan) => Some(plan),
+            None => {
+                let plan = self.explain_json_for_slow_query(query).await;
+                if let Some(plan) = plan.as_ref() {
+                    self.stats.cache_explain(&cache_key, plan.clone());
+                }
+                plan
+            }
+        };
+        let explain_micros = explain_started.elapsed().as_micros() as u64;
+        let snapshot = SlowQuerySnapshot {
+            id: self
+                .stats
+                .next_slow_query_id
+                .fetch_add(1, Ordering::Relaxed)
+                + 1,
+            unix_ms: capture.unix_ms,
+            duration_ms: capture.duration_ms,
+            connection_id: self.connection_id,
+            database: self.database.clone(),
+            statement_type: capture.statement_type,
+            query_digest: capture.query_digest,
+            sql: query.to_string(),
+            error: capture.error,
+            outcome: capture.outcome,
+            execution_micros: capture.execution_micros,
+            explain_micros,
+            rows_returned: capture.rows_returned,
+            affected_rows: capture.affected_rows,
+            explain_json,
+        };
+        self.stats
+            .record_query(snapshot.clone(), self.config.max_slow_queries);
+        if let Some(log) = self.config.slow_query_log.as_ref() {
+            if let Err(error) = log.record(&snapshot) {
+                debug!("slow query log write failed: {error}");
             }
         }
     }
@@ -51819,7 +53425,9 @@ fn parse_sql_value(value: &str) -> anyhow::Result<SqlValue> {
         }
         let bytes = hex
             .as_bytes()
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| {
                 let text = std::str::from_utf8(pair)?;
                 u8::from_str_radix(text, 16).map_err(anyhow::Error::from)
@@ -51837,7 +53445,9 @@ fn parse_sql_value(value: &str) -> anyhow::Result<SqlValue> {
         }
         let bytes = hex
             .as_bytes()
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| {
                 let text = std::str::from_utf8(pair)?;
                 u8::from_str_radix(text, 16).map_err(anyhow::Error::from)

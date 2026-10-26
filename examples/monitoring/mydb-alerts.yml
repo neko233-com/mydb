@@ -1,0 +1,31 @@
+groups:
+  - name: mydb
+    rules:
+      - alert: MyDBUnavailable
+        expr: up{job="mydb"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: MyDB metrics collection has failed for two minutes
+      - alert: MyDBAuditUnhealthy
+        expr: (mydb_audit_healthy{job="mydb"} == 0) and on(job,instance) (up{job="mydb"} == 1)
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: MyDB audit writer is unhealthy
+      - alert: MyDBAuthenticationFailures
+        expr: (rate(mydb_authentication_failures_total{job="mydb"}[2m]) > 0) and on(job,instance) (up{job="mydb"} == 1)
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: MyDB login failures persist
+      - alert: MyDBStorageErrors
+        expr: (rate(mydb_storage_errors_total{job="mydb"}[2m]) > 0) and on(job,instance) (up{job="mydb"} == 1)
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: MyDB storage errors persist

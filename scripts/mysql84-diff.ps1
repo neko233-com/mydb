@@ -8,7 +8,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$container = "mydb-mysql-84-diff"
+$container = "mydb-mysql-84-diff-$([guid]::NewGuid().ToString('N'))"
 $database = "mydb_diff84_$([guid]::NewGuid().ToString('N'))"
 $scopedRevokeUser = "scoped_revoke_$([guid]::NewGuid().ToString('N').Substring(0, 8))"
 $globalRevokeUser = "global_revoke_$([guid]::NewGuid().ToString('N').Substring(0, 8))"
@@ -190,9 +190,8 @@ function Invoke-DiffCase {
 }
 
 try {
-    docker rm -f $container 2>$null | Out-Null
     # Match the Windows single-node deployment: MySQL lower_case_table_names=1.
-    docker run --name $container -e MYSQL_ROOT_PASSWORD=root -d mysql:8.4 --lower-case-table-names=1 | Out-Null
+    docker run --name $container --label 'com.neko233.mydb.compatibility-test=1' --cpus 1 --memory 1g --memory-swap 1g --pids-limit 256 --log-driver json-file --log-opt max-size=1m --log-opt max-file=3 -e "MYSQL_ROOT_PASSWORD=$MyDbPassword" -d mysql:8.4 --lower-case-table-names=1 | Out-Null
 
     $deadline = [DateTime]::UtcNow.AddSeconds(90)
     do {
@@ -370,5 +369,5 @@ try {
     } catch {
         Write-Warning "MyDB cleanup skipped: $($_.Exception.Message)"
     }
-    docker rm -f $container 2>$null | Out-Null
+    docker rm --force --volumes $container 2>$null | Out-Null
 }

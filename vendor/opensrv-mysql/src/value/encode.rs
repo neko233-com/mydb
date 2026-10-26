@@ -85,8 +85,8 @@ where
 // NOTE: yes, I know the = / => distinction is ugly
 macro_rules! like_try_into {
     ($self:ident, $source:ty = $target:ty, $w:ident, $m:ident, $c:ident) => {{
-        let min = <$target>::min_value() as $source;
-        let max = <$target>::max_value() as $source;
+        let min = <$target>::MIN as $source;
+        let max = <$target>::MAX as $source;
         if *$self <= max && *$self >= min {
             $w.$m(*$self as $target)
         } else {
@@ -94,8 +94,8 @@ macro_rules! like_try_into {
         }
     }};
     ($self:ident, $source:ty => $target:ty, $w:ident, $m:ident, $c:ident) => {{
-        let min = <$target>::min_value() as $source;
-        let max = <$target>::max_value() as $source;
+        let min = <$target>::MIN as $source;
+        let max = <$target>::MAX as $source;
         if *$self <= max && *$self >= min {
             $w.$m::<LittleEndian>(*$self as $target)
         } else {

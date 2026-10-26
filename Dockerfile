@@ -1,8 +1,10 @@
-ARG RUST_IMAGE=rust:1-trixie
-ARG RUNTIME_IMAGE=debian:13-slim
-ARG TARGET_CACHE_ID=mydb-target-trixie
+ARG RUST_IMAGE=rust:1-bookworm@sha256:e12566d5abc17a0da741628782cdb504b68b8961f5bfcf677936bf3e8b32de29
+ARG RUNTIME_IMAGE=debian:13-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad
+ARG TARGET_CACHE_ID=mydb-target-bookworm
 FROM ${RUST_IMAGE} AS builder
 ARG TARGET_CACHE_ID
+ARG CARGO_BUILD_JOBS=1
+ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS} CARGO_INCREMENTAL=0
 WORKDIR /src
 
 COPY Cargo.toml Cargo.lock ./
@@ -10,8 +12,8 @@ COPY crates ./crates
 COPY vendor ./vendor
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,id=${TARGET_CACHE_ID},target=/src/target \
-    cargo build --release -p mydb-server -p mydb-migrate -p mydb-dump && \
-    cargo build --release -p mydb-cli --bins && \
+    cargo build --release --locked -p mydb-server -p mydb-migrate -p mydb-dump && \
+    cargo build --release --locked -p mydb-cli --bins && \
     cp /src/target/release/mydb-server /tmp/mydb-server && \
     cp /src/target/release/mydb-cli /tmp/mydb-cli && \
     cp /src/target/release/mydb /tmp/mydb && \
@@ -20,7 +22,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 FROM ${RUNTIME_IMAGE}
 LABEL org.opencontainers.image.title="MyDB" \
-      org.opencontainers.image.description="MySQL-compatible actor-ordered game database"
+      org.opencontainers.image.description="Single-node durable MySQL-compatible database"
 
 RUN groupadd --system --gid 10001 mydb && \
     useradd --system --uid 10001 --gid mydb --home-dir /var/lib/mydb --shell /usr/sbin/nologin mydb && \
