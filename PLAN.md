@@ -72,8 +72,8 @@
 - [x] 6.3 `cargo +stable-x86_64-pc-windows-gnullvm build --release --locked -p mydb-server -p mydb-cli -p mydb-migrate -p mydb-dump`（通过）
 - [x] 6.4 本机启动冒烟：release 二进制、`/healthz`、`/readyz`、`/metrics`、OTLP 状态、OTLP `/v1/metrics`+`/v1/logs`、SQL 建表/写入/范围扫描、OLAP 裁剪、权限隔离（`scripts/verify-monitoring-runtime.py` 通过）
 - [x] 6.5 本机无 MySQL/podman，未重跑同机基准；已如实标注“未重跑”，不写新倍数
-- [x] 6.6 版本号 `0.1.38`，提交信息符合 `<type>(<scope>): <中文描述>`，推送 `main`（提交 `42d51d8`，后续文档/规范提交另记）
-- [x] 6.7 Linux musl 静态构建规范与 CI：`AGENTS.md`、`docs/zh/musl-build.md`、`.github/workflows/build-linux-musl.yml`；GitHub Actions run `45051995511` 构建、静态校验与产物上传通过
+- [x] 6.6 版本号 `0.1.38`，提交信息符合 `<type>(<scope>): <中文描述>`，推送 `main`；GitHub Release `v0.1.38` 已发布（Windows zip + Linux musl tar，校验和已上传）
+- [x] 6.7 Linux musl 静态构建规范与 CI：`AGENTS.md`、`docs/zh/musl-build.md`、`.github/workflows/build-linux-musl.yml`；GitHub Actions run `45060434795` 构建、静态校验与产物上传通过
 
 ## 7. 风险与回退
 

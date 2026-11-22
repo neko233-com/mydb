@@ -771,7 +771,7 @@ CDC 是 MyDB 相对 MySQL 的**额外扩展，默认关闭**，不宣称 MySQL b
 
 ### v0.1.38 观测与 OLAP 裁剪版
 
-发布说明与已知边界见 [docs/zh/releases/v0.1.38.md](docs/zh/releases/v0.1.38.md)。
+发布说明与已知边界见 [docs/zh/releases/v0.1.38.md](docs/zh/releases/v0.1.38.md)，产物见 [Release v0.1.38](https://github.com/neko233-com/mydb/releases/tag/v0.1.38)。
 
 - ✅ OpenTelemetry OTLP/HTTP 原生导出：指标 + 慢查询 `stmt` trace + 可选日志；Basic（用户名+密码）/ Bearer 鉴权；密钥支持环境变量与文件；管理 API 可查询导出状态且不泄露凭据
 - ✅ 对齐 MySQL 9 Telemetry：`stmt` span 使用 Internal kind，附带 `mysql.digest_text`、`mysql.cpu_time`、`mysql.rows_sent/affected`、`mysql.error_count` 等属性；新增 `/v1/logs`（默认关闭，敏感字段脱敏）
@@ -781,7 +781,7 @@ CDC 是 MyDB 相对 MySQL 的**额外扩展，默认关闭**，不宣称 MySQL b
 - ✅ 生产探针：`/healthz`、`/readyz`；管理 API 4 MiB 请求体上限；OTLP 凭据配置校验与脱敏
 - ✅ 依赖更新：`cargo update`，移除未使用的 `dashmap`/`console`/`indicatif` 与部分未使用 crate 依赖
 - ✅ 本机门槛：`cargo test --workspace`、`clippy -D warnings`、release 构建与原生 release smoke（探针、认证、SQL 权限隔离、OLAP 裁剪、指标隐私）通过
-- ✅ Linux musl 静态发布规范：`AGENTS.md` 明确 musl 构建与依赖体检规则；`.github/workflows/build-linux-musl.yml` 构建 `x86_64-unknown-linux-musl`，校验无 `INTERP`/`NEEDED` 并打包上传（run 45051995511 首次通过）
+- ✅ Linux musl 静态发布规范：`AGENTS.md` 明确 musl 构建与依赖体检规则；`.github/workflows/build-linux-musl.yml` 构建 `x86_64-unknown-linux-musl`，校验无 `INTERP`/`NEEDED` 并打包上传（run 45060434795 通过，产物随 Release v0.1.38 发布）
 - ⏳ 未完成：列裁剪、向量化聚合、并行页扫描；本轮未重跑同机 MySQL 对比基准，不新增性能倍数结论
 
 ### v0.1.36 稳定修复版（发布候选）
