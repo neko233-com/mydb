@@ -69,6 +69,12 @@ mydbdump restore --url 'mysql://root:password@127.0.0.1:3306' --database game --
 
 Rehearse restore on an isolated instance before and after an upgrade. Use `mydb-migrate` to move a database from MySQL. Full command examples and the HTTP backup API are in the backup and migration sections of [README.md](../../README.md).
 
+`backup.auto_backup_interval` (hours, 0 = off) and `backup.max_backups` are now active: a background task takes full/incremental backups and prunes to the retention count while keeping every parent chain intact.
+
+### CDC change capture (extension, off by default)
+
+CDC is a read-side tailer over committed WAL records that writes row-level NDJSON. It never runs on the write hot path and is not a MySQL binlog/replication compatible implementation. Reload `cdc.enabled` with `POST /api/v1/config/reload`, or toggle it at runtime with `POST /api/v1/cdc/enable` / `POST /api/v1/cdc/disable`. Inspect state at `GET /api/v1/cdc/status` and changes at `GET /api/v1/cdc/changes?since_lsn=0&limit=100`. Events and the cursor live under `<data_dir>/cdc`.
+
 ## Tests, benchmarks, and disk
 
 Local checks:

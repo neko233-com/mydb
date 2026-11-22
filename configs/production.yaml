@@ -81,5 +81,28 @@ observability:
     timeout_secs: 5
     service_name: "mydb"
     headers: {}
+    # 生产采集器必须使用 HTTPS + 以下任一鉴权（或显式 headers）
+    auth:
+      method: "none"        # none | basic | bearer
+      username: ""
+      password: ""          # 建议改用 MYDB_OTLP_PASSWORD / password_file
+      password_file: null
+      token: ""
     export_traces: true
     include_sql: false
+
+# CDC：默认关闭；可热重载或用 /api/v1/cdc/enable 动态开启。
+cdc:
+  enabled: false
+  dir: null
+  file_prefix: "events"
+  max_file_size: "128M"
+  max_files: 10
+  poll_interval_ms: 500
+  flush_every: 1
+  include_before: true
+  include_ddl: true
+  include_row_images: true
+  filters:
+    databases: []
+    tables: []

@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -14,10 +14,10 @@ use parking_lot::RwLock;
 use rust_decimal::{Decimal, RoundingStrategy};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::sync::{oneshot, Notify};
+use tokio::sync::oneshot;
 use tracing::{debug, error, info};
 
-use mydb_wal::{WalReader, WalRecord, WalRecordType, WalWriter};
+use mydb_wal::{WalChange, WalChangeOp, WalReader, WalRecord, WalRecordType, WalWriter};
 
 mod mvcc;
 
@@ -229,8 +229,14 @@ fn read_u64(bytes: &[u8], pos: &mut usize) -> Option<u64> {
 // ============================================================================
 
 pub struct BufferPool {
-    pages: RwLock<HashMap<(String, u32), Page>>,
+    pages: RwLock<HashMap<String, HashMap<u32, Page>>>,
     max_pages: usize,
+    /// Page-access counters for zone-map pruning. They live here because the
+    /// buffer pool already owns every decoded page and is shared by every
+    /// `Database` instance.
+    olap_pages_scanned: AtomicU64,
+    olap_pages_pruned: AtomicU64,
+    olap_rows_pruned: AtomicU64,
 }
 
 impl BufferPool {
@@ -241,7 +247,28 @@ impl BufferPool {
         Self {
             pages: RwLock::new(HashMap::with_capacity(max_pages)),
             max_pages,
+            olap_pages_scanned: AtomicU64::new(0),
+            olap_pages_pruned: AtomicU64::new(0),
+            olap_rows_pruned: AtomicU64::new(0),
         }
+    }
+
+    pub fn record_olap_page_scanned(&self) {
+        self.olap_pages_scanned.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_olap_page_pruned(&self, rows: u32) {
+        self.olap_pages_pruned.fetch_add(1, Ordering::Relaxed);
+        self.olap_rows_pruned
+            .fetch_add(u64::from(rows), Ordering::Relaxed);
+    }
+
+    pub fn olap_counters(&self) -> (u64, u64, u64) {
+        (
+            self.olap_pages_scanned.load(Ordering::Relaxed),
+            self.olap_pages_pruned.load(Ordering::Relaxed),
+            self.olap_rows_pruned.load(Ordering::Relaxed),
+        )
     }
 
     fn parse_size(size: &str) -> usize {
@@ -270,27 +297,39 @@ impl BufferPool {
     }
 
     pub fn get_table_page(&self, namespace: &str, page_number: u32) -> Option<Page> {
-        self.pages
-            .read()
-            .get(&(namespace.to_string(), page_number))
-            .cloned()
+        self.pages.read().get(namespace)?.get(&page_number).cloned()
     }
 
     pub fn insert_table_page(&self, namespace: &str, page: Page) {
         let mut pages = self.pages.write();
-        if pages.len() >= self.max_pages {
-            if let Some((oldest, _)) = pages.iter().min_by_key(|(_, page)| page.header.lsn) {
-                let oldest = oldest.clone();
-                pages.remove(&oldest);
+        if pages.values().map(HashMap::len).sum::<usize>() >= self.max_pages {
+            let oldest = pages
+                .iter()
+                .filter_map(|(owner, shard)| {
+                    shard
+                        .iter()
+                        .min_by_key(|(_, page)| page.header.lsn)
+                        .map(|(number, page)| (owner.clone(), *number, page.header.lsn))
+                })
+                .min_by_key(|(_, _, lsn)| *lsn);
+            if let Some((owner, number, _)) = oldest {
+                if let Some(shard) = pages.get_mut(&owner) {
+                    shard.remove(&number);
+                }
             }
         }
-        pages.insert((namespace.to_string(), page.header.page_number), page);
+        pages
+            .entry(namespace.to_string())
+            .or_default()
+            .insert(page.header.page_number, page);
     }
 
     pub fn mark_dirty(&self, page_number: u32) {
         let mut pages = self.pages.write();
-        if let Some(page) = pages.get_mut(&(String::new(), page_number)) {
-            page.header.is_dirty = true;
+        if let Some(shard) = pages.get_mut("") {
+            if let Some(page) = shard.get_mut(&page_number) {
+                page.header.is_dirty = true;
+            }
         }
     }
 
@@ -298,15 +337,18 @@ impl BufferPool {
         self.pages
             .read()
             .values()
-            .filter(|p| p.header.is_dirty)
+            .flat_map(HashMap::values)
+            .filter(|page| page.header.is_dirty)
             .cloned()
             .collect()
     }
 
     pub fn clear_dirty_flags(&self) {
         let mut pages = self.pages.write();
-        for page in pages.values_mut() {
-            page.header.is_dirty = false;
+        for shard in pages.values_mut() {
+            for page in shard.values_mut() {
+                page.header.is_dirty = false;
+            }
         }
     }
 
@@ -317,7 +359,7 @@ impl BufferPool {
     }
 
     pub fn page_count(&self) -> usize {
-        self.pages.read().len()
+        self.pages.read().values().map(HashMap::len).sum()
     }
 
     pub fn clear(&self) {
@@ -325,8 +367,7 @@ impl BufferPool {
     }
 
     pub fn clear_namespace(&self, namespace: &str) {
-        let mut pages = self.pages.write();
-        pages.retain(|(ns, _), _| ns != namespace);
+        self.pages.write().remove(namespace);
     }
 }
 
@@ -2064,11 +2105,14 @@ type RowValueIndex = HashMap<(String, String), HashMap<Vec<u8>, Vec<usize>>>;
 struct PackedRows {
     pages: Vec<Page>,
     overflow: bool,
+    /// `rows[start..end]` of the source slice that each page contains.
+    row_ranges: Vec<(usize, usize)>,
 }
 
 fn pack_row_pages(first_page_number: u32, rows: &[Row]) -> Result<PackedRows> {
     let encoded = rows.iter().map(Row::encode).collect::<Vec<_>>();
     let mut pages = Vec::new();
+    let mut row_ranges = Vec::new();
     let mut index = 0;
     while index < encoded.len() {
         let mut page = Page::new(
@@ -2085,6 +2129,7 @@ fn pack_row_pages(first_page_number: u32, rows: &[Row]) -> Result<PackedRows> {
                 return Ok(PackedRows {
                     pages: Vec::new(),
                     overflow: true,
+                    row_ranges: Vec::new(),
                 });
             }
             if cursor + 4 + row.len() > page.data.len() {
@@ -2100,10 +2145,12 @@ fn pack_row_pages(first_page_number: u32, rows: &[Row]) -> Result<PackedRows> {
         page.data[4..8].copy_from_slice(&page.header.row_count.to_le_bytes());
         page.header.is_dirty = true;
         pages.push(page);
+        row_ranges.push((start, index));
     }
     Ok(PackedRows {
         pages,
         overflow: false,
+        row_ranges,
     })
 }
 
@@ -2175,6 +2222,176 @@ fn unpack_page_rows(page: &Page) -> Vec<Row> {
 // Database
 // ============================================================================
 
+/// Per-page, per-column min/max/null summary used to skip pages that cannot
+/// satisfy a filtered scan. Values are compared with the same MySQL ordering
+/// helper as row predicates, so numeric and collation semantics stay aligned.
+#[derive(Debug, Clone)]
+struct ColumnZone {
+    null_count: u32,
+    /// False while every observed value in this page is NULL; min/max are only
+    /// meaningful once the first non-NULL value arrives.
+    initialized: bool,
+    min: Vec<u8>,
+    max: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PageZoneMap {
+    rows: u32,
+    columns: HashMap<String, ColumnZone>,
+}
+
+impl PageZoneMap {
+    fn from_rows(rows: &[Row], schema: &TableSchema) -> Self {
+        let mut map = PageZoneMap {
+            rows: rows.len() as u32,
+            columns: HashMap::new(),
+        };
+        for row in rows {
+            for (column, value) in &row.values {
+                let key = column.to_ascii_lowercase();
+                let is_null = row.null_columns.contains(column);
+                let zone = map.columns.entry(key.clone()).or_insert_with(|| ColumnZone {
+                    null_count: 0,
+                    initialized: false,
+                    min: Vec::new(),
+                    max: Vec::new(),
+                });
+                if is_null {
+                    zone.null_count = zone.null_count.saturating_add(1);
+                    continue;
+                }
+                if !zone.initialized {
+                    zone.initialized = true;
+                    zone.min = value.clone();
+                    zone.max = value.clone();
+                    continue;
+                }
+                if mysql_scalar_cmp_for_column(value, &zone.min, Some(schema), &key).is_lt() {
+                    zone.min = value.clone();
+                }
+                if mysql_scalar_cmp_for_column(value, &zone.max, Some(schema), &key).is_gt() {
+                    zone.max = value.clone();
+                }
+            }
+        }
+        map
+    }
+
+    fn zone(&self, column: &str) -> Option<&ColumnZone> {
+        self.columns.get(&column.to_ascii_lowercase())
+    }
+
+    /// Zone with at least one non-NULL value. Value predicates on an
+    /// all-NULL column always report "may match" (conservative, never wrong).
+    fn value_zone(&self, column: &str) -> Option<&ColumnZone> {
+        self.zone(column).filter(|zone| zone.initialized)
+    }
+
+    /// Conservative page filter: `true` means "this page may still contain a
+    /// matching row" and it must be decoded. `false` is only returned when the
+    /// summary proves that no row can match; an unknown shape always returns
+    /// `true`, because dropping a row is far worse than scanning one page.
+    fn may_match(&self, predicate: &RowPredicate, schema: &TableSchema) -> bool {
+        may_match_with_zones(Some(self), predicate, schema)
+    }
+}
+
+fn may_match_with_zones(
+    zones: Option<&PageZoneMap>,
+    predicate: &RowPredicate,
+    schema: &TableSchema,
+) -> bool {
+    let Some(zones) = zones else {
+        return true;
+    };
+    match predicate {
+        RowPredicate::Eq(column, value) | RowPredicate::ExactEq(column, value) => {
+            let Some(zone) = zones.value_zone(column) else {
+                return true;
+            };
+            mysql_scalar_cmp_for_column(value, &zone.min, Some(schema), column).is_ge()
+                && mysql_scalar_cmp_for_column(value, &zone.max, Some(schema), column).is_le()
+        }
+        RowPredicate::NotEq(column, value) => {
+            let Some(zone) = zones.value_zone(column) else {
+                return true;
+            };
+            !(mysql_scalar_equal_for_column(&zone.min, &zone.max, Some(schema), column)
+                && mysql_scalar_equal_for_column(&zone.min, value, Some(schema), column))
+        }
+        RowPredicate::Less(column, value) => {
+            let Some(zone) = zones.value_zone(column) else {
+                return true;
+            };
+            mysql_scalar_cmp_for_column(&zone.min, value, Some(schema), column).is_lt()
+        }
+        RowPredicate::LessOrEq(column, value) => {
+            let Some(zone) = zones.value_zone(column) else {
+                return true;
+            };
+            mysql_scalar_cmp_for_column(&zone.min, value, Some(schema), column).is_le()
+        }
+        RowPredicate::Greater(column, value) => {
+            let Some(zone) = zones.value_zone(column) else {
+                return true;
+            };
+            mysql_scalar_cmp_for_column(&zone.max, value, Some(schema), column).is_gt()
+        }
+        RowPredicate::GreaterOrEq(column, value) => {
+            let Some(zone) = zones.value_zone(column) else {
+                return true;
+            };
+            mysql_scalar_cmp_for_column(&zone.max, value, Some(schema), column).is_ge()
+        }
+        RowPredicate::In(column, values) => {
+            let Some(zone) = zones.value_zone(column) else {
+                return true;
+            };
+            values.iter().any(|value| {
+                mysql_scalar_cmp_for_column(value, &zone.min, Some(schema), column).is_ge()
+                    && mysql_scalar_cmp_for_column(value, &zone.max, Some(schema), column).is_le()
+            })
+        }
+        RowPredicate::Between(column, lower, upper) => {
+            let Some(zone) = zones.value_zone(column) else {
+                return true;
+            };
+            mysql_scalar_cmp_for_column(&zone.max, lower, Some(schema), column).is_ge()
+                && mysql_scalar_cmp_for_column(&zone.min, upper, Some(schema), column).is_le()
+        }
+        RowPredicate::IsNull(column) => zones
+            .zone(column)
+            .is_none_or(|zone| zone.null_count > 0),
+        RowPredicate::IsNotNull(column) => zones
+            .zone(column)
+            .is_none_or(|zone| zones.rows > zone.null_count),
+        RowPredicate::And(left, right) => {
+            may_match_with_zones(Some(zones), left, schema)
+                && may_match_with_zones(Some(zones), right, schema)
+        }
+        RowPredicate::Or(left, right) => {
+            may_match_with_zones(Some(zones), left, schema)
+                || may_match_with_zones(Some(zones), right, schema)
+        }
+        RowPredicate::Never | RowPredicate::AlwaysFalse => false,
+        // `Like`, cross-column comparisons and the constant-true case need
+        // row context that a min/max summary cannot provide.
+        RowPredicate::Like(..)
+        | RowPredicate::ColumnCompare(..)
+        | RowPredicate::AlwaysTrue => true,
+    }
+}
+
+/// Cached zone maps for one table. The schema generation guards against a
+/// rewrite path that forgot to invalidate the cache: an old generation is
+/// discarded instead of consulted.
+#[derive(Default)]
+struct TableZoneCache {
+    generation: u64,
+    pages: HashMap<u32, Arc<PageZoneMap>>,
+}
+
 pub struct Database {
     pub name: String,
     pub tables: RwLock<HashMap<String, TableSchema>>,
@@ -2202,6 +2419,9 @@ pub struct Database {
     /// Volatile canonical rows for ENGINE=MEMORY. Metadata is durable, rows are
     /// deliberately neither paged nor replayed from WAL after restart.
     memory_rows: RwLock<HashMap<String, Vec<Row>>>,
+    /// Zone-map cache. Built from rows at rewrite time and from decoded pages
+    /// on the first filtered scan of an older table.
+    page_zones: RwLock<HashMap<String, TableZoneCache>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -2333,6 +2553,7 @@ impl Database {
             next_row_id: RwLock::new(HashMap::new()),
             pending_rewrites: RwLock::new(HashMap::new()),
             memory_rows: RwLock::new(HashMap::new()),
+            page_zones: RwLock::new(HashMap::new()),
         }
     }
 
@@ -2539,6 +2760,7 @@ impl Database {
                 .insert(table_name.clone(), 1);
         }
         self.next_row_id.write().insert(table_name.clone(), 1);
+        self.invalidate_page_zones(&table_name);
         tables.insert(table_name.clone(), schema);
         drop(tables);
         if memory {
@@ -2561,6 +2783,7 @@ impl Database {
             .find(|stored| stored.eq_ignore_ascii_case(name))
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("Table '{}' does not exist", name))?;
+        self.invalidate_page_zones(&stored_name);
 
         let database_dir = self.data_dir.join(&self.name);
         let safe_table = rewrite_component(&stored_name)?;
@@ -2956,6 +3179,7 @@ impl Database {
         let stored_table = self
             .stored_table_name(table_name)
             .ok_or_else(|| anyhow::anyhow!("Table '{}' does not exist", table_name))?;
+        self.invalidate_page_zones(&stored_table);
         let schema_snapshot = self
             .get_table(&stored_table)
             .ok_or_else(|| anyhow::anyhow!("Table '{}' does not exist", table_name))?;
@@ -3160,6 +3384,112 @@ impl Database {
         Ok(rows_per_page.saturating_mul(u64::from(next_page_number)))
     }
 
+    fn cached_page_zone(
+        &self,
+        table_name: &str,
+        schema: &TableSchema,
+        page_number: u32,
+    ) -> Option<Arc<PageZoneMap>> {
+        let cache = self.page_zones.read();
+        let entry = cache.get(table_name)?;
+        if entry.generation != schema.generation {
+            return None;
+        }
+        entry.pages.get(&page_number).cloned()
+    }
+
+    fn store_page_zone(
+        &self,
+        table_name: &str,
+        schema: &TableSchema,
+        page_number: u32,
+        zone: Arc<PageZoneMap>,
+    ) {
+        let mut cache = self.page_zones.write();
+        let entry = cache
+            .entry(table_name.to_string())
+            .or_insert_with(|| TableZoneCache {
+                generation: schema.generation,
+                pages: HashMap::new(),
+            });
+        if entry.generation != schema.generation {
+            entry.pages.clear();
+            entry.generation = schema.generation;
+        }
+        // Bound per-table memory: zone maps are a cache, not an index. Dropping
+        // them only costs a rebuild on the next filtered scan.
+        if entry.pages.len() >= 8192 {
+            entry.pages.clear();
+        }
+        entry.pages.insert(page_number, zone);
+    }
+
+    fn invalidate_page_zones(&self, table_name: &str) {
+        self.page_zones.write().remove(table_name);
+    }
+
+    /// Decode only pages that may satisfy `filter`. Zone maps are consulted
+    /// before `unpack_page_rows`, so a pruned page costs a page read but not a
+    /// row decode; the zone itself is built once and reused while the schema
+    /// generation is unchanged.
+    fn scan_pages_filtered<I>(
+        &self,
+        table_name: &str,
+        schema: &TableSchema,
+        page_numbers: I,
+        filter: Option<&RowPredicate>,
+        limit: Option<usize>,
+    ) -> Result<Vec<Row>>
+    where
+        I: IntoIterator<Item = u32>,
+    {
+        let namespace = self.page_namespace(table_name);
+        let mut rows = Vec::new();
+        for page_num in page_numbers {
+            let page = if let Some(page) = self.buffer_pool.get_table_page(&namespace, page_num) {
+                Some(page)
+            } else {
+                let page = self.disk_manager.read_page(table_name, page_num)?;
+                if let Some(page) = &page {
+                    self.buffer_pool.insert_table_page(&namespace, page.clone());
+                }
+                page
+            };
+            let Some(page) = page else {
+                continue;
+            };
+            let zone = if filter.is_some() {
+                self.cached_page_zone(table_name, schema, page_num)
+            } else {
+                None
+            };
+            if let (Some(predicate), Some(zones)) = (filter, zone.as_ref()) {
+                if !zones.may_match(predicate, schema) {
+                    self.buffer_pool
+                        .record_olap_page_pruned(page.header.row_count);
+                    continue;
+                }
+            }
+            let decoded = unpack_page_rows(&page);
+            if filter.is_some() {
+                self.buffer_pool.record_olap_page_scanned();
+            }
+            if zone.is_none() && filter.is_some() {
+                let built = Arc::new(PageZoneMap::from_rows(&decoded, schema));
+                self.store_page_zone(table_name, schema, page_num, built);
+            }
+            for row in decoded.into_iter().filter(|row| {
+                filter.is_none_or(|predicate| predicate.matches_with_schema(row, Some(schema)))
+            }) {
+                rows.push(row);
+                if limit.is_some_and(|limit| rows.len() >= limit) {
+                    return Ok(rows);
+                }
+            }
+        }
+        Ok(rows)
+    }
+
     /// Get all rows from a table
     pub fn scan_table(&self, table_name: &str) -> Result<Vec<Row>> {
         let stored_table = self
@@ -3234,6 +3564,8 @@ impl Database {
         let schema = self
             .get_table(table_name)
             .ok_or_else(|| anyhow::anyhow!("Table '{}' does not exist", table_name))?;
+        let has_overlay = self.memory_rows.read().contains_key(table_name)
+            || self.pending_rewrites.read().contains_key(table_name);
         if self.overflow_tables.read().contains(table_name) {
             return Ok(self
                 .scan_table(table_name)?
@@ -3249,6 +3581,15 @@ impl Database {
             Some(RowPredicate::ExactEq(column, value)) => (column, vec![value], true),
             Some(RowPredicate::In(column, values)) => (column, values.iter().collect(), false),
             _ => {
+                if !has_overlay {
+                    return self.scan_pages_filtered(
+                        table_name,
+                        &schema,
+                        0..schema.next_page_number,
+                        filter,
+                        limit,
+                    );
+                }
                 return Ok(self
                     .scan_table(table_name)?
                     .into_iter()
@@ -3262,6 +3603,15 @@ impl Database {
             }
         };
         if !indexed_columns(&schema).contains(column) {
+            if !has_overlay {
+                return self.scan_pages_filtered(
+                    table_name,
+                    &schema,
+                    0..schema.next_page_number,
+                    filter,
+                    limit,
+                );
+            }
             return Ok(self
                 .scan_table(table_name)?
                 .into_iter()
@@ -3340,30 +3690,7 @@ impl Database {
         }
         let mut page_numbers: Vec<_> = page_numbers.into_iter().collect();
         page_numbers.sort_unstable();
-        let namespace = self.page_namespace(table_name);
-        let mut rows = Vec::new();
-        'pages: for page_num in page_numbers {
-            let page = if let Some(page) = self.buffer_pool.get_table_page(&namespace, page_num) {
-                Some(page)
-            } else {
-                let page = self.disk_manager.read_page(table_name, page_num)?;
-                if let Some(page) = &page {
-                    self.buffer_pool.insert_table_page(&namespace, page.clone());
-                }
-                page
-            };
-            if let Some(page) = page {
-                for row in unpack_page_rows(&page).into_iter().filter(|row| {
-                    filter.is_none_or(|predicate| predicate.matches_with_schema(row, Some(&schema)))
-                }) {
-                    rows.push(row);
-                    if limit.is_some_and(|limit| rows.len() >= limit) {
-                        break 'pages;
-                    }
-                }
-            }
-        }
-        Ok(rows)
+        self.scan_pages_filtered(table_name, &schema, page_numbers, filter, limit)
     }
 
     /// Delete all rows (for simplicity, mark pages as deleted)
@@ -3703,6 +4030,7 @@ impl Database {
             .stored_table_name(table_name)
             .ok_or_else(|| anyhow::anyhow!("Table '{}' does not exist", table_name))?;
         let table_name = stored_table.as_str();
+        self.invalidate_page_zones(table_name);
         let rows = self.prepare_replacement_rows(table_name, rows)?;
         let schema = self
             .get_table(table_name)
@@ -3725,6 +4053,7 @@ impl Database {
             .stored_table_name(table_name)
             .ok_or_else(|| anyhow::anyhow!("Table '{}' does not exist", table_name))?;
         let table_name = stored_table.as_str();
+        self.invalidate_page_zones(table_name);
         let rows = self.prepare_replacement_rows(table_name, rows)?;
         let schema = self
             .get_table(table_name)
@@ -3739,6 +4068,17 @@ impl Database {
         let packed = pack_row_pages(0, &rows)?;
         let pages = packed.pages;
         let overflow = packed.overflow;
+        let row_ranges = packed.row_ranges;
+        let mut zones = HashMap::with_capacity(pages.len());
+        if !overflow {
+            for (index, page) in pages.iter().enumerate() {
+                let (start, end) = row_ranges[index];
+                zones.insert(
+                    page.header.page_number,
+                    Arc::new(PageZoneMap::from_rows(&rows[start..end], &schema)),
+                );
+            }
+        }
         let database_dir = self.data_dir.join(&self.name);
         let safe_table = rewrite_component(table_name)?;
         let marker = TableRewriteMarker {
@@ -3788,6 +4128,20 @@ impl Database {
         self.buffer_pool.clear_namespace(&namespace);
         for page in &pages {
             self.buffer_pool.insert_table_page(&namespace, page.clone());
+        }
+        {
+            let mut cache = self.page_zones.write();
+            if overflow {
+                cache.remove(table_name);
+            } else {
+                cache.insert(
+                    table_name.to_string(),
+                    TableZoneCache {
+                        generation: marker.new_generation,
+                        pages: zones,
+                    },
+                );
+            }
         }
         self.replace_table_logical_indexes(table_name, &schema, &rows);
         for page in &pages {
@@ -3940,11 +4294,16 @@ impl Database {
                 (rows, false)
             } else {
                 let mut rows = Vec::new();
+                let mut zones = HashMap::new();
                 for page_number in self.disk_manager.list_pages(&table_name)? {
                     let Some(page) = self.disk_manager.read_page(&table_name, page_number)? else {
                         continue;
                     };
                     let page_rows = unpack_page_rows(&page);
+                    zones.insert(
+                        page_number,
+                        Arc::new(PageZoneMap::from_rows(&page_rows, &schema)),
+                    );
                     add_rows_to_page_index(
                         &mut page_index,
                         &table_name,
@@ -3955,6 +4314,15 @@ impl Database {
                     rows.extend(page_rows);
                     self.buffer_pool
                         .insert_table_page(&self.page_namespace(&table_name), page);
+                }
+                if !zones.is_empty() {
+                    self.page_zones.write().insert(
+                        table_name.clone(),
+                        TableZoneCache {
+                            generation: schema.generation,
+                            pages: zones,
+                        },
+                    );
                 }
                 (rows, false)
             };
@@ -6519,6 +6887,218 @@ pub fn wal_group_commit_unix_ms(record: &WalRecord) -> Option<u64> {
         .flatten()
 }
 
+/// Decode a grouped WAL commit payload into neutral CDC changes. This reuses
+/// the same versioned decoder as WAL replay, so every historical group format
+/// remains readable by the CDC reader without a second compatibility path.
+pub fn decode_wal_group_changes(payload: &[u8]) -> Result<Vec<WalChange>> {
+    let group = decode_wal_group(payload)?;
+    let mut changes = Vec::new();
+    for transaction in group.transactions {
+        for command in transaction {
+            cdc_changes_for_command(command, &mut changes);
+        }
+    }
+    Ok(changes)
+}
+
+fn cdc_predicate_before(predicate: &Option<RowPredicate>, out: &mut Vec<(String, Vec<u8>)>) {
+    let Some(predicate) = predicate else { return };
+    match predicate {
+        RowPredicate::Eq(column, value)
+        | RowPredicate::NotEq(column, value)
+        | RowPredicate::Less(column, value)
+        | RowPredicate::LessOrEq(column, value)
+        | RowPredicate::Greater(column, value)
+        | RowPredicate::GreaterOrEq(column, value)
+        | RowPredicate::Like(column, value)
+        | RowPredicate::ExactEq(column, value) => out.push((column.clone(), value.clone())),
+        RowPredicate::In(column, values) => {
+            if let Some(value) = values.first() {
+                out.push((column.clone(), value.clone()));
+            }
+        }
+        RowPredicate::Between(column, low, _) => out.push((column.clone(), low.clone())),
+        RowPredicate::IsNull(column) | RowPredicate::IsNotNull(column) => {
+            out.push((column.clone(), Vec::new()));
+        }
+        RowPredicate::And(left, right) | RowPredicate::Or(left, right) => {
+            cdc_predicate_before(&Some(*left.clone()), out);
+            cdc_predicate_before(&Some(*right.clone()), out);
+        }
+        RowPredicate::Never
+        | RowPredicate::AlwaysTrue
+        | RowPredicate::AlwaysFalse
+        | RowPredicate::ColumnCompare(..) => {}
+    }
+}
+
+fn cdc_changes_for_command(command: WriteCommand, out: &mut Vec<WalChange>) {
+    match command {
+        WriteCommand::Insert { database, table, row } => out.push(WalChange {
+            operation: WalChangeOp::Insert,
+            database,
+            table,
+            before: Vec::new(),
+            after: row.values,
+            ddl_sql: None,
+        }),
+        WriteCommand::Upsert {
+            database,
+            table,
+            row,
+            ..
+        } => out.push(WalChange {
+            operation: WalChangeOp::Upsert,
+            database,
+            table,
+            before: Vec::new(),
+            after: row.values,
+            ddl_sql: None,
+        }),
+        WriteCommand::Update {
+            database,
+            table,
+            filter,
+            assignments,
+        } => {
+            let mut before = Vec::new();
+            cdc_predicate_before(&filter, &mut before);
+            let after = assignments
+                .into_iter()
+                .filter_map(|(column, value)| value.map(|value| (column, value)))
+                .collect();
+            out.push(WalChange {
+                operation: WalChangeOp::Update,
+                database,
+                table,
+                before,
+                after,
+                ddl_sql: None,
+            });
+        }
+        WriteCommand::ExpressionUpdate {
+            database,
+            table,
+            filter,
+            assignments,
+        } => {
+            let mut before = Vec::new();
+            cdc_predicate_before(&filter, &mut before);
+            let after = assignments
+                .into_iter()
+                .filter(|assignment| {
+                    matches!(&assignment.value, UpdateValueExpression::Literal(Some(_)))
+                })
+                .filter_map(|assignment| match assignment.value {
+                    UpdateValueExpression::Literal(Some(value)) => {
+                        Some((assignment.target_column, value))
+                    }
+                    _ => None,
+                })
+                .collect();
+            out.push(WalChange {
+                operation: WalChangeOp::Update,
+                database,
+                table,
+                before,
+                after,
+                ddl_sql: None,
+            });
+        }
+        WriteCommand::Delete {
+            database,
+            table,
+            filter,
+        } => {
+            let mut before = Vec::new();
+            cdc_predicate_before(&filter, &mut before);
+            out.push(WalChange {
+                operation: WalChangeOp::Delete,
+                database,
+                table,
+                before,
+                after: Vec::new(),
+                ddl_sql: None,
+            });
+        }
+        WriteCommand::ReplaceRows { database, table, rows, .. } => {
+            for row in rows {
+                out.push(WalChange {
+                    operation: WalChangeOp::Insert,
+                    database: database.clone(),
+                    table: table.clone(),
+                    before: Vec::new(),
+                    after: row.values,
+                    ddl_sql: None,
+                });
+            }
+        }
+        WriteCommand::CreateTable { database, schema } => out.push(WalChange {
+            operation: WalChangeOp::Ddl,
+            database,
+            table: schema.name.clone(),
+            before: Vec::new(),
+            after: Vec::new(),
+            ddl_sql: None,
+        }),
+        WriteCommand::DropTable { database, table } => out.push(WalChange {
+            operation: WalChangeOp::Ddl,
+            database,
+            table,
+            before: Vec::new(),
+            after: Vec::new(),
+            ddl_sql: None,
+        }),
+        WriteCommand::AlterTable { database, table, .. } => out.push(WalChange {
+            operation: WalChangeOp::Ddl,
+            database,
+            table,
+            before: Vec::new(),
+            after: Vec::new(),
+            ddl_sql: None,
+        }),
+        // Non-table mutations (XA markers, cleanup, routines/events) carry no
+        // row image. They are still surfaced as DDL for a complete audit trail.
+        other => out.push(WalChange {
+            operation: WalChangeOp::Ddl,
+            database: String::new(),
+            table: String::new(),
+            before: Vec::new(),
+            after: Vec::new(),
+            ddl_sql: cdc_ddl_label(&other).map(str::to_string),
+        }),
+    }
+}
+
+fn cdc_ddl_label(command: &WriteCommand) -> Option<&'static str> {
+    match command {
+        WriteCommand::CreateDatabase(_) => Some("CREATE DATABASE"),
+        WriteCommand::DropDatabase(_) => Some("DROP DATABASE"),
+        WriteCommand::CreateProcedure { .. } | WriteCommand::CreateProcedureV2 { .. } => {
+            Some("CREATE PROCEDURE")
+        }
+        WriteCommand::DropProcedure { .. } => Some("DROP PROCEDURE"),
+        WriteCommand::AlterProcedure { .. } | WriteCommand::AlterProcedureV2 { .. } => {
+            Some("ALTER PROCEDURE")
+        }
+        WriteCommand::CreateFunctionV2 { .. } => Some("CREATE FUNCTION"),
+        WriteCommand::DropFunction { .. } => Some("DROP FUNCTION"),
+        WriteCommand::AlterFunctionV2 { .. } => Some("ALTER FUNCTION"),
+        WriteCommand::CreateEventV4 { .. } => Some("CREATE EVENT"),
+        WriteCommand::DropEvent { .. } => Some("DROP EVENT"),
+        WriteCommand::AlterEventV4 { .. } | WriteCommand::AlterEventV7 { .. } => {
+            Some("ALTER EVENT")
+        }
+        WriteCommand::RenameEventV6 { .. } | WriteCommand::RenameEventV8 { .. } => {
+            Some("RENAME EVENT")
+        }
+        WriteCommand::FinishEventV5 { .. } => Some("FINISH EVENT"),
+        WriteCommand::XaCommitMarker { .. } => Some("XA COMMIT"),
+        WriteCommand::CleanupOrphanStorage | WriteCommand::ForeignKeyChecksDisabled => None,
+        _ => None,
+    }
+}
+
 struct PreparedWrite {
     tx_id: u64,
     commands: Vec<WriteCommand>,
@@ -6625,7 +7205,6 @@ struct CommitShard {
     index: usize,
     wal_writer: Arc<parking_lot::Mutex<WalWriter>>,
     commit_state: parking_lot::Mutex<CommitState>,
-    commit_notify: Notify,
     checkpoint_state: parking_lot::Mutex<CommitCheckpointState>,
     group_commit_window: Duration,
     databases: Arc<RwLock<HashMap<String, Arc<Database>>>>,
@@ -6881,8 +7460,6 @@ impl CommitShard {
                 (true, state.generation)
             }
         };
-        self.commit_notify.notify_one();
-
         if became_leader {
             let mut guard = LeaderGuard {
                 state: &self.commit_state,
@@ -7161,6 +7738,22 @@ pub struct StorageStatsSnapshot {
     pub wal_sync_micros: u64,
     pub apply_micros: u64,
     pub checkpoint_micros: u64,
+    pub olap_pages_scanned: u64,
+    pub olap_pages_pruned: u64,
+    pub olap_rows_pruned: u64,
+}
+
+impl StorageStatsSnapshot {
+    /// Share of candidate pages that zone maps removed from a filtered scan.
+    /// Zero before any filtered scan; never divide-by-zero.
+    pub fn olap_prune_ratio(&self) -> f64 {
+        let total = self.olap_pages_scanned + self.olap_pages_pruned;
+        if total == 0 {
+            0.0
+        } else {
+            self.olap_pages_pruned as f64 / total as f64
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -7254,6 +7847,9 @@ pub struct StorageEngineManager {
     /// and a single backup/PITR stream (see AGENTS.md: backup needs a single
     /// ordered WAL, which sharding would otherwise fragment per shard).
     global_lsn: Arc<AtomicU64>,
+    /// Set once catalog load and WAL replay complete. Readiness probes must not
+    /// report ready while recovery is still running.
+    ready: Arc<AtomicBool>,
 }
 
 impl Drop for StorageEngineManager {
@@ -7379,7 +7975,6 @@ impl StorageEngineManager {
                     active: false,
                     generation: 0,
                 }),
-                commit_notify: Notify::new(),
                 checkpoint_state: parking_lot::Mutex::new(CommitCheckpointState::default()),
                 group_commit_window,
                 databases: databases.clone(),
@@ -7409,6 +8004,7 @@ impl StorageEngineManager {
             stats,
             commit_coordination,
             global_lsn,
+            ready: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -7452,7 +8048,13 @@ impl StorageEngineManager {
             "Storage engine initialized with {} databases",
             self.databases.read().len()
         );
+        self.ready.store(true, Ordering::Release);
         Ok(())
+    }
+
+    /// True after catalog load and WAL replay have completed.
+    pub fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::Acquire)
     }
 
     async fn cleanup_stale_temporary_tables(&self) -> Result<()> {
@@ -7983,6 +8585,9 @@ impl StorageEngineManager {
             wal_sync_micros: self.stats.wal_sync_micros.load(Ordering::Relaxed),
             apply_micros: self.stats.apply_micros.load(Ordering::Relaxed),
             checkpoint_micros: self.stats.checkpoint_micros.load(Ordering::Relaxed),
+            olap_pages_scanned: self.buffer_pool.olap_counters().0,
+            olap_pages_pruned: self.buffer_pool.olap_counters().1,
+            olap_rows_pruned: self.buffer_pool.olap_counters().2,
         }
     }
 
@@ -13344,6 +13949,62 @@ mod tests {
         assert!(decode_wal_group(&buf).unwrap().committed_unix_ms.is_some());
     }
 
+    #[test]
+    fn buffer_pool_namespaces_are_isolated_and_eviction_is_bounded() {
+        let pool = BufferPool::new(1024, "2K");
+        let mut a = Page::new(0, PageType::Data, 1024);
+        a.header.lsn = 1;
+        let mut b = Page::new(0, PageType::Data, 1024);
+        b.header.lsn = 2;
+        let mut c = Page::new(1, PageType::Data, 1024);
+        c.header.lsn = 3;
+        pool.insert_table_page("a", a);
+        pool.insert_table_page("b", b);
+        assert_eq!(pool.page_count(), 2);
+        pool.insert_table_page("b", c);
+        assert_eq!(pool.page_count(), 2);
+        assert!(pool.get_table_page("a", 0).is_none());
+        assert!(pool.get_table_page("b", 0).is_some());
+        assert!(pool.get_table_page("b", 1).is_some());
+        pool.clear_namespace("b");
+        assert_eq!(pool.page_count(), 0);
+    }
+
+    #[test]
+    fn wal_group_decodes_into_cdc_changes() {
+        let mut row = Row::new();
+        row.push("id", 1u64.to_le_bytes().to_vec());
+        let id_predicate = RowPredicate::Eq("id".to_string(), 1u64.to_le_bytes().to_vec());
+        let commands = vec![
+            WriteCommand::Insert {
+                database: "db".to_string(),
+                table: "t".to_string(),
+                row,
+            },
+            WriteCommand::Delete {
+                database: "db".to_string(),
+                table: "t".to_string(),
+                filter: Some(id_predicate),
+            },
+        ];
+        let mut buf = Vec::new();
+        let slices: Vec<&[WriteCommand]> = vec![commands.as_slice()];
+        encode_wal_group_into(&mut buf, &slices).unwrap();
+        let changes = decode_wal_group_changes(&buf).unwrap();
+        assert_eq!(changes.len(), 2);
+        assert_eq!(changes[0].operation, mydb_wal::WalChangeOp::Insert);
+        assert_eq!(changes[0].table, "t");
+        assert_eq!(
+            changes[0].after,
+            vec![("id".to_string(), 1u64.to_le_bytes().to_vec())]
+        );
+        assert_eq!(changes[1].operation, mydb_wal::WalChangeOp::Delete);
+        assert_eq!(
+            changes[1].before,
+            vec![("id".to_string(), 1u64.to_le_bytes().to_vec())]
+        );
+    }
+
     #[tokio::test]
     async fn committed_batch_is_redone_once_and_marked_applied() {
         let (_temp, manager) = recovery_manager().await;
@@ -15170,13 +15831,77 @@ mod tests {
         let reloaded: TableSchema =
             serde_json::from_slice(&serde_json::to_vec(&persisted).unwrap()).unwrap();
         assert_eq!(auto_increment_column(&reloaded).as_deref(), Some("id"));
-        assert_eq!(
-            manager
-                .execute_write(insert_command("ids", "0"))
-                .await
-                .unwrap()
-                .last_insert_id,
-            1
+    }
+
+    #[tokio::test]
+    async fn zone_maps_prune_range_scans_and_invalidate_on_rewrite() {
+        let (_temp, manager) = recovery_manager().await;
+        let mut commands = Vec::new();
+        for id in 1..=900_u64 {
+            let mut row = Row::new();
+            row.push("id", id.to_string().into_bytes());
+            row.push(
+                "value",
+                format!("pad-{id:04}-{}", "x".repeat(48)).into_bytes(),
+            );
+            commands.push(WriteCommand::Insert {
+                database: "game".into(),
+                table: "a".into(),
+                row,
+            });
+        }
+        manager.execute_batch(commands).await.unwrap();
+        manager.flush().unwrap();
+
+        let between = RowPredicate::Between(
+            "id".into(),
+            b"100".to_vec(),
+            b"199".to_vec(),
         );
+        let rows = manager
+            .scan_table_filtered("game", "a", Some(&between))
+            .unwrap();
+        assert_eq!(rows.len(), 100, "range scan must stay exact");
+        assert!(
+            rows.iter().all(|row| row
+                .get("id")
+                .and_then(|value| std::str::from_utf8(value).ok())
+                .and_then(|value| value.parse::<u64>().ok())
+                .is_some_and(|id| (100..=199).contains(&id))),
+            "zone pruning must never leak rows outside the range"
+        );
+        let pruned_after_first = manager.stats().olap_pages_pruned;
+        assert!(
+            pruned_after_first > 0,
+            "checkpoint must publish zone maps for filtered scans"
+        );
+
+        let before = manager.stats().olap_pages_pruned;
+        let less = RowPredicate::Less("id".into(), b"50".to_vec());
+        let rows = manager
+            .scan_table_filtered("game", "a", Some(&less))
+            .unwrap();
+        assert_eq!(rows.len(), 49);
+        assert!(
+            manager.stats().olap_pages_pruned > before,
+            "a cached zone map must prune pages without rebuilding"
+        );
+
+        manager
+            .execute_write(WriteCommand::Update {
+                database: "game".into(),
+                table: "a".into(),
+                filter: Some(RowPredicate::Eq("id".into(), b"1".to_vec())),
+                assignments: vec![("value".into(), Some(b"zzz-updated".to_vec()))],
+            })
+            .await
+            .unwrap();
+        manager.flush().unwrap();
+        let updated = RowPredicate::GreaterOrEq("value".into(), b"zzz".to_vec());
+        let rows = manager
+            .scan_table_filtered("game", "a", Some(&updated))
+            .unwrap();
+        assert_eq!(rows.len(), 1, "rewrite must invalidate stale zone maps");
+        assert_eq!(rows[0].get("value"), Some(b"zzz-updated".as_slice()));
     }
 }

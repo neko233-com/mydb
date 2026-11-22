@@ -13,7 +13,7 @@ mydb-wire = { path = "../mydb-wire" }
 mydb-config = { path = "../mydb-config" }
 mydb-storage = { path = "../mydb-storage" }
 mydb-wal = { path = "../mydb-wal" }
-mydb-transaction = { path = "../mydb-transaction" }
+mydb-cdc = { path = "../mydb-cdc" }
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -32,6 +32,7 @@ tokio-rustls.workspace = true
 rustls-pemfile.workspace = true
 reqwest.workspace = true
 sha2.workspace = true
+base64.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-service.workspace = true

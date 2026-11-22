@@ -99,6 +99,19 @@ GET  /api/v1/backup/list        # 查看备份列表
 POST /api/v1/backup/restore     # 恢复备份
 DELETE /api/v1/backup/:id       # 删除备份
 ```
+`backup.auto_backup_interval`（小时，0=关闭）开启后由后台任务自动执行全量/增量备份并按 `backup.max_backups` 保留（裁剪时保持父链完整）。
+
+#### CDC 变更捕获（额外扩展，默认关闭）
+```
+GET  /api/v1/cdc/status         # 开关状态、游标 LSN、计数、最近错误
+POST /api/v1/cdc/enable         # 动态开启（无需重启）
+POST /api/v1/cdc/disable        # 动态关闭
+POST /api/v1/cdc/reload         # 仅重载 CDC 配置段
+GET  /api/v1/cdc/changes?since_lsn=0&limit=100  # 读取变更事件
+GET  /api/v1/cdc/checkpoint                     # 消费端确认 LSN 与 lag
+POST /api/v1/cdc/checkpoint                     # 提交消费确认 { "lsn": N }
+```
+CDC 段同样随 `POST /api/v1/config/reload` 热重载；事件落 `<data_dir>/cdc`，游标持久化在 `cursor.json`，消费确认持久化在 `checkpoint.json`。它不是 MySQL binlog 兼容实现；迁移 TiDB 见 `docs/zh/tidb-migration.md`。
 
 #### 内存管理
 ```
@@ -199,6 +212,11 @@ memory:
 - 实时内存使用率
 - Buffer Pool 命中率
 - 内存分配统计
+- Prometheus `/metrics`（只读凭据）
+- OpenTelemetry OTLP/HTTP：指标、慢查询 trace、Basic/Bearer 鉴权、热开关
+- OLAP 页级 zone map：`mydb_olap_pages_scanned/pruned/rows_pruned`
+- CDC：`last_lsn`、`checkpoint_lsn`、`lag_lsn`
+- 探针：`/healthz`、`/readyz`
 
 ---
 
@@ -266,6 +284,11 @@ memory:
 - [x] 压力测试工具
 - [x] 故障注入测试
 - [x] 文档完善
+- [x] 健康/就绪探针（`/healthz`、`/readyz`）
+- [x] OpenTelemetry OTLP/HTTP（指标 + trace + Basic/Bearer 鉴权）
+- [x] OLAP 页级 zone map（保守谓词裁剪 + 指标）
+- [x] CDC 消费断点与 TiDB 迁移手册
+- [ ] 列裁剪、向量化聚合、并行页扫描
 - [ ] 社区建设
 
 ---

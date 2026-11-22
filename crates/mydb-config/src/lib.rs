@@ -26,6 +26,8 @@ pub struct ServerConfig {
     pub agent: AgentSection,
     #[serde(default)]
     pub observability: ObservabilitySection,
+    #[serde(default)]
+    pub cdc: CdcSection,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -183,6 +185,39 @@ pub struct ObservabilitySection {
     pub otlp: OtlpSection,
 }
 
+/// Upstream authenticates collectors that are not on a trusted network.
+/// `basic` uses username/password; `bearer` uses a token. Secrets are never
+/// echoed by the admin API.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct OtlpAuthSection {
+    /// `none` (default), `bearer` or `basic`.
+    #[serde(default)]
+    pub method: String,
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub password: String,
+    /// Read the password from this file instead of the YAML value. The server
+    /// resolves it on load and never persists the content.
+    #[serde(default)]
+    pub password_file: Option<PathBuf>,
+    #[serde(default)]
+    pub token: String,
+}
+
+impl OtlpAuthSection {
+    /// An empty YAML value means no authentication, which keeps old configs
+    /// working without an explicit `method: none`.
+    pub fn normalized_method(&self) -> &str {
+        let method = self.method.trim();
+        if method.is_empty() {
+            "none"
+        } else {
+            method
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OtlpSection {
     /// OTLP/HTTP JSON export. Prometheus `/metrics` remains available even
@@ -201,6 +236,10 @@ pub struct OtlpSection {
     pub service_name: String,
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
+    /// Upstream authentication. When both `headers.Authorization` and this
+    /// section are set, the explicit header wins.
+    #[serde(default)]
+    pub auth: OtlpAuthSection,
     /// Export spans for slow/error SQL captured by the monitor. There is no
     /// per-statement instrumentation cost on the query hot path.
     #[serde(default = "default_true")]
@@ -209,6 +248,49 @@ pub struct OtlpSection {
     /// default and export the digest instead.
     #[serde(default)]
     pub include_sql: bool,
+}
+
+/// Change Data Capture. An extension over MySQL that stays off by default so
+/// the write hot path pays no cost until explicitly enabled. Every field is
+/// hot-reloadable through the admin config API; only `data_dir` (storage) is
+/// fixed at boot because it locates the WAL stream that is tailed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CdcSection {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Output directory. Defaults to `<data_dir>/cdc` when unset.
+    #[serde(default)]
+    pub dir: Option<PathBuf>,
+    #[serde(default = "default_cdc_file_prefix")]
+    pub file_prefix: String,
+    #[serde(default = "default_cdc_max_file_size")]
+    pub max_file_size: String,
+    #[serde(default = "default_cdc_max_files")]
+    pub max_files: u32,
+    /// How often the read-side WAL tailer scans for new committed groups.
+    #[serde(default = "default_cdc_poll_interval_ms")]
+    pub poll_interval_ms: u64,
+    /// Emit at most one NDJSON line per this many committed groups. `1` emits all.
+    #[serde(default = "default_cdc_flush_every")]
+    pub flush_every: u64,
+    #[serde(default = "default_true")]
+    pub include_before: bool,
+    #[serde(default = "default_true")]
+    pub include_ddl: bool,
+    #[serde(default = "default_true")]
+    pub include_row_images: bool,
+    #[serde(default)]
+    pub filters: CdcFilters,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct CdcFilters {
+    /// Empty means all databases.
+    #[serde(default)]
+    pub databases: Vec<String>,
+    /// Empty means all tables. A table may be `db.table` or just `table`.
+    #[serde(default)]
+    pub tables: Vec<String>,
 }
 
 // Default values
@@ -324,6 +406,21 @@ fn default_otlp_service_name() -> String {
 fn default_max_load_data_size() -> usize {
     1024 * 1024 * 1024
 }
+fn default_cdc_file_prefix() -> String {
+    "events".to_string()
+}
+fn default_cdc_max_file_size() -> String {
+    "128M".to_string()
+}
+fn default_cdc_max_files() -> u32 {
+    10
+}
+fn default_cdc_poll_interval_ms() -> u64 {
+    500
+}
+fn default_cdc_flush_every() -> u64 {
+    1
+}
 
 impl Default for ServerSection {
     fn default() -> Self {
@@ -436,8 +533,27 @@ impl Default for OtlpSection {
             timeout_secs: default_otlp_timeout_secs(),
             service_name: default_otlp_service_name(),
             headers: BTreeMap::new(),
+            auth: OtlpAuthSection::default(),
             export_traces: true,
             include_sql: false,
+        }
+    }
+}
+
+impl Default for CdcSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            dir: None,
+            file_prefix: default_cdc_file_prefix(),
+            max_file_size: default_cdc_max_file_size(),
+            max_files: default_cdc_max_files(),
+            poll_interval_ms: default_cdc_poll_interval_ms(),
+            flush_every: default_cdc_flush_every(),
+            include_before: true,
+            include_ddl: true,
+            include_row_images: true,
+            filters: CdcFilters::default(),
         }
     }
 }
@@ -508,6 +624,18 @@ impl ServerConfig {
         if let Ok(value) = std::env::var("MYDB_OTLP_ENDPOINT") {
             self.observability.otlp.endpoint = value;
         }
+        if let Ok(value) = std::env::var("MYDB_OTLP_AUTH_METHOD") {
+            self.observability.otlp.auth.method = value;
+        }
+        if let Ok(value) = std::env::var("MYDB_OTLP_USERNAME") {
+            self.observability.otlp.auth.username = value;
+        }
+        if let Some(value) = secret_from_env("MYDB_OTLP_PASSWORD")? {
+            self.observability.otlp.auth.password = value;
+        }
+        if let Some(value) = secret_from_env("MYDB_OTLP_TOKEN")? {
+            self.observability.otlp.auth.token = value;
+        }
         if let Ok(value) = std::env::var("MYDB_METRICS_TOKEN_FILE") {
             self.observability.metrics_token_file = Some(PathBuf::from(value));
         }
@@ -528,6 +656,18 @@ impl ServerConfig {
                 value.to_ascii_lowercase().as_str(),
                 "1" | "true" | "on" | "yes"
             );
+        }
+        if let Ok(value) = std::env::var("MYDB_CDC_ENABLED") {
+            self.cdc.enabled = matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "on" | "yes"
+            );
+        }
+        if let Ok(value) = std::env::var("MYDB_CDC_DIR") {
+            self.cdc.dir = Some(PathBuf::from(value));
+        }
+        if let Ok(value) = std::env::var("MYDB_CDC_POLL_INTERVAL_MS") {
+            self.cdc.poll_interval_ms = value.parse()?;
         }
         Ok(())
     }
@@ -652,5 +792,28 @@ mod tests {
             serde_yaml::from_str(include_str!("../../../configs/production.yaml")).unwrap();
         assert!(production.agent.slow_query_log);
         assert_eq!(production.observability.otlp.service_name, "mydb");
+    }
+
+    #[test]
+    fn cdc_is_disabled_by_default() {
+        let config = ServerConfig::default();
+        assert!(!config.cdc.enabled);
+        assert_eq!(config.cdc.file_prefix, "events");
+        assert_eq!(config.cdc.poll_interval_ms, 500);
+        assert_eq!(config.cdc.flush_every, 1);
+        assert!(config.cdc.include_before);
+        assert!(config.cdc.filters.databases.is_empty());
+    }
+
+    #[test]
+    fn cdc_section_parses_from_yaml() {
+        let config: ServerConfig = serde_yaml::from_str(
+            "cdc:\n  enabled: true\n  poll_interval_ms: 100\n  filters:\n    tables: [db.t1]\n",
+        )
+        .unwrap();
+        assert!(config.cdc.enabled);
+        assert_eq!(config.cdc.poll_interval_ms, 100);
+        assert_eq!(config.cdc.filters.tables, vec!["db.t1"]);
+        assert_eq!(config.cdc.max_files, 10);
     }
 }

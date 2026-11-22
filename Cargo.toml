@@ -9,6 +9,7 @@ members = [
     "crates/mydb-transaction",
     "crates/mydb-config",
     "crates/mydb-wal",
+    "crates/mydb-cdc",
     "crates/mydb-migrate",
     "crates/mydb-dump",
     "crates/mydb-bench",
@@ -16,7 +17,7 @@ members = [
 exclude = ["vendor/opensrv-mysql"]
 
 [workspace.package]
-version = "0.1.37"
+version = "0.1.38"
 edition = "2021"
 license = "MIT"
 authors = ["neko233"]
@@ -36,7 +37,6 @@ byteorder = "1"
 sha2 = "0.10"
 rand = "0.8"
 parking_lot = "0.12"
-dashmap = "5"
 arc-swap = "1"
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = { version = "0.10.4", features = ["case-insensitive"] }
@@ -44,8 +44,6 @@ uuid = { version = "1", features = ["v1", "v4"] }
 clap = { version = "4", features = ["derive"] }
 toml = "0.8"
 dirs = "5"
-indicatif = "0.17"
-console = "0.15"
 tempfile = "3"
 async-trait = "0.1"
 opensrv-mysql = { path = "vendor/opensrv-mysql", version = "0.7", default-features = false, features = ["tls"] }

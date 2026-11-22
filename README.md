@@ -177,15 +177,15 @@ cargo build --release
 
 # 正式包只包含 server/cli/mydb/migrate/dump、配置、安装脚本和文档；
 # mydb-bench、测试结果与 target/bench 不进入发布包
-.\scripts\build-release.ps1 -Version "0.1.37"
+.\scripts\build-release.ps1 -Version "0.1.38"
 # 发布包同时生成同名 `.sha256` 校验文件；发布脚本默认只构建不上传，必须显式加 `-ConfirmPublish`，并在交互提示中输入 `PUBLISH v<version>` 才会创建 GitHub tag/release；脚本会拒绝覆盖已存在的 Release。
 # 日常开发在 main。已发布版本用 tag 记录，不保留长期发布分支。
 
 ```powershell
 # 仅构建/打包候选物（推荐先做这一步）
-.\scripts\build-release.ps1 -Version "0.1.37"
+.\scripts\build-release.ps1 -Version "0.1.38"
 # 最终发布：仍需人工输入精确确认文本
-.\scripts\build-release.ps1 -Version "0.1.37" -ConfirmPublish
+.\scripts\build-release.ps1 -Version "0.1.38" -ConfirmPublish
 ```
 
 # 安装到系统
@@ -351,7 +351,7 @@ Metrics233 / Grafana 原生安全接入：使用专用只读 `/metrics` 凭据�
 P95/P99、锁、WAL、审计和安全配置监控。MetricsPanel233 可自动生成仪表盘与持续告警；
 Grafana 通过 Prometheus 数据源接入。公网仅暴露 HTTPS `/metrics`，管理 API 保持 loopback。
 配置、权限边界与示例见 [接入指南](docs/zh/metrics-panel.md) 和
-[Grafana dashboard](examples/monitoring/grafana-mydb.json)。该接入需要 `0.1.37` 及以上；发布及平台验收记录见 [CheckList.md](CheckList.md)。
+[Grafana dashboard](examples/monitoring/grafana-mydb.json)。该接入需要 `0.1.38` 及以上；发布及平台验收记录见 [CheckList.md](CheckList.md)。
 
 ### Prometheus 指标
 
@@ -367,6 +367,50 @@ curl --config /path/to/private-metrics.curl http://127.0.0.1:4306/metrics
 - WAL fsync 延迟、Group Commit 批次大小
 - Checkpoint 耗时、存储页使用量
 - 错误率、死锁次数
+- OLAP 页裁剪：`mydb_olap_pages_scanned_total`、`mydb_olap_pages_pruned_total`、`mydb_olap_rows_pruned_total`
+- CDC：`mydb_cdc_enabled`、`mydb_cdc_last_lsn`、`mydb_cdc_checkpoint_lsn`、`mydb_cdc_lag_lsn`
+
+### OpenTelemetry（OTLP/HTTP）
+
+`observability.otlp` 以标准 OTLP/HTTP JSON 导出指标与慢查询 trace，默认关闭；关闭时不采集快照。
+管理端点：
+
+```bash
+# 采集器鉴权状态（不含密码/令牌）：GET /api/v1/observability/otlp
+curl -H "Authorization: Bearer $MYDB_ADMIN_TOKEN" http://127.0.0.1:4306/api/v1/observability/otlp
+```
+
+生产配置要点：
+- `auth.method: basic` 使用 `username` + `password`；密码建议来自 `MYDB_OTLP_PASSWORD`、
+  `MYDB_OTLP_PASSWORD_FILE` 或 `password_file`，不要把明文密码写入 YAML。
+- `auth.method: bearer` 使用 `token`（可用 `MYDB_OTLP_TOKEN`）。
+- 显式 `headers.Authorization` 与 `auth` 二选一；非 loopback 端点带凭据时必须 HTTPS。
+- `enabled` 可热重载，无需重启；`/api/v1/status` 同时返回导出成功/失败计数与最近错误。
+
+### OLAP 页级 zone map
+
+MyDB 仍是行存、单机数据库，不宣称列存引擎或向量化执行。本版在行存页上增加
+**页级 min/max/NULL zone map**：
+
+- 每页按列记录非 NULL 最小/最大值和 NULL 计数，按表 schema generation 缓存；
+- `WHERE` 的 `=/IN/</<=/>/>=/BETWEEN/AND/OR/IS NULL/IS NOT NULL` 可跳过不可能命中的页；
+- 只做保守裁剪：字符串按 MySQL 排序规则比较，无法判定时一律扫描，绝不漏行；
+- 页在 checkpoint/重写时重建 zone map，更新后旧缓存失效；
+- 通过 `mydb_olap_pages_pruned_total` / `rows_pruned` 可直接观测收益。
+
+列裁剪、向量化聚合、并行页扫描仍是后续迭代项，不把当前实现表述为“OLAP 已全面完成”。
+
+### CDC → TiDB 迁移
+
+`GET/POST /api/v1/cdc/checkpoint` 提供消费端断点（独立于生产端 `cursor.json`），
+`lag_lsn` 可直接判断追平进度。快照 + CDC 的完整迁移步骤、事件格式与幂等 Loader 要求
+见 [MyDB → TiDB 迁移手册](docs/zh/tidb-migration.md)。
+
+### 健康探针
+
+- `GET /healthz`：进程存活，无鉴权；
+- `GET /readyz`：目录加载与 WAL 回放完成后返回 200，否则 503；
+- 管理 API 请求体上限 4 MiB，避免单机被大 JSON 拖垮。
 
 ### HTTP 管理 API
 
@@ -672,6 +716,18 @@ bash scripts/docker-smoke.sh
 
 性能优化不以关闭 WAL 持久化或弱化恢复语义换取数字。默认 250μs Group Commit 窗口优先并发吞吐，checkpoint 按 1024 个已提交请求触发；不声明未经实测证明的固定倍数。
 
+2026-11-18 新增两项结构性优化：移除提交入队时无人等待的通知；BufferPool 页索引改为按命名空间嵌套（查找不再分配键、`clear_namespace` 降为 O(1)）。两项均通过 Clippy 与全量测试，但**当前环境无 podman/Docker/MySQL，未重跑同机基准**，故不声明新的性能倍数；已知差距仍是并发写 P99 与点读 P50。详见 [性能报告.md](性能报告.md)。
+
+### CDC 变更捕获与增量备份（额外扩展）
+
+CDC 是 MyDB 相对 MySQL 的**额外扩展，默认关闭**，不宣称 MySQL binlog/复制兼容。它作为读侧任务 tail 已提交的 `GroupCommit` WAL 记录，把行级 INSERT/UPSERT/UPDATE/DELETE/DDL 变更写成 NDJSON；不参与写入热路径，关闭时零开销，开启也不会改动 WAL 持久化语义。
+
+- 配置段 `cdc`：`enabled`（默认 `false`）、`dir`（默认 `<data_dir>/cdc`）、`file_prefix`、`max_file_size`、`max_files`、`poll_interval_ms`、`flush_every`、`include_before`、`include_ddl`、`include_row_images`、`filters.databases`、`filters.tables`。
+- 热重载：`POST /api/v1/config/reload` 重读 YAML 即生效；也可 `POST /api/v1/cdc/enable`、`POST /api/v1/cdc/disable` 动态开关，或 `POST /api/v1/cdc/reload` 仅重载 CDC 段。
+- 查询：`GET /api/v1/cdc/status`、`GET /api/v1/cdc/changes?since_lsn=0&limit=100`。
+- 重启安全：`cursor.json` 保存最后 LSN，按 LSN 去重吸收重复/陈旧记录；事件按提交组写入并轮转，行值以 base64 编码避免非 UTF-8 损坏。
+- 增量备份：`backup.auto_backup_interval`（小时，`0` = 关闭）现在会调度自动全量/增量备份，`backup.max_backups` 控制保留数并在裁剪时保留父链；备份元数据包含 `cdc_cursor_lsn` 以便与变更流对账。
+
 ---
 
 ## 📋 验收状态
@@ -701,6 +757,17 @@ bash scripts/docker-smoke.sh
 - ✅ 2026-08-17 Linux Docker Rust 门禁：隔离容器 2 CPU/2 GiB 通过 fmt、workspace Clippy、workspace 全量测试与 release 构建；构建卷已清理
 - ✅ 2026-08-17 Windows 当前源码打包：5 个 release 二进制构建成功，本地 zip 解包完整性与 SHA-256 校验通过；本次 v0.1.35 发布包按同一源码生成
 - ⏳ Ubuntu 24.04 物理性能、macOS 原生验收、大数据压力与生产安全运维验收；宿主真实断电不在开发机执行，单机等价逻辑用 Docker 故障模型覆盖；以 [CheckList.md](CheckList.md) 与 [性能报告.md](性能报告.md) 为准
+
+### v0.1.38 观测与 OLAP 裁剪版
+
+- ✅ OpenTelemetry OTLP/HTTP 原生导出：指标 + 慢查询 trace；Basic（用户名+密码）/ Bearer 鉴权；密钥支持环境变量与文件；管理 API 可查询导出状态且不泄露凭据
+- ✅ OTLP 导出器常驻，`enabled` 支持热重载；关闭时零快照开销；新增 `GET /api/v1/observability/otlp`
+- ✅ OLAP 页级 zone map：min/max/NULL 保守裁剪，范围扫描跳过无关页；新增 `mydb_olap_*` Prometheus/OTLP 指标与回归测试
+- ✅ CDC 消费断点：`GET/POST /api/v1/cdc/checkpoint`、`lag_lsn`；新增 [MyDB → TiDB 迁移手册](docs/zh/tidb-migration.md)
+- ✅ 生产探针：`/healthz`、`/readyz`；管理 API 4 MiB 请求体上限；OTLP 凭据配置校验与脱敏
+- ✅ 依赖更新：`cargo update`，移除未使用的 `dashmap`/`console`/`indicatif` 与部分未使用 crate 依赖
+- ✅ 本机门槛：`cargo test --workspace`、`clippy -D warnings`、release 构建（见下方验收记录）
+- ⏳ 未完成：列裁剪、向量化聚合、并行页扫描；本轮未重跑同机 MySQL 对比基准，不新增性能倍数结论
 
 ### v0.1.36 稳定修复版（发布候选）
 

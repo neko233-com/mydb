@@ -7,7 +7,7 @@ use std::sync::OnceLock;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use axum::extract::{Path as AxumPath, Query as AxumQuery, State};
+use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query as AxumQuery, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
@@ -80,6 +80,7 @@ struct AdminState {
     login_rate_limiter: Arc<parking_lot::Mutex<LoginRateLimiter>>,
     otlp_exporter: observability::OtlpExporter,
     metrics_token: Option<Arc<str>>,
+    cdc: Arc<mydb_cdc::CdcManager>,
 }
 
 #[derive(Debug, Clone)]
@@ -309,21 +310,37 @@ async fn run_server(args: Args, config: mydb_config::ServerConfig) -> Result<()>
         metrics_panel::load_token(config.observability.metrics_token_file.as_deref())?
             .map(Arc::<str>::from);
 
-    let http_listener = bind_http_listener(&config).await?;
+    let cdc = Arc::new(mydb_cdc::CdcManager::new(
+        config.storage.data_dir.clone(),
+        config.cdc.clone(),
+    ));
+    if cdc.is_enabled() {
+        info!(dir = %cdc.status().dir, "CDC enabled");
+    }
+    let (cdc_shutdown, cdc_shutdown_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(mydb_cdc::run_cdc_tailer(
+        cdc.clone(),
+        config.storage.data_dir.join("wal"),
+        cdc_shutdown_rx,
+    ));
 
+    let state = AdminState {
+        storage: storage.clone(),
+        wire_stats: wire_stats.clone(),
+        protocol_config: protocol_config.clone(),
+        config: Arc::new(RwLock::new(config.clone())),
+        config_path: args.config.clone(),
+        started: Instant::now(),
+        sessions: sessions.clone(),
+        login_rate_limiter,
+        otlp_exporter: otlp_exporter.clone(),
+        metrics_token,
+        cdc: cdc.clone(),
+    };
+
+    let http_listener = bind_http_listener(&config).await?;
     if let Some(listener) = http_listener {
-        let state = AdminState {
-            storage: storage.clone(),
-            wire_stats: wire_stats.clone(),
-            protocol_config: protocol_config.clone(),
-            config: Arc::new(RwLock::new(config.clone())),
-            config_path: args.config.clone(),
-            started: Instant::now(),
-            sessions: sessions.clone(),
-            login_rate_limiter,
-            otlp_exporter: otlp_exporter.clone(),
-            metrics_token,
-        };
+        let state = state.clone();
         tokio::spawn(async move {
             if let Err(error) = run_admin_server(listener, state).await {
                 tracing::error!("HTTP management server stopped: {}", error);
@@ -331,23 +348,32 @@ async fn run_server(args: Args, config: mydb_config::ServerConfig) -> Result<()>
         });
     }
 
+    let (auto_backup_shutdown, auto_backup_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(run_auto_backup(state, auto_backup_rx));
+
     let (exporter_shutdown, exporter_shutdown_rx) = tokio::sync::watch::channel(false);
     if config.observability.otlp.enabled {
         info!(
             endpoint = %config.observability.otlp.endpoint,
             interval_secs = config.observability.otlp.interval_secs,
+            auth = config.observability.otlp.auth.normalized_method(),
             "OTLP exporter enabled"
         );
-        tokio::spawn(observability::run_otlp_exporter(
-            otlp_exporter.clone(),
-            wire_stats.clone(),
-            storage.clone(),
-            protocol_config.read().audit_log.clone(),
-            config.server.host.clone(),
-            config.server.port,
-            exporter_shutdown_rx,
-        ));
     }
+    // The loop stays resident while disabled so `POST /api/v1/config/reload`
+    // and `/api/v1/observability/otlp` can toggle export without a restart.
+    tokio::spawn(observability::run_otlp_exporter(
+        observability::OtlpExporterContext {
+            exporter: otlp_exporter.clone(),
+            wire_stats: wire_stats.clone(),
+            storage: storage.clone(),
+            audit_log: protocol_config.read().audit_log.clone(),
+            cdc: cdc.clone(),
+            server_host: config.server.host.clone(),
+            server_port: config.server.port,
+        },
+        exporter_shutdown_rx,
+    ));
 
     // Start TCP listener
     let listener =
@@ -420,6 +446,8 @@ async fn run_server(args: Args, config: mydb_config::ServerConfig) -> Result<()>
 
     let _ = scheduler_stop.send(true);
     let _ = exporter_shutdown.send(true);
+    let _ = cdc_shutdown.send(true);
+    let _ = auto_backup_shutdown.send(true);
     if let Err(error) = scheduler.await {
         tracing::error!("EVENT scheduler task failed while stopping: {}", error);
     }
@@ -453,8 +481,12 @@ fn validate_runtime_security(config: &mydb_config::ServerConfig) -> Result<()> {
             anyhow::bail!("MySQL and HTTP administrator secrets must be different");
         }
     }
-    if config.observability.otlp.enabled {
-        let endpoint = reqwest::Url::parse(&config.observability.otlp.endpoint)
+    if config.observability.otlp.enabled
+        || !config.observability.otlp.headers.is_empty()
+        || config.observability.otlp.auth.normalized_method() != "none"
+    {
+        let otlp = &config.observability.otlp;
+        let endpoint = reqwest::Url::parse(&otlp.endpoint)
             .map_err(|_| anyhow::anyhow!("invalid OTLP endpoint"))?;
         anyhow::ensure!(
             matches!(endpoint.scheme(), "http" | "https")
@@ -464,6 +496,60 @@ fn validate_runtime_security(config: &mydb_config::ServerConfig) -> Result<()> {
                 && endpoint.fragment().is_none(),
             "OTLP endpoint must be HTTP(S) without credentials, query or fragment"
         );
+        anyhow::ensure!(otlp.interval_secs >= 1, "otlp.interval_secs must be >= 1");
+        anyhow::ensure!(otlp.timeout_secs >= 1, "otlp.timeout_secs must be >= 1");
+        anyhow::ensure!(
+            !otlp.service_name.trim().is_empty(),
+            "otlp.service_name must not be empty"
+        );
+
+        let method = otlp.auth.normalized_method().to_ascii_lowercase();
+        let auth_configured = match method.as_str() {
+            "none" => false,
+            "basic" => {
+                anyhow::ensure!(
+                    !otlp.auth.username.trim().is_empty(),
+                    "otlp.auth.username is required for basic authentication"
+                );
+                anyhow::ensure!(
+                    otlp.auth.password.is_empty() != otlp.auth.password_file.is_none(),
+                    "set either otlp.auth.password or otlp.auth.password_file for basic authentication, not both"
+                );
+                let password = match otlp.auth.password_file.as_ref() {
+                    Some(path) => {
+                        let content = std::fs::read_to_string(path).with_context(|| {
+                            format!("read otlp.auth.password_file {}", path.display())
+                        })?;
+                        content.trim_end_matches(['\r', '\n']).to_string()
+                    }
+                    None => otlp.auth.password.clone(),
+                };
+                anyhow::ensure!(
+                    !password.is_empty(),
+                    "basic authentication requires a non-empty password"
+                );
+                true
+            }
+            "bearer" => {
+                anyhow::ensure!(
+                    !otlp.auth.token.trim().is_empty(),
+                    "otlp.auth.token is required for bearer authentication"
+                );
+                true
+            }
+            other => anyhow::bail!(
+                "unsupported otlp.auth.method '{other}'; use none, basic or bearer"
+            ),
+        };
+        anyhow::ensure!(
+            !auth_configured
+                || !otlp
+                    .headers
+                    .keys()
+                    .any(|name| name.eq_ignore_ascii_case("authorization")),
+            "set either otlp.auth or an explicit Authorization header, not both"
+        );
+
         let loopback = endpoint.host_str().is_some_and(|host| {
             host == "localhost"
                 || host
@@ -471,10 +557,9 @@ fn validate_runtime_security(config: &mydb_config::ServerConfig) -> Result<()> {
                     .parse::<std::net::IpAddr>()
                     .is_ok_and(|address| address.is_loopback())
         });
+        let has_credentials = auth_configured || !otlp.headers.is_empty();
         anyhow::ensure!(
-            config.observability.otlp.headers.is_empty()
-                || endpoint.scheme() == "https"
-                || loopback,
+            !has_credentials || endpoint.scheme() == "https" || loopback,
             "OTLP credentials require HTTPS except on loopback"
         );
     }
@@ -616,11 +701,20 @@ async fn run_admin_server(listener: tokio::net::TcpListener, state: AdminState) 
         .route("/admin", get(admin_ui))
         .route("/admin/doc", get(admin_doc))
         .route("/metrics", get(metrics))
+        .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
         .route("/api/v1/auth/login", post(auth_login))
         .route("/api/v1/auth/logout", post(auth_logout))
+        .route("/api/v1/observability/otlp", get(observability_otlp))
         .route("/api/v1/status", get(status))
         .route("/api/v1/config", get(get_config).put(put_config))
         .route("/api/v1/config/reload", post(reload_config))
+    .route("/api/v1/cdc/status", get(cdc_status))
+    .route("/api/v1/cdc/enable", post(cdc_enable))
+    .route("/api/v1/cdc/disable", post(cdc_disable))
+    .route("/api/v1/cdc/reload", post(cdc_reload))
+    .route("/api/v1/cdc/changes", get(cdc_changes))
+    .route("/api/v1/cdc/checkpoint", get(cdc_checkpoint_get).post(cdc_checkpoint_set))
         .route("/api/v1/memory/stats", get(memory_stats))
         .route("/api/v1/memory/flush", post(memory_flush))
         .route("/api/v1/storage/inventory", get(storage_inventory))
@@ -638,6 +732,7 @@ async fn run_admin_server(listener: tokio::net::TcpListener, state: AdminState) 
         .route("/api/v1/agent/diagnose", post(agent_diagnose))
         .route("/api/v1/agent/sql", post(agent_sql_debug))
         .route("/api/v1/sql/query", post(sql_query))
+        .layer(DefaultBodyLimit::max(4 * 1024 * 1024))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
     let address = listener.local_addr()?;
@@ -973,6 +1068,11 @@ async fn metrics(State(state): State<AdminState>, headers: HeaderMap) -> Respons
             state.wire_stats.statement_digest_dropped(),
         )
     );
+    let cdc_status = state.cdc.is_enabled().then(|| state.cdc.status());
+    let body = format!(
+        "{body}{}",
+        observability::prometheus_olap_cdc_metrics(&storage, cdc_status.as_ref())
+    );
     let body = format!(
         "{body}{}",
         metrics_panel::security_metrics(
@@ -995,6 +1095,25 @@ async fn metrics(State(state): State<AdminState>, headers: HeaderMap) -> Respons
         body,
     )
         .into_response()
+}
+
+/// Liveness probe. It proves the HTTP task is serving; it deliberately says
+/// nothing about recovery, disk or replication state.
+async fn healthz() -> impl IntoResponse {
+    (StatusCode::OK, Json(json!({"status": "ok"})))
+}
+
+/// Readiness probe. MyDB reports ready only after catalog load and WAL replay
+/// completed; otherwise orchestrators should not route traffic to this process.
+async fn readyz(State(state): State<AdminState>) -> impl IntoResponse {
+    if state.storage.is_ready() {
+        (StatusCode::OK, Json(json!({"ready": true})))
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"ready": false, "reason": "storage recovery in progress"})),
+        )
+    }
 }
 
 async fn status(
@@ -1048,20 +1167,23 @@ async fn status(
             "written": snapshot.written,
             "dropped": snapshot.dropped,
         })),
-        "otlp": {
-            "enabled": otlp.enabled,
-            "endpoint": otlp.endpoint,
-            "interval_seconds": otlp.interval_seconds,
-            "service_name": otlp.service_name,
-            "export_traces": otlp.export_traces,
-            "include_sql": otlp.include_sql,
-            "metric_exports": otlp.metric_exports,
-            "span_exports": otlp.span_exports,
-            "failures": otlp.failures,
-            "last_success_unix_ms": otlp.last_success_unix_ms,
-            "last_error": otlp.last_error,
-        }
+        "olap": {
+            "pages_scanned": storage.olap_pages_scanned,
+            "pages_pruned": storage.olap_pages_pruned,
+            "rows_pruned": storage.olap_rows_pruned,
+            "prune_ratio": storage.olap_prune_ratio(),
+        },
+        "cdc": state.cdc.status(),
+        "otlp": otlp.to_json()
     })))
+}
+
+async fn observability_otlp(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, StatusCode> {
+    authorize(&headers, &state)?;
+    Ok(Json(state.otlp_exporter.status().to_json()))
 }
 
 async fn get_config(
@@ -1103,12 +1225,127 @@ async fn reload_config(
     ))
 }
 
+async fn cdc_status(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, StatusCode> {
+    authorize(&headers, &state)?;
+    Ok(Json(json!(state.cdc.status())))
+}
+
+fn set_cdc_enabled(state: &AdminState, enabled: bool) -> Result<()> {
+    let mut candidate = state.config.read().clone();
+    candidate.cdc.enabled = enabled;
+    state.cdc.apply(candidate.cdc.clone())?;
+    *state.config.write() = candidate;
+    Ok(())
+}
+
+async fn cdc_enable(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, StatusCode> {
+    authorize(&headers, &state)?;
+    set_cdc_enabled(&state, true).map_err(|error| {
+        tracing::warn!("Failed to enable CDC: {error}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    Ok(Json(json!({"enabled": true})))
+}
+
+async fn cdc_disable(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, StatusCode> {
+    authorize(&headers, &state)?;
+    set_cdc_enabled(&state, false).map_err(|error| {
+        tracing::warn!("Failed to disable CDC: {error}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    Ok(Json(json!({"enabled": false})))
+}
+
+async fn cdc_reload(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, StatusCode> {
+    reload_config(State(state), headers).await
+}
+
+#[derive(Deserialize)]
+struct CdcChangesQuery {
+    #[serde(default)]
+    since_lsn: u64,
+    #[serde(default = "default_cdc_changes_limit")]
+    limit: usize,
+}
+
+fn default_cdc_changes_limit() -> usize {
+    100
+}
+
+#[derive(Deserialize)]
+struct CdcCheckpointRequest {
+    lsn: u64,
+}
+
+async fn cdc_checkpoint_get(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, StatusCode> {
+    authorize(&headers, &state)?;
+    let status = state.cdc.status();
+    Ok(Json(json!({
+        "enabled": status.enabled,
+        "last_lsn": status.last_lsn,
+        "checkpoint_lsn": status.checkpoint_lsn,
+        "lag_lsn": status.lag_lsn(),
+    })))
+}
+
+async fn cdc_checkpoint_set(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Json(request): Json<CdcCheckpointRequest>,
+) -> Result<Json<Value>, StatusCode> {
+    authorize(&headers, &state)?;
+    state.cdc.set_checkpoint(request.lsn).map_err(|error| {
+        tracing::warn!("Rejected CDC checkpoint {}: {error}", request.lsn);
+        StatusCode::CONFLICT
+    })?;
+    let status = state.cdc.status();
+    Ok(Json(json!({
+        "checkpoint_lsn": status.checkpoint_lsn,
+        "last_lsn": status.last_lsn,
+        "lag_lsn": status.lag_lsn(),
+    })))
+}
+
+async fn cdc_changes(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    AxumQuery(query): AxumQuery<CdcChangesQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    authorize(&headers, &state)?;
+    let events = state
+        .cdc
+        .read_changes(query.since_lsn, query.limit.min(1000))
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(json!({"events": events})))
+}
+
 fn redacted_config(config: &mydb_config::ServerConfig) -> mydb_config::ServerConfig {
     let mut redacted = config.clone();
     redacted.security.default_password = "<redacted>".to_string();
     redacted.http.admin_password = "<redacted>".to_string();
     for value in redacted.observability.otlp.headers.values_mut() {
         *value = "<redacted>".to_string();
+    }
+    if !redacted.observability.otlp.auth.password.is_empty() {
+        redacted.observability.otlp.auth.password = "<redacted>".to_string();
+    }
+    if !redacted.observability.otlp.auth.token.is_empty() {
+        redacted.observability.otlp.auth.token = "<redacted>".to_string();
     }
     redacted
 }
@@ -1129,6 +1366,14 @@ fn apply_runtime_config(
                 .clone();
         }
     }
+    if candidate.observability.otlp.auth.password == "<redacted>" {
+        candidate.observability.otlp.auth.password =
+            current.observability.otlp.auth.password.clone();
+    }
+    if candidate.observability.otlp.auth.token == "<redacted>" {
+        candidate.observability.otlp.auth.token =
+            current.observability.otlp.auth.token.clone();
+    }
     if candidate.security.default_password == "<redacted>" {
         candidate.security.default_password = current.security.default_password.clone();
     }
@@ -1138,6 +1383,10 @@ fn apply_runtime_config(
     validate_runtime_security(&candidate)?;
     validate_reloadable_config(&current, &candidate)?;
     let protocol = protocol_config_for(&candidate)?;
+    state.cdc.apply(candidate.cdc.clone()).map_err(|error| {
+        tracing::warn!("Rejected runtime CDC configuration: {error}");
+        anyhow::anyhow!("CDC configuration rejected: {error}")
+    })?;
     *state.protocol_config.write() = protocol;
     *state.config.write() = candidate;
     state
@@ -1160,10 +1409,9 @@ fn validate_reloadable_config(
         || current.http.port != candidate.http.port
         || current.http.enabled != candidate.http.enabled
         || current.observability.metrics_token_file != candidate.observability.metrics_token_file
-        || current.observability.otlp.enabled != candidate.observability.otlp.enabled
     {
         anyhow::bail!(
-            "listener, storage, memory, logging, character-set, metrics credential and OTLP enablement settings require a process restart"
+            "listener, storage, memory, logging, character-set and metrics credential settings require a process restart"
         );
     }
     Ok(())
@@ -1304,6 +1552,10 @@ struct BackupMetadata {
     wal_records: u64,
     #[serde(default)]
     wal_bytes: u64,
+    /// CDC cursor at creation time, so an incremental chain can be correlated
+    /// with the change stream. Old backups deserialize as 0.
+    #[serde(default)]
+    cdc_cursor_lsn: u64,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1370,9 +1622,16 @@ async fn backup_incremental(
     if state.storage.data_dir().join(RESTORE_MARKER).exists() {
         return Err(StatusCode::CONFLICT);
     }
+    let base_id = request.and_then(|Json(request)| request.base_id);
+    Ok(Json(perform_incremental_backup(&state, base_id).await?))
+}
+
+async fn perform_incremental_backup(
+    state: &AdminState,
+    requested_base: Option<String>,
+) -> Result<Value, StatusCode> {
     let config = state.config.read().clone();
     let backup_root = config.backup.backup_dir.clone();
-    let requested_base = request.and_then(|Json(request)| request.base_id);
     if let Some(id) = &requested_base {
         validate_backup_id(id)?;
     }
@@ -1421,6 +1680,7 @@ async fn backup_incremental(
         to_lsn,
         wal_records: to_lsn - base.to_lsn,
         wal_bytes: 0,
+        cdc_cursor_lsn: state.cdc.status().last_lsn,
     };
     let source_wal = state.storage.data_dir().join("wal");
     let metadata = tokio::task::spawn_blocking({
@@ -1446,7 +1706,7 @@ async fn backup_incremental(
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     .map_err(|_| StatusCode::CONFLICT)?;
-    Ok(Json(json!({
+    Ok(json!({
         "id": metadata.id,
         "kind": metadata.kind,
         "parent_id": metadata.parent_id,
@@ -1454,8 +1714,9 @@ async fn backup_incremental(
         "to_lsn": metadata.to_lsn,
         "wal_records": metadata.wal_records,
         "wal_bytes": metadata.wal_bytes,
+        "cdc_cursor_lsn": metadata.cdc_cursor_lsn,
         "no_changes": metadata.wal_records == 0,
-    })))
+    }))
 }
 
 async fn create_full_backup(state: AdminState) -> Result<Json<Value>, StatusCode> {
@@ -1477,6 +1738,7 @@ async fn create_full_backup(state: AdminState) -> Result<Json<Value>, StatusCode
         to_lsn,
         wal_records: to_lsn,
         wal_bytes: 0,
+        cdc_cursor_lsn: state.cdc.status().last_lsn,
     };
     let backup_root = config.backup.backup_dir.clone();
     let source = state.storage.data_dir().to_path_buf();
@@ -1508,6 +1770,7 @@ async fn create_full_backup(state: AdminState) -> Result<Json<Value>, StatusCode
         "to_lsn": metadata.to_lsn,
         "wal_records": metadata.wal_records,
         "wal_bytes": metadata.wal_bytes,
+        "cdc_cursor_lsn": metadata.cdc_cursor_lsn,
     })))
 }
 
@@ -1526,6 +1789,113 @@ async fn backup_list(
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(json!({"backups": backups})))
+}
+
+const AUTO_BACKUP_CHECK_SECS: u64 = 60;
+
+/// Prune to `max_backups` while keeping every ancestor of the retained set,
+/// so a retained incremental backup always has a restorable parent chain.
+fn prune_backups(root: &Path, max_backups: u32) -> Result<Vec<String>> {
+    let max = max_backups as usize;
+    if max == 0 {
+        return Ok(Vec::new());
+    }
+    let backups = list_backup_metadata(root)?;
+    if backups.len() <= max {
+        return Ok(Vec::new());
+    }
+    let mut sorted = backups.clone();
+    sorted.sort_by(|left, right| left.created_at.cmp(&right.created_at));
+    let mut keep: HashSet<String> = sorted
+        .iter()
+        .rev()
+        .take(max)
+        .map(|backup| backup.id.clone())
+        .collect();
+    let parents: HashMap<String, String> = backups
+        .iter()
+        .filter_map(|backup| {
+            backup
+                .parent_id
+                .as_ref()
+                .map(|parent| (backup.id.clone(), parent.clone()))
+        })
+        .collect();
+    loop {
+        let ids: Vec<String> = keep.iter().cloned().collect();
+        let mut added = false;
+        for id in ids {
+            if let Some(parent) = parents.get(&id) {
+                if keep.insert(parent.clone()) {
+                    added = true;
+                }
+            }
+        }
+        if !added {
+            break;
+        }
+    }
+    let mut removed = Vec::new();
+    for backup in backups {
+        if !keep.contains(&backup.id) {
+            std::fs::remove_dir_all(root.join(&backup.id))?;
+            removed.push(backup.id);
+        }
+    }
+    Ok(removed)
+}
+
+/// Background scheduler that activates `backup.auto_backup_interval` and
+/// `backup.max_backups`, which were previously inert configuration knobs.
+async fn run_auto_backup(state: AdminState, mut shutdown: tokio::sync::watch::Receiver<bool>) {
+    let mut last_run = Instant::now();
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => break,
+            _ = tokio::time::sleep(std::time::Duration::from_secs(AUTO_BACKUP_CHECK_SECS)) => {}
+        }
+        let (interval_secs, max_backups, root) = {
+            let config = state.config.read();
+            (
+                config.backup.auto_backup_interval.saturating_mul(3600),
+                config.backup.max_backups,
+                config.backup.backup_dir.clone(),
+            )
+        };
+        if interval_secs == 0 || state.storage.data_dir().join(RESTORE_MARKER).exists() {
+            continue;
+        }
+        if last_run.elapsed().as_secs() < interval_secs as u64 {
+            continue;
+        }
+        last_run = Instant::now();
+        match perform_incremental_backup(&state, None).await {
+            Ok(value) => {
+                info!(
+                    id = %value.get("id").and_then(|v| v.as_str()).unwrap_or(""),
+                    "automatic incremental backup created"
+                );
+            }
+            Err(StatusCode::CONFLICT) => match create_full_backup(state.clone()).await {
+                Ok(value) => {
+                    info!(
+                        id = %value.get("id").and_then(|v| v.as_str()).unwrap_or(""),
+                        "automatic full backup created"
+                    );
+                }
+                Err(error) => tracing::warn!(?error, "automatic full backup failed"),
+            },
+            Err(error) => tracing::warn!(?error, "automatic incremental backup failed"),
+        }
+        match tokio::task::spawn_blocking(move || prune_backups(&root, max_backups)).await {
+            Ok(Ok(removed)) if !removed.is_empty() => {
+                info!(count = removed.len(), "pruned expired backups")
+            }
+            Ok(Err(error)) => tracing::warn!(%error, "backup retention failed"),
+            Err(error) => tracing::warn!(%error, "backup retention task failed"),
+            _ => {}
+        }
+    }
 }
 
 async fn backup_delete(
@@ -2840,7 +3210,18 @@ mod tests {
         assert!(!encoded.contains("private-value"));
         let mut candidate = config.clone();
         candidate.observability.otlp.enabled = false;
-        assert!(validate_reloadable_config(&config, &candidate).is_err());
+        assert!(
+            validate_reloadable_config(&config, &candidate).is_ok(),
+            "OTLP enablement is hot-reloadable now that the exporter loop is resident"
+        );
+        let mut auth_config = config.clone();
+        auth_config.observability.otlp.auth.method = "basic".into();
+        auth_config.observability.otlp.auth.username = "collector".into();
+        auth_config.observability.otlp.auth.password = "super-secret".into();
+        let encoded = serde_json::to_string(&redacted_config(&auth_config))
+            .expect("encode redacted auth config");
+        assert!(!encoded.contains("super-secret"));
+        assert!(encoded.contains("basic"));
     }
 
     #[test]
@@ -3006,6 +3387,9 @@ mod tests {
                 wal_sync_micros: 1_000,
                 apply_micros: 200,
                 checkpoint_micros: 300,
+                olap_pages_scanned: 0,
+                olap_pages_pruned: 0,
+                olap_rows_pruned: 0,
             },
             0,
             None,
@@ -3050,6 +3434,7 @@ mod tests {
             to_lsn: 2,
             wal_records: 2,
             wal_bytes: directory_size(&full_data.join("wal")).unwrap(),
+            cdc_cursor_lsn: 0,
         };
         write_json_atomic(&backup_root.join(full_id).join("metadata.json"), &full).unwrap();
 
@@ -3082,6 +3467,7 @@ mod tests {
             to_lsn: 4,
             wal_records: info.record_count,
             wal_bytes: info.bytes,
+            cdc_cursor_lsn: 0,
         };
         write_json_atomic(&incremental_dir.join("metadata.json"), &incremental).unwrap();
 
@@ -3149,6 +3535,7 @@ mod tests {
             to_lsn: 1,
             wal_records: 1,
             wal_bytes: directory_size(&wal_dir).unwrap(),
+            cdc_cursor_lsn: 0,
         };
         write_json_atomic(&backup_root.join(full_id).join("metadata.json"), &full).unwrap();
         std::fs::create_dir_all(&data_dir).unwrap();
@@ -3197,6 +3584,7 @@ mod tests {
             to_lsn: full_lsn,
             wal_records: full_lsn,
             wal_bytes: directory_size(&full_data.join("wal")).unwrap(),
+            cdc_cursor_lsn: 0,
         };
         write_json_atomic(&backup_root.join(full_id).join("metadata.json"), &full).unwrap();
 
@@ -3228,6 +3616,7 @@ mod tests {
             to_lsn: end_lsn,
             wal_records: info.record_count,
             wal_bytes: info.bytes,
+            cdc_cursor_lsn: 0,
         };
         write_json_atomic(&incremental_dir.join("metadata.json"), &incremental).unwrap();
         let chain = build_backup_chain(&backup_root, incremental_id).unwrap();

@@ -69,6 +69,12 @@ mydbdump restore --url 'mysql://root:password@127.0.0.1:3306' --database game --
 
 アップグレードの前後に、隔離したインスタンスで復元を確認します。MySQL からの移行は `mydb-migrate` を使います。コマンドと HTTP バックアップ API の全文は [README.md](../../README.md) のバックアップと移行の節にあります。
 
+`backup.auto_backup_interval`（時間、0=無効）と `backup.max_backups` が有効になりました。バックグラウンドタスクが完全/増分バックアップを作成し、親チェーンを保持しながら保持数まで削除します。
+
+### CDC 変更キャプチャ（拡張機能、既定は無効）
+
+CDC はコミット済み WAL レコードを読み取って行単位の NDJSON を出力する読み取り側のタスクです。書き込みホットパスには介在せず、MySQL の binlog/レプリケーション互換実装でもありません。`POST /api/v1/config/reload` で `cdc.enabled` をホットリロードするか、`POST /api/v1/cdc/enable` / `POST /api/v1/cdc/disable` で動的に切り替えます。状態は `GET /api/v1/cdc/status`、変更は `GET /api/v1/cdc/changes?since_lsn=0&limit=100` で確認できます。イベントとカーソルは `<data_dir>/cdc` にあります。
+
 ## テスト、ベンチマーク、ディスク
 
 ローカル確認:

@@ -19,6 +19,11 @@ http://&lt;server-ip&gt;:4306/admin/doc</pre><p data-i18n="localeText">页面自
 {"username":"root","password":"root"}
 POST /api/v1/sql/query
 Authorization: Bearer &lt;token&gt;</pre><p data-i18n="apiText">API 返回结果集、列、行、影响行数和 last_insert_id，并复用权限、事务、WAL 与 MVCC 路径。</p></section>
+<section id="cdc"><h2>CDC 变更捕获（额外扩展）</h2><p>CDC 默认关闭，作为读侧任务 tail 已提交的 WAL GroupCommit 记录并输出行级 NDJSON；不参与写入热路径，不改动 WAL 持久化语义，不是 MySQL binlog/复制兼容实现。</p><pre>GET  /api/v1/cdc/status
+POST /api/v1/cdc/enable
+POST /api/v1/cdc/disable
+POST /api/v1/cdc/reload
+GET  /api/v1/cdc/changes?since_lsn=0&amp;limit=100</pre><p>也可用 <code>POST /api/v1/config/reload</code> 热重载 <code>cdc</code> 配置段。事件与游标位于 <code>&lt;data_dir&gt;/cdc</code>。自动备份由 <code>backup.auto_backup_interval</code> 与 <code>backup.max_backups</code> 控制。</p></section>
 <section id="remote"><h2 data-i18n="remoteTitle">远程连接</h2><p data-i18n="remoteLanText">默认 server.host 与 http.host 都是 0.0.0.0；在防火墙仅向内网放行 3306/4306，客户端把 host 改成服务器 IP。</p><pre>jdbc:mysql://&lt;server-ip&gt;:3306/mydb?useSSL=false
 mysql -h &lt;server-ip&gt; -P 3306 -u root -p</pre><p class="tip" data-i18n="remoteTip">公网部署必须使用 TLS、强密码、最小权限、网络白名单和安全 secure_file_priv。</p></section>
 <section id="security"><h2 data-i18n="securityTitle">认证与安全</h2><p data-i18n="securityText">支持标准账户语法与常用 MySQL 认证插件：</p><pre>CREATE USER 'app'@'%' IDENTIFIED BY 'strong-password';

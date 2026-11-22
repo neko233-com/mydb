@@ -26,6 +26,16 @@ impl WalReader {
     /// subdirectories each holding their own `wal_*.log` (the sharded layout).
     /// Both are merged so backup/PITR and recovery see one unified stream.
     pub fn open(dir: PathBuf) -> Result<Self> {
+        Self::open_inner(dir, true)
+    }
+
+    /// Same as `open` but without per-open informational logging. Used by the
+    /// CDC WAL tailer, which re-opens on every poll.
+    pub fn open_silent(dir: PathBuf) -> Result<Self> {
+        Self::open_inner(dir, false)
+    }
+
+    fn open_inner(dir: PathBuf, log: bool) -> Result<Self> {
         let mut files = Vec::new();
 
         if dir.exists() {
@@ -68,7 +78,9 @@ impl WalReader {
 
         files.sort_by_key(|f| f.index);
 
-        info!("WAL reader: found {} files", files.len());
+        if log {
+            info!("WAL reader: found {} files", files.len());
+        }
 
         Ok(Self { files })
     }
@@ -96,6 +108,20 @@ impl WalReader {
             total_records, max_lsn
         );
 
+        Ok(max_lsn)
+    }
+
+    /// Replay without the per-scan informational log, for read-side consumers
+    /// that poll the WAL (CDC) and would otherwise flood the log.
+    pub fn replay_silent<F>(&self, mut callback: F) -> Result<u64>
+    where
+        F: FnMut(WalRecord),
+    {
+        let mut max_lsn = 0u64;
+        for file_info in &self.files {
+            let last_lsn = Self::replay_file(&file_info.path, &mut callback, false)?;
+            max_lsn = max_lsn.max(last_lsn);
+        }
         Ok(max_lsn)
     }
 

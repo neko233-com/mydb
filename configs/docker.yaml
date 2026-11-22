@@ -59,3 +59,19 @@ agent:
   enabled: true
   slow_query_threshold_ms: 100
   max_slow_queries: 512
+
+# CDC：默认关闭；可热重载或用 /api/v1/cdc/enable 动态开启。
+cdc:
+  enabled: false
+  dir: null
+  file_prefix: "events"
+  max_file_size: "128M"
+  max_files: 10
+  poll_interval_ms: 500
+  flush_every: 1
+  include_before: true
+  include_ddl: true
+  include_row_images: true
+  filters:
+    databases: []
+    tables: []

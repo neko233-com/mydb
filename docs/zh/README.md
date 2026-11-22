@@ -71,6 +71,12 @@ mydbdump restore --url 'mysql://root:password@127.0.0.1:3306' --database game --
 
 升级前后在隔离实例上演练恢复。从 MySQL 迁入使用 `mydb-migrate`。命令和 HTTP 备份 API 的完整示例在仓库 [README.md](../../README.md) 的备份与迁移章节。
 
+`backup.auto_backup_interval`（小时，0=关闭）与 `backup.max_backups` 现已生效：后台任务自动执行全量/增量备份并按保留数裁剪（保持父链完整）。
+
+### CDC 变更捕获（额外扩展，默认关闭）
+
+CDC 作为读侧任务 tail 已提交的 WAL 记录并输出行级 NDJSON，不参与写入热路径，也不是 MySQL binlog/复制兼容实现。用 `POST /api/v1/config/reload` 热重载 `cdc.enabled`，或 `POST /api/v1/cdc/enable`、`POST /api/v1/cdc/disable` 动态开关；状态见 `GET /api/v1/cdc/status`，变更见 `GET /api/v1/cdc/changes?since_lsn=0&limit=100`。事件与游标位于 `<data_dir>/cdc`。
+
 ## 测试、基准与磁盘
 
 本地检查：

@@ -131,9 +131,37 @@ observability:
     timeout_secs: 5
     # OTel service.name
     service_name: "mydb"
-    # 附加请求头，例如 Authorization
+    # 附加请求头，例如自定义 Authorization；与 auth 二选一
     headers: {}
+    # 采集器鉴权。method: none | basic | bearer
+    # basic 使用 username + password（密码建议用环境变量 MYDB_OTLP_PASSWORD
+    # 或 password_file，禁止把生产密码写进 YAML）。
+    auth:
+      method: "none"
+      username: ""
+      password: ""
+      password_file: null
+      token: ""
     # 导出慢查询/错误语句的 span（不改动查询热路径）
     export_traces: true
     # 是否在 span 中携带 SQL 原文（默认关闭，避免泄露业务数据）
     include_sql: false
+
+# CDC（变更数据捕获）：相对 MySQL 的额外扩展，默认关闭。
+# 可通过 /api/v1/config/reload 热重载，或用 /api/v1/cdc/enable|disable 动态开关。
+cdc:
+  enabled: false
+  # 输出目录，留空 = <data_dir>/cdc
+  dir: null
+  file_prefix: "events"
+  max_file_size: "128M"
+  max_files: 10
+  poll_interval_ms: 500
+  flush_every: 1
+  include_before: true
+  include_ddl: true
+  include_row_images: true
+  filters:
+    # 空列表 = 全部库/表
+    databases: []
+    tables: []

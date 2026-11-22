@@ -80,7 +80,8 @@ services:
       MYDB_URL: "mysql://root:root@mydb:3306"
       MYSQL_URL: "mysql://root:root@mysql:3306"
     # No long-running process; the orchestrator (scripts/bench_docker.py) drives
-    # `docker compose run bench --url ...` for each scenario/sample.
+    # `podman compose run bench --url ...` for each scenario/sample
+    # (Docker remains a compatibility fallback).
 
 volumes:
   mydb-data:

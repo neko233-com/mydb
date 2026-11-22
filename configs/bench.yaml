@@ -63,3 +63,19 @@ agent:
   enabled: true
   slow_query_threshold_ms: 100
   max_slow_queries: 1024
+
+# CDC：压测时保持关闭，避免额外 I/O 影响对比结果。
+cdc:
+  enabled: false
+  dir: null
+  file_prefix: "events"
+  max_file_size: "128M"
+  max_files: 10
+  poll_interval_ms: 500
+  flush_every: 1
+  include_before: true
+  include_ddl: true
+  include_row_images: true
+  filters:
+    databases: []
+    tables: []

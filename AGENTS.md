@@ -9,6 +9,7 @@
 - 原生安装默认面向内网使用：MySQL 与 Web 管理监听 `0.0.0.0`，分别使用 3306/4306；公网部署必须由防火墙、TLS、强密码和最小权限保护。
 - 日常开发只在 `main`。版本发布用 tag 记录，例如 `v0.1.36`；不为发布另开长期分支。
 - 发布是低频且有意的动作：构建、测试、打包可以自动执行，但创建 GitHub tag/release 和上传二进制必须经过人工确认；禁止为了试验或无意义改动重复发布。
+- **后续验证（压测、容器化/Docker Compose 验证）统一使用 podman**，不再依赖 Docker daemon；`compose.yaml` 用 `podman compose` / `podman-compose` 运行，压测容器用 podman 启停。CI 与本地脚本中出现的 `docker` 调用应逐步替换为等价的 `podman` 调用（保留兼容回退）。
 - 对外行为、配置默认值、安装器、Web HTML 文档和 CLI 提示必须同步更新；新增非显然逻辑要写解释性注释，并用 Rust 回归测试锁定行为。
 
 ## 强制规则
@@ -93,6 +94,8 @@ WAL 写入是每个提交的关键路径，任何修改必须遵守以下约束�
 - WAL 预分配粒度：8MB
 - WAL 文件最大大小：64MB
 - Checkpoint 间隔：1024 个已成功提交请求；`flush_consistent` 与 shutdown 无条件 checkpoint
+- **CDC 默认关闭**：它是相对 MySQL 的额外扩展，不是兼容项。可通过 `POST /api/v1/config/reload` 热重载配置开关，或用 `/api/v1/cdc/enable`、`/api/v1/cdc/disable` 动态开关，无需重启。事件落 `<data_dir>/cdc`，游标存 `cursor.json`。
+- **自动备份**：`backup.auto_backup_interval`（小时，`0` = 关闭）与 `backup.max_backups` 现已生效；裁剪时保留被保留备份依赖的全部父备份。备份元数据携带 `cdc_cursor_lsn`，用于与 CDC 流对账。
 
 ## InnoDB 名称兼容边界
 

@@ -5,10 +5,12 @@
 //! one snapshot per interval instead of per-statement instrumentation.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use base64::Engine;
 use parking_lot::{Mutex, RwLock};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -28,9 +30,54 @@ const MAX_EXPORTED_SPANS: usize = 256;
 /// cardinality has to stay bounded.
 const MAX_PROMETHEUS_DIGESTS: usize = 20;
 
+/// Resolved upstream credentials. The password is read once per configuration
+/// reload, never once per export, and never appears in `Debug` output.
+#[derive(Clone, PartialEq, Eq)]
+pub enum OtlpAuth {
+    None,
+    Bearer(String),
+    Basic { username: String, password: String },
+}
+
+impl OtlpAuth {
+    pub fn method_name(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Bearer(_) => "bearer",
+            Self::Basic { .. } => "basic",
+        }
+    }
+
+    fn authorization_header(&self) -> Option<String> {
+        match self {
+            Self::None => None,
+            Self::Bearer(token) => Some(format!("Bearer {token}")),
+            Self::Basic { username, password } => {
+                let encoded = base64::engine::general_purpose::STANDARD
+                    .encode(format!("{username}:{password}"));
+                Some(format!("Basic {encoded}"))
+            }
+        }
+    }
+}
+
+impl fmt::Debug for OtlpAuth {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::None => formatter.write_str("None"),
+            Self::Bearer(_) => formatter.write_str("Bearer(<redacted>)"),
+            Self::Basic { username, .. } => formatter
+                .debug_struct("Basic")
+                .field("username", username)
+                .field("password", &"<redacted>")
+                .finish(),
+        }
+    }
+}
+
 /// Runtime configuration of the exporter. A configuration reload replaces the
 /// whole struct, so the exporter can be retargeted without a restart.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OtlpSettings {
     pub enabled: bool,
     pub endpoint: String,
@@ -38,12 +85,31 @@ pub struct OtlpSettings {
     pub timeout: Duration,
     pub service_name: String,
     pub headers: BTreeMap<String, String>,
+    pub auth: OtlpAuth,
     pub export_traces: bool,
     pub include_sql: bool,
 }
 
+impl fmt::Debug for OtlpSettings {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OtlpSettings")
+            .field("enabled", &self.enabled)
+            .field("endpoint", &self.endpoint)
+            .field("interval", &self.interval)
+            .field("timeout", &self.timeout)
+            .field("service_name", &self.service_name)
+            .field("headers", &self.headers.keys().collect::<Vec<_>>())
+            .field("auth", &self.auth)
+            .field("export_traces", &self.export_traces)
+            .field("include_sql", &self.include_sql)
+            .finish()
+    }
+}
+
 impl OtlpSettings {
     pub fn from_section(section: &OtlpSection) -> Self {
+        let auth = resolve_auth(section);
         Self {
             enabled: section.enabled,
             endpoint: section.endpoint.trim_end_matches('/').to_string(),
@@ -51,9 +117,37 @@ impl OtlpSettings {
             timeout: Duration::from_secs(section.timeout_secs.max(1)),
             service_name: section.service_name.clone(),
             headers: section.headers.clone(),
+            auth,
             export_traces: section.export_traces,
             include_sql: section.include_sql,
         }
+    }
+}
+
+fn resolve_auth(section: &OtlpSection) -> OtlpAuth {
+    let method = section.auth.normalized_method().to_ascii_lowercase();
+    match method.as_str() {
+        "basic" => {
+            let mut password = section.auth.password.clone();
+            if password.is_empty() {
+                if let Some(path) = section.auth.password_file.as_ref() {
+                    match std::fs::read_to_string(path) {
+                        Ok(content) => password = content.trim_end_matches(['\r', '\n']).to_string(),
+                        Err(error) => tracing::warn!(
+                            path = %path.display(),
+                            error = %error,
+                            "failed to read OTLP password file"
+                        ),
+                    }
+                }
+            }
+            OtlpAuth::Basic {
+                username: section.auth.username.clone(),
+                password,
+            }
+        }
+        "bearer" => OtlpAuth::Bearer(section.auth.token.clone()),
+        _ => OtlpAuth::None,
     }
 }
 
@@ -72,6 +166,7 @@ pub struct OtlpStatusSnapshot {
     pub endpoint: String,
     pub interval_seconds: u64,
     pub service_name: String,
+    pub auth_method: String,
     pub export_traces: bool,
     pub include_sql: bool,
     pub metric_exports: u64,
@@ -81,12 +176,34 @@ pub struct OtlpStatusSnapshot {
     pub last_error: Option<String>,
 }
 
+impl OtlpStatusSnapshot {
+    /// Safe for the admin API: never contains a password, token or header
+    /// value, only the authentication method that an operator selected.
+    pub fn to_json(&self) -> Value {
+        json!({
+            "enabled": self.enabled,
+            "endpoint": self.endpoint,
+            "interval_seconds": self.interval_seconds,
+            "service_name": self.service_name,
+            "auth_method": self.auth_method,
+            "export_traces": self.export_traces,
+            "include_sql": self.include_sql,
+            "metric_exports": self.metric_exports,
+            "span_exports": self.span_exports,
+            "failures": self.failures,
+            "last_success_unix_ms": self.last_success_unix_ms,
+            "last_error": self.last_error,
+        })
+    }
+}
+
 /// Counters published in one export interval.
 pub struct MonitoringSnapshot<'a> {
     pub wire: &'a WireStatsSnapshot,
     pub storage: &'a mydb_storage::StorageStatsSnapshot,
     pub audit: &'a AuditLogSnapshot,
     pub latency: &'a QueryLatencySnapshot,
+    pub cdc: Option<&'a mydb_cdc::CdcStatus>,
     pub slow_queries_total: u64,
     pub digest_entries: usize,
     pub digest_dropped: u64,
@@ -129,6 +246,7 @@ impl OtlpExporter {
             endpoint: settings.endpoint.clone(),
             interval_seconds: settings.interval.as_secs(),
             service_name: settings.service_name.clone(),
+            auth_method: settings.auth.method_name().to_string(),
             export_traces: settings.export_traces,
             include_sql: settings.include_sql,
             metric_exports: self.counters.metric_exports.load(Ordering::Relaxed),
@@ -154,6 +272,7 @@ impl OtlpExporter {
         match post_json(
             &format!("{}{}", settings.endpoint, OTLP_METRICS_PATH),
             &settings.headers,
+            &settings.auth,
             &metrics_payload,
             settings.timeout,
         )
@@ -183,6 +302,7 @@ impl OtlpExporter {
         match post_json(
             &format!("{}{}", settings.endpoint, OTLP_TRACES_PATH),
             &settings.headers,
+            &settings.auth,
             &traces_payload,
             settings.timeout,
         )
@@ -209,16 +329,34 @@ impl OtlpExporter {
     }
 }
 
-/// Background exporter loop. The task exits when the server shuts down.
+/// Dependencies of the resident OTLP exporter loop, grouped to keep the
+/// signature stable as more exporters are added.
+pub struct OtlpExporterContext {
+    pub exporter: OtlpExporter,
+    pub wire_stats: Arc<mydb_wire::WireStats>,
+    pub storage: Arc<mydb_storage::StorageEngineManager>,
+    pub audit_log: Arc<mydb_wire::AuditLog>,
+    pub cdc: Arc<mydb_cdc::CdcManager>,
+    pub server_host: String,
+    pub server_port: u16,
+}
+
+/// Background exporter loop. It stays resident even while OTLP is disabled so
+/// an admin reload can turn it on without a process restart. Disabled cycles
+/// do not take a stats snapshot, keeping the idle cost to one timer tick.
 pub async fn run_otlp_exporter(
-    exporter: OtlpExporter,
-    wire_stats: Arc<mydb_wire::WireStats>,
-    storage: Arc<mydb_storage::StorageEngineManager>,
-    audit_log: Arc<mydb_wire::AuditLog>,
-    server_host: String,
-    server_port: u16,
+    context: OtlpExporterContext,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
+    let OtlpExporterContext {
+        exporter,
+        wire_stats,
+        storage,
+        audit_log,
+        cdc,
+        server_host,
+        server_port,
+    } = context;
     let version = env!("CARGO_PKG_VERSION").to_string();
     loop {
         let interval = exporter.settings.read().interval;
@@ -230,6 +368,10 @@ pub async fn run_otlp_exporter(
                 }
             }
         }
+        if !exporter.settings.read().enabled {
+            continue;
+        }
+        let cdc_status = cdc.is_enabled().then(|| cdc.status());
         let wire = wire_stats.snapshot();
         let storage_stats = storage.stats();
         let audit = audit_log.snapshot();
@@ -240,6 +382,7 @@ pub async fn run_otlp_exporter(
             storage: &storage_stats,
             audit: &audit,
             latency: &latency,
+            cdc: cdc_status.as_ref(),
             slow_queries_total: wire_stats.slow_queries_total(),
             digest_entries: wire_stats.statement_digest_count(),
             digest_dropped: wire_stats.statement_digest_dropped(),
@@ -258,6 +401,7 @@ pub async fn run_otlp_exporter(
 async fn post_json(
     url: &str,
     headers: &BTreeMap<String, String>,
+    auth: &OtlpAuth,
     payload: &Value,
     timeout: Duration,
 ) -> anyhow::Result<u16> {
@@ -270,8 +414,16 @@ async fn post_json(
         .post(url)
         .header("Content-Type", "application/json")
         .body(serde_json::to_vec(payload)?);
+    let explicit_authorization = headers
+        .keys()
+        .any(|name| name.eq_ignore_ascii_case("authorization"));
     for (name, value) in headers {
         request = request.header(name.as_str(), value.as_str());
+    }
+    if !explicit_authorization {
+        if let Some(value) = auth.authorization_header() {
+            request = request.header("Authorization", value);
+        }
     }
     let response = request
         .send()
@@ -306,9 +458,13 @@ fn resource_attributes(settings: &OtlpSettings, server: &ServerIdentity) -> Valu
     json!([
         string_attribute("service.name", &settings.service_name),
         string_attribute("service.version", &server.version),
+        string_attribute("service.instance.id", &format!("{}:{}", hostname(), server.port)),
         string_attribute("host.name", &hostname()),
         string_attribute("server.address", &server.host),
         int_attribute("server.port", i64::from(server.port)),
+        string_attribute("telemetry.sdk.name", "mydb-otlp"),
+        string_attribute("telemetry.sdk.language", "rust"),
+        string_attribute("telemetry.sdk.version", &server.version),
     ])
 }
 
@@ -344,6 +500,36 @@ fn counter_metric(name: &str, description: &str, unit: &str, value: u64, timesta
             }]
         }
     })
+}
+
+fn cdc_gauge_metric(
+    cdc: Option<&mydb_cdc::CdcStatus>,
+    suffix: &str,
+    value: impl Fn(&mydb_cdc::CdcStatus) -> u64,
+    timestamp: u64,
+) -> Value {
+    gauge_metric(
+        &format!("mydb.cdc.{suffix}"),
+        "CDC stream state. Zero when CDC is disabled.",
+        "1",
+        cdc.map(value).unwrap_or(0),
+        timestamp,
+    )
+}
+
+fn cdc_counter_metric(
+    cdc: Option<&mydb_cdc::CdcStatus>,
+    suffix: &str,
+    value: impl Fn(&mydb_cdc::CdcStatus) -> u64,
+    timestamp: u64,
+) -> Value {
+    counter_metric(
+        &format!("mydb.cdc.{suffix}"),
+        "CDC events emitted since process start. Zero when CDC is disabled.",
+        "1",
+        cdc.map(value).unwrap_or(0),
+        timestamp,
+    )
 }
 
 fn latency_histogram_metric(
@@ -561,6 +747,33 @@ fn otlp_metrics_payload(
             snapshot.digest_dropped,
             timestamp,
         ),
+        counter_metric(
+            "mydb.olap.pages.scanned",
+            "Pages decoded by filtered scans.",
+            "1",
+            storage.olap_pages_scanned,
+            timestamp,
+        ),
+        counter_metric(
+            "mydb.olap.pages.pruned",
+            "Pages skipped by zone-map pruning.",
+            "1",
+            storage.olap_pages_pruned,
+            timestamp,
+        ),
+        counter_metric(
+            "mydb.olap.rows.pruned",
+            "Rows skipped without decoding because their page was pruned.",
+            "1",
+            storage.olap_rows_pruned,
+            timestamp,
+        ),
+        cdc_gauge_metric(snapshot.cdc, "enabled", |status| u64::from(status.enabled), timestamp),
+        cdc_gauge_metric(snapshot.cdc, "last_lsn", |status| status.last_lsn, timestamp),
+        cdc_gauge_metric(snapshot.cdc, "checkpoint_lsn", |status| status.checkpoint_lsn, timestamp),
+        cdc_gauge_metric(snapshot.cdc, "lag_lsn", |status| status.lag_lsn(), timestamp),
+        cdc_counter_metric(snapshot.cdc, "events_total", |status| status.events_emitted, timestamp),
+        cdc_counter_metric(snapshot.cdc, "changes_total", |status| status.changes_emitted, timestamp),
         latency_histogram_metric(
             "mydb.query.latency",
             "Statement latency distribution.",
@@ -616,7 +829,9 @@ fn otlp_traces_payload(
             let end_nanos = start_nanos.saturating_add(snapshot.duration_ms.saturating_mul(1_000_000));
             let mut attributes = vec![
                 string_attribute("db.system", "mysql"),
+                string_attribute("db.system.name", "mysql"),
                 string_attribute("db.operation", &snapshot.statement_type),
+                string_attribute("db.operation.name", &snapshot.statement_type),
                 string_attribute("mydb.statement.digest", &format!("{:x}", Sha256::digest(snapshot.query_digest.as_bytes()))),
                 string_attribute("mydb.query.outcome", &snapshot.outcome),
                 int_attribute(
@@ -644,8 +859,8 @@ fn otlp_traces_payload(
                 json!({"code": 1})
             };
             json!({
-                "traceId": random_trace_id(),
-                "spanId": random_span_id(),
+                "traceId": stable_trace_id(server, snapshot),
+                "spanId": stable_span_id(server, snapshot),
                 "name": format!("mysql {}", snapshot.statement_type),
                 "kind": 3,
                 "startTimeUnixNano": start_nanos.to_string(),
@@ -668,12 +883,37 @@ fn otlp_traces_payload(
     })
 }
 
-fn random_trace_id() -> String {
-    uuid::Uuid::new_v4().simple().to_string()
+/// W3C trace identifiers stay stable for the same captured statement, so an
+/// operator can correlate a repeated export or a log line instead of chasing a
+/// fresh random id on every interval. A captured statement is unique per
+/// connection and id, which is sufficient here because MyDB does not accept an
+/// upstream `traceparent` on the MySQL wire protocol.
+fn stable_trace_id(server: &ServerIdentity, snapshot: &SlowQuerySnapshot) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"mydb-trace");
+    hasher.update(server.version.as_bytes());
+    hasher.update(snapshot.connection_id.to_le_bytes());
+    hasher.update(snapshot.id.to_le_bytes());
+    let digest = hasher.finalize();
+    hex_prefix(&digest, 16)
 }
 
-fn random_span_id() -> String {
-    uuid::Uuid::new_v4().simple().to_string()[..16].to_string()
+fn stable_span_id(server: &ServerIdentity, snapshot: &SlowQuerySnapshot) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"mydb-span");
+    hasher.update(server.version.as_bytes());
+    hasher.update(snapshot.connection_id.to_le_bytes());
+    hasher.update(snapshot.id.to_le_bytes());
+    let digest = hasher.finalize();
+    hex_prefix(&digest, 8)
+}
+
+fn hex_prefix(digest: &[u8], bytes: usize) -> String {
+    let mut output = String::with_capacity(bytes * 2);
+    for byte in digest.iter().take(bytes) {
+        output.push_str(&format!("{byte:02x}"));
+    }
+    output
 }
 
 /// Prometheus exposition of the monitoring state that has no counterpart in
@@ -780,6 +1020,67 @@ pub fn prometheus_monitoring_metrics(
     body
 }
 
+/// Zone-map and CDC counters that complement the legacy `/metrics` block.
+/// They are emitted separately so the original metric list keeps its exact
+/// names and ordering for existing dashboards.
+pub fn prometheus_olap_cdc_metrics(
+    storage: &mydb_storage::StorageStatsSnapshot,
+    cdc: Option<&mydb_cdc::CdcStatus>,
+) -> String {
+    let mut body = String::new();
+    body.push_str("# HELP mydb_olap_pages_scanned_total Pages decoded by filtered scans.\n");
+    body.push_str("# TYPE mydb_olap_pages_scanned_total counter\n");
+    body.push_str(&format!(
+        "mydb_olap_pages_scanned_total {}\n",
+        storage.olap_pages_scanned
+    ));
+    body.push_str("# HELP mydb_olap_pages_pruned_total Pages skipped by zone-map pruning.\n");
+    body.push_str("# TYPE mydb_olap_pages_pruned_total counter\n");
+    body.push_str(&format!(
+        "mydb_olap_pages_pruned_total {}\n",
+        storage.olap_pages_pruned
+    ));
+    body.push_str("# HELP mydb_olap_rows_pruned_total Rows skipped without decoding.\n");
+    body.push_str("# TYPE mydb_olap_rows_pruned_total counter\n");
+    body.push_str(&format!(
+        "mydb_olap_rows_pruned_total {}\n",
+        storage.olap_rows_pruned
+    ));
+    body.push_str("# HELP mydb_cdc_enabled Whether CDC is enabled.\n");
+    body.push_str("# TYPE mydb_cdc_enabled gauge\n");
+    body.push_str(&format!(
+        "mydb_cdc_enabled {}\n",
+        u8::from(cdc.is_some_and(|status| status.enabled))
+    ));
+    if let Some(status) = cdc {
+        body.push_str("# HELP mydb_cdc_last_lsn Last committed LSN emitted to the CDC stream.\n");
+        body.push_str("# TYPE mydb_cdc_last_lsn gauge\n");
+        body.push_str(&format!("mydb_cdc_last_lsn {}\n", status.last_lsn));
+        body.push_str("# HELP mydb_cdc_checkpoint_lsn Consumer-confirmed LSN.\n");
+        body.push_str("# TYPE mydb_cdc_checkpoint_lsn gauge\n");
+        body.push_str(&format!(
+            "mydb_cdc_checkpoint_lsn {}\n",
+            status.checkpoint_lsn
+        ));
+        body.push_str("# HELP mydb_cdc_lag_lsn LSN distance between producer and consumer.\n");
+        body.push_str("# TYPE mydb_cdc_lag_lsn gauge\n");
+        body.push_str(&format!("mydb_cdc_lag_lsn {}\n", status.lag_lsn()));
+        body.push_str("# HELP mydb_cdc_events_total CDC commit events written.\n");
+        body.push_str("# TYPE mydb_cdc_events_total counter\n");
+        body.push_str(&format!(
+            "mydb_cdc_events_total {}\n",
+            status.events_emitted
+        ));
+        body.push_str("# HELP mydb_cdc_changes_total CDC row/DDL changes written.\n");
+        body.push_str("# TYPE mydb_cdc_changes_total counter\n");
+        body.push_str(&format!(
+            "mydb_cdc_changes_total {}\n",
+            status.changes_emitted
+        ));
+    }
+    body
+}
+
 fn escape_prometheus_label(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
     for character in value.chars() {
@@ -806,6 +1107,7 @@ mod tests {
             timeout: Duration::from_secs(5),
             service_name: "mydb".to_string(),
             headers: BTreeMap::new(),
+            auth: OtlpAuth::None,
             export_traces: true,
             include_sql: false,
         }
@@ -870,6 +1172,9 @@ mod tests {
             wal_sync_micros: 1000,
             apply_micros: 10,
             checkpoint_micros: 20,
+            olap_pages_scanned: 0,
+            olap_pages_pruned: 0,
+            olap_rows_pruned: 0,
         };
         let audit = AuditLogSnapshot {
             healthy: true,
@@ -882,6 +1187,7 @@ mod tests {
             storage: &storage,
             audit: &audit,
             latency: &latency,
+            cdc: None,
             slow_queries_total: 3,
             digest_entries: 12,
             digest_dropped: 0,
@@ -1047,5 +1353,54 @@ mod tests {
     #[test]
     fn prometheus_labels_are_escaped() {
         assert_eq!(escape_prometheus_label("a\"b\\c\nd"), "a\\\"b\\\\c\\nd");
+    }
+
+    #[test]
+    fn otlp_basic_auth_uses_standard_base64_and_redacts_debug() {
+        let auth = OtlpAuth::Basic {
+            username: "user".to_string(),
+            password: "p@ss".to_string(),
+        };
+        assert_eq!(
+            auth.authorization_header().as_deref(),
+            Some("Basic dXNlcjpwQHNz")
+        );
+        let debug = format!("{auth:?}");
+        assert!(!debug.contains("p@ss"));
+        assert!(debug.contains("<redacted>"));
+        assert_eq!(auth.method_name(), "basic");
+    }
+
+    #[test]
+    fn otlp_bearer_auth_header_and_empty_auth() {
+        assert_eq!(
+            OtlpAuth::Bearer("token-value".to_string())
+                .authorization_header()
+                .as_deref(),
+            Some("Bearer token-value")
+        );
+        assert_eq!(OtlpAuth::None.authorization_header(), None);
+        assert_eq!(OtlpAuth::None.method_name(), "none");
+    }
+
+    #[test]
+    fn otlp_settings_from_section_resolves_password_file_without_exposing_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("otlp-password");
+        std::fs::write(&path, "file-secret\n").unwrap();
+        let mut section = mydb_config::OtlpSection::default();
+        section.auth.method = "basic".into();
+        section.auth.username = "collector".into();
+        section.auth.password_file = Some(path);
+        let settings = OtlpSettings::from_section(&section);
+        let expected = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode("collector:file-secret")
+        );
+        assert_eq!(
+            settings.auth.authorization_header().as_deref(),
+            Some(expected.as_str())
+        );
+        assert!(!format!("{:?}", settings.auth).contains("file-secret"));
     }
 }
