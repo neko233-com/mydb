@@ -771,6 +771,8 @@ CDC 是 MyDB 相对 MySQL 的**额外扩展，默认关闭**，不宣称 MySQL b
 
 ### v0.1.38 观测与 OLAP 裁剪版
 
+发布说明与已知边界见 [docs/zh/releases/v0.1.38.md](docs/zh/releases/v0.1.38.md)。
+
 - ✅ OpenTelemetry OTLP/HTTP 原生导出：指标 + 慢查询 `stmt` trace + 可选日志；Basic（用户名+密码）/ Bearer 鉴权；密钥支持环境变量与文件；管理 API 可查询导出状态且不泄露凭据
 - ✅ 对齐 MySQL 9 Telemetry：`stmt` span 使用 Internal kind，附带 `mysql.digest_text`、`mysql.cpu_time`、`mysql.rows_sent/affected`、`mysql.error_count` 等属性；新增 `/v1/logs`（默认关闭，敏感字段脱敏）
 - ✅ OTLP 导出器常驻，`enabled` 支持热重载；关闭时零快照开销；新增 `GET /api/v1/observability/otlp`
