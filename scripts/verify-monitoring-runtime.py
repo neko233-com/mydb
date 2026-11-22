@@ -91,6 +91,8 @@ def main():
                 else:
                     raise RuntimeError("Native server did not become ready within 30 seconds")
                 check(request("/metrics")[0] == 401, "Anonymous metrics access succeeded")
+                check(request("/healthz")[0] == 200, "Liveness probe failed")
+                check(request("/readyz")[0] == 200, "Readiness probe failed")
                 check(request("/api/v1/config", scrape)[0] == 401, "Scrape credential reached management")
                 check(request("/api/v1/sql/query", scrape, "POST", {"sql": "SELECT 1"})[0] == 401, "Scrape credential reached SQL")
                 status, body = request("/api/v1/auth/login", method="POST", body={"username": "ci-admin", "password": admin})
@@ -105,6 +107,22 @@ def main():
                 sql("CREATE DATABASE ci_monitor")
                 sql("CREATE TABLE ci_monitor.probe (id INT PRIMARY KEY, value VARCHAR(100))")
                 sql("INSERT INTO ci_monitor.probe VALUES (1, 'private-native-smoke-value')")
+                sql("CREATE TABLE ci_monitor.olap_probe (id INT, value VARCHAR(100))")
+                values = ",".join(f"({index}, 'v{index:04d}')" for index in range(900))
+                sql(f"INSERT INTO ci_monitor.olap_probe VALUES {values}")
+                check(request("/api/v1/memory/flush", session, "POST", {})[0] == 200,
+                      "Consistent flush failed")
+                status, body = request(
+                    "/api/v1/sql/query",
+                    session,
+                    "POST",
+                    {"sql": "SELECT * FROM ci_monitor.olap_probe WHERE value BETWEEN 'v0100' AND 'v0199'"},
+                )
+                check(status == 200 and "v0100" in body and "v0199" in body and "v0200" not in body,
+                      "OLAP zone-map range scan returned the wrong rows")
+                status, body = request("/api/v1/observability/otlp", session)
+                check(status == 200 and json.loads(body).get("auth_method") in {"none", "basic", "bearer"},
+                      "OTLP status endpoint did not report a valid auth mode")
                 sql(f"CREATE USER 'ci_reader'@'%' IDENTIFIED BY '{reader_password}'")
                 sql("GRANT SELECT ON ci_monitor.* TO 'ci_reader'@'%'")
                 status, body = request("/api/v1/auth/login", method="POST", body={"username": "ci_reader", "password": reader_password})
@@ -118,6 +136,12 @@ def main():
                 result = subprocess.run([str(client), "-h", "127.0.0.1", "-P", str(sql_port), "-u", "root", "-p", database_password, "-e", "SELECT VERSION()"], capture_output=True, text=True, timeout=10, env=environment)
                 check(result.returncode == 0 and ("mydb-" + args.expected_version) in result.stdout, "Packaged native CLI/protocol version mismatch")
                 metrics = request("/metrics", scrape)[1]
+                pruned = next(
+                    (int(line.split()[-1]) for line in metrics.splitlines()
+                     if line.startswith("mydb_olap_pages_pruned_total ")),
+                    0,
+                )
+                check(pruned > 0, "OLAP zone map did not prune any page")
                 for private in (admin, database_password, scrape, reader_password, "private-native-smoke-value", "ci_reader"):
                     check(private not in metrics, "Public metrics disclosed private fixture data")
             finally:

@@ -39,7 +39,7 @@ mysql --protocol=TCP -h 127.0.0.1 -P 3306 -u root -p
 
 Linux / macOS 使用 `scripts/install.sh`。Windows 使用 `scripts/install.ps1`，默认目录是 `C:\Server\mydb\mydb-server`，服务名是 `MyDBServer`。首次安装把随机密钥写到配置目录的 `secrets`，升级只替换二进制。
 
-已发布的二进制可以用 `mydb update --check` 查看版本，用 `mydb update` 更新。更新保留配置、数据和密钥。
+已发布的二进制可以用 `mydb update --check` 查看版本，用 `mydb update` 更新。更新保留配置、数据和密钥。Linux 发布构建必须使用 musl 静态目标，见 [musl-build.md](musl-build.md)。
 
 ## 生产部署
 

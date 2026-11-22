@@ -175,6 +175,14 @@ cd mydb
 # 编译（Release 模式）
 cargo build --release
 
+# Linux 生产/发布必须使用 musl 静态目标，避免依赖目标机 glibc
+# 依赖：rustup target add x86_64-unknown-linux-musl；apt-get install musl-tools
+CC_x86_64_unknown_linux_musl=musl-gcc \
+  cargo build --release --locked --target x86_64-unknown-linux-musl \
+  -p mydb-server -p mydb-cli -p mydb-migrate -p mydb-dump
+file target/x86_64-unknown-linux-musl/release/mydb-server  # 应显示 statically linked
+# 完整规范与验收命令见 docs/zh/musl-build.md
+
 # 正式包只包含 server/cli/mydb/migrate/dump、配置、安装脚本和文档；
 # mydb-bench、测试结果与 target/bench 不进入发布包
 .\scripts\build-release.ps1 -Version "0.1.38"
@@ -766,8 +774,9 @@ CDC 是 MyDB 相对 MySQL 的**额外扩展，默认关闭**，不宣称 MySQL b
 - ✅ CDC 消费断点：`GET/POST /api/v1/cdc/checkpoint`、`lag_lsn`；新增 [MyDB → TiDB 迁移手册](docs/zh/tidb-migration.md)
 - ✅ 生产探针：`/healthz`、`/readyz`；管理 API 4 MiB 请求体上限；OTLP 凭据配置校验与脱敏
 - ✅ 依赖更新：`cargo update`，移除未使用的 `dashmap`/`console`/`indicatif` 与部分未使用 crate 依赖
-- ✅ 本机门槛：`cargo test --workspace`、`clippy -D warnings`、release 构建（见下方验收记录）
-- ⏳ 未完成：列裁剪、向量化聚合、并行页扫描；本轮未重跑同机 MySQL 对比基准，不新增性能倍数结论
+- ✅ 本机门槛：`cargo test --workspace`、`clippy -D warnings`、release 构建与原生 release smoke（探针、认证、SQL 权限隔离、OLAP 裁剪、指标隐私）通过
+- ✅ Linux musl 静态发布规范：`AGENTS.md` 明确 musl 构建与依赖体检规则；`.github/workflows/build-linux-musl.yml` 构建 `x86_64-unknown-linux-musl` 并校验 `statically linked`/无 `NEEDED`
+- ⏳ 未完成：musl 工作流尚未在 GitHub runner 首次执行；列裁剪、向量化聚合、并行页扫描；本轮未重跑同机 MySQL 对比基准，不新增性能倍数结论
 
 ### v0.1.36 稳定修复版（发布候选）
 

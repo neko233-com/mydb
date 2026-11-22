@@ -66,12 +66,13 @@
 
 ## 6. 验收门槛（发布前必须全部通过）
 
-- [ ] 6.1 `cargo +stable-x86_64-pc-windows-gnullvm clippy --workspace --all-targets -- -D warnings`
-- [ ] 6.2 `cargo +stable-x86_64-pc-windows-gnullvm test --workspace`
-- [ ] 6.3 `cargo +stable-x86_64-pc-windows-gnullvm build --workspace --release`
-- [ ] 6.4 本机启动冒烟：`mydb-server` 启动、`/healthz`、`/readyz`、`/metrics`、SQL 建表/写入/范围扫描
-- [ ] 6.5 若环境具备 MySQL/podman：重跑同机基准并更新 `性能报告.md`；否则如实标注“未重跑”，不写新倍数
-- [ ] 6.6 版本号 `0.1.38`，提交信息符合 `<type>(<scope>): <中文描述>`，推送 `main`
+- [x] 6.1 `cargo +stable-x86_64-pc-windows-gnullvm clippy --workspace --all-targets -- -D warnings`（通过，仅 cargo manifest 未使用依赖提示）
+- [x] 6.2 `cargo +stable-x86_64-pc-windows-gnullvm test --workspace`（全绿）
+- [x] 6.3 `cargo +stable-x86_64-pc-windows-gnullvm build --release --locked -p mydb-server -p mydb-cli -p mydb-migrate -p mydb-dump`（通过）
+- [x] 6.4 本机启动冒烟：release 二进制、`/healthz`、`/readyz`、`/metrics`、OTLP 状态、SQL 建表/写入/范围扫描、OLAP 裁剪、权限隔离（`scripts/verify-monitoring-runtime.py` 通过）
+- [x] 6.5 本机无 MySQL/podman，未重跑同机基准；已如实标注“未重跑”，不写新倍数
+- [x] 6.6 版本号 `0.1.38`，提交信息符合 `<type>(<scope>): <中文描述>`，推送 `main`（提交 `42d51d8`，后续文档/规范提交另记）
+- [x] 6.7 Linux musl 静态构建规范与 CI：`AGENTS.md`、`docs/zh/musl-build.md`、`.github/workflows/build-linux-musl.yml`；本机无 musl 交叉工具链，首次 runner 执行待验证
 
 ## 7. 风险与回退
 

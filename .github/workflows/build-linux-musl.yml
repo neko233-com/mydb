@@ -1,0 +1,66 @@
+name: Build Linux musl static binaries
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  musl:
+    name: linux-x86_64-musl
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+      CC_x86_64_unknown_linux_musl: musl-gcc
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+        with:
+          toolchain: '1.99.1'
+          targets: x86_64-unknown-linux-musl
+      - name: Build static release binaries
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --target x86_64-unknown-linux-musl \
+            -p mydb-server -p mydb-cli -p mydb-migrate -p mydb-dump
+      - name: Verify static linking
+        run: |
+          set -euo pipefail
+          root="target/x86_64-unknown-linux-musl/release"
+          for binary in mydb-server mydb-cli mydb mydb-migrate mydbdump; do
+            file "$root/$binary" | grep -q 'statically linked'
+            if readelf -d "$root/$binary" | grep -q NEEDED; then
+              echo "$binary still has dynamic dependencies" >&2
+              exit 1
+            fi
+          done
+      - name: Package artifacts
+        run: |
+          set -euo pipefail
+          version=$(cargo pkgid --locked -p mydb-server | sed 's/.*#//; s/.*@//')
+          root="target/x86_64-unknown-linux-musl/release"
+          package="mydb-${version}-linux-x86_64-musl"
+          mkdir -p "target/$package"
+          cp "$root/mydb-server" "$root/mydb-cli" "$root/mydb" "$root/mydb-migrate" "$root/mydbdump" "target/$package/"
+          tar -C target -czf "target/$package.tar.gz" "$package"
+          (cd target && sha256sum "$package.tar.gz" > "$package.tar.gz.sha256")
+          printf 'version=%s\nmusl=static\n' "$version" > "target/$package/build-info.txt"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mydb-linux-x86_64-musl
+          retention-days: 7
+          if-no-files-found: error
+          path: |
+            target/mydb-*-linux-x86_64-musl.tar.gz
+            target/mydb-*-linux-x86_64-musl.tar.gz.sha256
