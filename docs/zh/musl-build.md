@@ -21,12 +21,13 @@ cargo build --release --locked --target x86_64-unknown-linux-musl \
 ```bash
 root=target/x86_64-unknown-linux-musl/release
 for bin in mydb-server mydb-cli mydb mydb-migrate mydbdump; do
-  file "$root/$bin" | grep -q 'statically linked'
-  ! readelf -d "$root/$bin" | grep -q NEEDED
+  file "$root/$bin"
+  ! readelf -l "$root/$bin" | grep -q INTERP
+  ! readelf -d "$root/$bin" 2>/dev/null | grep -q NEEDED
 done
 ```
 
-`file` 必须显示 `statically linked`，`readelf -d` 不得出现 `NEEDED`。任一失败即阻断发布。
+产物不得包含程序解释器（`INTERP`，即动态加载器），`readelf -d` 不得出现 `NEEDED`。任一失败即阻断发布。`file` 输出必须显示静态链接（部分构建会显示 `static-pie`）。
 
 ## 依赖体检
 

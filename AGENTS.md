@@ -66,7 +66,7 @@ WAL 写入是每个提交的关键路径，任何修改必须遵守以下约束�
 
 ## 构建与依赖规范（Linux 必须 musl 静态）
 
-1. **Linux 发布产物统一使用 `x86_64-unknown-linux-musl`**，禁止发布依赖 glibc 版本的 Linux 二进制。构建环境需安装 `musl-tools`，并设置 `CC_x86_64_unknown_linux_musl=musl-gcc`；产物必须通过 `file` 显示 `statically linked`，且 `readelf -d` 无 `NEEDED` 条目。
+1. **Linux 发布产物统一使用 `x86_64-unknown-linux-musl`**，禁止发布依赖 glibc 版本的 Linux 二进制。构建环境需安装 `musl-tools`，并设置 `CC_x86_64_unknown_linux_musl=musl-gcc`；产物必须无 `INTERP` 程序解释器、`readelf -d` 无 `NEEDED` 条目（`file` 显示 `statically linked` 或 `static-pie`）。
 2. **新增依赖前先做 musl 体检**：运行 `cargo tree --target x86_64-unknown-linux-musl -e normal`，确认可在 musl 下编译。优先纯 Rust crate；禁止新引入 `openssl-sys`、`libz-sys`、`libsqlite3-sys` 等绑定系统 C 库的依赖，TLS 统一用 `rustls`。
 3. **允许的 C 依赖必须静态内置**：`zstd-sys`、`ring` 等确需 C/汇编的 crate 只能以静态库形式编入二进制，不得要求目标机安装 `.so`/`.dll`；新增此类依赖需在 PR/提交说明中写明理由与体积影响。
 4. **CI 门槛**：Linux 构建 job 必须执行 `cargo build --release --locked --target x86_64-unknown-linux-musl`，并对 `mydb-server`、`mydb-cli`、`mydb-migrate`、`mydbdump` 做静态链接校验；失败即阻断发布。

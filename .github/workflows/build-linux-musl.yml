@@ -39,8 +39,13 @@ jobs:
           set -euo pipefail
           root="target/x86_64-unknown-linux-musl/release"
           for binary in mydb-server mydb-cli mydb mydb-migrate mydbdump; do
-            file "$root/$binary" | grep -q 'statically linked'
-            if readelf -d "$root/$binary" | grep -q NEEDED; then
+            echo "== $binary =="
+            file "$root/$binary"
+            if readelf -l "$root/$binary" | grep -q 'INTERP'; then
+              echo "$binary has a program interpreter (dynamic loader)" >&2
+              exit 1
+            fi
+            if readelf -d "$root/$binary" 2>/dev/null | grep -q NEEDED; then
               echo "$binary still has dynamic dependencies" >&2
               exit 1
             fi
