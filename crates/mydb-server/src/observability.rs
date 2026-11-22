@@ -4,7 +4,7 @@
 //! reads counters that the wire layer already maintains, so enabling it costs
 //! one snapshot per interval instead of per-statement instrumentation.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -23,12 +23,190 @@ use mydb_wire::{
 
 const OTLP_METRICS_PATH: &str = "/v1/metrics";
 const OTLP_TRACES_PATH: &str = "/v1/traces";
+const OTLP_LOGS_PATH: &str = "/v1/logs";
 /// Upper bound of exported spans per interval. A burst of slow statements
 /// must not produce an unbounded payload.
 const MAX_EXPORTED_SPANS: usize = 256;
 /// Number of statement digests exported as Prometheus labels. Prometheus label
 /// cardinality has to stay bounded.
 const MAX_PROMETHEUS_DIGESTS: usize = 20;
+/// Upper bound of buffered tracing events and exported log records per cycle.
+const MAX_BUFFERED_LOGS: usize = 4096;
+const MAX_EXPORTED_LOGS: usize = 256;
+
+#[derive(Clone)]
+struct CapturedLog {
+    id: u64,
+    time_unix_nanos: u64,
+    severity_number: i64,
+    severity_text: String,
+    body: String,
+    target: String,
+    attributes: BTreeMap<String, String>,
+}
+
+/// Bounded buffer feeding the OTLP logs signal. `tracing` stays on its normal
+/// synchronous path; only the exporter reads this buffer once per interval.
+pub struct OtlpLogBuffer {
+    sequence: AtomicU64,
+    entries: Mutex<VecDeque<CapturedLog>>,
+}
+
+impl OtlpLogBuffer {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            sequence: AtomicU64::new(0),
+            entries: Mutex::new(VecDeque::with_capacity(MAX_BUFFERED_LOGS)),
+        })
+    }
+
+    fn push(&self, mut log: CapturedLog) {
+        log.id = self.sequence.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut entries = self.entries.lock();
+        if entries.len() == MAX_BUFFERED_LOGS {
+            entries.pop_front();
+        }
+        entries.push_back(log);
+    }
+
+    fn since(&self, last_id: u64) -> Vec<CapturedLog> {
+        let entries = self.entries.lock();
+        let mut pending: Vec<CapturedLog> = entries
+            .iter()
+            .filter(|entry| entry.id > last_id)
+            .cloned()
+            .collect();
+        if pending.len() > MAX_EXPORTED_LOGS {
+            pending.drain(..pending.len() - MAX_EXPORTED_LOGS);
+        }
+        pending
+    }
+}
+
+#[derive(Default)]
+struct LogVisitor {
+    body: Option<String>,
+    attributes: BTreeMap<String, String>,
+}
+
+impl LogVisitor {
+    fn record(&mut self, field: &tracing::field::Field, value: String) {
+        if field.name() == "message" {
+            self.body = Some(value);
+            return;
+        }
+        if is_sensitive_log_key(field.name()) {
+            self.attributes
+                .insert(field.name().to_string(), "<redacted>".to_string());
+        } else {
+            self.attributes.insert(field.name().to_string(), value);
+        }
+    }
+}
+
+impl tracing::field::Visit for LogVisitor {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn fmt::Debug) {
+        self.record(field, format!("{value:?}"));
+    }
+
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        self.record(field, value.to_string());
+    }
+
+    fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+        self.record(field, value.to_string());
+    }
+
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        self.record(field, value.to_string());
+    }
+
+    fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+        self.record(field, value.to_string());
+    }
+}
+
+fn is_sensitive_log_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    ["password", "token", "secret", "authorization", "credential"]
+        .iter()
+        .any(|needle| key.contains(needle))
+}
+
+/// `tracing` layer that mirrors events into the OTLP log buffer. Exporter
+/// diagnostics are skipped so a failing collector cannot feed itself.
+pub struct OtlpLogLayer {
+    buffer: Arc<OtlpLogBuffer>,
+}
+
+impl OtlpLogLayer {
+    pub fn new(buffer: Arc<OtlpLogBuffer>) -> Self {
+        Self { buffer }
+    }
+}
+
+impl<S> tracing_subscriber::Layer<S> for OtlpLogLayer
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _context: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let metadata = event.metadata();
+        if metadata.target().contains("mydb_server::observability") {
+            return;
+        }
+        let mut visitor = LogVisitor::default();
+        event.record(&mut visitor);
+        let body = visitor.body.unwrap_or_default();
+        if body.is_empty() && visitor.attributes.is_empty() {
+            return;
+        }
+        let level = *metadata.level();
+        let (severity_text, severity_number) = if level == tracing::Level::ERROR {
+            ("ERROR", 17)
+        } else if level == tracing::Level::WARN {
+            ("WARN", 13)
+        } else if level == tracing::Level::INFO {
+            ("INFO", 9)
+        } else if level == tracing::Level::DEBUG {
+            ("DEBUG", 5)
+        } else {
+            ("TRACE", 1)
+        };
+        self.buffer.push(CapturedLog {
+            id: 0,
+            time_unix_nanos: unix_nanos(),
+            severity_number,
+            severity_text: severity_text.to_string(),
+            body,
+            target: metadata.target().to_string(),
+            attributes: visitor.attributes,
+        });
+    }
+}
+
+/// Install the normal stdout subscriber plus the OTLP log mirror.
+pub fn init_logging() -> anyhow::Result<()> {
+    use tracing_subscriber::prelude::*;
+    let filter =
+        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(tracing_subscriber::fmt::layer())
+        .with(OtlpLogLayer::new(log_buffer()))
+        .try_init()
+        .map_err(|error| anyhow::anyhow!("failed to initialize logging: {error}"))
+}
+
+/// Process-wide log buffer shared by the tracing layer and the exporter, so
+/// Windows service mode and normal mode use the same instance.
+pub fn log_buffer() -> Arc<OtlpLogBuffer> {
+    static LOG_BUFFER: std::sync::OnceLock<Arc<OtlpLogBuffer>> = std::sync::OnceLock::new();
+    LOG_BUFFER.get_or_init(OtlpLogBuffer::new).clone()
+}
 
 /// Resolved upstream credentials. The password is read once per configuration
 /// reload, never once per export, and never appears in `Debug` output.
@@ -87,6 +265,7 @@ pub struct OtlpSettings {
     pub headers: BTreeMap<String, String>,
     pub auth: OtlpAuth,
     pub export_traces: bool,
+    pub export_logs: bool,
     pub include_sql: bool,
 }
 
@@ -102,6 +281,7 @@ impl fmt::Debug for OtlpSettings {
             .field("headers", &self.headers.keys().collect::<Vec<_>>())
             .field("auth", &self.auth)
             .field("export_traces", &self.export_traces)
+            .field("export_logs", &self.export_logs)
             .field("include_sql", &self.include_sql)
             .finish()
     }
@@ -119,6 +299,7 @@ impl OtlpSettings {
             headers: section.headers.clone(),
             auth,
             export_traces: section.export_traces,
+            export_logs: section.export_logs,
             include_sql: section.include_sql,
         }
     }
@@ -155,6 +336,7 @@ fn resolve_auth(section: &OtlpSection) -> OtlpAuth {
 struct OtlpCounters {
     metric_exports: AtomicU64,
     span_exports: AtomicU64,
+    log_exports: AtomicU64,
     failures: AtomicU64,
     last_success_unix_ms: AtomicU64,
     last_error: Mutex<Option<String>>,
@@ -168,9 +350,11 @@ pub struct OtlpStatusSnapshot {
     pub service_name: String,
     pub auth_method: String,
     pub export_traces: bool,
+    pub export_logs: bool,
     pub include_sql: bool,
     pub metric_exports: u64,
     pub span_exports: u64,
+    pub log_exports: u64,
     pub failures: u64,
     pub last_success_unix_ms: u64,
     pub last_error: Option<String>,
@@ -187,9 +371,11 @@ impl OtlpStatusSnapshot {
             "service_name": self.service_name,
             "auth_method": self.auth_method,
             "export_traces": self.export_traces,
+            "export_logs": self.export_logs,
             "include_sql": self.include_sql,
             "metric_exports": self.metric_exports,
             "span_exports": self.span_exports,
+            "log_exports": self.log_exports,
             "failures": self.failures,
             "last_success_unix_ms": self.last_success_unix_ms,
             "last_error": self.last_error,
@@ -222,6 +408,8 @@ pub struct OtlpExporter {
     settings: Arc<RwLock<OtlpSettings>>,
     counters: Arc<OtlpCounters>,
     last_exported_slow_query_id: Arc<AtomicU64>,
+    last_exported_log_id: Arc<AtomicU64>,
+    log_buffer: Arc<OtlpLogBuffer>,
 }
 
 impl OtlpExporter {
@@ -230,6 +418,8 @@ impl OtlpExporter {
             settings: Arc::new(RwLock::new(OtlpSettings::from_section(section))),
             counters: Arc::new(OtlpCounters::default()),
             last_exported_slow_query_id: Arc::new(AtomicU64::new(0)),
+            last_exported_log_id: Arc::new(AtomicU64::new(0)),
+            log_buffer: log_buffer(),
         }
     }
 
@@ -248,9 +438,11 @@ impl OtlpExporter {
             service_name: settings.service_name.clone(),
             auth_method: settings.auth.method_name().to_string(),
             export_traces: settings.export_traces,
+            export_logs: settings.export_logs,
             include_sql: settings.include_sql,
             metric_exports: self.counters.metric_exports.load(Ordering::Relaxed),
             span_exports: self.counters.span_exports.load(Ordering::Relaxed),
+            log_exports: self.counters.log_exports.load(Ordering::Relaxed),
             failures: self.counters.failures.load(Ordering::Relaxed),
             last_success_unix_ms: self.counters.last_success_unix_ms.load(Ordering::Relaxed),
             last_error: self.counters.last_error.lock().clone(),
@@ -291,34 +483,70 @@ impl OtlpExporter {
             Err(error) => self.record_failure(error.to_string()),
         }
 
-        if !settings.export_traces {
-            return;
-        }
-        let spans = collect_spans(slow_queries, &self.last_exported_slow_query_id);
-        if spans.is_empty() {
-            return;
-        }
-        let traces_payload = otlp_traces_payload(&settings, &spans, server);
-        match post_json(
-            &format!("{}{}", settings.endpoint, OTLP_TRACES_PATH),
-            &settings.headers,
-            &settings.auth,
-            &traces_payload,
-            settings.timeout,
-        )
-        .await
-        {
-            Ok(status) if (200..300).contains(&status) => {
-                self.counters.span_exports.fetch_add(1, Ordering::Relaxed);
-                self.counters
-                    .last_success_unix_ms
-                    .store(unix_millis(), Ordering::Relaxed);
-                *self.counters.last_error.lock() = None;
+        if settings.export_traces {
+            let spans = collect_spans(slow_queries, &self.last_exported_slow_query_id);
+            if !spans.is_empty() {
+                let traces_payload = otlp_traces_payload(&settings, &spans, server);
+                match post_json(
+                    &format!("{}{}", settings.endpoint, OTLP_TRACES_PATH),
+                    &settings.headers,
+                    &settings.auth,
+                    &traces_payload,
+                    settings.timeout,
+                )
+                .await
+                {
+                    Ok(status) if (200..300).contains(&status) => {
+                        self.counters.span_exports.fetch_add(1, Ordering::Relaxed);
+                        self.counters
+                            .last_success_unix_ms
+                            .store(unix_millis(), Ordering::Relaxed);
+                        *self.counters.last_error.lock() = None;
+                    }
+                    Ok(status) => {
+                        self.record_failure(format!(
+                            "OTLP traces endpoint returned HTTP {status}"
+                        ));
+                    }
+                    Err(error) => self.record_failure(error.to_string()),
+                }
             }
-            Ok(status) => {
-                self.record_failure(format!("OTLP traces endpoint returned HTTP {status}"));
+        }
+
+        if settings.export_logs {
+            let logs = self
+                .log_buffer
+                .since(self.last_exported_log_id.load(Ordering::Relaxed));
+            if !logs.is_empty() {
+                if let Some(last) = logs.last() {
+                    self.last_exported_log_id
+                        .store(last.id, Ordering::Relaxed);
+                }
+                let logs_payload = otlp_logs_payload(&settings, &logs, server);
+                match post_json(
+                    &format!("{}{}", settings.endpoint, OTLP_LOGS_PATH),
+                    &settings.headers,
+                    &settings.auth,
+                    &logs_payload,
+                    settings.timeout,
+                )
+                .await
+                {
+                    Ok(status) if (200..300).contains(&status) => {
+                        self.counters.log_exports.fetch_add(1, Ordering::Relaxed);
+                        self.counters
+                            .last_success_unix_ms
+                            .store(unix_millis(), Ordering::Relaxed);
+                        *self.counters.last_error.lock() = None;
+                    }
+                    Ok(status) => {
+                        self.record_failure(format!(
+                            "OTLP logs endpoint returned HTTP {status}"
+                        ));
+                    }
+                    Err(error) => self.record_failure(error.to_string()),
+                }
             }
-            Err(error) => self.record_failure(error.to_string()),
         }
     }
 
@@ -795,7 +1023,8 @@ fn otlp_metrics_payload(
     })
 }
 
-/// Slow statements recorded since the previous export become client spans.
+/// Slow statements recorded since the previous export become MySQL 9 style
+/// `stmt` internal spans.
 /// The watermark advances even when the export fails, so a broken collector
 /// cannot make the exporter resend the same spans forever.
 fn collect_spans(
@@ -839,16 +1068,25 @@ fn otlp_traces_payload(
                     snapshot.duration_ms as i64,
                 ),
                 int_attribute("db.mysql.connection_id", i64::from(snapshot.connection_id)),
+                string_attribute("mysql.digest_text", &snapshot.query_digest),
+                int_attribute("mysql.cpu_time", snapshot.execution_micros as i64),
+                int_attribute("mysql.lock_time", 0),
+                int_attribute("mysql.error_count", i64::from(snapshot.error.is_some())),
+                int_attribute("mysql.warning_count", 0),
             ];
             if settings.include_sql {
                 attributes.push(string_attribute("db.statement", &snapshot.sql));
                 attributes.push(string_attribute("db.name", &snapshot.database));
+                attributes.push(string_attribute("mysql.sql_text", &snapshot.sql));
+                attributes.push(string_attribute("mysql.current_schema", &snapshot.database));
             }
             if let Some(rows) = snapshot.rows_returned {
                 attributes.push(int_attribute("db.response.returned_rows", rows as i64));
+                attributes.push(int_attribute("mysql.rows_sent", rows as i64));
             }
             if let Some(affected) = snapshot.affected_rows {
                 attributes.push(int_attribute("db.response.affected_rows", affected as i64));
+                attributes.push(int_attribute("mysql.rows_affected", affected as i64));
             }
             if let Some(error) = snapshot.error.as_ref().filter(|_| settings.include_sql) {
                 attributes.push(string_attribute("error.message", error));
@@ -861,8 +1099,8 @@ fn otlp_traces_payload(
             json!({
                 "traceId": stable_trace_id(server, snapshot),
                 "spanId": stable_span_id(server, snapshot),
-                "name": format!("mysql {}", snapshot.statement_type),
-                "kind": 3,
+                "name": "stmt",
+                "kind": 1,
                 "startTimeUnixNano": start_nanos.to_string(),
                 "endTimeUnixNano": end_nanos.to_string(),
                 "attributes": attributes,
@@ -878,6 +1116,38 @@ fn otlp_traces_payload(
             "scopeSpans": [{
                 "scope": {"name": "mydb", "version": server.version},
                 "spans": otlp_spans,
+            }]
+        }]
+    })
+}
+
+/// Mirror of MySQL 9's OTLP logs signal: one record per captured `tracing`
+/// event, with the target and structured fields preserved as attributes.
+fn otlp_logs_payload(settings: &OtlpSettings, logs: &[CapturedLog], server: &ServerIdentity) -> Value {
+    let records: Vec<Value> = logs
+        .iter()
+        .map(|log| {
+            let mut attributes = vec![string_attribute("code.target", &log.target)];
+            for (key, value) in &log.attributes {
+                attributes.push(string_attribute(key, value));
+            }
+            json!({
+                "timeUnixNano": log.time_unix_nanos.to_string(),
+                "severityNumber": log.severity_number,
+                "severityText": log.severity_text,
+                "body": {"stringValue": log.body},
+                "attributes": attributes,
+            })
+        })
+        .collect();
+    json!({
+        "resourceLogs": [{
+            "resource": {
+                "attributes": resource_attributes(settings, server)
+            },
+            "scopeLogs": [{
+                "scope": {"name": "mydb", "version": server.version},
+                "logRecords": records,
             }]
         }]
     })
@@ -1109,6 +1379,7 @@ mod tests {
             headers: BTreeMap::new(),
             auth: OtlpAuth::None,
             export_traces: true,
+            export_logs: false,
             include_sql: false,
         }
     }
@@ -1261,7 +1532,8 @@ mod tests {
             &server_identity(),
         );
         let span = &payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
-        assert_eq!(span["kind"], json!(3));
+        assert_eq!(span["kind"], json!(1));
+        assert_eq!(span["name"], json!("stmt"));
         assert_eq!(span["status"]["code"], json!(1));
         assert_eq!(span["traceId"].as_str().map(str::len), Some(32));
         assert_eq!(span["spanId"].as_str().map(str::len), Some(16));
@@ -1270,6 +1542,10 @@ mod tests {
             .iter()
             .any(|attribute| attribute["key"] == json!("db.system")
                 && attribute["value"]["stringValue"] == json!("mysql")));
+        assert!(attributes.iter().any(|attribute| {
+            attribute["key"] == json!("mysql.cpu_time")
+                && attribute["value"]["intValue"] == json!("240000")
+        }));
         assert!(!attributes
             .iter()
             .any(|attribute| attribute["key"] == json!("db.statement")));
@@ -1402,5 +1678,60 @@ mod tests {
             Some(expected.as_str())
         );
         assert!(!format!("{:?}", settings.auth).contains("file-secret"));
+    }
+
+    #[test]
+    fn logs_payload_uses_otlp_log_shape_and_bounded_fields() {
+        let log = CapturedLog {
+            id: 1,
+            time_unix_nanos: 1_700_000_000_000_000_000,
+            severity_number: 13,
+            severity_text: "WARN".to_string(),
+            body: "test warning".to_string(),
+            target: "mydb_server::test".to_string(),
+            attributes: BTreeMap::from([("retry".to_string(), "2".to_string())]),
+        };
+        let payload = otlp_logs_payload(&settings(), &[log], &server_identity());
+        let record = &payload["resourceLogs"][0]["scopeLogs"][0]["logRecords"][0];
+        assert_eq!(record["severityNumber"], json!(13));
+        assert_eq!(record["severityText"], json!("WARN"));
+        assert_eq!(record["body"]["stringValue"], json!("test warning"));
+        let attributes = record["attributes"].as_array().expect("attributes");
+        assert!(attributes.iter().any(|attribute| {
+            attribute["key"] == json!("code.target")
+                && attribute["value"]["stringValue"] == json!("mydb_server::test")
+        }));
+        assert!(attributes.iter().any(|attribute| {
+            attribute["key"] == json!("retry")
+                && attribute["value"]["stringValue"] == json!("2")
+        }));
+    }
+
+    #[test]
+    fn sensitive_log_keys_are_redacted() {
+        assert!(is_sensitive_log_key("password"));
+        assert!(is_sensitive_log_key("authorization"));
+        assert!(is_sensitive_log_key("MYDB_OTLP_TOKEN"));
+        assert!(!is_sensitive_log_key("rows"));
+    }
+
+    #[test]
+    fn log_buffer_is_bounded_and_reports_only_new_records() {
+        let buffer = OtlpLogBuffer::new();
+        for id in 0..(MAX_BUFFERED_LOGS + 10) {
+            buffer.push(CapturedLog {
+                id: 0,
+                time_unix_nanos: 1,
+                severity_number: 9,
+                severity_text: "INFO".to_string(),
+                body: format!("log {id}"),
+                target: "test".to_string(),
+                attributes: BTreeMap::new(),
+            });
+        }
+        let pending = buffer.since(0);
+        assert_eq!(pending.len(), MAX_EXPORTED_LOGS);
+        assert_eq!(pending.last().map(|log| log.id), Some((MAX_BUFFERED_LOGS + 10) as u64));
+        assert!(buffer.since(pending.last().expect("last log").id).is_empty());
     }
 }

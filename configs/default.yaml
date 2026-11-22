@@ -144,6 +144,8 @@ observability:
       token: ""
     # 导出慢查询/错误语句的 span（不改动查询热路径）
     export_traces: true
+    # 导出 tracing 日志到 OTLP /v1/logs（默认关闭；日志可能含业务数据）
+    export_logs: false
     # 是否在 span 中携带 SQL 原文（默认关闭，避免泄露业务数据）
     include_sql: false
 

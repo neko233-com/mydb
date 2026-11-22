@@ -380,7 +380,8 @@ curl --config /path/to/private-metrics.curl http://127.0.0.1:4306/metrics
 
 ### OpenTelemetry（OTLP/HTTP）
 
-`observability.otlp` 以标准 OTLP/HTTP JSON 导出指标与慢查询 trace，默认关闭；关闭时不采集快照。
+`observability.otlp` 以标准 OTLP/HTTP JSON 导出指标、慢查询 `stmt` trace 和可选日志，默认关闭；关闭时不采集快照。实现参考 MySQL 9 Telemetry，并保留单机零热路径分配。
+
 管理端点：
 
 ```bash
@@ -394,6 +395,8 @@ curl -H "Authorization: Bearer $MYDB_ADMIN_TOKEN" http://127.0.0.1:4306/api/v1/o
 - `auth.method: bearer` 使用 `token`（可用 `MYDB_OTLP_TOKEN`）。
 - 显式 `headers.Authorization` 与 `auth` 二选一；非 loopback 端点带凭据时必须 HTTPS。
 - `enabled` 可热重载，无需重启；`/api/v1/status` 同时返回导出成功/失败计数与最近错误。
+- `export_logs: true` 开启 `/v1/logs`（MySQL 9.1 对齐）；默认关闭，密码/token/secret 字段强制脱敏，详见
+  [OpenTelemetry 接入](docs/zh/opentelemetry.md)。
 
 ### OLAP 页级 zone map
 
@@ -768,7 +771,8 @@ CDC 是 MyDB 相对 MySQL 的**额外扩展，默认关闭**，不宣称 MySQL b
 
 ### v0.1.38 观测与 OLAP 裁剪版
 
-- ✅ OpenTelemetry OTLP/HTTP 原生导出：指标 + 慢查询 trace；Basic（用户名+密码）/ Bearer 鉴权；密钥支持环境变量与文件；管理 API 可查询导出状态且不泄露凭据
+- ✅ OpenTelemetry OTLP/HTTP 原生导出：指标 + 慢查询 `stmt` trace + 可选日志；Basic（用户名+密码）/ Bearer 鉴权；密钥支持环境变量与文件；管理 API 可查询导出状态且不泄露凭据
+- ✅ 对齐 MySQL 9 Telemetry：`stmt` span 使用 Internal kind，附带 `mysql.digest_text`、`mysql.cpu_time`、`mysql.rows_sent/affected`、`mysql.error_count` 等属性；新增 `/v1/logs`（默认关闭，敏感字段脱敏）
 - ✅ OTLP 导出器常驻，`enabled` 支持热重载；关闭时零快照开销；新增 `GET /api/v1/observability/otlp`
 - ✅ OLAP 页级 zone map：min/max/NULL 保守裁剪，范围扫描跳过无关页；新增 `mydb_olap_*` Prometheus/OTLP 指标与回归测试
 - ✅ CDC 消费断点：`GET/POST /api/v1/cdc/checkpoint`、`lag_lsn`；新增 [MyDB → TiDB 迁移手册](docs/zh/tidb-migration.md)

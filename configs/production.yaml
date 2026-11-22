@@ -89,6 +89,7 @@ observability:
       password_file: null
       token: ""
     export_traces: true
+    export_logs: false
     include_sql: false
 
 # CDC：默认关闭；可热重载或用 /api/v1/cdc/enable 动态开启。

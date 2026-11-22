@@ -244,6 +244,10 @@ pub struct OtlpSection {
     /// per-statement instrumentation cost on the query hot path.
     #[serde(default = "default_true")]
     pub export_traces: bool,
+    /// Export `tracing` events as OTLP logs. Disabled by default: log bodies
+    /// can contain application data even after credential fields are redacted.
+    #[serde(default)]
+    pub export_logs: bool,
     /// SQL text may contain business or personal data. Keep it disabled by
     /// default and export the digest instead.
     #[serde(default)]
@@ -535,6 +539,7 @@ impl Default for OtlpSection {
             headers: BTreeMap::new(),
             auth: OtlpAuthSection::default(),
             export_traces: true,
+            export_logs: false,
             include_sql: false,
         }
     }
@@ -617,6 +622,18 @@ impl ServerConfig {
         }
         if let Ok(value) = std::env::var("MYDB_OTLP_ENABLED") {
             self.observability.otlp.enabled = matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "on" | "yes"
+            );
+        }
+        if let Ok(value) = std::env::var("MYDB_OTLP_TRACES") {
+            self.observability.otlp.export_traces = matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "on" | "yes"
+            );
+        }
+        if let Ok(value) = std::env::var("MYDB_OTLP_LOGS") {
+            self.observability.otlp.export_logs = matches!(
                 value.to_ascii_lowercase().as_str(),
                 "1" | "true" | "on" | "yes"
             );

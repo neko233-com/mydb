@@ -57,7 +57,7 @@ mydb-server --config /etc/mydb/production.yaml
 
 配置 `security.tls_cert`、`security.tls_key`，并设置 `require_secure_transport: true`。Docker 烟测里的 `root/root` 只属于本地兼容测试。
 
-Prometheus 指标在 `http://127.0.0.1:4306/metrics`。强密码模式下先登录管理 API，再带 Bearer token 访问。
+Prometheus 指标在 `http://127.0.0.1:4306/metrics`。强密码模式下先登录管理 API，再带 Bearer token 访问。OTLP metrics/traces/logs 与 MySQL 9 对照见 [OpenTelemetry 接入](opentelemetry.md)。
 
 ## 备份与迁移
 

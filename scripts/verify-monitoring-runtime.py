@@ -9,9 +9,11 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
 def port():
@@ -38,6 +40,25 @@ def main():
         http_port = port()
     admin, database_password, scrape, reader_password = (secrets.token_hex(32) for _ in range(4))
     base = f"http://127.0.0.1:{http_port}"
+    otlp_requests = []
+    collector_port = port()
+    while collector_port in (sql_port, http_port):
+        collector_port = port()
+
+    class Collector(BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(length).decode("utf-8", "replace")
+            otlp_requests.append((self.path, body))
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *_args):
+            pass
+
+    collector = ThreadingHTTPServer(("127.0.0.1", collector_port), Collector)
+    collector_thread = threading.Thread(target=collector.serve_forever, daemon=True)
+    collector_thread.start()
 
     def request(path, token="", method="GET", body=None):
         headers = {"Content-Type": "application/json"}
@@ -68,8 +89,20 @@ def main():
             "memory": {"max_memory": "128M"},
             "security": {"default_username": "root", "default_password": database_password, "enforce_strong_passwords": True, "local_infile": False},
             "backup": {"backup_dir": str(root / "backups"), "auto_backup_interval": 0},
-            "logging": {"file": "", "level": "warn"},
-            "observability": {"metrics_token_file": str(credential)},
+            "logging": {"file": "", "level": "info"},
+            "observability": {
+                "metrics_token_file": str(credential),
+                "otlp": {
+                    "enabled": True,
+                    "endpoint": f"http://127.0.0.1:{collector_port}",
+                    "interval_secs": 1,
+                    "timeout_secs": 2,
+                    "service_name": "mydb-ci",
+                    "export_traces": True,
+                    "export_logs": True,
+                    "include_sql": False,
+                },
+            },
         }
         config_file = root / "config.json"
         config_file.write_text(json.dumps(config), encoding="utf-8")
@@ -123,6 +156,23 @@ def main():
                 status, body = request("/api/v1/observability/otlp", session)
                 check(status == 200 and json.loads(body).get("auth_method") in {"none", "basic", "bearer"},
                       "OTLP status endpoint did not report a valid auth mode")
+                deadline = time.monotonic() + 8
+                while time.monotonic() < deadline:
+                    if any(path == "/v1/metrics" for path, _ in otlp_requests) and any(
+                        path == "/v1/logs" for path, _ in otlp_requests
+                    ):
+                        break
+                    time.sleep(0.2)
+                check(any(path == "/v1/metrics" for path, _ in otlp_requests),
+                      "OTLP metrics were not exported")
+                check(any(path == "/v1/logs" for path, _ in otlp_requests),
+                      "OTLP logs were not exported")
+                log_payload = next(json.loads(body) for path, body in otlp_requests if path == "/v1/logs")
+                check(bool(log_payload["resourceLogs"][0]["scopeLogs"][0]["logRecords"]),
+                      "OTLP logs payload had no records")
+                metrics_payload = next(json.loads(body) for path, body in otlp_requests if path == "/v1/metrics")
+                check(bool(metrics_payload["resourceMetrics"][0]["scopeMetrics"][0]["metrics"]),
+                      "OTLP metrics payload had no metrics")
                 sql(f"CREATE USER 'ci_reader'@'%' IDENTIFIED BY '{reader_password}'")
                 sql("GRANT SELECT ON ci_monitor.* TO 'ci_reader'@'%'")
                 status, body = request("/api/v1/auth/login", method="POST", body={"username": "ci_reader", "password": reader_password})
@@ -154,7 +204,9 @@ def main():
                         process.wait(timeout=5)
         total = sum(path.stat().st_size for path in root.rglob("*") if path.is_file())
         check(total <= 64 << 20, "Native monitoring smoke exceeded its 64 MiB fixture budget")
-    print(json.dumps({"version": args.expected_version, "native_cli_protocol": True, "read_only_metrics": True, "sql_management_isolation": True, "sql_privacy": True, "temporary_bytes": total, "temporary_data_removed": True}))
+    collector.shutdown()
+    collector.server_close()
+    print(json.dumps({"version": args.expected_version, "native_cli_protocol": True, "read_only_metrics": True, "sql_management_isolation": True, "sql_privacy": True, "otlp_metrics_logs": True, "temporary_bytes": total, "temporary_data_removed": True}))
 
 
 if __name__ == "__main__":

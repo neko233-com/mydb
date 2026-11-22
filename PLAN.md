@@ -35,6 +35,7 @@
 - [x] 2.5 状态可观测：`GET /api/v1/observability/otlp` 返回开关、端点、鉴权类型、成功/失败计数、最近错误（不含密钥）
 - [x] 2.6 OTLP 指标补充 CDC 与 OLAP：`mydb.cdc.*`、`mydb.olap.*`、导出器失败计数
 - [x] 2.7 测试：鉴权头生成、配置校验、脱敏、热开关状态、OTLP payload 结构
+- [x] 2.8 对齐 MySQL 9 Telemetry：`stmt` Internal span + `mysql.*` 属性；新增 OTLP `/v1/logs`（`export_logs` 默认关闭、敏感字段脱敏）；运行时冒烟验证 `/v1/metrics` 与 `/v1/logs` 均到达采集器；对照与缺口写入 `docs/zh/opentelemetry.md`
 
 ## 3. OLAP 页级 zone map（G6）
 
@@ -69,7 +70,7 @@
 - [x] 6.1 `cargo +stable-x86_64-pc-windows-gnullvm clippy --workspace --all-targets -- -D warnings`（通过，仅 cargo manifest 未使用依赖提示）
 - [x] 6.2 `cargo +stable-x86_64-pc-windows-gnullvm test --workspace`（全绿）
 - [x] 6.3 `cargo +stable-x86_64-pc-windows-gnullvm build --release --locked -p mydb-server -p mydb-cli -p mydb-migrate -p mydb-dump`（通过）
-- [x] 6.4 本机启动冒烟：release 二进制、`/healthz`、`/readyz`、`/metrics`、OTLP 状态、SQL 建表/写入/范围扫描、OLAP 裁剪、权限隔离（`scripts/verify-monitoring-runtime.py` 通过）
+- [x] 6.4 本机启动冒烟：release 二进制、`/healthz`、`/readyz`、`/metrics`、OTLP 状态、OTLP `/v1/metrics`+`/v1/logs`、SQL 建表/写入/范围扫描、OLAP 裁剪、权限隔离（`scripts/verify-monitoring-runtime.py` 通过）
 - [x] 6.5 本机无 MySQL/podman，未重跑同机基准；已如实标注“未重跑”，不写新倍数
 - [x] 6.6 版本号 `0.1.38`，提交信息符合 `<type>(<scope>): <中文描述>`，推送 `main`（提交 `42d51d8`，后续文档/规范提交另记）
 - [x] 6.7 Linux musl 静态构建规范与 CI：`AGENTS.md`、`docs/zh/musl-build.md`、`.github/workflows/build-linux-musl.yml`；GitHub Actions run `45051995511` 构建、静态校验与产物上传通过
