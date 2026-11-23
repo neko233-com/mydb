@@ -362,7 +362,9 @@ fn resolve_auth(section: &OtlpSection) -> OtlpAuth {
             if password.is_empty() {
                 if let Some(path) = section.auth.password_file.as_ref() {
                     match std::fs::read_to_string(path) {
-                        Ok(content) => password = content.trim_end_matches(['\r', '\n']).to_string(),
+                        Ok(content) => {
+                            password = content.trim_end_matches(['\r', '\n']).to_string()
+                        }
                         Err(error) => tracing::warn!(
                             path = %path.display(),
                             error = %error,
@@ -545,12 +547,14 @@ impl OtlpExporter {
         }
 
         if settings.export_traces {
-            let statements =
-                wire_stats.statement_traces_since(self.last_exported_statement_trace_id.load(Ordering::Relaxed));
-            let sessions =
-                wire_stats.session_traces_since(self.last_exported_session_trace_id.load(Ordering::Relaxed));
-            let controls =
-                wire_stats.control_traces_since(self.last_exported_control_trace_id.load(Ordering::Relaxed));
+            let statements = wire_stats.statement_traces_since(
+                self.last_exported_statement_trace_id
+                    .load(Ordering::Relaxed),
+            );
+            let sessions = wire_stats
+                .session_traces_since(self.last_exported_session_trace_id.load(Ordering::Relaxed));
+            let controls = wire_stats
+                .control_traces_since(self.last_exported_control_trace_id.load(Ordering::Relaxed));
             if let Some(last) = statements.last() {
                 self.last_exported_statement_trace_id
                     .store(last.id, Ordering::Relaxed);
@@ -585,9 +589,7 @@ impl OtlpExporter {
                         *self.counters.last_error.lock() = None;
                     }
                     Ok(status) => {
-                        self.record_failure(format!(
-                            "OTLP traces endpoint returned HTTP {status}"
-                        ));
+                        self.record_failure(format!("OTLP traces endpoint returned HTTP {status}"));
                     }
                     Err(error) => self.record_failure(error.to_string()),
                 }
@@ -600,8 +602,7 @@ impl OtlpExporter {
                 .since(self.last_exported_log_id.load(Ordering::Relaxed));
             if !logs.is_empty() {
                 if let Some(last) = logs.last() {
-                    self.last_exported_log_id
-                        .store(last.id, Ordering::Relaxed);
+                    self.last_exported_log_id.store(last.id, Ordering::Relaxed);
                 }
                 let logs_payload = otlp_logs_payload(&settings, &logs, server);
                 match post_otlp(
@@ -623,9 +624,7 @@ impl OtlpExporter {
                         *self.counters.last_error.lock() = None;
                     }
                     Ok(status) => {
-                        self.record_failure(format!(
-                            "OTLP logs endpoint returned HTTP {status}"
-                        ));
+                        self.record_failure(format!("OTLP logs endpoint returned HTTP {status}"));
                     }
                     Err(error) => self.record_failure(error.to_string()),
                 }
@@ -707,9 +706,7 @@ pub async fn run_otlp_exporter(
             port: server_port,
             version: version.clone(),
         };
-        exporter
-            .export_once(&snapshot, &wire_stats, &server)
-            .await;
+        exporter.export_once(&snapshot, &wire_stats, &server).await;
     }
 }
 
@@ -1051,7 +1048,10 @@ fn encode_metrics_request(payload: &Value) -> Vec<u8> {
             encode_resource(resource, &mut resource_message);
             pb_message_field(1, &resource_message, &mut message);
         }
-        if let Some(scope_metrics) = resource_metric.get("scopeMetrics").and_then(Value::as_array) {
+        if let Some(scope_metrics) = resource_metric
+            .get("scopeMetrics")
+            .and_then(Value::as_array)
+        {
             for scope_metric in scope_metrics {
                 let mut scope_message = Vec::new();
                 if let Some(scope) = scope_metric.get("scope") {
@@ -1165,7 +1165,10 @@ fn resource_attributes(settings: &OtlpSettings, server: &ServerIdentity) -> Valu
     json!([
         string_attribute("service.name", &settings.service_name),
         string_attribute("service.version", &server.version),
-        string_attribute("service.instance.id", &format!("{}:{}", hostname(), server.port)),
+        string_attribute(
+            "service.instance.id",
+            &format!("{}:{}", hostname(), server.port)
+        ),
         string_attribute("host.name", &hostname()),
         string_attribute("server.address", &server.host),
         int_attribute("server.port", i64::from(server.port)),
@@ -1475,12 +1478,42 @@ fn otlp_metrics_payload(
             storage.olap_rows_pruned,
             timestamp,
         ),
-        cdc_gauge_metric(snapshot.cdc, "enabled", |status| u64::from(status.enabled), timestamp),
-        cdc_gauge_metric(snapshot.cdc, "last_lsn", |status| status.last_lsn, timestamp),
-        cdc_gauge_metric(snapshot.cdc, "checkpoint_lsn", |status| status.checkpoint_lsn, timestamp),
-        cdc_gauge_metric(snapshot.cdc, "lag_lsn", |status| status.lag_lsn(), timestamp),
-        cdc_counter_metric(snapshot.cdc, "events_total", |status| status.events_emitted, timestamp),
-        cdc_counter_metric(snapshot.cdc, "changes_total", |status| status.changes_emitted, timestamp),
+        cdc_gauge_metric(
+            snapshot.cdc,
+            "enabled",
+            |status| u64::from(status.enabled),
+            timestamp,
+        ),
+        cdc_gauge_metric(
+            snapshot.cdc,
+            "last_lsn",
+            |status| status.last_lsn,
+            timestamp,
+        ),
+        cdc_gauge_metric(
+            snapshot.cdc,
+            "checkpoint_lsn",
+            |status| status.checkpoint_lsn,
+            timestamp,
+        ),
+        cdc_gauge_metric(
+            snapshot.cdc,
+            "lag_lsn",
+            |status| status.lag_lsn(),
+            timestamp,
+        ),
+        cdc_counter_metric(
+            snapshot.cdc,
+            "events_total",
+            |status| status.events_emitted,
+            timestamp,
+        ),
+        cdc_counter_metric(
+            snapshot.cdc,
+            "changes_total",
+            |status| status.changes_emitted,
+            timestamp,
+        ),
         latency_histogram_metric(
             "mydb.query.latency",
             "Statement latency distribution.",
@@ -1562,7 +1595,10 @@ fn otlp_traces_payload(
                 &format!("{:x}", Sha256::digest(statement.digest.as_bytes())),
             ),
             string_attribute("mydb.query.outcome", &statement.outcome),
-            int_attribute("mydb.query.duration_ms", statement.duration_micros as i64 / 1_000),
+            int_attribute(
+                "mydb.query.duration_ms",
+                statement.duration_micros as i64 / 1_000,
+            ),
             int_attribute("db.mysql.connection_id", i64::from(statement.connection_id)),
             string_attribute(
                 "mysql.event_name",
@@ -1629,7 +1665,10 @@ fn otlp_traces_payload(
             attributes.push(string_attribute("db.name", &statement.database));
             attributes.push(string_attribute("mysql.sql_text", &statement.sql));
             attributes.push(string_attribute("db.namespace", &statement.database));
-            attributes.push(string_attribute("mysql.current_schema", &statement.database));
+            attributes.push(string_attribute(
+                "mysql.current_schema",
+                &statement.database,
+            ));
         }
         let status = if statement.error.is_some() {
             json!({"code": 2, "message": if settings.include_sql { statement.error.clone().unwrap_or_default() } else { "SQL execution failed".to_string() }})
@@ -1669,7 +1708,11 @@ fn otlp_traces_payload(
 
 /// Mirror of MySQL 9's OTLP logs signal: one record per captured `tracing`
 /// event, with the target and structured fields preserved as attributes.
-fn otlp_logs_payload(settings: &OtlpSettings, logs: &[CapturedLog], server: &ServerIdentity) -> Value {
+fn otlp_logs_payload(
+    settings: &OtlpSettings,
+    logs: &[CapturedLog],
+    server: &ServerIdentity,
+) -> Value {
     let records: Vec<Value> = logs
         .iter()
         .map(|log| {
@@ -2265,8 +2308,7 @@ mod tests {
                 && attribute["value"]["stringValue"] == json!("mydb_server::test")
         }));
         assert!(attributes.iter().any(|attribute| {
-            attribute["key"] == json!("retry")
-                && attribute["value"]["stringValue"] == json!("2")
+            attribute["key"] == json!("retry") && attribute["value"]["stringValue"] == json!("2")
         }));
     }
 
@@ -2294,7 +2336,12 @@ mod tests {
         }
         let pending = buffer.since(0);
         assert_eq!(pending.len(), MAX_EXPORTED_LOGS);
-        assert_eq!(pending.last().map(|log| log.id), Some((MAX_BUFFERED_LOGS + 10) as u64));
-        assert!(buffer.since(pending.last().expect("last log").id).is_empty());
+        assert_eq!(
+            pending.last().map(|log| log.id),
+            Some((MAX_BUFFERED_LOGS + 10) as u64)
+        );
+        assert!(buffer
+            .since(pending.last().expect("last log").id)
+            .is_empty());
     }
 }

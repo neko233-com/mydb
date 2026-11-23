@@ -556,9 +556,9 @@ fn validate_runtime_security(config: &mydb_config::ServerConfig) -> Result<()> {
                 );
                 true
             }
-            other => anyhow::bail!(
-                "unsupported otlp.auth.method '{other}'; use none, basic or bearer"
-            ),
+            other => {
+                anyhow::bail!("unsupported otlp.auth.method '{other}'; use none, basic or bearer")
+            }
         };
         anyhow::ensure!(
             !auth_configured
@@ -728,12 +728,15 @@ async fn run_admin_server(listener: tokio::net::TcpListener, state: AdminState) 
         .route("/api/v1/status", get(status))
         .route("/api/v1/config", get(get_config).put(put_config))
         .route("/api/v1/config/reload", post(reload_config))
-    .route("/api/v1/cdc/status", get(cdc_status))
-    .route("/api/v1/cdc/enable", post(cdc_enable))
-    .route("/api/v1/cdc/disable", post(cdc_disable))
-    .route("/api/v1/cdc/reload", post(cdc_reload))
-    .route("/api/v1/cdc/changes", get(cdc_changes))
-    .route("/api/v1/cdc/checkpoint", get(cdc_checkpoint_get).post(cdc_checkpoint_set))
+        .route("/api/v1/cdc/status", get(cdc_status))
+        .route("/api/v1/cdc/enable", post(cdc_enable))
+        .route("/api/v1/cdc/disable", post(cdc_disable))
+        .route("/api/v1/cdc/reload", post(cdc_reload))
+        .route("/api/v1/cdc/changes", get(cdc_changes))
+        .route(
+            "/api/v1/cdc/checkpoint",
+            get(cdc_checkpoint_get).post(cdc_checkpoint_set),
+        )
         .route("/api/v1/memory/stats", get(memory_stats))
         .route("/api/v1/memory/flush", post(memory_flush))
         .route("/api/v1/storage/inventory", get(storage_inventory))
@@ -1390,8 +1393,7 @@ fn apply_runtime_config(
             current.observability.otlp.auth.password.clone();
     }
     if candidate.observability.otlp.auth.token == "<redacted>" {
-        candidate.observability.otlp.auth.token =
-            current.observability.otlp.auth.token.clone();
+        candidate.observability.otlp.auth.token = current.observability.otlp.auth.token.clone();
     }
     if candidate.security.default_password == "<redacted>" {
         candidate.security.default_password = current.security.default_password.clone();

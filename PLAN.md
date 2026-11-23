@@ -1,4 +1,4 @@
-# PLAN.md — v0.1.39 MySQL 9 Telemetry 全量对齐计划
+# PLAN.md — v0.1.40 OLAP 并行页扫描计划
 
 > 本文是当前迭代的唯一执行计划。完成一项勾选一项；未完成的项必须保留原因，不得用“已支持/生产级”表述掩盖。
 > 目标定位不变：**单机 MySQL 8.0~8.4 协议与语法兼容数据库**，不引入分布式、集群、复制或 router 抽象。
@@ -48,7 +48,10 @@
 - [x] 3.3 接入 `scan_table_filtered_limit` 的非索引与溢出行路径；统计 `pages_scanned/pages_pruned/rows_pruned`
 - [x] 3.4 指标：Prometheus 与 OTLP 暴露 `mydb_olap_pages_pruned_total` 等
 - [x] 3.5 测试：数值/字符串/NULL/AND-OR 裁剪正确性；更新后 checksum 失效；结果与全量扫描逐行一致
-- [x] 3.6 明确记录未做项：列裁剪、向量化聚合、并行页扫描留待下一迭代（不得宣称 OLAP 已“全面领先”）
+- [x] 3.6 明确记录未做项：列裁剪、向量化聚合留待下一迭代（不得宣称 OLAP 已“全面领先”）
+- [x] 3.7 并行页扫描：无 `LIMIT` 且候选页 ≥8 时按连续页块并行解码；按页号排序合并，行序与串行一致；`LIMIT` 保持串行短路
+- [x] 3.8 全局并发配额：按 CPU 核数 / 单查询 worker 推导并行扫描上限并封顶 4；配额不足自动回退串行，`MYDB_OLAP_SCAN_THREADS=1` 可强制串行
+- [x] 3.9 精确性回归：3000 行跨 8 页以上，`BETWEEN` 命中 1500 行，断言升序页合并与首尾 ID；保留 zone map 既有回归
 
 ## 4. CDC → TiDB 迁移支撑（G5）
 
@@ -74,13 +77,17 @@
 - [x] 6.3 `cargo +stable-x86_64-pc-windows-gnullvm build --release --locked -p mydb-server -p mydb-cli -p mydb-migrate -p mydb-dump`（通过）
 - [x] 6.4 本机启动冒烟：release 二进制、`/healthz`、`/readyz`、`/metrics`、OTLP 状态、OTLP `/v1/metrics`+`/v1/logs`、SQL 建表/写入/范围扫描、OLAP 裁剪、权限隔离（`scripts/verify-monitoring-runtime.py` 通过）
 - [x] 6.5 本机无 MySQL/podman，未重跑同机基准；已如实标注“未重跑”，不写新倍数
-- [x] 6.6 版本号 `0.1.39`，提交信息符合 `<type>(<scope>): <中文描述>`，推送 `main`；本轮不自动创建 GitHub Release
+- [ ] 6.6 版本号 `0.1.40`，提交信息符合 `<type>(<scope>): <中文描述>`，推送 `main`；本轮不自动创建 GitHub Release
 - [x] 6.7 Linux musl 静态构建规范与 CI：`AGENTS.md`、`docs/zh/musl-build.md`、`.github/workflows/build-linux-musl.yml`
-- [ ] 6.8 musl 本轮需在推送后手动触发 workflow，等待静态产物校验结果
+- [ ] 6.8 本次并行扫描改动需推送后触发 musl workflow，等待静态产物校验结果
+- [x] 6.9 OLAP 并行路径单测通过（`parallel_page_scan_preserves_page_order_and_filtering`）
+- [ ] 6.10 全 workspace 测试、Clippy `-D warnings`、Windows release 构建与运行时冒烟（并行扫描改动）
 
 ## 7. 风险与回退
 
 - 页级 zone map 只做“跳过不可能命中的页”，命中判断必须保守；任何不确定情况返回“可能命中”，绝不漏行。
+- 并行页扫描只并行解码，不改变页内行序；合并必须按页号升序，并以回归测试锁死。
+- 并发扫描受全局配额限制；配额不足回退串行是正确性优先的降级，不是错误。
 - OTLP 导出在独立任务中执行，不进入查询/提交热路径；关闭时不采集快照。
 - CDC 仍是额外扩展，不是 MySQL binlog；文档中不得表述为复制兼容。
 - 性能结论以同机实测为准；没有实测就只记录优化点与可观测计数。

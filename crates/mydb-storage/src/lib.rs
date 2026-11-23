@@ -3,7 +3,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
@@ -22,6 +22,68 @@ use mydb_wal::{WalChange, WalChangeOp, WalReader, WalRecord, WalRecordType, WalW
 mod mvcc;
 
 pub use mvcc::{IsolationLevel, MvccManager, ReadView, TransactionId};
+
+/// A scan must span enough pages before worker startup and ordered merging
+/// become cheaper than a tight serial loop.
+const OLAP_PARALLEL_SCAN_MIN_PAGES: usize = 8;
+/// Per-query hard cap. The default adapts to the host, but concurrent queries
+/// must not turn a single analytical scan into unbounded thread fan-out.
+const OLAP_PARALLEL_SCAN_MAX_THREADS: usize = 8;
+/// Maximum number of simultaneously parallel scans. Derived from the host's
+/// core count and the per-scan worker count so total decode threads stay near
+/// the machine's real parallelism instead of multiplying per connection.
+const OLAP_PARALLEL_SCAN_MAX_ACTIVE: usize = 4;
+
+static ACTIVE_PARALLEL_SCANS: AtomicUsize = AtomicUsize::new(0);
+
+struct ParallelScanPermit;
+
+impl Drop for ParallelScanPermit {
+    fn drop(&mut self) {
+        ACTIVE_PARALLEL_SCANS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn try_acquire_parallel_scan(workers: usize) -> Option<ParallelScanPermit> {
+    let cores = std::thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(1);
+    let max_active = (cores / workers.max(1))
+        .max(1)
+        .min(OLAP_PARALLEL_SCAN_MAX_ACTIVE);
+    loop {
+        let active = ACTIVE_PARALLEL_SCANS.load(Ordering::Acquire);
+        if active >= max_active {
+            return None;
+        }
+        if ACTIVE_PARALLEL_SCANS
+            .compare_exchange_weak(active, active + 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return Some(ParallelScanPermit);
+        }
+    }
+}
+
+/// Worker count for parallel page scans. `MYDB_OLAP_SCAN_THREADS` overrides
+/// auto-detection for benchmarking and capacity planning; `1` disables the
+/// parallel path entirely.
+fn olap_scan_threads() -> usize {
+    static THREADS: OnceLock<usize> = OnceLock::new();
+    *THREADS.get_or_init(|| {
+        std::env::var("MYDB_OLAP_SCAN_THREADS")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .map(|value| value.min(32))
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(|value| value.get())
+                    .unwrap_or(1)
+                    .min(OLAP_PARALLEL_SCAN_MAX_THREADS)
+            })
+    })
+}
 
 #[inline(always)]
 fn bincode_fast() -> impl Options {
@@ -2251,12 +2313,15 @@ impl PageZoneMap {
             for (column, value) in &row.values {
                 let key = column.to_ascii_lowercase();
                 let is_null = row.null_columns.contains(column);
-                let zone = map.columns.entry(key.clone()).or_insert_with(|| ColumnZone {
-                    null_count: 0,
-                    initialized: false,
-                    min: Vec::new(),
-                    max: Vec::new(),
-                });
+                let zone = map
+                    .columns
+                    .entry(key.clone())
+                    .or_insert_with(|| ColumnZone {
+                        null_count: 0,
+                        initialized: false,
+                        min: Vec::new(),
+                        max: Vec::new(),
+                    });
                 if is_null {
                     zone.null_count = zone.null_count.saturating_add(1);
                     continue;
@@ -2360,9 +2425,7 @@ fn may_match_with_zones(
             mysql_scalar_cmp_for_column(&zone.max, lower, Some(schema), column).is_ge()
                 && mysql_scalar_cmp_for_column(&zone.min, upper, Some(schema), column).is_le()
         }
-        RowPredicate::IsNull(column) => zones
-            .zone(column)
-            .is_none_or(|zone| zone.null_count > 0),
+        RowPredicate::IsNull(column) => zones.zone(column).is_none_or(|zone| zone.null_count > 0),
         RowPredicate::IsNotNull(column) => zones
             .zone(column)
             .is_none_or(|zone| zones.rows > zone.null_count),
@@ -2377,9 +2440,7 @@ fn may_match_with_zones(
         RowPredicate::Never | RowPredicate::AlwaysFalse => false,
         // `Like`, cross-column comparisons and the constant-true case need
         // row context that a min/max summary cannot provide.
-        RowPredicate::Like(..)
-        | RowPredicate::ColumnCompare(..)
-        | RowPredicate::AlwaysTrue => true,
+        RowPredicate::Like(..) | RowPredicate::ColumnCompare(..) | RowPredicate::AlwaysTrue => true,
     }
 }
 
@@ -3428,10 +3489,70 @@ impl Database {
         self.page_zones.write().remove(table_name);
     }
 
+    /// Decode a single page and return its matching rows. `None` means the
+    /// page slot is absent; an empty vector means the page was pruned or held
+    /// no matching rows. Keeping allocation and zone-map mutation here lets
+    /// both the serial and parallel scan paths share identical semantics.
+    fn scan_one_page(
+        &self,
+        table_name: &str,
+        schema: &TableSchema,
+        namespace: &str,
+        page_num: u32,
+        filter: Option<&RowPredicate>,
+    ) -> Result<Option<Vec<Row>>> {
+        let page = if let Some(page) = self.buffer_pool.get_table_page(namespace, page_num) {
+            Some(page)
+        } else {
+            let page = self.disk_manager.read_page(table_name, page_num)?;
+            if let Some(page) = &page {
+                self.buffer_pool.insert_table_page(namespace, page.clone());
+            }
+            page
+        };
+        let Some(page) = page else {
+            return Ok(None);
+        };
+        let zone = if filter.is_some() {
+            self.cached_page_zone(table_name, schema, page_num)
+        } else {
+            None
+        };
+        if let (Some(predicate), Some(zones)) = (filter, zone.as_ref()) {
+            if !zones.may_match(predicate, schema) {
+                self.buffer_pool
+                    .record_olap_page_pruned(page.header.row_count);
+                return Ok(Some(Vec::new()));
+            }
+        }
+        let decoded = unpack_page_rows(&page);
+        if filter.is_some() {
+            self.buffer_pool.record_olap_page_scanned();
+        }
+        if zone.is_none() && filter.is_some() {
+            let built = Arc::new(PageZoneMap::from_rows(&decoded, schema));
+            self.store_page_zone(table_name, schema, page_num, built);
+        }
+        Ok(Some(
+            decoded
+                .into_iter()
+                .filter(|row| {
+                    filter.is_none_or(|predicate| predicate.matches_with_schema(row, Some(schema)))
+                })
+                .collect(),
+        ))
+    }
+
     /// Decode only pages that may satisfy `filter`. Zone maps are consulted
     /// before `unpack_page_rows`, so a pruned page costs a page read but not a
     /// row decode; the zone itself is built once and reused while the schema
     /// generation is unchanged.
+    ///
+    /// Large scans without `LIMIT` are decoded across a bounded worker set.
+    /// Page order is restored before returning, so row order remains
+    /// deterministic and identical to the serial path. `LIMIT` stays serial:
+    /// stopping at the first N matching rows is strictly cheaper than
+    /// speculatively decoding later pages.
     fn scan_pages_filtered<I>(
         &self,
         table_name: &str,
@@ -3444,43 +3565,64 @@ impl Database {
         I: IntoIterator<Item = u32>,
     {
         let namespace = self.page_namespace(table_name);
+        let page_numbers: Vec<u32> = page_numbers.into_iter().collect();
         let mut rows = Vec::new();
-        for page_num in page_numbers {
-            let page = if let Some(page) = self.buffer_pool.get_table_page(&namespace, page_num) {
-                Some(page)
-            } else {
-                let page = self.disk_manager.read_page(table_name, page_num)?;
-                if let Some(page) = &page {
-                    self.buffer_pool.insert_table_page(&namespace, page.clone());
-                }
-                page
-            };
-            let Some(page) = page else {
-                continue;
-            };
-            let zone = if filter.is_some() {
-                self.cached_page_zone(table_name, schema, page_num)
+        if limit.is_none() && page_numbers.len() >= OLAP_PARALLEL_SCAN_MIN_PAGES {
+            let workers = olap_scan_threads().min(page_numbers.len());
+            let _permit = if workers > 1 {
+                try_acquire_parallel_scan(workers)
             } else {
                 None
             };
-            if let (Some(predicate), Some(zones)) = (filter, zone.as_ref()) {
-                if !zones.may_match(predicate, schema) {
-                    self.buffer_pool
-                        .record_olap_page_pruned(page.header.row_count);
-                    continue;
+            if workers > 1 && _permit.is_some() {
+                let chunk_size = page_numbers.len().div_ceil(workers);
+                let namespace_ref = namespace.as_str();
+                let mut gathered: Vec<(u32, Vec<Row>)> = Vec::new();
+                std::thread::scope(|scope| -> Result<()> {
+                    let mut handles = Vec::with_capacity(workers);
+                    for chunk in page_numbers.chunks(chunk_size) {
+                        handles.push(scope.spawn(move || -> Result<Vec<(u32, Vec<Row>)>> {
+                            let mut local = Vec::new();
+                            for &page_num in chunk {
+                                if let Some(page_rows) = self.scan_one_page(
+                                    table_name,
+                                    schema,
+                                    namespace_ref,
+                                    page_num,
+                                    filter,
+                                )? {
+                                    if !page_rows.is_empty() {
+                                        local.push((page_num, page_rows));
+                                    }
+                                }
+                            }
+                            Ok(local)
+                        }));
+                    }
+                    for handle in handles {
+                        let local = handle.join().map_err(|_| {
+                            anyhow::anyhow!("OLAP parallel page scan worker panicked")
+                        })??;
+                        gathered.extend(local);
+                    }
+                    Ok(())
+                })?;
+                gathered.sort_unstable_by_key(|(page_num, _)| *page_num);
+                rows.reserve(gathered.iter().map(|(_, page_rows)| page_rows.len()).sum());
+                for (_, page_rows) in gathered {
+                    rows.extend(page_rows);
                 }
+                return Ok(rows);
             }
-            let decoded = unpack_page_rows(&page);
-            if filter.is_some() {
-                self.buffer_pool.record_olap_page_scanned();
-            }
-            if zone.is_none() && filter.is_some() {
-                let built = Arc::new(PageZoneMap::from_rows(&decoded, schema));
-                self.store_page_zone(table_name, schema, page_num, built);
-            }
-            for row in decoded.into_iter().filter(|row| {
-                filter.is_none_or(|predicate| predicate.matches_with_schema(row, Some(schema)))
-            }) {
+        }
+
+        for page_num in page_numbers {
+            let Some(page_rows) =
+                self.scan_one_page(table_name, schema, &namespace, page_num, filter)?
+            else {
+                continue;
+            };
+            for row in page_rows {
                 rows.push(row);
                 if limit.is_some_and(|limit| rows.len() >= limit) {
                     return Ok(rows);
@@ -6934,7 +7076,11 @@ fn cdc_predicate_before(predicate: &Option<RowPredicate>, out: &mut Vec<(String,
 
 fn cdc_changes_for_command(command: WriteCommand, out: &mut Vec<WalChange>) {
     match command {
-        WriteCommand::Insert { database, table, row } => out.push(WalChange {
+        WriteCommand::Insert {
+            database,
+            table,
+            row,
+        } => out.push(WalChange {
             operation: WalChangeOp::Insert,
             database,
             table,
@@ -7021,7 +7167,12 @@ fn cdc_changes_for_command(command: WriteCommand, out: &mut Vec<WalChange>) {
                 ddl_sql: None,
             });
         }
-        WriteCommand::ReplaceRows { database, table, rows, .. } => {
+        WriteCommand::ReplaceRows {
+            database,
+            table,
+            rows,
+            ..
+        } => {
             for row in rows {
                 out.push(WalChange {
                     operation: WalChangeOp::Insert,
@@ -7049,7 +7200,9 @@ fn cdc_changes_for_command(command: WriteCommand, out: &mut Vec<WalChange>) {
             after: Vec::new(),
             ddl_sql: None,
         }),
-        WriteCommand::AlterTable { database, table, .. } => out.push(WalChange {
+        WriteCommand::AlterTable {
+            database, table, ..
+        } => out.push(WalChange {
             operation: WalChangeOp::Ddl,
             database,
             table,
@@ -15853,11 +16006,7 @@ mod tests {
         manager.execute_batch(commands).await.unwrap();
         manager.flush().unwrap();
 
-        let between = RowPredicate::Between(
-            "id".into(),
-            b"100".to_vec(),
-            b"199".to_vec(),
-        );
+        let between = RowPredicate::Between("id".into(), b"100".to_vec(), b"199".to_vec());
         let rows = manager
             .scan_table_filtered("game", "a", Some(&between))
             .unwrap();
@@ -15903,5 +16052,53 @@ mod tests {
             .unwrap();
         assert_eq!(rows.len(), 1, "rewrite must invalidate stale zone maps");
         assert_eq!(rows[0].get("value"), Some(b"zzz-updated".as_slice()));
+    }
+
+    #[tokio::test]
+    async fn parallel_page_scan_preserves_page_order_and_filtering() {
+        let (_temp, manager) = recovery_manager().await;
+        let mut commands = Vec::new();
+        for id in 1..=3000_u64 {
+            let mut row = Row::new();
+            row.push("id", format!("{id:05}").into_bytes());
+            row.push(
+                "value",
+                format!("pad-{id:05}-{}", "x".repeat(40)).into_bytes(),
+            );
+            commands.push(WriteCommand::Insert {
+                database: "game".into(),
+                table: "a".into(),
+                row,
+            });
+        }
+        manager.execute_batch(commands).await.unwrap();
+        manager.flush().unwrap();
+
+        let database = manager.get_database("game").unwrap();
+        let pages = database.get_table("a").unwrap().next_page_number;
+        assert!(
+            pages as usize >= OLAP_PARALLEL_SCAN_MIN_PAGES,
+            "test data must span the parallel threshold, got {pages} pages"
+        );
+
+        let between = RowPredicate::Between("id".into(), b"00500".to_vec(), b"01999".to_vec());
+        let rows = database.scan_table_filtered("a", Some(&between)).unwrap();
+        assert_eq!(rows.len(), 1500, "parallel scan must stay exact");
+
+        let ids = rows
+            .iter()
+            .map(|row| {
+                std::str::from_utf8(row.get("id").unwrap())
+                    .unwrap()
+                    .parse::<u64>()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ids.first().copied(), Some(500));
+        assert_eq!(ids.last().copied(), Some(1999));
+        assert!(
+            ids.windows(2).all(|window| window[0] < window[1]),
+            "parallel page merge must restore ascending page order"
+        );
     }
 }

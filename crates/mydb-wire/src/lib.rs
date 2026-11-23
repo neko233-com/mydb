@@ -4889,9 +4889,7 @@ pub fn parse_traceparent(value: &[u8]) -> Option<(String, String)> {
         || parent_span_id.len() != 16
         || flags.len() != 2
         || !trace_id.bytes().all(|byte| byte.is_ascii_hexdigit())
-        || !parent_span_id
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit())
+        || !parent_span_id.bytes().all(|byte| byte.is_ascii_hexdigit())
         || !flags.bytes().all(|byte| byte.is_ascii_hexdigit())
         || trace_id.bytes().all(|byte| byte == b'0')
     {
@@ -5492,10 +5490,7 @@ impl WireStats {
     }
 
     pub fn record_statement_trace(&self, mut trace: StatementTrace) {
-        trace.id = self
-            .next_statement_trace_id
-            .fetch_add(1, Ordering::Relaxed)
-            + 1;
+        trace.id = self.next_statement_trace_id.fetch_add(1, Ordering::Relaxed) + 1;
         trace.span_id = format!("{:016x}", trace.id);
         let mut traces = self.statement_traces.lock();
         if traces.len() == MAX_TRACE_BUFFER {
@@ -54722,10 +54717,18 @@ mod tests {
                 "00f067aa0ba902b7".to_string()
             ))
         );
-        assert!(parse_traceparent(b"00-00000000000000000000000000000000-00f067aa0ba902b7-01").is_none());
-        assert!(parse_traceparent(b"01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01").is_none());
-        assert!(parse_traceparent(b"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7").is_none());
-        assert!(parse_traceparent(b"00-4bf92f3577b34da6a3ce929d0e0e473g-00f067aa0ba902b7-01").is_none());
+        assert!(
+            parse_traceparent(b"00-00000000000000000000000000000000-00f067aa0ba902b7-01").is_none()
+        );
+        assert!(
+            parse_traceparent(b"01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01").is_none()
+        );
+        assert!(
+            parse_traceparent(b"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7").is_none()
+        );
+        assert!(
+            parse_traceparent(b"00-4bf92f3577b34da6a3ce929d0e0e473g-00f067aa0ba902b7-01").is_none()
+        );
     }
 
     #[test]

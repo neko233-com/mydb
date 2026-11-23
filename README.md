@@ -185,15 +185,15 @@ file target/x86_64-unknown-linux-musl/release/mydb-server  # 应显示 staticall
 
 # 正式包只包含 server/cli/mydb/migrate/dump、配置、安装脚本和文档；
 # mydb-bench、测试结果与 target/bench 不进入发布包
-.\scripts\build-release.ps1 -Version "0.1.39"
+.\scripts\build-release.ps1 -Version "0.1.40"
 # 发布包同时生成同名 `.sha256` 校验文件；发布脚本默认只构建不上传，必须显式加 `-ConfirmPublish`，并在交互提示中输入 `PUBLISH v<version>` 才会创建 GitHub tag/release；脚本会拒绝覆盖已存在的 Release。
 # 日常开发在 main。已发布版本用 tag 记录，不保留长期发布分支。
 
 ```powershell
 # 仅构建/打包候选物（推荐先做这一步）
-.\scripts\build-release.ps1 -Version "0.1.39"
+.\scripts\build-release.ps1 -Version "0.1.40"
 # 最终发布：仍需人工输入精确确认文本
-.\scripts\build-release.ps1 -Version "0.1.39" -ConfirmPublish
+.\scripts\build-release.ps1 -Version "0.1.40" -ConfirmPublish
 ```
 
 # 安装到系统
@@ -398,18 +398,21 @@ curl -H "Authorization: Bearer $MYDB_ADMIN_TOKEN" http://127.0.0.1:4306/api/v1/o
 - `export_logs: true` 开启 `/v1/logs`（MySQL 9.1 对齐）；默认关闭，密码/token/secret 字段强制脱敏，详见
   [OpenTelemetry 接入](docs/zh/opentelemetry.md)。
 
-### OLAP 页级 zone map
+### OLAP 页级 zone map 与并行扫描
 
 MyDB 仍是行存、单机数据库，不宣称列存引擎或向量化执行。本版在行存页上增加
-**页级 min/max/NULL zone map**：
+**页级 min/max/NULL zone map** 与**有界并行页解码**：
 
 - 每页按列记录非 NULL 最小/最大值和 NULL 计数，按表 schema generation 缓存；
 - `WHERE` 的 `=/IN/</<=/>/>=/BETWEEN/AND/OR/IS NULL/IS NOT NULL` 可跳过不可能命中的页；
 - 只做保守裁剪：字符串按 MySQL 排序规则比较，无法判定时一律扫描，绝不漏行；
 - 页在 checkpoint/重写时重建 zone map，更新后旧缓存失效；
+- 无 `LIMIT` 且跨 ≥8 页的扫描按页分块并行解码，返回前恢复页序；`LIMIT` 保持串行短路；
+- 并行扫描受全局配额约束，避免多连接把线程数乘爆；`MYDB_OLAP_SCAN_THREADS=1` 可强制串行，默认取 CPU 核数且上限 8；
 - 通过 `mydb_olap_pages_pruned_total` / `rows_pruned` 可直接观测收益。
 
-列裁剪、向量化聚合、并行页扫描仍是后续迭代项，不把当前实现表述为“OLAP 已全面完成”。
+列裁剪、向量化聚合仍是后续迭代项；并行扫描已完成并有精确性/顺序回归测试，
+但不把当前实现表述为“OLAP 已全面完成”。
 
 ### CDC → TiDB 迁移
 
@@ -769,6 +772,17 @@ CDC 是 MyDB 相对 MySQL 的**额外扩展，默认关闭**，不宣称 MySQL b
 - ✅ 2026-08-17 Windows 当前源码打包：5 个 release 二进制构建成功，本地 zip 解包完整性与 SHA-256 校验通过；本次 v0.1.35 发布包按同一源码生成
 - ⏳ Ubuntu 24.04 物理性能、macOS 原生验收、大数据压力与生产安全运维验收；宿主真实断电不在开发机执行，单机等价逻辑用 Docker 故障模型覆盖；以 [CheckList.md](CheckList.md) 与 [性能报告.md](性能报告.md) 为准
 
+### v0.1.40 OLAP 并行页扫描版
+
+发布说明见 [docs/zh/releases/v0.1.40.md](docs/zh/releases/v0.1.40.md)。
+
+- ✅ 页级 zone map 保留：过滤条件在解码前裁剪整页，仍走保守判定、绝不漏行
+- ✅ 无 `LIMIT` 的多页扫描按页分块并行解码；页序在返回前恢复，结果与串行路径逐行一致
+- ✅ 并行度受全局配额约束（按 CPU 核数/单查询 worker 推导），`MYDB_OLAP_SCAN_THREADS` 可调/禁用
+- ✅ `LIMIT` 保持串行短路；小结果集或索引定位不足 8 页时不做线程调度
+- ✅ 新增 3000 行跨页回归，验证 `BETWEEN` 精确结果与升序页合并；未重跑 MySQL 对比基准，不声明固定倍数
+- ⏳ 未完成：列裁剪、向量化聚合、优化器对象级统计
+
 ### v0.1.39 MySQL 9 Telemetry 全量对齐版
 
 发布说明与已知边界见 [docs/zh/releases/v0.1.39.md](docs/zh/releases/v0.1.39.md)。
@@ -777,7 +791,7 @@ CDC 是 MyDB 相对 MySQL 的**额外扩展，默认关闭**，不宣称 MySQL b
 - ✅ `CLIENT_QUERY_ATTRIBUTES` 与 `traceparent` 透传：文本协议和 prepared 执行均支持具名查询属性
 - ✅ OTLP 默认 `http/protobuf` + `gzip`，手写 traces/metrics/logs protobuf 编码；保留 `http/json` 调试模式
 - ✅ MySQL 9 `mysql.*` 执行属性、`TCP_NODELAY`、无属性时的上下文清理；OLAP 继续使用页级 zone map 解码前裁剪
-- ⏳ 已知边界：优化器执行统计、对象级 `mysql.object_*`、列裁剪、向量化聚合、并行页扫描未完成；musl 发布以 CI 产物为准
+- ⏳ 已知边界：优化器执行统计、对象级 `mysql.object_*`、列裁剪、向量化聚合未完成；并行页扫描已在 v0.1.40 完成
 
 ### v0.1.38 观测与 OLAP 裁剪版
 

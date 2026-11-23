@@ -194,7 +194,9 @@ impl CdcManager {
         runtime.pending_changes.clear();
         runtime.last_error = None;
         if runtime.file.is_none() {
-            let path = runtime.dir.join(event_file_name(&runtime.prefix, runtime.file_index));
+            let path = runtime
+                .dir
+                .join(event_file_name(&runtime.prefix, runtime.file_index));
             let file = OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -240,9 +242,10 @@ impl CdcManager {
             events_emitted: runtime.events_emitted,
             changes_emitted: runtime.changes_emitted,
             files_rotated: runtime.files_rotated,
-            current_file: runtime.file.as_ref().map(|_| {
-                event_file_name(&runtime.prefix, runtime.file_index)
-            }),
+            current_file: runtime
+                .file
+                .as_ref()
+                .map(|_| event_file_name(&runtime.prefix, runtime.file_index)),
             last_error: runtime.last_error.clone(),
         }
     }
@@ -355,7 +358,11 @@ impl CdcManager {
 
     fn filter_change(&self, change: &WalChange, runtime: &CdcRuntime) -> Option<CdcChangeEvent> {
         if !runtime.filters.databases.is_empty()
-            && !runtime.filters.databases.iter().any(|db| db == &change.database)
+            && !runtime
+                .filters
+                .databases
+                .iter()
+                .any(|db| db == &change.database)
         {
             return None;
         }
@@ -403,7 +410,9 @@ impl CdcManager {
             prune_files(&runtime.dir, &runtime.prefix, runtime.max_files)?;
         }
         if runtime.file.is_none() {
-            let path = runtime.dir.join(event_file_name(&runtime.prefix, runtime.file_index));
+            let path = runtime
+                .dir
+                .join(event_file_name(&runtime.prefix, runtime.file_index));
             let file = OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -434,9 +443,7 @@ impl CdcManager {
             .filter(|path| {
                 path.file_name()
                     .and_then(|name| name.to_str())
-                    .is_some_and(|name| {
-                        name.starts_with(&runtime.prefix) && name.ends_with(".log")
-                    })
+                    .is_some_and(|name| name.starts_with(&runtime.prefix) && name.ends_with(".log"))
             })
             .collect();
         files.sort();
@@ -616,12 +623,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let manager = CdcManager::new(dir.path().to_path_buf(), section());
         manager
-            .append_group(
-                7,
-                7,
-                1234,
-                &[change(WalChangeOp::Insert, "t1")],
-            )
+            .append_group(7, 7, 1234, &[change(WalChangeOp::Insert, "t1")])
             .unwrap();
         let status = manager.status();
         assert_eq!(status.last_lsn, 7);

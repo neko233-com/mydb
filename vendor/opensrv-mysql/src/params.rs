@@ -54,9 +54,7 @@ impl<'a> ParamParser<'a> {
         flags: u8,
         query_attributes: bool,
     ) -> Self {
-        let parameter_count = if query_attributes
-            && (stmt.params > 0 || flags & 0x08 != 0)
-        {
+        let parameter_count = if query_attributes && (stmt.params > 0 || flags & 0x08 != 0) {
             read_lenenc(&mut input).map(|count| count as u16)
         } else {
             None
@@ -130,9 +128,8 @@ impl<'a> Iterator for Params<'a> {
                     let (typ, rest) = self.input.split_at(2);
                     self.input = rest;
                     self.bound_types.push((
-                        myc::constants::ColumnType::try_from(typ[0]).unwrap_or_else(|e| {
-                            panic!("bad column type 0x{:x}: {}", typ[0], e)
-                        }),
+                        myc::constants::ColumnType::try_from(typ[0])
+                            .unwrap_or_else(|e| panic!("bad column type 0x{:x}: {}", typ[0], e)),
                         (typ[1] & 128) != 0,
                     ));
                     let name = if self.query_attributes {

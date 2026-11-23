@@ -198,10 +198,7 @@ pub enum Command<'a> {
     Quit,
 }
 
-pub fn execute(
-    i: &[u8],
-    capabilities: CapabilityFlags,
-) -> nom::IResult<&[u8], Command<'_>> {
+pub fn execute(i: &[u8], capabilities: CapabilityFlags) -> nom::IResult<&[u8], Command<'_>> {
     let (i, stmt) = nom::number::complete::le_u32(i)?;
     let (i, flags) = nom::number::complete::le_u8(i)?;
     let (i, _iterations) = nom::number::complete::le_u32(i)?;
@@ -233,10 +230,7 @@ pub fn send_long_data(i: &[u8]) -> nom::IResult<&[u8], Command<'_>> {
 /// payload is `count`, then `name_len/name/value_len/value` pairs, then SQL.
 /// A malformed attribute block leaves the payload untouched so the backend
 /// rejects it instead of executing a truncated statement.
-fn parse_query_payload(
-    i: &[u8],
-    capabilities: CapabilityFlags,
-) -> (&[u8], Vec<(&[u8], &[u8])>) {
+fn parse_query_payload(i: &[u8], capabilities: CapabilityFlags) -> (&[u8], Vec<(&[u8], &[u8])>) {
     if !capabilities.contains(CapabilityFlags::CLIENT_QUERY_ATTRIBUTES) {
         return (i, Vec::new());
     }
@@ -251,18 +245,16 @@ fn parse_query_payload(
         let Ok((next, name_len)) = read_length_encoded_number(rest) else {
             return (i, Vec::new());
         };
-        let Ok((next, name)) = nom::bytes::complete::take::<_, _, nom::error::Error<&[u8]>>(
-            name_len as usize,
-        )(next)
+        let Ok((next, name)) =
+            nom::bytes::complete::take::<_, _, nom::error::Error<&[u8]>>(name_len as usize)(next)
         else {
             return (i, Vec::new());
         };
         let Ok((next, value_len)) = read_length_encoded_number(next) else {
             return (i, Vec::new());
         };
-        let Ok((next, value)) = nom::bytes::complete::take::<_, _, nom::error::Error<&[u8]>>(
-            value_len as usize,
-        )(next)
+        let Ok((next, value)) =
+            nom::bytes::complete::take::<_, _, nom::error::Error<&[u8]>>(value_len as usize)(next)
         else {
             return (i, Vec::new());
         };
@@ -296,10 +288,9 @@ pub fn parse(i: &[u8], client_capabilities: CapabilityFlags) -> nom::IResult<&[u
             preceded(tag(&[CommandByte::COM_STMT_PREPARE as u8]), rest),
             Command::Prepare,
         ),
-        preceded(
-            tag(&[CommandByte::COM_STMT_EXECUTE as u8]),
-            |i| execute(i, client_capabilities),
-        ),
+        preceded(tag(&[CommandByte::COM_STMT_EXECUTE as u8]), |i| {
+            execute(i, client_capabilities)
+        }),
         preceded(
             tag(&[CommandByte::COM_STMT_SEND_LONG_DATA as u8]),
             send_long_data,
@@ -379,9 +370,7 @@ mod tests {
 
         let (_, command) = parse(&packet, query_attributes()).expect("parse execute");
         match command {
-            Command::Execute {
-                params, flags, ..
-            } => {
+            Command::Execute { params, flags, .. } => {
                 assert_eq!(flags, 0);
                 assert_eq!(params, &[0u8; 3]);
             }
