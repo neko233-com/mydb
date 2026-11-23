@@ -1,19 +1,21 @@
 # OpenTelemetry 接入（对齐 MySQL 9）
 
-MyDB 原生导出 OTLP/HTTP JSON，覆盖 metrics、traces、logs 三种信号。实现参考 MySQL 9 的 Telemetry 组件（`component_telemetry`），但保持单机、零热路径分配。
+MyDB 原生导出 OTLP/HTTP，默认 `http/protobuf` + `gzip`（与 MySQL 9 一致），可选 `http/json` 便于抓包调试，覆盖 metrics、traces、logs 三种信号。实现参考 MySQL 9 的 Telemetry 组件（`component_telemetry`），但保持单机、零热路径分配。
 
 ## 端点与配置
 
 | 信号 | 路径 | 默认 |
 |---|---|---|
 | Metrics | `POST /v1/metrics` | 开启 |
-| Traces | `POST /v1/traces` | 开启（仅慢查询/错误语句） |
+| Traces | `POST /v1/traces` | 开启（Control/session/stmt 全量） |
 | Logs | `POST /v1/logs` | 关闭（日志可能含业务数据） |
 
 ```yaml
 observability:
   otlp:
     enabled: true
+    protocol: "http/protobuf"   # MySQL 9 默认；调试可用 http/json
+    compression: "gzip"         # none 关闭压缩
     endpoint: "https://collector.example.com:4318"
     interval_secs: 15
     timeout_secs: 5
@@ -36,12 +38,12 @@ observability:
 | 能力 | MySQL 9 | MyDB 当前 |
 |---|---|---|
 | Metrics | Server meters + 可选指标 | `mydb.*` 指标 + Prometheus 同源 |
-| Statement span | 所有语句，名称 `stmt` | 慢查询/错误语句，名称 `stmt`，含 `mysql.*` 与语义属性 |
-| Session span | 连接关闭时导出 | 未实现 |
-| Control span | 配置变更时导出 | 未实现 |
+| Statement span | 所有语句，名称 `stmt` | 所有语句，名称 `stmt`，含 `mysql.*` 与语义属性 |
+| Session span | 连接关闭时导出 | 连接关闭时导出，名称 `session` |
+| Control span | 配置变更时导出 | 启动与配置重载时导出，名称 `Control` |
 | Logs | 9.1+ 支持 `/v1/logs` | 支持，默认关闭 |
-| Trace context | 接受 `traceparent` 查询属性 | 未实现（MySQL 协议层透传待补） |
-| 传输 | OTLP/HTTP protobuf | OTLP/HTTP JSON |
+| Trace context | 接受 `traceparent` 查询属性 | 文本协议与 prepared 执行的查询属性均透传 `traceparent` |
+| 传输 | OTLP/HTTP protobuf + gzip | OTLP/HTTP protobuf + gzip，默认一致；可切换 JSON |
 | 鉴权 | headers/TLS | Basic、Bearer、headers，显式 Authorization 优先 |
 
 ## 隐私

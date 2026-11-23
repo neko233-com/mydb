@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Bounded native release smoke; standard library only, no production data."""
 import argparse
+import gzip
 import json
 import os
 from pathlib import Path
@@ -48,8 +49,12 @@ def main():
     class Collector(BaseHTTPRequestHandler):
         def do_POST(self):
             length = int(self.headers.get("Content-Length", "0"))
-            body = self.rfile.read(length).decode("utf-8", "replace")
-            otlp_requests.append((self.path, body))
+            raw = self.rfile.read(length)
+            if self.headers.get("Content-Encoding", "") == "gzip":
+                raw = gzip.decompress(raw)
+            otlp_requests.append(
+                (self.path, raw, self.headers.get("Content-Type", ""))
+            )
             self.send_response(200)
             self.end_headers()
 
@@ -153,26 +158,47 @@ def main():
                 )
                 check(status == 200 and "v0100" in body and "v0199" in body and "v0200" not in body,
                       "OLAP zone-map range scan returned the wrong rows")
+                result = subprocess.run(
+                    [str(client), "-h", "127.0.0.1", "-P", str(sql_port), "-u", "root",
+                     "-p", database_password, "-e", "SELECT 1"],
+                    capture_output=True, text=True, timeout=10, env=environment,
+                )
+                check(result.returncode == 0, "Wire query for OTLP stmt span failed")
                 status, body = request("/api/v1/observability/otlp", session)
                 check(status == 200 and json.loads(body).get("auth_method") in {"none", "basic", "bearer"},
                       "OTLP status endpoint did not report a valid auth mode")
                 deadline = time.monotonic() + 8
                 while time.monotonic() < deadline:
-                    if any(path == "/v1/metrics" for path, _ in otlp_requests) and any(
-                        path == "/v1/logs" for path, _ in otlp_requests
+                    if (
+                        any(path == "/v1/metrics" for path, _, _ in otlp_requests)
+                        and any(path == "/v1/logs" for path, _, _ in otlp_requests)
+                        and any(
+                            path == "/v1/traces" and b"stmt" in body
+                            for path, body, _ in otlp_requests
+                        )
                     ):
                         break
                     time.sleep(0.2)
-                check(any(path == "/v1/metrics" for path, _ in otlp_requests),
+                check(any(path == "/v1/metrics" for path, _, _ in otlp_requests),
                       "OTLP metrics were not exported")
-                check(any(path == "/v1/logs" for path, _ in otlp_requests),
+                check(any(path == "/v1/logs" for path, _, _ in otlp_requests),
                       "OTLP logs were not exported")
-                log_payload = next(json.loads(body) for path, body in otlp_requests if path == "/v1/logs")
-                check(bool(log_payload["resourceLogs"][0]["scopeLogs"][0]["logRecords"]),
+                check(any(path == "/v1/traces" for path, _, _ in otlp_requests),
+                      "OTLP traces were not exported")
+                def otlp_body(path):
+                    for request_path, body, content_type in otlp_requests:
+                        if request_path == path:
+                            check(content_type == "application/x-protobuf",
+                                  f"{path} did not use the MySQL 9 default protobuf encoding")
+                            check(body[:1] == b"\x0a", f"{path} was not a valid OTLP protobuf request")
+                            return body
+                    raise RuntimeError(f"{path} was not received")
+
+                check(b"logRecords" not in otlp_body("/v1/logs") and len(otlp_body("/v1/logs")) > 8,
                       "OTLP logs payload had no records")
-                metrics_payload = next(json.loads(body) for path, body in otlp_requests if path == "/v1/metrics")
-                check(bool(metrics_payload["resourceMetrics"][0]["scopeMetrics"][0]["metrics"]),
-                      "OTLP metrics payload had no metrics")
+                check(len(otlp_body("/v1/metrics")) > 8, "OTLP metrics payload had no metrics")
+                check(b"stmt" in otlp_body("/v1/traces"),
+                      "OTLP traces payload did not contain a stmt span")
                 sql(f"CREATE USER 'ci_reader'@'%' IDENTIFIED BY '{reader_password}'")
                 sql("GRANT SELECT ON ci_monitor.* TO 'ci_reader'@'%'")
                 status, body = request("/api/v1/auth/login", method="POST", body={"username": "ci_reader", "password": reader_password})

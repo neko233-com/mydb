@@ -76,6 +76,8 @@ observability:
   otlp:
     # 生产环境接入 OpenTelemetry 采集器时置为 true
     enabled: false
+    protocol: "http/protobuf"  # MySQL 9 默认；调试可改 http/json
+    compression: "gzip"        # none 关闭压缩
     endpoint: "http://127.0.0.1:4318"
     interval_secs: 15
     timeout_secs: 5

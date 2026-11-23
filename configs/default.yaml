@@ -123,6 +123,10 @@ observability:
   otlp:
     # 未配置采集器时保持关闭；Prometheus /metrics 始终可用
     enabled: false
+    # OTLP/HTTP 线格式：http/protobuf（MySQL 9 默认）或 http/json
+    protocol: "http/protobuf"
+    # 请求体压缩：gzip（MySQL 9 默认）或 none
+    compression: "gzip"
     # 采集器基址，自动追加 /v1/metrics 与 /v1/traces
     endpoint: "http://127.0.0.1:4318"
     # 导出间隔（秒）

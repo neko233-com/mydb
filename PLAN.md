@@ -1,4 +1,4 @@
-# PLAN.md — v0.1.38 生产级落地计划
+# PLAN.md — v0.1.39 MySQL 9 Telemetry 全量对齐计划
 
 > 本文是当前迭代的唯一执行计划。完成一项勾选一项；未完成的项必须保留原因，不得用“已支持/生产级”表述掩盖。
 > 目标定位不变：**单机 MySQL 8.0~8.4 协议与语法兼容数据库**，不引入分布式、集群、复制或 router 抽象。
@@ -36,6 +36,8 @@
 - [x] 2.6 OTLP 指标补充 CDC 与 OLAP：`mydb.cdc.*`、`mydb.olap.*`、导出器失败计数
 - [x] 2.7 测试：鉴权头生成、配置校验、脱敏、热开关状态、OTLP payload 结构
 - [x] 2.8 对齐 MySQL 9 Telemetry：`stmt` Internal span + `mysql.*` 属性；新增 OTLP `/v1/logs`（`export_logs` 默认关闭、敏感字段脱敏）；运行时冒烟验证 `/v1/metrics` 与 `/v1/logs` 均到达采集器；对照与缺口写入 `docs/zh/opentelemetry.md`
+- [x] 2.9 v0.1.39 全量对齐：`Control`/`session`/`stmt` 三类 span；`CLIENT_QUERY_ATTRIBUTES` 与 `traceparent` 文本/prepared 透传；默认 OTLP `http/protobuf` + `gzip` 编码；`sql_errno/sqlstate` 取自实际错误；运行时冒烟验证默认 protobuf/gzip 与 `stmt` span 到达采集器
+- [ ] 2.10 未完成：优化器 `rows_examined`/tmp/sort/select 统计与对象级 `mysql.object_*`；无可靠数据源时不伪造
 
 ## 3. OLAP 页级 zone map（G6）
 
@@ -72,8 +74,9 @@
 - [x] 6.3 `cargo +stable-x86_64-pc-windows-gnullvm build --release --locked -p mydb-server -p mydb-cli -p mydb-migrate -p mydb-dump`（通过）
 - [x] 6.4 本机启动冒烟：release 二进制、`/healthz`、`/readyz`、`/metrics`、OTLP 状态、OTLP `/v1/metrics`+`/v1/logs`、SQL 建表/写入/范围扫描、OLAP 裁剪、权限隔离（`scripts/verify-monitoring-runtime.py` 通过）
 - [x] 6.5 本机无 MySQL/podman，未重跑同机基准；已如实标注“未重跑”，不写新倍数
-- [x] 6.6 版本号 `0.1.38`，提交信息符合 `<type>(<scope>): <中文描述>`，推送 `main`；GitHub Release `v0.1.38` 已发布（Windows zip + Linux musl tar，校验和已上传）
-- [x] 6.7 Linux musl 静态构建规范与 CI：`AGENTS.md`、`docs/zh/musl-build.md`、`.github/workflows/build-linux-musl.yml`；GitHub Actions run `45060434795` 构建、静态校验与产物上传通过
+- [x] 6.6 版本号 `0.1.39`，提交信息符合 `<type>(<scope>): <中文描述>`，推送 `main`；本轮不自动创建 GitHub Release
+- [x] 6.7 Linux musl 静态构建规范与 CI：`AGENTS.md`、`docs/zh/musl-build.md`、`.github/workflows/build-linux-musl.yml`
+- [ ] 6.8 musl 本轮需在推送后手动触发 workflow，等待静态产物校验结果
 
 ## 7. 风险与回退
 

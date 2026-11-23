@@ -224,6 +224,12 @@ pub struct OtlpSection {
     /// when this is disabled.
     #[serde(default)]
     pub enabled: bool,
+    /// Wire encoding for OTLP/HTTP. MySQL 9 defaults to `http/protobuf`.
+    #[serde(default = "default_otlp_protocol")]
+    pub protocol: String,
+    /// Payload compression. MySQL 9 defaults to `gzip`; `none` disables it.
+    #[serde(default = "default_otlp_compression")]
+    pub compression: String,
     /// Base endpoint such as `http://127.0.0.1:4318`. Paths `/v1/metrics`
     /// and `/v1/traces` are appended automatically.
     #[serde(default = "default_otlp_endpoint")]
@@ -395,6 +401,14 @@ fn default_slow_query_log_max_size() -> String {
 fn default_slow_query_log_max_files() -> u32 {
     10
 }
+fn default_otlp_protocol() -> String {
+    "http/protobuf".to_string()
+}
+
+fn default_otlp_compression() -> String {
+    "gzip".to_string()
+}
+
 fn default_otlp_endpoint() -> String {
     "http://127.0.0.1:4318".to_string()
 }
@@ -532,6 +546,8 @@ impl Default for OtlpSection {
     fn default() -> Self {
         Self {
             enabled: false,
+            protocol: default_otlp_protocol(),
+            compression: default_otlp_compression(),
             endpoint: default_otlp_endpoint(),
             interval_secs: default_otlp_interval_secs(),
             timeout_secs: default_otlp_timeout_secs(),

@@ -302,6 +302,15 @@ async fn run_server(args: Args, config: mydb_config::ServerConfig) -> Result<()>
     let sessions = Arc::new(parking_lot::Mutex::new(HashMap::new()));
     let login_rate_limiter = Arc::new(parking_lot::Mutex::new(LoginRateLimiter::default()));
     let otlp_exporter = observability::OtlpExporter::new(&config.observability.otlp);
+    wire_stats.set_statement_tracing(
+        config.observability.otlp.enabled && config.observability.otlp.export_traces,
+    );
+    wire_stats.record_control_trace(
+        config.observability.otlp.export_traces,
+        config.observability.otlp.enabled,
+        config.observability.otlp.export_logs,
+        "startup",
+    );
     let metrics_token =
         metrics_panel::load_token(config.observability.metrics_token_file.as_deref())?
             .map(Arc::<str>::from);
@@ -494,6 +503,20 @@ fn validate_runtime_security(config: &mydb_config::ServerConfig) -> Result<()> {
         );
         anyhow::ensure!(otlp.interval_secs >= 1, "otlp.interval_secs must be >= 1");
         anyhow::ensure!(otlp.timeout_secs >= 1, "otlp.timeout_secs must be >= 1");
+        anyhow::ensure!(
+            matches!(
+                otlp.protocol.trim().to_ascii_lowercase().as_str(),
+                "http/protobuf" | "http/json" | "protobuf" | "json"
+            ),
+            "otlp.protocol must be http/protobuf or http/json"
+        );
+        anyhow::ensure!(
+            matches!(
+                otlp.compression.trim().to_ascii_lowercase().as_str(),
+                "none" | "gzip" | "identity"
+            ),
+            "otlp.compression must be gzip or none"
+        );
         anyhow::ensure!(
             !otlp.service_name.trim().is_empty(),
             "otlp.service_name must not be empty"
@@ -1388,6 +1411,16 @@ fn apply_runtime_config(
     state
         .otlp_exporter
         .apply(&state.config.read().observability.otlp);
+    let otlp = state.config.read().observability.otlp.clone();
+    state
+        .wire_stats
+        .set_statement_tracing(otlp.enabled && otlp.export_traces);
+    state.wire_stats.record_control_trace(
+        otlp.export_traces,
+        otlp.enabled,
+        otlp.export_logs,
+        "configuration reload",
+    );
     state.sessions.lock().clear();
     Ok(())
 }

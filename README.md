@@ -185,15 +185,15 @@ file target/x86_64-unknown-linux-musl/release/mydb-server  # 应显示 staticall
 
 # 正式包只包含 server/cli/mydb/migrate/dump、配置、安装脚本和文档；
 # mydb-bench、测试结果与 target/bench 不进入发布包
-.\scripts\build-release.ps1 -Version "0.1.38"
+.\scripts\build-release.ps1 -Version "0.1.39"
 # 发布包同时生成同名 `.sha256` 校验文件；发布脚本默认只构建不上传，必须显式加 `-ConfirmPublish`，并在交互提示中输入 `PUBLISH v<version>` 才会创建 GitHub tag/release；脚本会拒绝覆盖已存在的 Release。
 # 日常开发在 main。已发布版本用 tag 记录，不保留长期发布分支。
 
 ```powershell
 # 仅构建/打包候选物（推荐先做这一步）
-.\scripts\build-release.ps1 -Version "0.1.38"
+.\scripts\build-release.ps1 -Version "0.1.39"
 # 最终发布：仍需人工输入精确确认文本
-.\scripts\build-release.ps1 -Version "0.1.38" -ConfirmPublish
+.\scripts\build-release.ps1 -Version "0.1.39" -ConfirmPublish
 ```
 
 # 安装到系统
@@ -768,6 +768,16 @@ CDC 是 MyDB 相对 MySQL 的**额外扩展，默认关闭**，不宣称 MySQL b
 - ✅ 2026-08-17 Linux Docker Rust 门禁：隔离容器 2 CPU/2 GiB 通过 fmt、workspace Clippy、workspace 全量测试与 release 构建；构建卷已清理
 - ✅ 2026-08-17 Windows 当前源码打包：5 个 release 二进制构建成功，本地 zip 解包完整性与 SHA-256 校验通过；本次 v0.1.35 发布包按同一源码生成
 - ⏳ Ubuntu 24.04 物理性能、macOS 原生验收、大数据压力与生产安全运维验收；宿主真实断电不在开发机执行，单机等价逻辑用 Docker 故障模型覆盖；以 [CheckList.md](CheckList.md) 与 [性能报告.md](性能报告.md) 为准
+
+### v0.1.39 MySQL 9 Telemetry 全量对齐版
+
+发布说明与已知边界见 [docs/zh/releases/v0.1.39.md](docs/zh/releases/v0.1.39.md)。
+
+- ✅ `Control`、`session`、`stmt` 三类 span 全量导出；所有语句（不只慢查询）进入 trace
+- ✅ `CLIENT_QUERY_ATTRIBUTES` 与 `traceparent` 透传：文本协议和 prepared 执行均支持具名查询属性
+- ✅ OTLP 默认 `http/protobuf` + `gzip`，手写 traces/metrics/logs protobuf 编码；保留 `http/json` 调试模式
+- ✅ MySQL 9 `mysql.*` 执行属性、`TCP_NODELAY`、无属性时的上下文清理；OLAP 继续使用页级 zone map 解码前裁剪
+- ⏳ 已知边界：优化器执行统计、对象级 `mysql.object_*`、列裁剪、向量化聚合、并行页扫描未完成；musl 发布以 CI 产物为准
 
 ### v0.1.38 观测与 OLAP 裁剪版
 

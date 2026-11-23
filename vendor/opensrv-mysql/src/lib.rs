@@ -215,6 +215,10 @@ pub trait AsyncMysqlShim<W: Send> {
         results: QueryResultWriter<'a, W>,
     ) -> Result<(), Self::Error>;
 
+    /// Called before `on_query` with MySQL query attributes negotiated through
+    /// `CLIENT_QUERY_ATTRIBUTES`. The default ignores them for compatibility.
+    fn set_query_attributes(&mut self, _attributes: &[(&[u8], &[u8])]) {}
+
     /// Returns the client-side file name when this query starts a LOCAL INFILE transfer.
     fn local_infile_name(&self, _query: &[u8]) -> Option<Vec<u8>> {
         None
@@ -352,6 +356,7 @@ where
             | CapabilityFlags::CLIENT_PS_MULTI_RESULTS
             | CapabilityFlags::CLIENT_TRANSACTIONS
             | CapabilityFlags::CLIENT_SESSION_TRACK
+            | CapabilityFlags::CLIENT_QUERY_ATTRIBUTES
             | CapabilityFlags::CLIENT_CONNECT_ATTRS
             | CapabilityFlags::CLIENT_DEPRECATE_EOF;
 
@@ -615,7 +620,8 @@ where
             match res {
                 Ok(cmd) => {
                     match cmd.1 {
-                        Command::Query(q) => {
+                        Command::Query { sql: q, attributes } => {
+                            self.shim.set_query_attributes(&attributes);
                             if let Some(file_name) = self.shim.local_infile_name(q) {
                                 if !self
                                     .client_capabilities
@@ -736,7 +742,12 @@ where
                                 )
                                 .await?;
                         }
-                        Command::Execute { stmt, params } => {
+                        Command::Execute {
+                            stmt,
+                            flags,
+                            query_attributes,
+                            params,
+                        } => {
                             let state = stmts.get_mut(&stmt).ok_or_else(|| {
                                 io::Error::new(
                                     io::ErrorKind::InvalidData,
@@ -744,7 +755,12 @@ where
                                 )
                             })?;
                             {
-                                let params = params::ParamParser::new(params, state);
+                                let params = params::ParamParser::new(
+                                    params,
+                                    state,
+                                    flags,
+                                    query_attributes,
+                                );
                                 let w = QueryResultWriter::new(
                                     &mut self.writer,
                                     true,

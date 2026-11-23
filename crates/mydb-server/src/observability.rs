@@ -17,16 +17,13 @@ use sha2::{Digest, Sha256};
 
 use mydb_config::OtlpSection;
 use mydb_wire::{
-    AuditLogSnapshot, QueryLatencySnapshot, SlowQueryLogSnapshot, SlowQuerySnapshot,
-    StatementDigestSnapshot, WireStatsSnapshot,
+    AuditLogSnapshot, ControlTrace, QueryLatencySnapshot, SessionTrace, SlowQueryLogSnapshot,
+    StatementDigestSnapshot, StatementTrace, WireStatsSnapshot,
 };
 
 const OTLP_METRICS_PATH: &str = "/v1/metrics";
 const OTLP_TRACES_PATH: &str = "/v1/traces";
 const OTLP_LOGS_PATH: &str = "/v1/logs";
-/// Upper bound of exported spans per interval. A burst of slow statements
-/// must not produce an unbounded payload.
-const MAX_EXPORTED_SPANS: usize = 256;
 /// Number of statement digests exported as Prometheus labels. Prometheus label
 /// cardinality has to stay bounded.
 const MAX_PROMETHEUS_DIGESTS: usize = 20;
@@ -253,11 +250,59 @@ impl fmt::Debug for OtlpAuth {
     }
 }
 
+/// OTLP/HTTP wire encoding. MySQL 9 defaults to `http/protobuf`; the JSON
+/// variant stays for local debugging and collectors that only accept JSON.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OtlpProtocol {
+    Protobuf,
+    Json,
+}
+
+impl OtlpProtocol {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Protobuf => "http/protobuf",
+            Self::Json => "http/json",
+        }
+    }
+
+    fn parse(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "http/json" | "json" => Self::Json,
+            _ => Self::Protobuf,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OtlpCompression {
+    None,
+    Gzip,
+}
+
+impl OtlpCompression {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Gzip => "gzip",
+        }
+    }
+
+    fn parse(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "none" | "identity" => Self::None,
+            _ => Self::Gzip,
+        }
+    }
+}
+
 /// Runtime configuration of the exporter. A configuration reload replaces the
 /// whole struct, so the exporter can be retargeted without a restart.
 #[derive(Clone)]
 pub struct OtlpSettings {
     pub enabled: bool,
+    pub protocol: OtlpProtocol,
+    pub compression: OtlpCompression,
     pub endpoint: String,
     pub interval: Duration,
     pub timeout: Duration,
@@ -274,6 +319,8 @@ impl fmt::Debug for OtlpSettings {
         formatter
             .debug_struct("OtlpSettings")
             .field("enabled", &self.enabled)
+            .field("protocol", &self.protocol.name())
+            .field("compression", &self.compression.name())
             .field("endpoint", &self.endpoint)
             .field("interval", &self.interval)
             .field("timeout", &self.timeout)
@@ -292,6 +339,8 @@ impl OtlpSettings {
         let auth = resolve_auth(section);
         Self {
             enabled: section.enabled,
+            protocol: OtlpProtocol::parse(&section.protocol),
+            compression: OtlpCompression::parse(&section.compression),
             endpoint: section.endpoint.trim_end_matches('/').to_string(),
             interval: Duration::from_secs(section.interval_secs.max(1)),
             timeout: Duration::from_secs(section.timeout_secs.max(1)),
@@ -345,6 +394,8 @@ struct OtlpCounters {
 #[derive(Debug, Clone)]
 pub struct OtlpStatusSnapshot {
     pub enabled: bool,
+    pub protocol: &'static str,
+    pub compression: &'static str,
     pub endpoint: String,
     pub interval_seconds: u64,
     pub service_name: String,
@@ -366,6 +417,8 @@ impl OtlpStatusSnapshot {
     pub fn to_json(&self) -> Value {
         json!({
             "enabled": self.enabled,
+            "protocol": self.protocol,
+            "compression": self.compression,
             "endpoint": self.endpoint,
             "interval_seconds": self.interval_seconds,
             "service_name": self.service_name,
@@ -407,7 +460,9 @@ pub struct ServerIdentity {
 pub struct OtlpExporter {
     settings: Arc<RwLock<OtlpSettings>>,
     counters: Arc<OtlpCounters>,
-    last_exported_slow_query_id: Arc<AtomicU64>,
+    last_exported_statement_trace_id: Arc<AtomicU64>,
+    last_exported_session_trace_id: Arc<AtomicU64>,
+    last_exported_control_trace_id: Arc<AtomicU64>,
     last_exported_log_id: Arc<AtomicU64>,
     log_buffer: Arc<OtlpLogBuffer>,
 }
@@ -417,7 +472,9 @@ impl OtlpExporter {
         Self {
             settings: Arc::new(RwLock::new(OtlpSettings::from_section(section))),
             counters: Arc::new(OtlpCounters::default()),
-            last_exported_slow_query_id: Arc::new(AtomicU64::new(0)),
+            last_exported_statement_trace_id: Arc::new(AtomicU64::new(0)),
+            last_exported_session_trace_id: Arc::new(AtomicU64::new(0)),
+            last_exported_control_trace_id: Arc::new(AtomicU64::new(0)),
             last_exported_log_id: Arc::new(AtomicU64::new(0)),
             log_buffer: log_buffer(),
         }
@@ -433,6 +490,8 @@ impl OtlpExporter {
         let settings = self.settings.read().clone();
         OtlpStatusSnapshot {
             enabled: settings.enabled,
+            protocol: settings.protocol.name(),
+            compression: settings.compression.name(),
             endpoint: settings.endpoint.clone(),
             interval_seconds: settings.interval.as_secs(),
             service_name: settings.service_name.clone(),
@@ -452,7 +511,7 @@ impl OtlpExporter {
     async fn export_once(
         &self,
         snapshot: &MonitoringSnapshot<'_>,
-        slow_queries: &[SlowQuerySnapshot],
+        wire_stats: &mydb_wire::WireStats,
         server: &ServerIdentity,
     ) {
         let settings = self.settings.read().clone();
@@ -461,10 +520,12 @@ impl OtlpExporter {
         }
         let timestamp = unix_nanos();
         let metrics_payload = otlp_metrics_payload(&settings, snapshot, server, timestamp);
-        match post_json(
+        match post_otlp(
             &format!("{}{}", settings.endpoint, OTLP_METRICS_PATH),
             &settings.headers,
             &settings.auth,
+            settings.protocol,
+            settings.compression,
             &metrics_payload,
             settings.timeout,
         )
@@ -484,13 +545,33 @@ impl OtlpExporter {
         }
 
         if settings.export_traces {
-            let spans = collect_spans(slow_queries, &self.last_exported_slow_query_id);
-            if !spans.is_empty() {
-                let traces_payload = otlp_traces_payload(&settings, &spans, server);
-                match post_json(
+            let statements =
+                wire_stats.statement_traces_since(self.last_exported_statement_trace_id.load(Ordering::Relaxed));
+            let sessions =
+                wire_stats.session_traces_since(self.last_exported_session_trace_id.load(Ordering::Relaxed));
+            let controls =
+                wire_stats.control_traces_since(self.last_exported_control_trace_id.load(Ordering::Relaxed));
+            if let Some(last) = statements.last() {
+                self.last_exported_statement_trace_id
+                    .store(last.id, Ordering::Relaxed);
+            }
+            if let Some(last) = sessions.last() {
+                self.last_exported_session_trace_id
+                    .store(last.id, Ordering::Relaxed);
+            }
+            if let Some(last) = controls.last() {
+                self.last_exported_control_trace_id
+                    .store(last.id, Ordering::Relaxed);
+            }
+            if !statements.is_empty() || !sessions.is_empty() || !controls.is_empty() {
+                let traces_payload =
+                    otlp_traces_payload(&settings, &statements, &sessions, &controls, server);
+                match post_otlp(
                     &format!("{}{}", settings.endpoint, OTLP_TRACES_PATH),
                     &settings.headers,
                     &settings.auth,
+                    settings.protocol,
+                    settings.compression,
                     &traces_payload,
                     settings.timeout,
                 )
@@ -523,10 +604,12 @@ impl OtlpExporter {
                         .store(last.id, Ordering::Relaxed);
                 }
                 let logs_payload = otlp_logs_payload(&settings, &logs, server);
-                match post_json(
+                match post_otlp(
                     &format!("{}{}", settings.endpoint, OTLP_LOGS_PATH),
                     &settings.headers,
                     &settings.auth,
+                    settings.protocol,
+                    settings.compression,
                     &logs_payload,
                     settings.timeout,
                 )
@@ -596,7 +679,12 @@ pub async fn run_otlp_exporter(
                 }
             }
         }
-        if !exporter.settings.read().enabled {
+        let active = {
+            let settings = exporter.settings.read();
+            settings.enabled
+        };
+        wire_stats.set_statement_tracing(active && exporter.settings.read().export_traces);
+        if !active {
             continue;
         }
         let cdc_status = cdc.is_enabled().then(|| cdc.status());
@@ -604,7 +692,6 @@ pub async fn run_otlp_exporter(
         let storage_stats = storage.stats();
         let audit = audit_log.snapshot();
         let latency = wire_stats.query_latency();
-        let slow_queries = wire_stats.slow_queries();
         let snapshot = MonitoringSnapshot {
             wire: &wire,
             storage: &storage_stats,
@@ -621,18 +708,38 @@ pub async fn run_otlp_exporter(
             version: version.clone(),
         };
         exporter
-            .export_once(&snapshot, &slow_queries, &server)
+            .export_once(&snapshot, &wire_stats, &server)
             .await;
     }
 }
 
-async fn post_json(
+async fn post_otlp(
     url: &str,
     headers: &BTreeMap<String, String>,
     auth: &OtlpAuth,
+    protocol: OtlpProtocol,
+    compression: OtlpCompression,
     payload: &Value,
     timeout: Duration,
 ) -> anyhow::Result<u16> {
+    let body = match protocol {
+        OtlpProtocol::Json => serde_json::to_vec(payload)?,
+        OtlpProtocol::Protobuf => encode_otlp_protobuf(url, payload)?,
+    };
+    let body = match compression {
+        OtlpCompression::Gzip => {
+            use std::io::Write as _;
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder.write_all(&body)?;
+            encoder.finish()?
+        }
+        OtlpCompression::None => body,
+    };
+    let content_type = match protocol {
+        OtlpProtocol::Json => "application/json",
+        OtlpProtocol::Protobuf => "application/x-protobuf",
+    };
     let client = reqwest::Client::builder()
         .timeout(timeout)
         .redirect(reqwest::redirect::Policy::none())
@@ -640,8 +747,11 @@ async fn post_json(
         .map_err(|error| anyhow::anyhow!("failed to build OTLP HTTP client: {error}"))?;
     let mut request = client
         .post(url)
-        .header("Content-Type", "application/json")
-        .body(serde_json::to_vec(payload)?);
+        .header("Content-Type", content_type)
+        .body(body);
+    if compression == OtlpCompression::Gzip {
+        request = request.header("Content-Encoding", "gzip");
+    }
     let explicit_authorization = headers
         .keys()
         .any(|name| name.eq_ignore_ascii_case("authorization"));
@@ -658,6 +768,371 @@ async fn post_json(
         .await
         .map_err(|error| anyhow::anyhow!("OTLP export request failed: {}", error.without_url()))?;
     Ok(response.status().as_u16())
+}
+
+/// Encode the OTLP payload built for JSON into the protobuf wire format
+/// advertised by MySQL 9's default `http/protobuf` transport. The schema uses
+/// the stable field numbers from the OpenTelemetry proto definitions.
+fn encode_otlp_protobuf(url: &str, payload: &Value) -> anyhow::Result<Vec<u8>> {
+    if url.ends_with(OTLP_TRACES_PATH) {
+        Ok(encode_trace_request(payload))
+    } else if url.ends_with(OTLP_METRICS_PATH) {
+        Ok(encode_metrics_request(payload))
+    } else if url.ends_with(OTLP_LOGS_PATH) {
+        Ok(encode_logs_request(payload))
+    } else {
+        anyhow::bail!("unknown OTLP signal path: {url}")
+    }
+}
+
+fn pb_varint(mut value: u64, output: &mut Vec<u8>) {
+    while value >= 0x80 {
+        output.push((value as u8) | 0x80);
+        value >>= 7;
+    }
+    output.push(value as u8);
+}
+
+fn pb_key(field: u32, wire: u8, output: &mut Vec<u8>) {
+    pb_varint(u64::from(field) << 3 | u64::from(wire), output);
+}
+
+fn pb_varint_field(field: u32, value: u64, output: &mut Vec<u8>) {
+    pb_key(field, 0, output);
+    pb_varint(value, output);
+}
+
+fn pb_fixed64_field(field: u32, value: u64, output: &mut Vec<u8>) {
+    pb_key(field, 1, output);
+    output.extend_from_slice(&value.to_le_bytes());
+}
+
+fn pb_bytes_field(field: u32, value: &[u8], output: &mut Vec<u8>) {
+    pb_key(field, 2, output);
+    pb_varint(value.len() as u64, output);
+    output.extend_from_slice(value);
+}
+
+fn pb_string_field(field: u32, value: &str, output: &mut Vec<u8>) {
+    pb_bytes_field(field, value.as_bytes(), output);
+}
+
+fn pb_message_field(field: u32, message: &[u8], output: &mut Vec<u8>) {
+    pb_bytes_field(field, message, output);
+}
+
+fn hex_to_bytes(value: &str) -> Option<Vec<u8>> {
+    if !value.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(value.len() / 2);
+    for chunk in value.as_bytes().chunks(2) {
+        bytes.push(u8::from_str_radix(std::str::from_utf8(chunk).ok()?, 16).ok()?);
+    }
+    Some(bytes)
+}
+
+fn encode_any_value(value: &Value, output: &mut Vec<u8>) {
+    if let Some(text) = value.get("stringValue").and_then(Value::as_str) {
+        pb_string_field(1, text, output);
+    } else if let Some(flag) = value.get("boolValue").and_then(Value::as_bool) {
+        pb_varint_field(2, u64::from(flag), output);
+    } else if let Some(text) = value.get("intValue").and_then(Value::as_str) {
+        if let Ok(number) = text.parse::<i64>() {
+            pb_varint_field(3, number as u64, output);
+        }
+    } else if let Some(number) = value.get("doubleValue").and_then(Value::as_f64) {
+        pb_fixed64_field(4, number.to_bits(), output);
+    }
+}
+
+fn encode_attributes(attributes: &[Value], output: &mut Vec<u8>, field: u32) {
+    for attribute in attributes {
+        let Some(key) = attribute.get("key").and_then(Value::as_str) else {
+            continue;
+        };
+        let mut message = Vec::new();
+        pb_string_field(1, key, &mut message);
+        if let Some(value) = attribute.get("value") {
+            let mut any = Vec::new();
+            encode_any_value(value, &mut any);
+            if !any.is_empty() {
+                pb_message_field(2, &any, &mut message);
+            }
+        }
+        pb_message_field(field, &message, output);
+    }
+}
+
+fn encode_resource(resource: &Value, output: &mut Vec<u8>) {
+    if let Some(attributes) = resource.get("attributes").and_then(Value::as_array) {
+        encode_attributes(attributes, output, 1);
+    }
+}
+
+fn encode_scope(scope: &Value, output: &mut Vec<u8>) {
+    if let Some(name) = scope.get("name").and_then(Value::as_str) {
+        pb_string_field(1, name, output);
+    }
+    if let Some(version) = scope.get("version").and_then(Value::as_str) {
+        pb_string_field(2, version, output);
+    }
+}
+
+fn encode_status(status: &Value, output: &mut Vec<u8>) {
+    if let Some(message) = status.get("message").and_then(Value::as_str) {
+        pb_string_field(2, message, output);
+    }
+    if let Some(code) = status.get("code").and_then(Value::as_i64) {
+        pb_varint_field(3, code as u64, output);
+    }
+}
+
+fn encode_span(span: &Value, output: &mut Vec<u8>) {
+    if let Some(trace) = span
+        .get("traceId")
+        .and_then(Value::as_str)
+        .and_then(hex_to_bytes)
+    {
+        pb_bytes_field(1, &trace, output);
+    }
+    if let Some(span_id) = span
+        .get("spanId")
+        .and_then(Value::as_str)
+        .and_then(hex_to_bytes)
+    {
+        pb_bytes_field(2, &span_id, output);
+    }
+    if let Some(parent) = span
+        .get("parentSpanId")
+        .and_then(Value::as_str)
+        .and_then(hex_to_bytes)
+    {
+        if !parent.is_empty() {
+            pb_bytes_field(4, &parent, output);
+        }
+    }
+    if let Some(name) = span.get("name").and_then(Value::as_str) {
+        pb_string_field(5, name, output);
+    }
+    if let Some(kind) = span.get("kind").and_then(Value::as_i64) {
+        pb_varint_field(6, kind as u64, output);
+    }
+    let start = span
+        .get("startTimeUnixNano")
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    let end = span
+        .get("endTimeUnixNano")
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(start);
+    pb_fixed64_field(7, start, output);
+    pb_fixed64_field(8, end, output);
+    if let Some(attributes) = span.get("attributes").and_then(Value::as_array) {
+        encode_attributes(attributes, output, 9);
+    }
+    if let Some(status) = span.get("status") {
+        let mut message = Vec::new();
+        encode_status(status, &mut message);
+        if !message.is_empty() {
+            pb_message_field(15, &message, output);
+        }
+    }
+}
+
+fn encode_trace_request(payload: &Value) -> Vec<u8> {
+    let mut request = Vec::new();
+    let Some(resource_spans) = payload.get("resourceSpans").and_then(Value::as_array) else {
+        return request;
+    };
+    for resource_span in resource_spans {
+        let mut message = Vec::new();
+        if let Some(resource) = resource_span.get("resource") {
+            let mut resource_message = Vec::new();
+            encode_resource(resource, &mut resource_message);
+            pb_message_field(1, &resource_message, &mut message);
+        }
+        if let Some(scope_spans) = resource_span.get("scopeSpans").and_then(Value::as_array) {
+            for scope_span in scope_spans {
+                let mut scope_message = Vec::new();
+                if let Some(scope) = scope_span.get("scope") {
+                    let mut instrument_scope = Vec::new();
+                    encode_scope(scope, &mut instrument_scope);
+                    pb_message_field(1, &instrument_scope, &mut scope_message);
+                }
+                if let Some(spans) = scope_span.get("spans").and_then(Value::as_array) {
+                    for span in spans {
+                        let mut span_message = Vec::new();
+                        encode_span(span, &mut span_message);
+                        pb_message_field(2, &span_message, &mut scope_message);
+                    }
+                }
+                pb_message_field(2, &scope_message, &mut message);
+            }
+        }
+        pb_message_field(1, &message, &mut request);
+    }
+    request
+}
+
+fn encode_number_data_point(point: &Value, output: &mut Vec<u8>) {
+    if let Some(attributes) = point.get("attributes").and_then(Value::as_array) {
+        encode_attributes(attributes, output, 7);
+    }
+    if let Some(time) = point
+        .get("timeUnixNano")
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        pb_fixed64_field(3, time, output);
+    }
+    if let Some(value) = point
+        .get("asInt")
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse::<i64>().ok())
+    {
+        pb_fixed64_field(6, value as u64, output);
+    } else if let Some(value) = point.get("asDouble").and_then(Value::as_f64) {
+        pb_fixed64_field(4, value.to_bits(), output);
+    }
+}
+
+fn encode_metric(metric: &Value, output: &mut Vec<u8>) {
+    if let Some(name) = metric.get("name").and_then(Value::as_str) {
+        pb_string_field(1, name, output);
+    }
+    if let Some(description) = metric.get("description").and_then(Value::as_str) {
+        pb_string_field(2, description, output);
+    }
+    if let Some(unit) = metric.get("unit").and_then(Value::as_str) {
+        pb_string_field(3, unit, output);
+    }
+    if let Some(gauge) = metric.get("gauge") {
+        let mut message = Vec::new();
+        if let Some(points) = gauge.get("dataPoints").and_then(Value::as_array) {
+            for point in points {
+                let mut point_message = Vec::new();
+                encode_number_data_point(point, &mut point_message);
+                pb_message_field(1, &point_message, &mut message);
+            }
+        }
+        pb_message_field(5, &message, output);
+    }
+    if let Some(sum) = metric.get("sum") {
+        let mut message = Vec::new();
+        if let Some(points) = sum.get("dataPoints").and_then(Value::as_array) {
+            for point in points {
+                let mut point_message = Vec::new();
+                encode_number_data_point(point, &mut point_message);
+                pb_message_field(1, &point_message, &mut message);
+            }
+        }
+        if let Some(temporality) = sum.get("aggregationTemporality").and_then(Value::as_i64) {
+            pb_varint_field(2, temporality as u64, &mut message);
+        }
+        if let Some(monotonic) = sum.get("isMonotonic").and_then(Value::as_bool) {
+            pb_varint_field(3, u64::from(monotonic), &mut message);
+        }
+        pb_message_field(7, &message, output);
+    }
+}
+
+fn encode_metrics_request(payload: &Value) -> Vec<u8> {
+    let mut request = Vec::new();
+    let Some(resource_metrics) = payload.get("resourceMetrics").and_then(Value::as_array) else {
+        return request;
+    };
+    for resource_metric in resource_metrics {
+        let mut message = Vec::new();
+        if let Some(resource) = resource_metric.get("resource") {
+            let mut resource_message = Vec::new();
+            encode_resource(resource, &mut resource_message);
+            pb_message_field(1, &resource_message, &mut message);
+        }
+        if let Some(scope_metrics) = resource_metric.get("scopeMetrics").and_then(Value::as_array) {
+            for scope_metric in scope_metrics {
+                let mut scope_message = Vec::new();
+                if let Some(scope) = scope_metric.get("scope") {
+                    let mut instrument_scope = Vec::new();
+                    encode_scope(scope, &mut instrument_scope);
+                    pb_message_field(1, &instrument_scope, &mut scope_message);
+                }
+                if let Some(metrics) = scope_metric.get("metrics").and_then(Value::as_array) {
+                    for metric in metrics {
+                        let mut metric_message = Vec::new();
+                        encode_metric(metric, &mut metric_message);
+                        pb_message_field(2, &metric_message, &mut scope_message);
+                    }
+                }
+                pb_message_field(2, &scope_message, &mut message);
+            }
+        }
+        pb_message_field(1, &message, &mut request);
+    }
+    request
+}
+
+fn encode_log_record(record: &Value, output: &mut Vec<u8>) {
+    if let Some(time) = record
+        .get("timeUnixNano")
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        pb_fixed64_field(1, time, output);
+    }
+    if let Some(severity) = record.get("severityNumber").and_then(Value::as_i64) {
+        pb_varint_field(2, severity as u64, output);
+    }
+    if let Some(text) = record.get("severityText").and_then(Value::as_str) {
+        pb_string_field(3, text, output);
+    }
+    if let Some(body) = record.get("body") {
+        let mut body_message = Vec::new();
+        encode_any_value(body, &mut body_message);
+        if !body_message.is_empty() {
+            pb_message_field(5, &body_message, output);
+        }
+    }
+    if let Some(attributes) = record.get("attributes").and_then(Value::as_array) {
+        encode_attributes(attributes, output, 6);
+    }
+}
+
+fn encode_logs_request(payload: &Value) -> Vec<u8> {
+    let mut request = Vec::new();
+    let Some(resource_logs) = payload.get("resourceLogs").and_then(Value::as_array) else {
+        return request;
+    };
+    for resource_log in resource_logs {
+        let mut message = Vec::new();
+        if let Some(resource) = resource_log.get("resource") {
+            let mut resource_message = Vec::new();
+            encode_resource(resource, &mut resource_message);
+            pb_message_field(1, &resource_message, &mut message);
+        }
+        if let Some(scope_logs) = resource_log.get("scopeLogs").and_then(Value::as_array) {
+            for scope_log in scope_logs {
+                let mut scope_message = Vec::new();
+                if let Some(scope) = scope_log.get("scope") {
+                    let mut instrument_scope = Vec::new();
+                    encode_scope(scope, &mut instrument_scope);
+                    pb_message_field(1, &instrument_scope, &mut scope_message);
+                }
+                if let Some(records) = scope_log.get("logRecords").and_then(Value::as_array) {
+                    for record in records {
+                        let mut record_message = Vec::new();
+                        encode_log_record(record, &mut record_message);
+                        pb_message_field(2, &record_message, &mut scope_message);
+                    }
+                }
+                pb_message_field(2, &scope_message, &mut message);
+            }
+        }
+        pb_message_field(1, &message, &mut request);
+    }
+    request
 }
 
 fn unix_nanos() -> u64 {
@@ -680,6 +1155,10 @@ fn string_attribute(key: &str, value: &str) -> Value {
 
 fn int_attribute(key: &str, value: i64) -> Value {
     json!({"key": key, "value": {"intValue": value.to_string()}})
+}
+
+fn bool_attribute(key: &str, value: bool) -> Value {
+    json!({"key": key, "value": {"boolValue": value}})
 }
 
 fn resource_attributes(settings: &OtlpSettings, server: &ServerIdentity) -> Value {
@@ -1023,91 +1502,158 @@ fn otlp_metrics_payload(
     })
 }
 
-/// Slow statements recorded since the previous export become MySQL 9 style
-/// `stmt` internal spans.
-/// The watermark advances even when the export fails, so a broken collector
-/// cannot make the exporter resend the same spans forever.
-fn collect_spans(
-    slow_queries: &[SlowQuerySnapshot],
-    last_exported_id: &AtomicU64,
-) -> Vec<SlowQuerySnapshot> {
-    let since = last_exported_id.load(Ordering::Relaxed);
-    let mut pending: Vec<SlowQuerySnapshot> = slow_queries
-        .iter()
-        .filter(|snapshot| snapshot.id > since)
-        .cloned()
-        .collect();
-    if pending.len() > MAX_EXPORTED_SPANS {
-        pending.drain(..pending.len() - MAX_EXPORTED_SPANS);
-    }
-    if let Some(last) = pending.last() {
-        last_exported_id.store(last.id, Ordering::Relaxed);
-    }
-    pending
-}
-
 fn otlp_traces_payload(
     settings: &OtlpSettings,
-    spans: &[SlowQuerySnapshot],
+    statements: &[StatementTrace],
+    sessions: &[SessionTrace],
+    controls: &[ControlTrace],
     server: &ServerIdentity,
 ) -> Value {
-    let otlp_spans: Vec<Value> = spans
-        .iter()
-        .map(|snapshot| {
-            let start_nanos = snapshot.unix_ms.saturating_mul(1_000_000);
-            let end_nanos = start_nanos.saturating_add(snapshot.duration_ms.saturating_mul(1_000_000));
-            let mut attributes = vec![
-                string_attribute("db.system", "mysql"),
-                string_attribute("db.system.name", "mysql"),
-                string_attribute("db.operation", &snapshot.statement_type),
-                string_attribute("db.operation.name", &snapshot.statement_type),
-                string_attribute("mydb.statement.digest", &format!("{:x}", Sha256::digest(snapshot.query_digest.as_bytes()))),
-                string_attribute("mydb.query.outcome", &snapshot.outcome),
-                int_attribute(
-                    "mydb.query.duration_ms",
-                    snapshot.duration_ms as i64,
+    let mut otlp_spans: Vec<Value> = Vec::new();
+    for control in controls {
+        let attributes = vec![
+            bool_attribute("trace_enabled", control.trace_enabled),
+            bool_attribute("metrics_enabled", control.metrics_enabled),
+            bool_attribute("logs_enabled", control.logs_enabled),
+            string_attribute("details", &control.details),
+        ];
+        otlp_spans.push(json!({
+            "traceId": control.trace_id,
+            "spanId": control.span_id,
+            "name": "Control",
+            "kind": 1,
+            "startTimeUnixNano": control.time_unix_nanos.to_string(),
+            "endTimeUnixNano": control.time_unix_nanos.to_string(),
+            "attributes": attributes,
+            "status": {"code": 1},
+        }));
+    }
+    for session in sessions {
+        let mut attributes = vec![
+            int_attribute("mysql.processlist_id", i64::from(session.processlist_id)),
+            int_attribute("mysql.thread_id", i64::from(session.thread_id)),
+            string_attribute("mysql.user", &session.user),
+            string_attribute("mysql.host", &session.host),
+            string_attribute("mysql.group", ""),
+            string_attribute("mysql.session_attr.host", &session.host),
+        ];
+        if let Some(database) = session.database.as_deref() {
+            attributes.push(string_attribute("mysql.session_attr.db", database));
+        }
+        otlp_spans.push(json!({
+            "traceId": session.trace_id,
+            "spanId": session.span_id,
+            "name": "session",
+            "kind": 1,
+            "startTimeUnixNano": session.start_unix_nanos.to_string(),
+            "endTimeUnixNano": session.end_unix_nanos.to_string(),
+            "attributes": attributes,
+            "status": {"code": 1},
+        }));
+    }
+    for statement in statements {
+        let mut attributes = vec![
+            string_attribute("db.system", "mysql"),
+            string_attribute("db.system.name", "mysql"),
+            string_attribute("db.operation", &statement.statement_type),
+            string_attribute("db.operation.name", &statement.statement_type),
+            string_attribute(
+                "mydb.statement.digest",
+                &format!("{:x}", Sha256::digest(statement.digest.as_bytes())),
+            ),
+            string_attribute("mydb.query.outcome", &statement.outcome),
+            int_attribute("mydb.query.duration_ms", statement.duration_micros as i64 / 1_000),
+            int_attribute("db.mysql.connection_id", i64::from(statement.connection_id)),
+            string_attribute(
+                "mysql.event_name",
+                &format!(
+                    "statement/sql/{}",
+                    statement.statement_type.to_ascii_lowercase()
                 ),
-                int_attribute("db.mysql.connection_id", i64::from(snapshot.connection_id)),
-                string_attribute("mysql.digest_text", &snapshot.query_digest),
-                int_attribute("mysql.cpu_time", snapshot.execution_micros as i64),
-                int_attribute("mysql.lock_time", 0),
-                int_attribute("mysql.error_count", i64::from(snapshot.error.is_some())),
-                int_attribute("mysql.warning_count", 0),
-            ];
-            if settings.include_sql {
-                attributes.push(string_attribute("db.statement", &snapshot.sql));
-                attributes.push(string_attribute("db.name", &snapshot.database));
-                attributes.push(string_attribute("mysql.sql_text", &snapshot.sql));
-                attributes.push(string_attribute("mysql.current_schema", &snapshot.database));
-            }
-            if let Some(rows) = snapshot.rows_returned {
-                attributes.push(int_attribute("db.response.returned_rows", rows as i64));
-                attributes.push(int_attribute("mysql.rows_sent", rows as i64));
-            }
-            if let Some(affected) = snapshot.affected_rows {
-                attributes.push(int_attribute("db.response.affected_rows", affected as i64));
-                attributes.push(int_attribute("mysql.rows_affected", affected as i64));
-            }
-            if let Some(error) = snapshot.error.as_ref().filter(|_| settings.include_sql) {
-                attributes.push(string_attribute("error.message", error));
-            }
-            let status = if snapshot.error.is_some() {
-                json!({"code": 2, "message": if settings.include_sql { snapshot.error.clone().unwrap_or_default() } else { "SQL execution failed".to_string() }})
-            } else {
-                json!({"code": 1})
-            };
-            json!({
-                "traceId": stable_trace_id(server, snapshot),
-                "spanId": stable_span_id(server, snapshot),
-                "name": "stmt",
-                "kind": 1,
-                "startTimeUnixNano": start_nanos.to_string(),
-                "endTimeUnixNano": end_nanos.to_string(),
-                "attributes": attributes,
-                "status": status,
-            })
-        })
-        .collect();
+            ),
+            int_attribute("mysql.lock_time", 0),
+            string_attribute("mysql.digest_text", &statement.digest),
+            int_attribute("mysql.sql_errno", i64::from(statement.sql_errno)),
+            string_attribute(
+                "mysql.sqlstate",
+                statement.sqlstate.as_deref().unwrap_or("00000"),
+            ),
+            int_attribute("mysql.error_count", i64::from(statement.error.is_some())),
+            int_attribute("mysql.warning_count", statement.warning_count as i64),
+            int_attribute("mysql.rows_examined", 0),
+            int_attribute("mysql.created_tmp_disk_tables", 0),
+            int_attribute("mysql.created_tmp_tables", 0),
+            int_attribute("mysql.select_full_join", 0),
+            int_attribute("mysql.select_full_range_join", 0),
+            int_attribute("mysql.select_range", 0),
+            int_attribute("mysql.select_range_check", 0),
+            int_attribute("mysql.select_scan", 0),
+            int_attribute("mysql.sort_merge_passes", 0),
+            int_attribute("mysql.sort_range", 0),
+            int_attribute("mysql.sort_rows", 0),
+            int_attribute("mysql.sort_scan", 0),
+            int_attribute("mysql.no_index_used", 0),
+            int_attribute("mysql.no_good_index_used", 0),
+            int_attribute("mysql.max_controlled_memory", 0),
+            int_attribute("mysql.max_total_memory", 0),
+            int_attribute("mysql.cpu_time", statement.duration_micros as i64),
+        ];
+        if let Some(rows) = statement.rows_sent {
+            attributes.push(int_attribute("db.response.returned_rows", rows as i64));
+            attributes.push(int_attribute("mysql.rows_sent", rows as i64));
+        }
+        if let Some(affected) = statement.rows_affected {
+            attributes.push(int_attribute("db.response.affected_rows", affected as i64));
+            attributes.push(int_attribute("mysql.rows_affected", affected as i64));
+        }
+        if let Some(error) = statement.error.as_ref() {
+            attributes.push(string_attribute(
+                "mysql.message_text",
+                if settings.include_sql {
+                    error
+                } else {
+                    "SQL execution failed"
+                },
+            ));
+            attributes.push(string_attribute(
+                "error.message",
+                if settings.include_sql {
+                    error
+                } else {
+                    "SQL execution failed"
+                },
+            ));
+        }
+        if settings.include_sql {
+            attributes.push(string_attribute("db.statement", &statement.sql));
+            attributes.push(string_attribute("db.name", &statement.database));
+            attributes.push(string_attribute("mysql.sql_text", &statement.sql));
+            attributes.push(string_attribute("db.namespace", &statement.database));
+            attributes.push(string_attribute("mysql.current_schema", &statement.database));
+        }
+        let status = if statement.error.is_some() {
+            json!({"code": 2, "message": if settings.include_sql { statement.error.clone().unwrap_or_default() } else { "SQL execution failed".to_string() }})
+        } else {
+            json!({"code": 1})
+        };
+        otlp_spans.push(json!({
+            "traceId": statement.trace_id,
+            "spanId": statement.span_id,
+            "parentSpanId": statement.parent_span_id,
+            "name": "stmt",
+            "kind": 1,
+            "startTimeUnixNano": statement.start_unix_nanos.to_string(),
+            "endTimeUnixNano": statement.end_unix_nanos.to_string(),
+            "attributes": attributes,
+            "status": status,
+        }));
+    }
+    otlp_spans.sort_by_key(|span| {
+        span.get("startTimeUnixNano")
+            .and_then(Value::as_str)
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0)
+    });
     json!({
         "resourceSpans": [{
             "resource": {
@@ -1151,39 +1697,6 @@ fn otlp_logs_payload(settings: &OtlpSettings, logs: &[CapturedLog], server: &Ser
             }]
         }]
     })
-}
-
-/// W3C trace identifiers stay stable for the same captured statement, so an
-/// operator can correlate a repeated export or a log line instead of chasing a
-/// fresh random id on every interval. A captured statement is unique per
-/// connection and id, which is sufficient here because MyDB does not accept an
-/// upstream `traceparent` on the MySQL wire protocol.
-fn stable_trace_id(server: &ServerIdentity, snapshot: &SlowQuerySnapshot) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(b"mydb-trace");
-    hasher.update(server.version.as_bytes());
-    hasher.update(snapshot.connection_id.to_le_bytes());
-    hasher.update(snapshot.id.to_le_bytes());
-    let digest = hasher.finalize();
-    hex_prefix(&digest, 16)
-}
-
-fn stable_span_id(server: &ServerIdentity, snapshot: &SlowQuerySnapshot) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(b"mydb-span");
-    hasher.update(server.version.as_bytes());
-    hasher.update(snapshot.connection_id.to_le_bytes());
-    hasher.update(snapshot.id.to_le_bytes());
-    let digest = hasher.finalize();
-    hex_prefix(&digest, 8)
-}
-
-fn hex_prefix(digest: &[u8], bytes: usize) -> String {
-    let mut output = String::with_capacity(bytes * 2);
-    for byte in digest.iter().take(bytes) {
-        output.push_str(&format!("{byte:02x}"));
-    }
-    output
 }
 
 /// Prometheus exposition of the monitoring state that has no counterpart in
@@ -1372,6 +1885,8 @@ mod tests {
     fn settings() -> OtlpSettings {
         OtlpSettings {
             enabled: true,
+            protocol: OtlpProtocol::Protobuf,
+            compression: OtlpCompression::Gzip,
             endpoint: "http://127.0.0.1:4318".to_string(),
             interval: Duration::from_secs(15),
             timeout: Duration::from_secs(5),
@@ -1507,73 +2022,150 @@ mod tests {
         );
     }
 
-    #[test]
-    fn traces_payload_exports_slow_statements_as_client_spans() {
-        let snapshot = SlowQuerySnapshot {
+    fn statement_trace() -> StatementTrace {
+        StatementTrace {
             id: 7,
-            unix_ms: 1_700_000_000_000,
-            duration_ms: 250,
+            trace_id: "0af7651916cd43dd8448eb211c80319c".to_string(),
+            parent_span_id: "b7ad6b7169203331".to_string(),
+            span_id: "0000000000000007".to_string(),
+            start_unix_nanos: 1_700_000_000_000_000_000,
+            end_unix_nanos: 1_700_000_000_250_000_000,
+            duration_micros: 250_000,
             connection_id: 3,
+            user: "app".to_string(),
             database: "shop".to_string(),
             statement_type: "SELECT".to_string(),
-            query_digest: "select * from `t` where id = ?".to_string(),
+            digest: "select * from `t` where id = ?".to_string(),
             sql: "select * from t where id = 42".to_string(),
-            error: None,
             outcome: "rows".to_string(),
-            execution_micros: 240_000,
-            explain_micros: 0,
-            rows_returned: Some(10),
-            affected_rows: None,
-            explain_json: None,
+            rows_sent: Some(10),
+            rows_affected: None,
+            error: None,
+            sql_errno: 0,
+            sqlstate: None,
+            warning_count: 0,
+        }
+    }
+
+    #[test]
+    fn traces_payload_exports_mysql9_spans() {
+        let session = SessionTrace {
+            id: 2,
+            trace_id: "0af7651916cd43dd8448eb211c80319d".to_string(),
+            span_id: "b7ad6b7169203332".to_string(),
+            start_unix_nanos: 1_699_999_000_000_000_000,
+            end_unix_nanos: 1_700_000_001_000_000_000,
+            processlist_id: 3,
+            thread_id: 3,
+            user: "app".to_string(),
+            host: "127.0.0.1".to_string(),
+            database: Some("shop".to_string()),
+        };
+        let control = ControlTrace {
+            id: 1,
+            trace_id: "0af7651916cd43dd8448eb211c80319e".to_string(),
+            span_id: "b7ad6b7169203333".to_string(),
+            time_unix_nanos: 1_700_000_000_000_000_000,
+            trace_enabled: true,
+            metrics_enabled: true,
+            logs_enabled: false,
+            details: "startup".to_string(),
         };
         let payload = otlp_traces_payload(
             &settings(),
-            std::slice::from_ref(&snapshot),
+            std::slice::from_ref(&statement_trace()),
+            &[session],
+            &[control],
             &server_identity(),
         );
-        let span = &payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
-        assert_eq!(span["kind"], json!(1));
-        assert_eq!(span["name"], json!("stmt"));
-        assert_eq!(span["status"]["code"], json!(1));
-        assert_eq!(span["traceId"].as_str().map(str::len), Some(32));
-        assert_eq!(span["spanId"].as_str().map(str::len), Some(16));
-        let attributes = span["attributes"].as_array().expect("attributes");
+        let spans = payload["resourceSpans"][0]["scopeSpans"][0]["spans"]
+            .as_array()
+            .expect("spans");
+        assert_eq!(spans.len(), 3);
+        let names: Vec<&str> = spans
+            .iter()
+            .filter_map(|span| span["name"].as_str())
+            .collect();
+        assert!(names.contains(&"Control"));
+        assert!(names.contains(&"session"));
+        assert!(names.contains(&"stmt"));
+        let stmt = spans
+            .iter()
+            .find(|span| span["name"] == json!("stmt"))
+            .expect("stmt");
+        assert_eq!(stmt["kind"], json!(1));
+        assert_eq!(stmt["status"]["code"], json!(1));
+        assert_eq!(stmt["traceId"].as_str().map(str::len), Some(32));
+        assert_eq!(stmt["spanId"].as_str().map(str::len), Some(16));
+        let attributes = stmt["attributes"].as_array().expect("attributes");
         assert!(attributes
             .iter()
             .any(|attribute| attribute["key"] == json!("db.system")
                 && attribute["value"]["stringValue"] == json!("mysql")));
         assert!(attributes.iter().any(|attribute| {
             attribute["key"] == json!("mysql.cpu_time")
-                && attribute["value"]["intValue"] == json!("240000")
+                && attribute["value"]["intValue"] == json!("250000")
         }));
+        assert!(attributes
+            .iter()
+            .any(|attribute| attribute["key"] == json!("mysql.rows_sent")
+                && attribute["value"]["intValue"] == json!("10")));
         assert!(!attributes
             .iter()
             .any(|attribute| attribute["key"] == json!("db.statement")));
+        let session_span = spans
+            .iter()
+            .find(|span| span["name"] == json!("session"))
+            .expect("session");
+        let session_attributes = session_span["attributes"].as_array().expect("attributes");
+        assert!(session_attributes
+            .iter()
+            .any(|attribute| attribute["key"] == json!("mysql.processlist_id")));
+        let control_span = spans
+            .iter()
+            .find(|span| span["name"] == json!("Control"))
+            .expect("control");
+        let control_attributes = control_span["attributes"].as_array().expect("attributes");
+        assert!(control_attributes
+            .iter()
+            .any(|attribute| attribute["key"] == json!("trace_enabled")
+                && attribute["value"]["boolValue"] == json!(true)));
+    }
+
+    #[test]
+    fn protobuf_encoder_emits_otlp_trace_request() {
+        let payload = otlp_traces_payload(
+            &settings(),
+            std::slice::from_ref(&statement_trace()),
+            &[],
+            &[],
+            &server_identity(),
+        );
+        let encoded = encode_otlp_protobuf("/v1/traces", &payload).expect("protobuf traces");
+        assert!(!encoded.is_empty());
+        // ExportTraceServiceRequest.resource_spans is field 1, length-delimited.
+        assert_eq!(encoded[0], 0x0a);
     }
 
     #[test]
     fn traces_payload_includes_sql_only_when_configured() {
-        let snapshot = SlowQuerySnapshot {
-            id: 9,
-            unix_ms: 1_700_000_000_000,
-            duration_ms: 10,
-            connection_id: 1,
-            database: "shop".to_string(),
-            statement_type: "UPDATE".to_string(),
-            query_digest: "update `t` set a = ?".to_string(),
-            sql: "update t set a = 1".to_string(),
-            error: Some("deadlock".to_string()),
-            outcome: "error".to_string(),
-            execution_micros: 10_000,
-            explain_micros: 0,
-            rows_returned: None,
-            affected_rows: Some(1),
-            explain_json: None,
-        };
+        let mut snapshot = statement_trace();
+        snapshot.id = 9;
+        snapshot.statement_type = "UPDATE".to_string();
+        snapshot.digest = "update `t` set a = ?".to_string();
+        snapshot.sql = "update t set a = 1".to_string();
+        snapshot.error = Some("deadlock".to_string());
+        snapshot.sql_errno = 1213;
+        snapshot.sqlstate = Some("40001".to_string());
+        snapshot.outcome = "error".to_string();
+        snapshot.rows_sent = None;
+        snapshot.rows_affected = Some(1);
         let mut enabled = settings();
         let private_payload = otlp_traces_payload(
             &enabled,
             std::slice::from_ref(&snapshot),
+            &[],
+            &[],
             &server_identity(),
         );
         let encoded = private_payload.to_string();
@@ -1584,6 +2176,8 @@ mod tests {
         let payload = otlp_traces_payload(
             &enabled,
             std::slice::from_ref(&snapshot),
+            &[],
+            &[],
             &server_identity(),
         );
         let span = &payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
@@ -1593,37 +2187,6 @@ mod tests {
             .iter()
             .any(|attribute| attribute["key"] == json!("db.statement")
                 && attribute["value"]["stringValue"] == json!("update t set a = 1")));
-    }
-
-    #[test]
-    fn collect_spans_only_returns_new_slow_queries() {
-        let last_id = AtomicU64::new(0);
-        let mut first = SlowQuerySnapshot {
-            id: 1,
-            unix_ms: 1,
-            duration_ms: 1,
-            connection_id: 1,
-            database: "db".to_string(),
-            statement_type: "SELECT".to_string(),
-            query_digest: "select ?".to_string(),
-            sql: "select 1".to_string(),
-            error: None,
-            outcome: "rows".to_string(),
-            execution_micros: 1,
-            explain_micros: 0,
-            rows_returned: None,
-            affected_rows: None,
-            explain_json: None,
-        };
-        let mut second = first.clone();
-        second.id = 2;
-        first.id = 1;
-        let spans = collect_spans(&[first.clone(), second.clone()], &last_id);
-        assert_eq!(spans.len(), 2);
-        assert_eq!(last_id.load(Ordering::Relaxed), 2);
-        let spans = collect_spans(&[first, second], &last_id);
-        assert!(spans.is_empty());
-        assert_eq!(last_id.load(Ordering::Relaxed), 2);
     }
 
     #[test]

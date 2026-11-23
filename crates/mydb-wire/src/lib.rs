@@ -62,6 +62,10 @@ const REGEX_CACHE_CAPACITY: usize = 256;
 /// need a faster refresh than that.
 const EXPLAIN_CACHE_TTL: Duration = Duration::from_secs(60);
 const EXPLAIN_CACHE_MAX_ENTRIES: usize = 256;
+/// Bounded in-memory trace buffers. OTLP export drains them every interval;
+/// the cap protects the server if a collector is down.
+const MAX_TRACE_BUFFER: usize = 4096;
+const MAX_TRACE_EXPORT_BATCH: usize = 512;
 const READ_ONLY_TRANSACTION_ERROR: &str = "Cannot execute statement in a READ ONLY transaction.";
 static REGEX_CACHE: OnceLock<parking_lot::Mutex<HashMap<String, Regex>>> = OnceLock::new();
 
@@ -4807,6 +4811,98 @@ impl QueryLatencyHistogram {
     }
 }
 
+#[derive(Debug, Clone)]
+/// MySQL 9 style `stmt` span captured after the response was written.
+pub struct StatementTrace {
+    pub id: u64,
+    pub trace_id: String,
+    pub parent_span_id: String,
+    pub span_id: String,
+    pub start_unix_nanos: u64,
+    pub end_unix_nanos: u64,
+    pub duration_micros: u64,
+    pub connection_id: u32,
+    pub user: String,
+    pub database: String,
+    pub statement_type: String,
+    pub digest: String,
+    pub sql: String,
+    pub outcome: String,
+    pub rows_sent: Option<usize>,
+    pub rows_affected: Option<u64>,
+    pub error: Option<String>,
+    pub sql_errno: u32,
+    pub sqlstate: Option<String>,
+    pub warning_count: u64,
+}
+
+/// MySQL 9 style `session` span emitted when the connection closes.
+#[derive(Debug, Clone)]
+pub struct SessionTrace {
+    pub id: u64,
+    pub trace_id: String,
+    pub span_id: String,
+    pub start_unix_nanos: u64,
+    pub end_unix_nanos: u64,
+    pub processlist_id: u32,
+    pub thread_id: u32,
+    pub user: String,
+    pub host: String,
+    pub database: Option<String>,
+}
+
+/// MySQL 9 style `Control` span emitted when telemetry configuration changes.
+#[derive(Debug, Clone)]
+pub struct ControlTrace {
+    pub id: u64,
+    pub trace_id: String,
+    pub span_id: String,
+    pub time_unix_nanos: u64,
+    pub trace_enabled: bool,
+    pub metrics_enabled: bool,
+    pub logs_enabled: bool,
+    pub details: String,
+}
+
+/// Deterministic trace/span pair for a connection so `stmt` spans can parent
+/// to the `session` span without sharing mutable state.
+pub fn session_trace_ids(connection_id: u32) -> (String, String) {
+    let digest = Sha256::digest(format!("mydb-session:{connection_id}").as_bytes());
+    (hex_bytes(&digest[..16]), hex_bytes(&digest[16..24]))
+}
+
+pub fn process_trace_ids(seed: &str) -> (String, String) {
+    let digest = Sha256::digest(seed.as_bytes());
+    (hex_bytes(&digest[..16]), hex_bytes(&digest[16..24]))
+}
+
+/// Validate the W3C `traceparent` value received as a MySQL query attribute.
+pub fn parse_traceparent(value: &[u8]) -> Option<(String, String)> {
+    let value = std::str::from_utf8(value).ok()?.trim();
+    let mut parts = value.split('-');
+    let version = parts.next()?;
+    let trace_id = parts.next()?;
+    let parent_span_id = parts.next()?;
+    let flags = parts.next()?;
+    if version != "00"
+        || trace_id.len() != 32
+        || parent_span_id.len() != 16
+        || flags.len() != 2
+        || !trace_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || !parent_span_id
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        || !flags.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || trace_id.bytes().all(|byte| byte == b'0')
+    {
+        return None;
+    }
+    Some((
+        trace_id.to_ascii_lowercase(),
+        parent_span_id.to_ascii_lowercase(),
+    ))
+}
+
 #[derive(Default)]
 pub struct WireStats {
     active_connections: AtomicUsize,
@@ -4856,6 +4952,13 @@ pub struct WireStats {
     prepared_xa: parking_lot::Mutex<HashMap<String, PreparedXaTransaction>>,
     xa_catalog_path: parking_lot::Mutex<Option<PathBuf>>,
     lock_changed: tokio::sync::Notify,
+    statement_trace_enabled: AtomicBool,
+    next_statement_trace_id: AtomicU64,
+    statement_traces: parking_lot::Mutex<VecDeque<StatementTrace>>,
+    next_session_trace_id: AtomicU64,
+    session_traces: parking_lot::Mutex<VecDeque<SessionTrace>>,
+    next_control_trace_id: AtomicU64,
+    control_traces: parking_lot::Mutex<VecDeque<ControlTrace>>,
 }
 
 #[derive(Debug, Clone)]
@@ -4865,6 +4968,7 @@ struct ActiveSession {
     database: Option<String>,
     command: String,
     started: Instant,
+    started_unix_nanos: u64,
     state: Option<String>,
     info: Option<String>,
 }
@@ -5378,6 +5482,127 @@ impl WireStats {
         self.next_connection_id.fetch_add(1, Ordering::Relaxed) + 1
     }
 
+    pub fn set_statement_tracing(&self, enabled: bool) {
+        self.statement_trace_enabled
+            .store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn statement_tracing_enabled(&self) -> bool {
+        self.statement_trace_enabled.load(Ordering::Relaxed)
+    }
+
+    pub fn record_statement_trace(&self, mut trace: StatementTrace) {
+        trace.id = self
+            .next_statement_trace_id
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
+        trace.span_id = format!("{:016x}", trace.id);
+        let mut traces = self.statement_traces.lock();
+        if traces.len() == MAX_TRACE_BUFFER {
+            traces.pop_front();
+        }
+        traces.push_back(trace);
+    }
+
+    pub fn statement_traces_since(&self, last_id: u64) -> Vec<StatementTrace> {
+        let traces = self.statement_traces.lock();
+        let mut pending: Vec<_> = traces
+            .iter()
+            .filter(|trace| trace.id > last_id)
+            .cloned()
+            .collect();
+        if pending.len() > MAX_TRACE_EXPORT_BATCH {
+            pending.drain(..pending.len() - MAX_TRACE_EXPORT_BATCH);
+        }
+        pending
+    }
+
+    pub fn record_session_trace(
+        &self,
+        connection_id: u32,
+        user: &str,
+        host: &str,
+        database: Option<&str>,
+        start_unix_nanos: u64,
+    ) {
+        let (trace_id, span_id) = session_trace_ids(connection_id);
+        let trace = SessionTrace {
+            id: self.next_session_trace_id.fetch_add(1, Ordering::Relaxed) + 1,
+            trace_id,
+            span_id,
+            start_unix_nanos,
+            end_unix_nanos: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64,
+            processlist_id: connection_id,
+            thread_id: connection_id,
+            user: user.to_string(),
+            host: host.to_string(),
+            database: database.map(str::to_string),
+        };
+        let mut traces = self.session_traces.lock();
+        if traces.len() == MAX_TRACE_BUFFER {
+            traces.pop_front();
+        }
+        traces.push_back(trace);
+    }
+
+    pub fn session_traces_since(&self, last_id: u64) -> Vec<SessionTrace> {
+        let traces = self.session_traces.lock();
+        let mut pending: Vec<_> = traces
+            .iter()
+            .filter(|trace| trace.id > last_id)
+            .cloned()
+            .collect();
+        if pending.len() > MAX_TRACE_EXPORT_BATCH {
+            pending.drain(..pending.len() - MAX_TRACE_EXPORT_BATCH);
+        }
+        pending
+    }
+
+    pub fn record_control_trace(
+        &self,
+        trace_enabled: bool,
+        metrics_enabled: bool,
+        logs_enabled: bool,
+        details: &str,
+    ) {
+        let id = self.next_control_trace_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let (trace_id, span_id) = process_trace_ids(&format!("mydb-control:{id}"));
+        let trace = ControlTrace {
+            id,
+            trace_id,
+            span_id,
+            time_unix_nanos: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64,
+            trace_enabled,
+            metrics_enabled,
+            logs_enabled,
+            details: details.to_string(),
+        };
+        let mut traces = self.control_traces.lock();
+        if traces.len() == MAX_TRACE_BUFFER {
+            traces.pop_front();
+        }
+        traces.push_back(trace);
+    }
+
+    pub fn control_traces_since(&self, last_id: u64) -> Vec<ControlTrace> {
+        let traces = self.control_traces.lock();
+        let mut pending: Vec<_> = traces
+            .iter()
+            .filter(|trace| trace.id > last_id)
+            .cloned()
+            .collect();
+        if pending.len() > MAX_TRACE_EXPORT_BATCH {
+            pending.drain(..pending.len() - MAX_TRACE_EXPORT_BATCH);
+        }
+        pending
+    }
+
     fn register_connection(&self, connection_id: u32, host: &str) -> oneshot::Receiver<()> {
         let (kill_sender, kill_receiver) = oneshot::channel();
         self.killed_connections.lock().remove(&connection_id);
@@ -5389,6 +5614,10 @@ impl WireStats {
                 database: None,
                 command: "Sleep".into(),
                 started: Instant::now(),
+                started_unix_nanos: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos() as u64,
                 state: None,
                 info: None,
             },
@@ -6472,6 +6701,23 @@ impl ConnectionRegistration {
 
 impl Drop for ConnectionRegistration {
     fn drop(&mut self) {
+        if self.stats.statement_tracing_enabled() {
+            let session = self
+                .stats
+                .active_sessions
+                .lock()
+                .get(&self.connection_id)
+                .cloned();
+            if let Some(session) = session {
+                self.stats.record_session_trace(
+                    self.connection_id,
+                    &session.user,
+                    &session.host,
+                    session.database.as_deref(),
+                    session.started_unix_nanos,
+                );
+            }
+        }
         self.stats.unregister_connection(self.connection_id);
         self.stats.disconnected();
     }
@@ -6813,6 +7059,7 @@ struct Backend {
     authenticated_user: parking_lot::Mutex<Option<String>>,
     active_roles: parking_lot::Mutex<Option<HashSet<String>>>,
     client_address: String,
+    trace_parent: Option<(String, String)>,
     xa_identifier: Option<XaIdentifier>,
     xa_branch_state: Option<XaBranchState>,
     aggregate_context: AggregateEvaluationContext,
@@ -7145,6 +7392,7 @@ impl Backend {
             stats,
             connection_id,
             salt,
+            trace_parent: None,
             in_transaction: false,
             autocommit: true,
             transaction_writes,
@@ -41304,6 +41552,19 @@ fn write_prepared_unsigned_integer<W: Write>(
     }
 }
 
+fn statement_error_status(error: &anyhow::Error) -> (u32, Option<String>) {
+    if let Some(condition) = error.downcast_ref::<ProcedureConditionError>() {
+        return (
+            u32::from(condition.0.error_code),
+            Some(condition.0.sqlstate.clone()),
+        );
+    }
+    if let Some(signal) = error.downcast_ref::<TriggerSignalError>() {
+        return (1644, Some(signal.sqlstate.clone()));
+    }
+    (1105, Some("HY000".to_string()))
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]
 struct TriggerSignalError {
@@ -41491,17 +41752,25 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for Backend {
             }
         };
         let expected_parameters = self.prepared_parameter_definitions(&query);
-        let values: Vec<String> = params
-            .into_iter()
-            .enumerate()
-            .map(|(index, param)| {
-                let column_type = expected_parameters
-                    .get(index)
-                    .map(|column| column.coltype)
-                    .unwrap_or(param.coltype);
-                mysql_parameter_to_literal(param.value.into_inner(), column_type)
-            })
-            .collect();
+        let mut trace_parent = None;
+        let mut values: Vec<String> = Vec::with_capacity(expected_parameters.len());
+        for (index, param) in params.into_iter().enumerate() {
+            if param
+                .name
+                .is_some_and(|name| name.eq_ignore_ascii_case(b"traceparent"))
+            {
+                if let opensrv_mysql::ValueInner::Bytes(value) = param.value.into_inner() {
+                    trace_parent = parse_traceparent(value);
+                }
+            }
+            if let Some(definition) = expected_parameters.get(index) {
+                values.push(mysql_parameter_to_literal(
+                    param.value.into_inner(),
+                    definition.coltype,
+                ));
+            }
+        }
+        self.trace_parent = trace_parent;
         let sql = bind_parameters(&query, &values);
         if normalize_sql_whitespace(sql.trim().trim_end_matches(';').trim())
             .to_ascii_uppercase()
@@ -41533,6 +41802,13 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for Backend {
         self.reset_connection()
             .await
             .map_err(|error| io::Error::other(error.to_string()))
+    }
+
+    fn set_query_attributes(&mut self, attributes: &[(&[u8], &[u8])]) {
+        self.trace_parent = attributes
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(b"traceparent"))
+            .and_then(|(_, value)| parse_traceparent(value));
     }
 
     async fn on_query<'a>(
@@ -41789,6 +42065,11 @@ impl Backend {
         let elapsed_micros = elapsed.as_micros() as u64;
         let elapsed_ms = elapsed.as_millis() as u64;
         let error = outcome.as_ref().err().map(ToString::to_string);
+        let (sql_errno, sqlstate) = outcome
+            .as_ref()
+            .err()
+            .map(statement_error_status)
+            .unwrap_or((0, None));
         let normalized_query = normalize_sql_whitespace(query.trim().trim_end_matches(';').trim());
         let statement_type = audit_statement_type(&normalized_query);
         let query_digest = sql_fingerprint(&normalized_query);
@@ -41819,6 +42100,44 @@ impl Backend {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
+        if self.stats.statement_tracing_enabled() {
+            let (session_trace_id, session_span_id) = session_trace_ids(self.connection_id);
+            let (trace_id, parent_span_id) = self
+                .trace_parent
+                .clone()
+                .unwrap_or((session_trace_id, session_span_id));
+            let end_unix_nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64;
+            self.stats.record_statement_trace(StatementTrace {
+                id: 0,
+                trace_id,
+                parent_span_id,
+                span_id: String::new(),
+                start_unix_nanos: end_unix_nanos
+                    .saturating_sub(elapsed_micros.saturating_mul(1_000)),
+                end_unix_nanos,
+                duration_micros: elapsed_micros,
+                connection_id: self.connection_id,
+                user: self
+                    .authenticated_user
+                    .lock()
+                    .clone()
+                    .unwrap_or_else(|| self.config.username.clone()),
+                database: self.database.clone(),
+                statement_type: statement_type.clone(),
+                digest: query_digest.clone(),
+                sql: query.to_string(),
+                outcome: outcome_kind.to_string(),
+                rows_sent: rows_returned,
+                rows_affected: affected_rows,
+                error: error.clone(),
+                sql_errno,
+                sqlstate: sqlstate.clone(),
+                warning_count: self.session_warning_count,
+            });
+        }
         self.stats.query_latency.record(elapsed_micros);
         self.stats.digest_stats.record(
             &query_digest,
@@ -54392,6 +54711,22 @@ fn hex_literal(value: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn traceparent_requires_w3c_shape_and_nonzero_trace_id() {
+        let valid = b"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+        assert_eq!(
+            parse_traceparent(valid),
+            Some((
+                "4bf92f3577b34da6a3ce929d0e0e4736".to_string(),
+                "00f067aa0ba902b7".to_string()
+            ))
+        );
+        assert!(parse_traceparent(b"00-00000000000000000000000000000000-00f067aa0ba902b7-01").is_none());
+        assert!(parse_traceparent(b"01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01").is_none());
+        assert!(parse_traceparent(b"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7").is_none());
+        assert!(parse_traceparent(b"00-4bf92f3577b34da6a3ce929d0e0e473g-00f067aa0ba902b7-01").is_none());
+    }
 
     #[test]
     fn update_target_accepts_mysql_table_aliases() {

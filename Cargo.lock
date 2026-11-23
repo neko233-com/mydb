@@ -727,6 +727,7 @@ dependencies = [
  "crc32fast",
  "libz-sys",
  "miniz_oxide",
+ "zlib-rs",
 ]
 
 [[package]]
@@ -1373,7 +1374,7 @@ checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
 
 [[package]]
 name = "mydb-bench"
-version = "0.1.38"
+version = "0.1.39"
 dependencies = [
  "anyhow",
  "clap",
@@ -1384,7 +1385,7 @@ dependencies = [
 
 [[package]]
 name = "mydb-cdc"
-version = "0.1.38"
+version = "0.1.39"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1402,7 +1403,7 @@ dependencies = [
 
 [[package]]
 name = "mydb-cli"
-version = "0.1.38"
+version = "0.1.39"
 dependencies = [
  "anyhow",
  "clap",
@@ -1421,7 +1422,7 @@ dependencies = [
 
 [[package]]
 name = "mydb-config"
-version = "0.1.38"
+version = "0.1.39"
 dependencies = [
  "anyhow",
  "dirs",
@@ -1437,7 +1438,7 @@ dependencies = [
 
 [[package]]
 name = "mydb-dump"
-version = "0.1.38"
+version = "0.1.39"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1451,7 +1452,7 @@ dependencies = [
 
 [[package]]
 name = "mydb-migrate"
-version = "0.1.38"
+version = "0.1.39"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1464,7 +1465,7 @@ dependencies = [
 
 [[package]]
 name = "mydb-parser"
-version = "0.1.38"
+version = "0.1.39"
 dependencies = [
  "anyhow",
  "clap",
@@ -1475,7 +1476,7 @@ dependencies = [
 
 [[package]]
 name = "mydb-server"
-version = "0.1.38"
+version = "0.1.39"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1484,6 +1485,7 @@ dependencies = [
  "chrono",
  "clap",
  "dirs",
+ "flate2",
  "mydb-cdc",
  "mydb-config",
  "mydb-storage",
@@ -1507,7 +1509,7 @@ dependencies = [
 
 [[package]]
 name = "mydb-storage"
-version = "0.1.38"
+version = "0.1.39"
 dependencies = [
  "anyhow",
  "bincode",
@@ -1526,7 +1528,7 @@ dependencies = [
 
 [[package]]
 name = "mydb-transaction"
-version = "0.1.38"
+version = "0.1.39"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1541,7 +1543,7 @@ dependencies = [
 
 [[package]]
 name = "mydb-wal"
-version = "0.1.38"
+version = "0.1.39"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1553,7 +1555,7 @@ dependencies = [
 
 [[package]]
 name = "mydb-wire"
-version = "0.1.38"
+version = "0.1.39"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3656,6 +3658,12 @@ dependencies = [
  "quote",
  "syn 3.0.10",
 ]
+
+[[package]]
+name = "zlib-rs"
+version = "0.6.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b268e58e7c693d7c271f93ffc4ba3b380412554231c85bf61ca7af91042a4112"
 
 [[package]]
 name = "zmij"
