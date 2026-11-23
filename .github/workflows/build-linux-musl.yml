@@ -19,6 +19,7 @@ jobs:
       CARGO_INCREMENTAL: '0'
       CC_x86_64_unknown_linux_musl: musl-gcc
       CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+      RUSTFLAGS: '-C target-feature=+crt-static -C link-arg=-static'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

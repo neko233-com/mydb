@@ -77,11 +77,13 @@
 - [x] 6.3 `cargo +stable-x86_64-pc-windows-gnullvm build --release --locked -p mydb-server -p mydb-cli -p mydb-migrate -p mydb-dump`（通过）
 - [x] 6.4 本机启动冒烟：release 二进制、`/healthz`、`/readyz`、`/metrics`、OTLP 状态、OTLP `/v1/metrics`+`/v1/logs`、SQL 建表/写入/范围扫描、OLAP 裁剪、权限隔离（`scripts/verify-monitoring-runtime.py` 通过）
 - [x] 6.5 本机无 MySQL/podman，未重跑同机基准；已如实标注“未重跑”，不写新倍数
-- [ ] 6.6 版本号 `0.1.40`，提交信息符合 `<type>(<scope>): <中文描述>`，推送 `main`；本轮不自动创建 GitHub Release
+- [x] 6.6 版本号 `0.1.40`，提交信息符合 `<type>(<scope>): <中文描述>`，推送 `main`
 - [x] 6.7 Linux musl 静态构建规范与 CI：`AGENTS.md`、`docs/zh/musl-build.md`、`.github/workflows/build-linux-musl.yml`
-- [ ] 6.8 本次并行扫描改动需推送后触发 musl workflow，等待静态产物校验结果
+- [x] 6.8 Docker 内 musl 构建通过：显式 `+crt-static` 且 `link-arg=-static`，5 个二进制均无 `INTERP/NEEDED`
 - [x] 6.9 OLAP 并行路径单测通过（`parallel_page_scan_preserves_page_order_and_filtering`）
-- [ ] 6.10 全 workspace 测试、Clippy `-D warnings`、Windows release 构建与运行时冒烟（并行扫描改动）
+- [x] 6.10 Linux Docker 全量门禁：fmt、Clippy `-D warnings`、`cargo test --workspace`（468 tests）、release 构建通过
+- [x] 6.11 容器运行时冒烟：CRUD/事务/聚合/重启/SIGKILL 恢复通过；OLAP 合成基准 14,001 行 3.1x
+- [ ] 6.12 创建 `v0.1.40` GitHub Release，上传 Windows zip 与 Linux musl tar.gz + SHA256
 
 ## 7. 风险与回退
 

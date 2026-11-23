@@ -1,0 +1,15 @@
+# Reproducible Linux gate for MyDB. Keeps host toolchains (MSVC/minGW) out of
+# the result and includes the musl target used by the release workflow.
+FROM rust:1-bookworm
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      musl-tools file binutils ca-certificates python3 && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN rustup component add rustfmt clippy && \
+    rustup target add x86_64-unknown-linux-musl
+
+ENV CARGO_INCREMENTAL=0 \
+    CARGO_BUILD_JOBS=2
+WORKDIR /src

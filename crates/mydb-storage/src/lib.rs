@@ -48,9 +48,7 @@ fn try_acquire_parallel_scan(workers: usize) -> Option<ParallelScanPermit> {
     let cores = std::thread::available_parallelism()
         .map(|value| value.get())
         .unwrap_or(1);
-    let max_active = (cores / workers.max(1))
-        .max(1)
-        .min(OLAP_PARALLEL_SCAN_MAX_ACTIVE);
+    let max_active = (cores / workers.max(1)).clamp(1, OLAP_PARALLEL_SCAN_MAX_ACTIVE);
     loop {
         let active = ACTIVE_PARALLEL_SCANS.load(Ordering::Acquire);
         if active >= max_active {
@@ -291,8 +289,11 @@ fn read_u64(bytes: &[u8], pos: &mut usize) -> Option<u64> {
 // ============================================================================
 
 pub struct BufferPool {
-    pages: RwLock<HashMap<String, HashMap<u32, Page>>>,
+    pages: RwLock<HashMap<String, HashMap<u32, Arc<Page>>>>,
     max_pages: usize,
+    /// Maintained under the `pages` write lock so eviction checks do not walk
+    /// every shard on each insert.
+    total_pages: AtomicUsize,
     /// Page-access counters for zone-map pruning. They live here because the
     /// buffer pool already owns every decoded page and is shared by every
     /// `Database` instance.
@@ -304,11 +305,12 @@ pub struct BufferPool {
 impl BufferPool {
     pub fn new(page_size: usize, buffer_pool_size: &str) -> Self {
         let size_bytes = Self::parse_size(buffer_pool_size);
-        let max_pages = size_bytes / page_size;
+        let max_pages = (size_bytes / page_size).max(1);
 
         Self {
             pages: RwLock::new(HashMap::with_capacity(max_pages)),
             max_pages,
+            total_pages: AtomicUsize::new(0),
             olap_pages_scanned: AtomicU64::new(0),
             olap_pages_pruned: AtomicU64::new(0),
             olap_rows_pruned: AtomicU64::new(0),
@@ -350,47 +352,70 @@ impl BufferPool {
         num * unit
     }
 
-    pub fn get_page(&self, page_number: u32) -> Option<Page> {
+    pub fn get_page(&self, page_number: u32) -> Option<Arc<Page>> {
         self.get_table_page("", page_number)
     }
 
-    pub fn insert_page(&self, page: Page) {
+    pub fn insert_page(&self, page: impl Into<Arc<Page>>) {
         self.insert_table_page("", page);
     }
 
-    pub fn get_table_page(&self, namespace: &str, page_number: u32) -> Option<Page> {
+    pub fn get_table_page(&self, namespace: &str, page_number: u32) -> Option<Arc<Page>> {
         self.pages.read().get(namespace)?.get(&page_number).cloned()
     }
 
-    pub fn insert_table_page(&self, namespace: &str, page: Page) {
-        let mut pages = self.pages.write();
-        if pages.values().map(HashMap::len).sum::<usize>() >= self.max_pages {
-            let oldest = pages
-                .iter()
-                .filter_map(|(owner, shard)| {
-                    shard
-                        .iter()
-                        .min_by_key(|(_, page)| page.header.lsn)
-                        .map(|(number, page)| (owner.clone(), *number, page.header.lsn))
-                })
-                .min_by_key(|(_, _, lsn)| *lsn);
-            if let Some((owner, number, _)) = oldest {
-                if let Some(shard) = pages.get_mut(&owner) {
-                    shard.remove(&number);
+    fn evict_if_needed(&self, pages: &mut HashMap<String, HashMap<u32, Arc<Page>>>) {
+        let count = self.total_pages.load(Ordering::Relaxed);
+        if count < self.max_pages {
+            return;
+        }
+        // Evict a batch, not a single page: with a 1 GiB pool the old path
+        // sorted the whole pool on every insert after saturation. The target
+        // leaves room for the page currently being inserted.
+        let batch = (self.max_pages / 16).max(1);
+        let target = self.max_pages.saturating_sub(batch);
+        let excess = count.saturating_sub(target);
+        if excess == 0 {
+            return;
+        }
+        let mut oldest: Vec<(u64, String, u32)> = pages
+            .iter()
+            .flat_map(|(owner, shard)| {
+                shard
+                    .iter()
+                    .map(move |(number, page)| (page.header.lsn, owner.clone(), *number))
+            })
+            .collect();
+        oldest.sort_unstable_by_key(|(lsn, _, _)| *lsn);
+        for (_, owner, number) in oldest.into_iter().take(excess) {
+            if let Some(shard) = pages.get_mut(&owner) {
+                if shard.remove(&number).is_some() {
+                    self.total_pages.fetch_sub(1, Ordering::Relaxed);
                 }
             }
         }
-        pages
+    }
+
+    pub fn insert_table_page(&self, namespace: &str, page: impl Into<Arc<Page>>) {
+        let page = page.into();
+        let page_number = page.header.page_number;
+        let mut pages = self.pages.write();
+        self.evict_if_needed(&mut pages);
+        let replaced = pages
             .entry(namespace.to_string())
             .or_default()
-            .insert(page.header.page_number, page);
+            .insert(page_number, page)
+            .is_some();
+        if !replaced {
+            self.total_pages.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     pub fn mark_dirty(&self, page_number: u32) {
         let mut pages = self.pages.write();
         if let Some(shard) = pages.get_mut("") {
             if let Some(page) = shard.get_mut(&page_number) {
-                page.header.is_dirty = true;
+                Arc::make_mut(page).header.is_dirty = true;
             }
         }
     }
@@ -401,7 +426,7 @@ impl BufferPool {
             .values()
             .flat_map(HashMap::values)
             .filter(|page| page.header.is_dirty)
-            .cloned()
+            .map(|page| page.as_ref().clone())
             .collect()
     }
 
@@ -409,7 +434,7 @@ impl BufferPool {
         let mut pages = self.pages.write();
         for shard in pages.values_mut() {
             for page in shard.values_mut() {
-                page.header.is_dirty = false;
+                Arc::make_mut(page).header.is_dirty = false;
             }
         }
     }
@@ -421,15 +446,19 @@ impl BufferPool {
     }
 
     pub fn page_count(&self) -> usize {
-        self.pages.read().values().map(HashMap::len).sum()
+        self.total_pages.load(Ordering::Relaxed)
     }
 
     pub fn clear(&self) {
         self.pages.write().clear();
+        self.total_pages.store(0, Ordering::Relaxed);
     }
 
     pub fn clear_namespace(&self, namespace: &str) {
-        self.pages.write().remove(namespace);
+        let mut pages = self.pages.write();
+        if let Some(shard) = pages.remove(namespace) {
+            self.total_pages.fetch_sub(shard.len(), Ordering::Relaxed);
+        }
     }
 }
 
@@ -3386,15 +3415,7 @@ impl Database {
         let namespace = self.page_namespace(table_name);
         let mut all_rows = Vec::new();
         for page_num in 0..next_page_number {
-            let page = if let Some(page) = self.buffer_pool.get_table_page(&namespace, page_num) {
-                Some(page)
-            } else {
-                let page = self.disk_manager.read_page(table_name, page_num)?;
-                if let Some(page) = &page {
-                    self.buffer_pool.insert_table_page(&namespace, page.clone());
-                }
-                page
-            };
+            let page = self.load_table_page(table_name, &namespace, page_num)?;
             if let Some(page) = page {
                 all_rows.extend(unpack_page_rows(&page));
             }
@@ -3428,16 +3449,7 @@ impl Database {
             return Ok(0);
         }
         let namespace = self.page_namespace(table_name);
-        let page = match self.buffer_pool.get_table_page(&namespace, 0) {
-            Some(page) => Some(page),
-            None => {
-                let page = self.disk_manager.read_page(table_name, 0)?;
-                if let Some(page) = &page {
-                    self.buffer_pool.insert_table_page(&namespace, page.clone());
-                }
-                page
-            }
-        };
+        let page = self.load_table_page(table_name, &namespace, 0)?;
         let rows_per_page = page
             .as_ref()
             .map(|page| u64::from(page.header.row_count))
@@ -3489,6 +3501,26 @@ impl Database {
         self.page_zones.write().remove(table_name);
     }
 
+    /// Fetch a table page, promoting a disk miss into the buffer pool without
+    /// deep-copying the 16 KiB page into the cache and again for the caller.
+    fn load_table_page(
+        &self,
+        table_name: &str,
+        namespace: &str,
+        page_num: u32,
+    ) -> Result<Option<Arc<Page>>> {
+        if let Some(page) = self.buffer_pool.get_table_page(namespace, page_num) {
+            return Ok(Some(page));
+        }
+        let Some(page) = self.disk_manager.read_page(table_name, page_num)? else {
+            return Ok(None);
+        };
+        let page = Arc::new(page);
+        self.buffer_pool
+            .insert_table_page(namespace, Arc::clone(&page));
+        Ok(Some(page))
+    }
+
     /// Decode a single page and return its matching rows. `None` means the
     /// page slot is absent; an empty vector means the page was pruned or held
     /// no matching rows. Keeping allocation and zone-map mutation here lets
@@ -3501,16 +3533,7 @@ impl Database {
         page_num: u32,
         filter: Option<&RowPredicate>,
     ) -> Result<Option<Vec<Row>>> {
-        let page = if let Some(page) = self.buffer_pool.get_table_page(namespace, page_num) {
-            Some(page)
-        } else {
-            let page = self.disk_manager.read_page(table_name, page_num)?;
-            if let Some(page) = &page {
-                self.buffer_pool.insert_table_page(namespace, page.clone());
-            }
-            page
-        };
-        let Some(page) = page else {
+        let Some(page) = self.load_table_page(table_name, namespace, page_num)? else {
             return Ok(None);
         };
         let zone = if filter.is_some() {
@@ -3655,17 +3678,9 @@ impl Database {
             .next_page_number;
 
         let mut rows = Vec::new();
+        let namespace = self.page_namespace(table_name);
         for page_num in 0..next_page_number {
-            let namespace = self.page_namespace(table_name);
-            let page = if let Some(page) = self.buffer_pool.get_table_page(&namespace, page_num) {
-                Some(page)
-            } else {
-                let page = self.disk_manager.read_page(table_name, page_num)?;
-                if let Some(page) = &page {
-                    self.buffer_pool.insert_table_page(&namespace, page.clone());
-                }
-                page
-            };
+            let page = self.load_table_page(table_name, &namespace, page_num)?;
             if let Some(page) = page {
                 rows.extend(unpack_page_rows(&page));
             }
@@ -16099,6 +16114,55 @@ mod tests {
         assert!(
             ids.windows(2).all(|window| window[0] < window[1]),
             "parallel page merge must restore ascending page order"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "manual OLAP scan benchmark"]
+    async fn olap_scan_benchmark_reports_throughput() {
+        let (_temp, manager) = recovery_manager().await;
+        let mut commands = Vec::with_capacity(20_000);
+        for id in 1..=20_000_u64 {
+            let mut row = Row::new();
+            row.push("id", format!("{id:05}").into_bytes());
+            row.push(
+                "value",
+                format!("pad-{id:05}-{}", "x".repeat(40)).into_bytes(),
+            );
+            commands.push(WriteCommand::Insert {
+                database: "game".into(),
+                table: "a".into(),
+                row,
+            });
+        }
+        manager.execute_batch(commands).await.unwrap();
+        manager.flush().unwrap();
+
+        let between = RowPredicate::Between("id".into(), b"01000".to_vec(), b"15000".to_vec());
+        let expected = 14_001usize;
+        assert_eq!(
+            manager
+                .scan_table_filtered("game", "a", Some(&between))
+                .unwrap()
+                .len(),
+            expected
+        );
+
+        let iterations = 7usize;
+        let started = Instant::now();
+        for _ in 0..iterations {
+            let rows = manager
+                .scan_table_filtered("game", "a", Some(&between))
+                .unwrap();
+            assert_eq!(rows.len(), expected);
+        }
+        let elapsed = started.elapsed();
+        let rows_per_second =
+            (expected as f64 * iterations as f64) / elapsed.as_secs_f64().max(f64::EPSILON);
+        println!(
+            "OLAP_BENCH rows={expected} iterations={iterations} threads={} elapsed_ms={} rows_per_second={rows_per_second:.0}",
+            olap_scan_threads(),
+            elapsed.as_millis()
         );
     }
 }
